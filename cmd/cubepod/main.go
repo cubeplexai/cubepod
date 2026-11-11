@@ -28,6 +28,7 @@ Global Flags:
 
 Commands:
   health                                      Check Gateway health status
+  mcp                                         Start native Model Context Protocol (MCP) JSON-RPC stdio server
   sandbox create [flags]                      Provision a new sandbox
   sandbox list [--template <id>]              List managed sandboxes
   sandbox get <sandbox-id>                    Get status for a sandbox
@@ -104,6 +105,11 @@ func main() {
 		output(res, jsonOutput, func() {
 			fmt.Printf("Status: %s\n", res["status"])
 		})
+
+	case "mcp":
+		if err := ServeMCP(ctx, c, os.Stdin, os.Stdout); err != nil {
+			fatal(err)
+		}
 
 	case "sandbox":
 		if len(subArgs) == 0 {
