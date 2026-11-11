@@ -33,3 +33,8 @@ make build
 # Run unit and integration tests
 make test
 ```
+
+## License
+
+CubePod is open-source software licensed under the [Apache License, Version 2.0](LICENSE).
+
