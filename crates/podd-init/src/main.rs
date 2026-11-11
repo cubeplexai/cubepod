@@ -24,8 +24,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::Instant;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitConfig {
     pub rootfs_device: PathBuf,
     pub workspace_device: PathBuf,
@@ -34,6 +35,7 @@ pub struct InitConfig {
     pub workspace_dir: PathBuf,
     pub default_uid: u32,
     pub default_gid: u32,
+    pub init_state_path: PathBuf,
     pub skip_pivot: bool,
     pub next_argv: Vec<String>,
 }
@@ -46,6 +48,21 @@ impl InitConfig {
             args
         };
 
+        let default_uid = env::var("CUBEPOD_UID")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1000);
+
+        let default_gid = env::var("CUBEPOD_GID")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1000);
+
+        let init_state_path = PathBuf::from(
+            env::var("CUBEPOD_INIT_STATE_PATH")
+                .unwrap_or_else(|_| "/run/cubepod/init-state.json".into()),
+        );
+
         Self {
             rootfs_device: PathBuf::from(
                 env::var("CUBEPOD_ROOTFS_DEV").unwrap_or_else(|_| "/dev/cubepod-rootfs".into()),
@@ -54,20 +71,86 @@ impl InitConfig {
                 env::var("CUBEPOD_WORKSPACE_DEV")
                     .unwrap_or_else(|_| "/dev/cubepod-workspace".into()),
             ),
-            upper_mount_path: PathBuf::from("/mnt/cubepod-upper"),
-            merged_root_path: PathBuf::from("/mnt/cubepod-merged"),
+            upper_mount_path: PathBuf::from(
+                env::var("CUBEPOD_UPPER_MOUNT").unwrap_or_else(|_| "/mnt/cubepod-upper".into()),
+            ),
+            merged_root_path: PathBuf::from(
+                env::var("CUBEPOD_MERGED_ROOT").unwrap_or_else(|_| "/mnt/cubepod-merged".into()),
+            ),
             workspace_dir: PathBuf::from("/workspace"),
-            default_uid: 1000,
-            default_gid: 1000,
+            default_uid,
+            default_gid,
+            init_state_path,
             skip_pivot: env::var("CUBEPOD_SKIP_PIVOT").as_deref() == Ok("1"),
             next_argv,
         }
     }
 }
 
+/// Action performed on a raw block volume during initial verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeAction {
+    Formatted,
+    Healed,
+    Mounted,
+    Skipped,
+}
+
+impl VolumeAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VolumeAction::Formatted => "formatted",
+            VolumeAction::Healed => "healed",
+            VolumeAction::Mounted => "mounted",
+            VolumeAction::Skipped => "skipped",
+        }
+    }
+}
+
+impl std::fmt::Display for VolumeAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// In-guest initialization marker written to `/run/cubepod/init-state.json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitState {
+    pub pivoted: bool,
+    pub rootfs_device: String,
+    pub rootfs_action: VolumeAction,
+    pub workspace_device: String,
+    pub workspace_action: VolumeAction,
+    pub duration_ms: u64,
+}
+
+impl InitState {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\n  \"pivoted\": {},\n  \"rootfs_device\": \"{}\",\n  \"rootfs_action\": \"{}\",\n  \"workspace_device\": \"{}\",\n  \"workspace_action\": \"{}\",\n  \"duration_ms\": {}\n}}\n",
+            self.pivoted,
+            self.rootfs_device,
+            self.rootfs_action.as_str(),
+            self.workspace_device,
+            self.workspace_action.as_str(),
+            self.duration_ms
+        )
+    }
+
+    pub fn write_to_file(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("failed to create dir {}: {e}", parent.display()))?;
+        }
+        fs::write(path, self.to_json())
+            .map_err(|e| format!("failed to write init state to {}: {e}", path.display()))?;
+        Ok(())
+    }
+}
+
 /// Ensures `device` has a valid `ext4` filesystem; formats with `mkfs.ext4` if blank,
 /// or runs `e2fsck -p` to auto-heal after unclean VM shutdowns.
-pub fn ensure_ext4(device: &Path, label: &str) -> Result<(), String> {
+pub fn ensure_ext4(device: &Path, label: &str) -> Result<VolumeAction, String> {
     if !device.exists() {
         return Err(format!("block device {} does not exist", device.display()));
     }
@@ -106,7 +189,7 @@ pub fn ensure_ext4(device: &Path, label: &str) -> Result<(), String> {
                 device.display()
             ));
         }
-        return Ok(());
+        return Ok(VolumeAction::Formatted);
     }
 
     eprintln!(
@@ -121,7 +204,8 @@ pub fn ensure_ext4(device: &Path, label: &str) -> Result<(), String> {
 
     // e2fsck exit code 0 = no errors, 1 = filesystem errors corrected, 2 = corrected (reboot suggested)
     match status.code() {
-        Some(0..=2) => Ok(()),
+        Some(0) => Ok(VolumeAction::Mounted),
+        Some(1..=2) => Ok(VolumeAction::Healed),
         other => Err(format!(
             "e2fsck -p failed on {} with exit code {:?}",
             device.display(),
@@ -131,21 +215,39 @@ pub fn ensure_ext4(device: &Path, label: &str) -> Result<(), String> {
 }
 
 pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
-    if cfg.skip_pivot {
-        eprintln!("[podd-init] CUBEPOD_SKIP_PIVOT=1 set, skipping block mount and pivot_root");
+    let start = Instant::now();
+
+    if cfg.skip_pivot || !cfg.rootfs_device.exists() {
+        if cfg.skip_pivot {
+            eprintln!("[podd-init] CUBEPOD_SKIP_PIVOT=1 set, skipping block mount and pivot_root");
+        } else {
+            eprintln!(
+                "[podd-init] no raw block device at {}, continuing on standard rootfs",
+                cfg.rootfs_device.display()
+            );
+        }
+        let state = InitState {
+            pivoted: false,
+            rootfs_device: cfg.rootfs_device.to_string_lossy().to_string(),
+            rootfs_action: VolumeAction::Skipped,
+            workspace_device: cfg.workspace_device.to_string_lossy().to_string(),
+            workspace_action: VolumeAction::Skipped,
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+        if let Err(e) = state.write_to_file(&cfg.init_state_path) {
+            eprintln!(
+                "[podd-init] warning: failed to write init state to {}: {e}",
+                cfg.init_state_path.display()
+            );
+        }
         return Ok(());
     }
 
-    if !cfg.rootfs_device.exists() {
-        eprintln!(
-            "[podd-init] no raw block device at {}, continuing on standard rootfs",
-            cfg.rootfs_device.display()
-        );
-        return Ok(());
-    }
+    // Set root mount propagation to MS_PRIVATE | MS_REC before assembling mounts to allow pivot_root.
+    make_mount_private(Path::new("/"))?;
 
     // 1. Heal or format RootFS Upper block device.
-    ensure_ext4(&cfg.rootfs_device, "cubepod-rootfs")?;
+    let rootfs_action = ensure_ext4(&cfg.rootfs_device, "cubepod-rootfs")?;
 
     // 2. Mount RootFS Upper block device and create upper/ and work/ directories.
     fs::create_dir_all(&cfg.upper_mount_path)
@@ -178,7 +280,7 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         return Err(format!("overlayfs mount failed with status {status}"));
     }
 
-    // 4. Mount Workspace block device at <merged>/workspace and chown to 1000:1000.
+    // 4. Mount Workspace block device at <merged>/workspace and chown to default_uid:default_gid.
     let rel_ws = cfg
         .workspace_dir
         .strip_prefix("/")
@@ -187,10 +289,13 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
     fs::create_dir_all(&merged_workspace)
         .map_err(|e| format!("mkdir {}: {e}", merged_workspace.display()))?;
 
-    if cfg.workspace_device.exists() {
-        ensure_ext4(&cfg.workspace_device, "cubepod-ws")?;
+    let workspace_action = if cfg.workspace_device.exists() {
+        let action = ensure_ext4(&cfg.workspace_device, "cubepod-ws")?;
         mount_ext4(&cfg.workspace_device, &merged_workspace)?;
-    }
+        action
+    } else {
+        VolumeAction::Skipped
+    };
     chown_path(&merged_workspace, cfg.default_uid, cfg.default_gid)?;
 
     // 5. Bind-mount virtual filesystems, the injected /opt/cubepod runtime volume,
@@ -247,10 +352,48 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         let _ = env::set_current_dir("/");
     }
 
+    // 7. Write init state marker
+    let state = InitState {
+        pivoted: true,
+        rootfs_device: cfg.rootfs_device.to_string_lossy().to_string(),
+        rootfs_action,
+        workspace_device: cfg.workspace_device.to_string_lossy().to_string(),
+        workspace_action,
+        duration_ms: start.elapsed().as_millis() as u64,
+    };
+    if let Err(e) = state.write_to_file(&cfg.init_state_path) {
+        eprintln!(
+            "[podd-init] warning: failed to write init state to {}: {e}",
+            cfg.init_state_path.display()
+        );
+    }
+
     eprintln!(
         "[podd-init] persistent OverlayFS root active (workdir={})",
         cfg.workspace_dir.display()
     );
+    Ok(())
+}
+
+fn make_mount_private(target: &Path) -> Result<(), String> {
+    let c_target = CString::new(target.to_string_lossy().as_bytes())
+        .map_err(|e| format!("invalid target path: {e}"))?;
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c_target.as_ptr(),
+            std::ptr::null(),
+            (libc::MS_PRIVATE | libc::MS_REC) as libc::c_ulong,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "mount private on {} failed: {}",
+            target.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
     Ok(())
 }
 
@@ -353,17 +496,159 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+    fn unique_temp_path(prefix: &str, ext: &str) -> PathBuf {
+        let count = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        env::temp_dir().join(format!("{prefix}-{}-{count}.{ext}", nanos))
+    }
+
+    struct TempFileGuard(PathBuf);
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
 
     #[test]
-    fn graceful_fallback_when_block_device_missing() {
-        let mut cfg = InitConfig::from_env_and_args(vec![]);
-        cfg.rootfs_device = PathBuf::from("/dev/nonexistent-cubepod-rootfs-test");
-        assert!(setup_and_pivot(&cfg).is_ok());
+    fn default_config_values() {
+        let cfg = InitConfig::from_env_and_args(vec![]);
+        assert_eq!(cfg.default_uid, 1000);
+        assert_eq!(cfg.default_gid, 1000);
+        assert_eq!(
+            cfg.init_state_path,
+            PathBuf::from("/run/cubepod/init-state.json")
+        );
+        assert_eq!(cfg.next_argv, vec!["/opt/cubepod/bin/podd".to_string()]);
     }
 
     #[test]
     fn default_next_argv_points_to_podd() {
         let cfg = InitConfig::from_env_and_args(vec![]);
         assert_eq!(cfg.next_argv, vec!["/opt/cubepod/bin/podd".to_string()]);
+    }
+
+    #[test]
+    fn graceful_fallback_when_block_device_missing() {
+        let state_path = unique_temp_path("test-fallback-state", "json");
+        let _guard = TempFileGuard(state_path.clone());
+
+        let mut cfg = InitConfig::from_env_and_args(vec![]);
+        cfg.rootfs_device = PathBuf::from("/dev/nonexistent-cubepod-rootfs-test");
+        cfg.init_state_path = state_path.clone();
+
+        assert!(setup_and_pivot(&cfg).is_ok());
+
+        assert!(state_path.exists());
+        let content = fs::read_to_string(&state_path).expect("read init-state.json");
+        assert!(content.contains("\"pivoted\": false"));
+        assert!(content.contains("\"rootfs_action\": \"skipped\""));
+        assert!(content.contains("\"workspace_action\": \"skipped\""));
+        assert!(content.contains("\"duration_ms\":"));
+    }
+
+    #[test]
+    fn skip_pivot_writes_skipped_state() {
+        let state_path = unique_temp_path("test-skip-state", "json");
+        let _guard = TempFileGuard(state_path.clone());
+
+        let mut cfg = InitConfig::from_env_and_args(vec![]);
+        cfg.skip_pivot = true;
+        cfg.init_state_path = state_path.clone();
+
+        assert!(setup_and_pivot(&cfg).is_ok());
+
+        assert!(state_path.exists());
+        let content = fs::read_to_string(&state_path).expect("read init-state.json");
+        assert!(content.contains("\"pivoted\": false"));
+        assert!(content.contains("\"rootfs_action\": \"skipped\""));
+        assert!(content.contains("\"workspace_action\": \"skipped\""));
+    }
+
+    #[test]
+    fn sparse_file_ensure_ext4_and_init_state_verification() {
+        let img_path = unique_temp_path("test-sparse", "img");
+        let _guard_img = TempFileGuard(img_path.clone());
+
+        // Create 64MB sparse file
+        let file = fs::File::create(&img_path).expect("create sparse file");
+        file.set_len(64 * 1024 * 1024).expect("truncate to 64MB");
+        drop(file);
+
+        // Run 1: format raw image with ext4
+        let action1 = ensure_ext4(&img_path, "cubepod-test").expect("ensure_ext4 run 1");
+        assert_eq!(
+            action1,
+            VolumeAction::Formatted,
+            "first ensure_ext4 run must format fresh sparse image"
+        );
+
+        // Run 2: existing ext4 image verified/healed with e2fsck
+        let action2 = ensure_ext4(&img_path, "cubepod-test").expect("ensure_ext4 run 2");
+        assert!(
+            action2 == VolumeAction::Mounted || action2 == VolumeAction::Healed,
+            "second ensure_ext4 run must return Mounted or Healed, got {:?}",
+            action2
+        );
+
+        // Verify init-state.json output serialization and file writing
+        let state_path = unique_temp_path("test-init-state", "json");
+        let _guard_state = TempFileGuard(state_path.clone());
+
+        let state = InitState {
+            pivoted: true,
+            rootfs_device: img_path.to_string_lossy().to_string(),
+            rootfs_action: action2,
+            workspace_device: "/dev/cubepod-workspace".to_string(),
+            workspace_action: VolumeAction::Skipped,
+            duration_ms: 128,
+        };
+
+        state.write_to_file(&state_path).expect("write init state");
+        assert!(state_path.exists());
+
+        let content = fs::read_to_string(&state_path).expect("read init-state.json");
+        assert!(content.contains("\"pivoted\": true"));
+        assert!(content.contains(&format!("\"rootfs_device\": \"{}\"", img_path.display())));
+        assert!(content.contains(&format!("\"rootfs_action\": \"{}\"", action2.as_str())));
+        assert!(content.contains("\"workspace_device\": \"/dev/cubepod-workspace\""));
+        assert!(content.contains("\"workspace_action\": \"skipped\""));
+        assert!(content.contains("\"duration_ms\": 128"));
+    }
+
+    #[test]
+    fn volume_action_as_str_and_display() {
+        assert_eq!(VolumeAction::Formatted.as_str(), "formatted");
+        assert_eq!(VolumeAction::Healed.as_str(), "healed");
+        assert_eq!(VolumeAction::Mounted.as_str(), "mounted");
+        assert_eq!(VolumeAction::Skipped.as_str(), "skipped");
+
+        assert_eq!(format!("{}", VolumeAction::Formatted), "formatted");
+        assert_eq!(format!("{}", VolumeAction::Healed), "healed");
+        assert_eq!(format!("{}", VolumeAction::Mounted), "mounted");
+        assert_eq!(format!("{}", VolumeAction::Skipped), "skipped");
+    }
+
+    #[test]
+    fn init_state_to_json_format() {
+        let state = InitState {
+            pivoted: true,
+            rootfs_device: "/dev/cubepod-rootfs".to_string(),
+            rootfs_action: VolumeAction::Mounted,
+            workspace_device: "/dev/cubepod-workspace".to_string(),
+            workspace_action: VolumeAction::Mounted,
+            duration_ms: 42,
+        };
+
+        let json = state.to_json();
+        let expected = "{\n  \"pivoted\": true,\n  \"rootfs_device\": \"/dev/cubepod-rootfs\",\n  \"rootfs_action\": \"mounted\",\n  \"workspace_device\": \"/dev/cubepod-workspace\",\n  \"workspace_action\": \"mounted\",\n  \"duration_ms\": 42\n}\n";
+        assert_eq!(json, expected);
     }
 }
