@@ -50,6 +50,7 @@ type ContainerManifest struct {
 	VolumeDevices   []VolumeDevice                `json:"volumeDevices,omitempty"`
 	Resources       v1alpha1.ResourceRequirements `json:"resources,omitempty"`
 	Env             []EnvVar                      `json:"env,omitempty"`
+	Privileged      bool                          `json:"privileged,omitempty"`
 }
 
 // VolumeManifest represents a Pod volume definition.
@@ -159,7 +160,9 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 	}
 
 	rtClass := tpl.RuntimeClassName
-	if rtClass == "" && !strings.EqualFold(vm, "Filesystem") {
+	if strings.EqualFold(rtClass, "none") || rtClass == "-" {
+		rtClass = ""
+	} else if rtClass == "" && !strings.EqualFold(vm, "Filesystem") {
 		rtClass = "kata-qemu"
 	}
 
@@ -256,6 +259,7 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 			})
 		}
 	} else {
+		mainContainer.Privileged = true
 		mainContainer.VolumeDevices = []VolumeDevice{
 			{
 				Name:       "rootfs-volume",

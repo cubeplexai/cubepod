@@ -147,3 +147,93 @@ func TestToCoreV1Pod_AllFields(t *testing.T) {
 		t.Fatalf("expected runtimeClassName kata-qemu in json, got %v", spec["runtimeClassName"])
 	}
 }
+
+func TestToCoreV1Container_PrivilegedSecurityContext(t *testing.T) {
+	// 1. Privileged = true
+	cPriv := ContainerManifest{
+		Name:       "sandbox",
+		Image:      "ubuntu:24.04",
+		Privileged: true,
+	}
+	v1Priv := toCoreV1Container(cPriv)
+	if v1Priv.SecurityContext == nil {
+		t.Fatal("expected SecurityContext to be non-nil when Privileged=true")
+	}
+	if v1Priv.SecurityContext.Privileged == nil || !*v1Priv.SecurityContext.Privileged {
+		t.Fatalf("expected SecurityContext.Privileged to be true, got %v", v1Priv.SecurityContext.Privileged)
+	}
+
+	dataPriv, err := json.Marshal(v1Priv)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	var parsedPriv map[string]any
+	if err := json.Unmarshal(dataPriv, &parsedPriv); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	sc, ok := parsedPriv["securityContext"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected securityContext map in json: %s", string(dataPriv))
+	}
+	if sc["privileged"] != true {
+		t.Fatalf("expected securityContext.privileged=true, got %v", sc["privileged"])
+	}
+
+	// 2. Privileged = false (default)
+	cUnpriv := ContainerManifest{
+		Name:       "sandbox",
+		Image:      "ubuntu:24.04",
+		Privileged: false,
+	}
+	v1Unpriv := toCoreV1Container(cUnpriv)
+	if v1Unpriv.SecurityContext != nil {
+		t.Fatalf("expected SecurityContext to be nil when Privileged=false, got %+v", v1Unpriv.SecurityContext)
+	}
+
+	dataUnpriv, err := json.Marshal(v1Unpriv)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+	var parsedUnpriv map[string]any
+	if err := json.Unmarshal(dataUnpriv, &parsedUnpriv); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	if _, exists := parsedUnpriv["securityContext"]; exists {
+		t.Fatalf("expected securityContext to be omitted in json: %s", string(dataUnpriv))
+	}
+}
+
+func TestToCoreV1Pod_PrivilegedContainerSerialization(t *testing.T) {
+	manifest := PodManifest{
+		Name:             "block-pod",
+		RuntimeClassName: "",
+		Containers: []ContainerManifest{
+			{
+				Name:       "sandbox",
+				Image:      "ubuntu:24.04",
+				Privileged: true,
+			},
+		},
+	}
+
+	pod := toCoreV1Pod(manifest, "test-ns")
+	data, err := json.Marshal(pod)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	spec := parsed["spec"].(map[string]any)
+	containers := spec["containers"].([]any)
+	if len(containers) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(containers))
+	}
+	cObj := containers[0].(map[string]any)
+	sc, ok := cObj["securityContext"].(map[string]any)
+	if !ok || sc["privileged"] != true {
+		t.Fatalf("expected containers[0].securityContext.privileged=true, got %v", cObj["securityContext"])
+	}
+}

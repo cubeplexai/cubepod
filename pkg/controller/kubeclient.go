@@ -379,6 +379,8 @@ func (c *RESTKubeClient) DeletePVC(ctx context.Context, namespace, name string) 
 }
 
 // EnsurePod applies a Kata MicroVM Pod via POST.
+// In volumeMode: Block, privileged containers have securityContext.privileged=true
+// serialized into the Pod JSON payload so podd-init has CAP_SYS_ADMIN.
 // 409 Conflict is treated as idempotent success.
 func (c *RESTKubeClient) EnsurePod(ctx context.Context, pod PodManifest) (string, error) {
 	ns := c.podNamespace(pod)
