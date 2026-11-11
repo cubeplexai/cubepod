@@ -6,13 +6,14 @@ runtime:
   runtimeClassName: "kata-qemu"
   defaultTemplate: "cubeplex-ubuntu24-desktop"
   # Lightweight initContainer image that injects /opt/cubepod/bin/{podd-init,podd} at Pod startup
-  poddInjectorImage: "ghcr.io/cubeplexai/cubepod-podd:v0.1.0"
+  poddInjectorImage: "ghcr.io/cubeplexai/cubepod-podd:v0.3.0"
   # Default workload sandbox image (clean OS/tooling image without podd baked in)
   defaultSandboxImage: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.3.0"
 
 storage:
-  # SPDK NVMe-oF Raw Block StorageClass (Longhorn V2 or OpenEBS Mayastor)
+  # SPDK NVMe-oF Raw Block StorageClass (Longhorn V2 or OpenEBS Mayastor) or Filesystem
   storageClassName: "longhorn-v2-block-thin"
+  volumeMode: "Block" # "Block" or "Filesystem"
   rootfsSize: "10Gi"
   workspaceSize: "20Gi"
 
@@ -22,12 +23,50 @@ warmPool:
 
 gateway:
   replicaCount: 2
+  image:
+    registry: "ghcr.io"
+    repository: "cubeplexai/cubepod-gateway"
+    tag: "v0.3.0"
+    pullPolicy: "IfNotPresent"
   port: 8080
+  service:
+    type: "ClusterIP"
+    port: 8080
+    nodePort: null
+  panelSecret: ""
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
 
 controller:
   replicaCount: 1
+  image:
+    registry: "ghcr.io"
+    repository: "cubeplexai/cubepod-controller"
+    tag: "v0.3.0"
+    pullPolicy: "IfNotPresent"
+  healthzPort: 8081
   workloadNamespace: "cubepod-workloads"
+  syncInterval: "5s"
+  kubeApi: ""
+  kubeToken: ""
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "1000m"
+      memory: "512Mi"
 
 egress:
   enabled: true
+  image:
+    registry: "ghcr.io"
+    repository: "cubeplexai/cubepod-egress"
+    tag: "v0.3.0"
+  port: 18080
   exchangeUrl: "https://cubeplex-backend.cubeplex.svc:8443/api/v1/internal/egress/exchange"

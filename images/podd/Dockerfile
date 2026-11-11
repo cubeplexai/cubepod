@@ -10,7 +10,7 @@
 
 FROM rust:1.85-bookworm AS builder
 WORKDIR /src
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock* ./
 COPY crates ./crates
 RUN cargo build --release --workspace
 

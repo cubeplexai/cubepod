@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release-binaries:
+    name: Build and Publish Release Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Build all binaries
+        run: |
+          make build
+          ls -la bin/
+
+      - name: Package release assets
+        id: package
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          ARCH="linux-amd64"
+          DIST_DIR="dist"
+          mkdir -p ${DIST_DIR}
+
+          for binary in podd-init podd cubepod-controller cubepod-gateway cubepod-egress; do
+            if [ -f "bin/${binary}" ]; then
+              cp "bin/${binary}" "${DIST_DIR}/${binary}-${TAG_NAME}-${ARCH}"
+            fi
+          done
+
+          # Create a unified tarball
+          tar -czf "${DIST_DIR}/cubepod-${TAG_NAME}-${ARCH}.tar.gz" -C bin .
+
+          # Generate SHA256 checksums
+          cd ${DIST_DIR}
+          sha256sum * > SHA256SUMS
+          cd ..
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          gh release create "${TAG_NAME}" dist/* \
+            --title "CubePod Release ${TAG_NAME}" \
+            --notes "Release ${TAG_NAME} compiled binaries for linux-amd64."
