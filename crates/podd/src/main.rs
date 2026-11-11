@@ -5,7 +5,7 @@
 //! - Foreground & background command execution (`POST /v1/commands/run`)
 //! - Managed process tracking and log streaming (`GET /v1/commands/{id}/status`, `GET /v1/commands/{id}/logs?cursor=N`)
 //! - Process group termination (`POST /v1/commands/{id}/kill`)
-//! - UID/GID-aware file read/write and directory listing (`PUT /v1/files`, `GET /v1/files`, `GET /v1/files/list`)
+//! - UID/GID-aware file read/write, deletion, directory listing, and atomic archive-sync (`PUT/GET/DELETE /v1/files`, `GET /v1/files/list`, `POST /v1/files/archive-sync`)
 //! - Pre-suspend filesystem flush (`POST /v1/lifecycle/prepare-stop`)
 //! - Daemon health (`GET /health`)
 
@@ -1011,6 +1011,372 @@ fn handle_file_list(
     }
 }
 
+fn handle_file_delete(stream: &mut TcpStream, query_params: &HashMap<String, String>) {
+    let raw_path = match query_params.get("path") {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            write_json(
+                stream,
+                "400 Bad Request",
+                r#"{"error":"missing_path_parameter"}"#,
+            );
+            return;
+        }
+    };
+
+    let path = Path::new(raw_path);
+    if !path.exists() && !path.is_symlink() {
+        write_json(stream, "404 Not Found", r#"{"error":"file_not_found"}"#);
+        return;
+    }
+
+    let result = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+
+    match result {
+        Ok(_) => {
+            let resp = format!(r#"{{"deleted":"{}"}}"#, escape_json(raw_path));
+            write_json(stream, "200 OK", &resp);
+        }
+        Err(e) => {
+            let resp = format!(
+                r#"{{"error":"failed_to_delete","details":"{}"}}"#,
+                escape_json(&e.to_string())
+            );
+            write_json(stream, "500 Internal Server Error", &resp);
+        }
+    }
+}
+
+// ============================================================================
+// Tar & Archive Handling (Zero-Dependency)
+// ============================================================================
+
+struct TarEntry {
+    path: String,
+    mode: u32,
+    typeflag: u8,
+    linkname: String,
+    data: Vec<u8>,
+}
+
+fn parse_octal(bytes: &[u8]) -> u64 {
+    let s = String::from_utf8_lossy(bytes);
+    let trimmed = s.trim_matches(|c: char| c.is_whitespace() || c == '\0');
+    if trimmed.is_empty() {
+        return 0;
+    }
+    u64::from_str_radix(trimmed, 8).unwrap_or(0)
+}
+
+fn parse_tar_string(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).to_string()
+}
+
+fn is_invalid_tar_path(path: &str) -> bool {
+    let trimmed = path.strip_prefix("./").unwrap_or(path);
+    if trimmed.starts_with('/') || trimmed.starts_with('\\') {
+        return true;
+    }
+    for seg in trimmed.split(&['/', '\\'][..]) {
+        if seg == ".." {
+            return true;
+        }
+    }
+    false
+}
+
+fn decompress_if_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        let mut child = Command::new("gzip")
+            .arg("-dc")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to spawn gzip: {e}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let data_vec = data.to_vec();
+            std::thread::spawn(move || {
+                let _ = stdin.write_all(&data_vec);
+            });
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| format!("gzip wait failed: {e}"))?;
+
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("gzip decompression error: {err}"));
+        }
+        Ok(output.stdout)
+    } else {
+        Ok(data.to_vec())
+    }
+}
+
+fn parse_tar(data: &[u8]) -> Result<Vec<TarEntry>, String> {
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    let mut next_long_name: Option<String> = None;
+
+    while offset + 512 <= data.len() {
+        let block = &data[offset..offset + 512];
+        if block.iter().all(|&b| b == 0) {
+            // End of tar archive
+            break;
+        }
+
+        let raw_name = parse_tar_string(&block[0..100]);
+        let mode = parse_octal(&block[100..108]) as u32;
+        let size = parse_octal(&block[124..136]) as usize;
+        let typeflag = block[156];
+        let linkname = parse_tar_string(&block[157..257]);
+        let prefix = parse_tar_string(&block[345..500]);
+
+        offset += 512;
+        let padded_size = size.div_ceil(512) * 512;
+        if offset + size > data.len() {
+            return Err("corrupt tar archive: unexpected end of data".to_string());
+        }
+
+        let entry_data = if size > 0 {
+            data[offset..offset + size].to_vec()
+        } else {
+            Vec::new()
+        };
+        let advance = if offset + padded_size <= data.len() {
+            padded_size
+        } else {
+            size
+        };
+        offset += advance;
+
+        if typeflag == b'L' {
+            let name = parse_tar_string(&entry_data);
+            next_long_name = Some(name);
+            continue;
+        }
+
+        if typeflag == b'x' || typeflag == b'g' {
+            continue;
+        }
+
+        let full_name = if let Some(long_name) = next_long_name.take() {
+            long_name
+        } else if !prefix.is_empty() {
+            format!("{prefix}/{raw_name}")
+        } else {
+            raw_name
+        };
+
+        if full_name.is_empty() {
+            continue;
+        }
+
+        entries.push(TarEntry {
+            path: full_name,
+            mode: if mode == 0 { 0o644 } else { mode },
+            typeflag,
+            linkname,
+            data: entry_data,
+        });
+    }
+
+    Ok(entries)
+}
+
+fn apply_permissions_and_ownership(path: &Path, mode: u32, uid: u32, gid: u32) {
+    if mode != 0 {
+        let perms = std::fs::Permissions::from_mode(mode & 0o777);
+        let _ = std::fs::set_permissions(path, perms);
+    }
+    if unsafe { libc::geteuid() == 0 } {
+        if let Ok(c_path) = std::ffi::CString::new(path.to_string_lossy().as_bytes()) {
+            unsafe {
+                libc::chown(c_path.as_ptr(), uid, gid);
+            }
+        }
+    }
+}
+
+fn handle_archive_sync(
+    stream: &mut TcpStream,
+    req: &HttpRequest,
+    query_params: &HashMap<String, String>,
+    config: &DaemonConfig,
+) {
+    if req.body.is_empty() {
+        write_json(
+            stream,
+            "400 Bad Request",
+            r#"{"error":"empty_archive_body"}"#,
+        );
+        return;
+    }
+
+    let dest_str = query_params
+        .get("dest")
+        .or_else(|| query_params.get("destination"))
+        .map(|s| s.as_str())
+        .unwrap_or(&config.workdir);
+
+    let uid = query_params
+        .get("uid")
+        .and_then(|u| u.parse::<u32>().ok())
+        .unwrap_or(1000);
+
+    let gid = query_params
+        .get("gid")
+        .and_then(|g| g.parse::<u32>().ok())
+        .unwrap_or(1000);
+
+    let remove_paths = query_params
+        .get("remove_paths")
+        .or_else(|| query_params.get("removePaths"));
+
+    let tar_data = match decompress_if_gzip(&req.body) {
+        Ok(d) => d,
+        Err(e) => {
+            let resp = format!(
+                r#"{{"error":"decompression_failed","details":"{}"}}"#,
+                escape_json(&e)
+            );
+            write_json(stream, "400 Bad Request", &resp);
+            return;
+        }
+    };
+
+    let entries = match parse_tar(&tar_data) {
+        Ok(e) => e,
+        Err(e) => {
+            let resp = format!(
+                r#"{{"error":"invalid_tar_archive","details":"{}"}}"#,
+                escape_json(&e)
+            );
+            write_json(stream, "400 Bad Request", &resp);
+            return;
+        }
+    };
+
+    // Reject any entry with ".." or leading "/" BEFORE extraction
+    for entry in &entries {
+        if is_invalid_tar_path(&entry.path)
+            || ((entry.typeflag == b'1' || entry.typeflag == b'2')
+                && is_invalid_tar_path(&entry.linkname))
+        {
+            write_json(
+                stream,
+                "400 Bad Request",
+                r#"{"error":"invalid_archive_path"}"#,
+            );
+            return;
+        }
+    }
+
+    let dest_path = Path::new(dest_str);
+    if let Err(e) = std::fs::create_dir_all(dest_path) {
+        let resp = format!(
+            r#"{{"error":"failed_to_create_dest","details":"{}"}}"#,
+            escape_json(&e.to_string())
+        );
+        write_json(stream, "500 Internal Server Error", &resp);
+        return;
+    }
+
+    // Remove uninstalled paths under dest if specified
+    if let Some(remove_list) = remove_paths {
+        for p in remove_list.split(',') {
+            let p = p.trim();
+            if p.is_empty() || is_invalid_tar_path(p) {
+                continue;
+            }
+            let rel_p = p.strip_prefix("./").unwrap_or(p).trim_start_matches('/');
+            let target = dest_path.join(rel_p);
+            if target.exists() || target.is_symlink() {
+                if target.is_dir() {
+                    let _ = std::fs::remove_dir_all(&target);
+                } else {
+                    let _ = std::fs::remove_file(&target);
+                }
+            }
+        }
+    }
+
+    let mut extracted_count = 0;
+    for entry in entries {
+        let rel_path = entry
+            .path
+            .strip_prefix("./")
+            .unwrap_or(&entry.path)
+            .trim_start_matches('/');
+        if rel_path.is_empty() || rel_path == "." {
+            continue;
+        }
+
+        let target = dest_path.join(rel_path);
+
+        if entry.typeflag == b'5' || rel_path.ends_with('/') {
+            if let Err(e) = std::fs::create_dir_all(&target) {
+                let resp = format!(
+                    r#"{{"error":"failed_to_create_dir","details":"{}"}}"#,
+                    escape_json(&e.to_string())
+                );
+                write_json(stream, "500 Internal Server Error", &resp);
+                return;
+            }
+            apply_permissions_and_ownership(&target, entry.mode, uid, gid);
+        } else if entry.typeflag == b'2' {
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::remove_file(&target);
+            if let Ok(c_link) = std::ffi::CString::new(entry.linkname.as_bytes()) {
+                if let Ok(c_target) = std::ffi::CString::new(target.to_string_lossy().as_bytes()) {
+                    unsafe {
+                        libc::symlink(c_link.as_ptr(), c_target.as_ptr());
+                    }
+                }
+            }
+            extracted_count += 1;
+        } else {
+            if let Some(parent) = target.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    let resp = format!(
+                        r#"{{"error":"failed_to_create_parent_dir","details":"{}"}}"#,
+                        escape_json(&e.to_string())
+                    );
+                    write_json(stream, "500 Internal Server Error", &resp);
+                    return;
+                }
+            }
+            if let Err(e) = std::fs::write(&target, &entry.data) {
+                let resp = format!(
+                    r#"{{"error":"failed_to_write_file","details":"{}"}}"#,
+                    escape_json(&e.to_string())
+                );
+                write_json(stream, "500 Internal Server Error", &resp);
+                return;
+            }
+            apply_permissions_and_ownership(&target, entry.mode, uid, gid);
+            extracted_count += 1;
+        }
+    }
+
+    let resp = format!(
+        r#"{{"status":"synced","dest":"{}","extracted":{}}}"#,
+        escape_json(dest_str),
+        extracted_count
+    );
+    write_json(stream, "200 OK", &resp);
+}
+
 pub fn handle_client(mut stream: TcpStream, config: &DaemonConfig, registry: &ProcessRegistry) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(120)));
@@ -1037,6 +1403,12 @@ pub fn handle_client(mut stream: TcpStream, config: &DaemonConfig, registry: &Pr
         }
         ("GET", "/v1/files") => {
             handle_file_get(&mut stream, &query_params);
+        }
+        ("DELETE", "/v1/files") => {
+            handle_file_delete(&mut stream, &query_params);
+        }
+        ("POST", "/v1/files/archive-sync") => {
+            handle_archive_sync(&mut stream, &req, &query_params, config);
         }
         ("GET", "/v1/files/list") => {
             handle_file_list(&mut stream, &query_params, config);
@@ -1525,5 +1897,223 @@ mod tests {
         let (status_kill, _, _) =
             http_request(&addr, "POST", "/v1/commands/unknown-proc/kill", &[], &[]);
         assert_eq!(status_kill, 404);
+    }
+
+    fn craft_tar_entry(name: &str, content: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        let name_bytes = name.as_bytes();
+        let len = name_bytes.len().min(100);
+        header[..len].copy_from_slice(&name_bytes[..len]);
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0001750\0");
+        header[116..124].copy_from_slice(b"0001750\0");
+        let size_str = format!("{:011o}\0", content.len());
+        header[124..136].copy_from_slice(size_str.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[156] = b'0';
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+
+        header[148..156].copy_from_slice(b"        ");
+        let sum: u32 = header.iter().map(|&b| b as u32).sum();
+        let chksum_str = format!("{:06o}\0 ", sum);
+        header[148..156].copy_from_slice(chksum_str.as_bytes());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&header);
+        out.extend_from_slice(content);
+        let pad = (512 - (content.len() % 512)) % 512;
+        out.extend(std::iter::repeat_n(0u8, pad));
+        out.extend(std::iter::repeat_n(0u8, 1024));
+        out
+    }
+
+    #[test]
+    fn test_archive_sync_tar_gz_and_remove_paths() {
+        let test_root = std::env::temp_dir().join(format!("podd-archive-{}", std::process::id()));
+        let dest_dir = test_root.join("workspace");
+        let src_dir = test_root.join("src_files");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::create_dir_all(src_dir.join("src")).unwrap();
+
+        // 1. Create a stale file in dest that should be removed
+        let stale_file = dest_dir.join("stale.txt");
+        std::fs::write(&stale_file, b"old content").unwrap();
+        assert!(stale_file.exists());
+
+        // 2. Prepare files to package into .tar.gz
+        let main_py = src_dir.join("src/main.py");
+        let readme = src_dir.join("README.md");
+        std::fs::write(&main_py, b"print('hello world')\n").unwrap();
+        std::fs::write(&readme, b"# Sample Archive Sync Project\n").unwrap();
+
+        // 3. Create .tar.gz archive using system tar
+        let tar_gz_path = test_root.join("archive.tar.gz");
+        let tar_status = Command::new("tar")
+            .args([
+                "-czf",
+                tar_gz_path.to_str().unwrap(),
+                "-C",
+                src_dir.to_str().unwrap(),
+                "src/main.py",
+                "README.md",
+            ])
+            .status()
+            .expect("failed to execute tar command");
+        assert!(tar_status.success());
+        let tar_gz_bytes = std::fs::read(&tar_gz_path).unwrap();
+
+        // 4. Start test server and send POST /v1/files/archive-sync
+        let (addr, _) = start_test_server("/tmp");
+        let target_url = format!(
+            "/v1/files/archive-sync?dest={}&uid=1000&gid=1000&remove_paths=stale.txt",
+            dest_dir.to_str().unwrap()
+        );
+        let (status, _, resp_body) = http_request(
+            &addr,
+            "POST",
+            &target_url,
+            &[("Content-Type", "application/gzip")],
+            &tar_gz_bytes,
+        );
+        assert_eq!(status, 200);
+
+        let json = JsonValue::parse(std::str::from_utf8(&resp_body).unwrap()).unwrap();
+        assert_eq!(json.get("status").unwrap().as_str().unwrap(), "synced");
+        assert_eq!(
+            json.get("dest").unwrap().as_str().unwrap(),
+            dest_dir.to_str().unwrap()
+        );
+        assert_eq!(json.get("extracted").unwrap().as_u64(), Some(2));
+
+        // 5. Verify disk contents: stale.txt deleted, src/main.py and README.md extracted
+        assert!(!stale_file.exists(), "stale.txt should have been removed");
+        assert_eq!(
+            std::fs::read(dest_dir.join("src/main.py")).unwrap(),
+            b"print('hello world')\n"
+        );
+        assert_eq!(
+            std::fs::read(dest_dir.join("README.md")).unwrap(),
+            b"# Sample Archive Sync Project\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_archive_sync_rejects_path_traversal() {
+        let test_root = std::env::temp_dir().join(format!("podd-traversal-{}", std::process::id()));
+        let dest_dir = test_root.join("workspace");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+
+        let malicious_tar = craft_tar_entry("../escape.txt", b"malicious content");
+
+        let (addr, _) = start_test_server("/tmp");
+        let target_url = format!(
+            "/v1/files/archive-sync?dest={}&uid=1000&gid=1000",
+            dest_dir.to_str().unwrap()
+        );
+
+        let (status, _, resp_body) = http_request(
+            &addr,
+            "POST",
+            &target_url,
+            &[("Content-Type", "application/x-tar")],
+            &malicious_tar,
+        );
+        assert_eq!(status, 400);
+
+        let json = JsonValue::parse(std::str::from_utf8(&resp_body).unwrap()).unwrap();
+        assert_eq!(
+            json.get("error").unwrap().as_str().unwrap(),
+            "invalid_archive_path"
+        );
+
+        // Verify that ../escape.txt was NEVER created on disk
+        let escaped_path = test_root.join("escape.txt");
+        assert!(
+            !escaped_path.exists(),
+            "malicious file must not be extracted"
+        );
+
+        // Also test leading slash
+        let leading_slash_tar = craft_tar_entry("/escape2.txt", b"malicious content 2");
+        let (status2, _, _) = http_request(
+            &addr,
+            "POST",
+            &target_url,
+            &[("Content-Type", "application/x-tar")],
+            &leading_slash_tar,
+        );
+        assert_eq!(status2, 400);
+
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_file_delete_endpoint() {
+        let dir = std::env::temp_dir().join(format!("podd-del-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let (addr, _) = start_test_server(&dir.to_string_lossy());
+
+        // 1. Create file and delete it
+        let file_path = dir.join("to_delete.txt");
+        std::fs::write(&file_path, b"delete me").unwrap();
+        assert!(file_path.exists());
+
+        let file_path_str = file_path.to_string_lossy().to_string();
+        let (del_status, _, del_resp) = http_request(
+            &addr,
+            "DELETE",
+            &format!("/v1/files?path={}", file_path_str),
+            &[],
+            &[],
+        );
+        assert_eq!(del_status, 200);
+        let del_json = JsonValue::parse(std::str::from_utf8(&del_resp).unwrap()).unwrap();
+        assert_eq!(
+            del_json.get("deleted").unwrap().as_str().unwrap(),
+            file_path_str
+        );
+        assert!(!file_path.exists(), "file should be deleted");
+
+        // 2. Delete non-existent file -> 404
+        let (nf_status, _, _) = http_request(
+            &addr,
+            "DELETE",
+            &format!("/v1/files?path={}", file_path_str),
+            &[],
+            &[],
+        );
+        assert_eq!(nf_status, 404);
+
+        // 3. Delete directory tree
+        let subdir = dir.join("subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("nested.txt"), b"nested").unwrap();
+        assert!(subdir.exists());
+
+        let subdir_str = subdir.to_string_lossy().to_string();
+        let (dir_status, _, dir_resp) = http_request(
+            &addr,
+            "DELETE",
+            &format!("/v1/files?path={}", subdir_str),
+            &[],
+            &[],
+        );
+        assert_eq!(dir_status, 200);
+        let dir_json = JsonValue::parse(std::str::from_utf8(&dir_resp).unwrap()).unwrap();
+        assert_eq!(
+            dir_json.get("deleted").unwrap().as_str().unwrap(),
+            subdir_str
+        );
+        assert!(!subdir.exists(), "directory should be deleted");
+
+        // 4. Missing path param -> 400
+        let (bad_status, _, _) = http_request(&addr, "DELETE", "/v1/files", &[], &[]);
+        assert_eq!(bad_status, 400);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
