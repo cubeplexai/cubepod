@@ -1,0 +1,28 @@
+title: "CEP-0005: Zero-Trust Egress Secret Injection (`cbxref_` mTLS Exchange) & Python SDK `v0.1.0`"
+cep-number: "0005"
+authors:
+  - "@xfgong"
+owning-area: "egress"
+participating-areas:
+  - "sdk"
+status: "implementable"
+creation-date: "2026-11-10"
+reviewers:
+  - "@xfgong"
+approvers:
+  - "@xfgong"
+stage: "alpha"
+latest-milestone: "v0.1"
+milestone:
+  alpha: "v0.1"
+  beta: "v0.2"
+  stable: "v1.0"
+feature-gates:
+  - name: "EgressSecretInjection"
+    components:
+      - "cubepod-controller"
+      - "cubepod-gateway"
+disable-supported: false
+metrics:
+  - "cubepod_egress_secret_exchanges_total"
+  - "cubepod_egress_secret_denied_total"

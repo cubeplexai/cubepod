@@ -1,0 +1,26 @@
+title: "CEP-0002: In-Guest Execution, Background Process Cursor, and Archive Sync Daemon (`podd`)"
+cep-number: "0002"
+authors:
+  - "@xfgong"
+owning-area: "runtime"
+participating-areas:
+  - "gateway"
+status: "implementable"
+creation-date: "2026-11-10"
+reviewers:
+  - "@xfgong"
+approvers:
+  - "@xfgong"
+stage: "alpha"
+latest-milestone: "v0.1"
+milestone:
+  alpha: "v0.1"
+  beta: "v0.2"
+  stable: "v1.0"
+feature-gates:
+  - name: "PoddExecutionDaemon"
+    components:
+      - "podd"
+disable-supported: false
+metrics:
+  - "cubepod_podd_active_processes"

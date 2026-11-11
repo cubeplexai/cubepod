@@ -1,0 +1,30 @@
+title: "CEP-0004: Unified E2B-Superset Gateway, Local Loopback Runtime, and Signed Panel Proxy (`cubepod-gateway`)"
+cep-number: "0004"
+authors:
+  - "@xfgong"
+owning-area: "gateway"
+participating-areas:
+  - "runtime"
+status: "implementable"
+creation-date: "2026-11-10"
+reviewers:
+  - "@xfgong"
+approvers:
+  - "@xfgong"
+stage: "alpha"
+latest-milestone: "v0.1"
+milestone:
+  alpha: "v0.1"
+  beta: "v0.2"
+  stable: "v1.0"
+feature-gates:
+  - name: "SignedPanelProxy"
+    components:
+      - "cubepod-gateway"
+  - name: "AutoResumeOnTraffic"
+    components:
+      - "cubepod-gateway"
+disable-supported: false
+metrics:
+  - "cubepod_gateway_requests_total"
+  - "cubepod_gateway_auto_resumes_total"

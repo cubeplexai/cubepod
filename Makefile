@@ -3,8 +3,8 @@
 GO ?= go
 CARGO ?= $(shell which cargo 2>/dev/null || echo "$(HOME)/.cargo/bin/cargo")
 BINDIR ?= $(CURDIR)/bin
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "v0.1.0-dev")
-LDFLAGS := -s -w -X github.com/cubeplexai/cubepod/pkg/version.Version=$(VERSION)
+CUBEPOD_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "v0.1.0")
+LDFLAGS := -s -w -X github.com/cubeplexai/cubepod/pkg/version.Version=$(CUBEPOD_VERSION)
 
 help:
 	@echo "CubePod Build & Development Makefile (Rust In-Guest Crates + Go Control Plane)"

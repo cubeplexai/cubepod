@@ -1,0 +1,31 @@
+title: "CEP-0003: Dual-Block-PVC, Pre-Attached WarmPool, and CoW Fork Kubernetes Operator (`cubepod-controller`)"
+cep-number: "0003"
+authors:
+  - "@xfgong"
+owning-area: "controller"
+participating-areas:
+  - "storage"
+  - "runtime"
+status: "implementable"
+creation-date: "2026-11-10"
+reviewers:
+  - "@xfgong"
+approvers:
+  - "@xfgong"
+stage: "alpha"
+latest-milestone: "v0.1"
+milestone:
+  alpha: "v0.1"
+  beta: "v0.2"
+  stable: "v1.0"
+feature-gates:
+  - name: "PreAttachedWarmPool"
+    components:
+      - "cubepod-controller"
+  - name: "CoWSandboxFork"
+    components:
+      - "cubepod-controller"
+disable-supported: true
+metrics:
+  - "cubepod_warmpool_available_replicas"
+  - "cubepod_podbox_reconcile_total"
