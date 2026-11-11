@@ -1,0 +1,31 @@
+services:
+  cubepod-gateway:
+    build:
+      context: ../..
+      dockerfile: images/gateway/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - CUBEPOD_RUNTIME_MODE=docker-loopback
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - cubepod-volumes:/var/lib/cubepod/volumes
+
+  cubepod-controller:
+    build:
+      context: ../..
+      dockerfile: images/controller/Dockerfile
+    ports:
+      - "8081:8081"
+    command: ["/usr/local/bin/cubepod-controller", "-addr=:8081"]
+
+  cubepod-egress:
+    build:
+      context: ../..
+      dockerfile: images/egress/Dockerfile
+    ports:
+      - "18080:18080"
+    command: ["/usr/local/bin/cubepod-egress", "-addr=:18080", "-default-allow=true"]
+
+volumes:
+  cubepod-volumes:

@@ -1,0 +1,74 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: podtemplates.cubepod.io
+  labels:
+    app.kubernetes.io/name: cubepod
+spec:
+  group: cubepod.io
+  names:
+    plural: podtemplates
+    singular: podtemplate
+    kind: PodTemplate
+    shortNames:
+      - pt
+      - ptemplate
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - image
+              properties:
+                runtimeClassName:
+                  type: string
+                image:
+                  type: string
+                poddImage:
+                  type: string
+                resources:
+                  type: object
+                  properties:
+                    cpuRequest:
+                      type: string
+                    cpuLimit:
+                      type: string
+                    memoryRequest:
+                      type: string
+                    memoryLimit:
+                      type: string
+                storage:
+                  type: object
+                  properties:
+                    storageClassName:
+                      type: string
+                    rootfsSize:
+                      type: string
+                    workspaceSize:
+                      type: string
+                egress:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                    image:
+                      type: string
+                    exchangeUrl:
+                      type: string
+      additionalPrinterColumns:
+        - name: Image
+          type: string
+          jsonPath: .spec.image
+        - name: RuntimeClass
+          type: string
+          jsonPath: .spec.runtimeClassName
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

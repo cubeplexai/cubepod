@@ -1,0 +1,53 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cubepod.fullname" . }}-controller
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: {{ .Values.controller.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "cubepod.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        {{- include "cubepod.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: {{ include "cubepod.serviceAccountName" . }}
+      containers:
+        - name: controller
+          image: "{{ .Values.controller.image.registry }}/{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
+          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+          args:
+            - "--addr=:{{ .Values.controller.healthzPort }}"
+            - "--namespace={{ .Values.controller.workloadNamespace }}"
+            - "--sync-interval={{ .Values.controller.syncInterval }}"
+            {{- if .Values.controller.kubeApi }}
+            - "--kube-api={{ .Values.controller.kubeApi }}"
+            {{- end }}
+            {{- if .Values.controller.kubeToken }}
+            - "--kube-token={{ .Values.controller.kubeToken }}"
+            {{- end }}
+          ports:
+            - name: healthz
+              containerPort: {{ .Values.controller.healthzPort }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
