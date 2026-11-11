@@ -13,6 +13,27 @@ import (
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
 
+// ReconcilerOption configures a Reconciler instance.
+type ReconcilerOption func(*Reconciler)
+
+// WithKubeClient configures the Kubernetes API client for resource lifecycle operations.
+func WithKubeClient(client KubeClient) ReconcilerOption {
+	return func(r *Reconciler) {
+		if client != nil {
+			r.kubeClient = client
+		}
+	}
+}
+
+// WithNamespace configures the default workload namespace.
+func WithNamespace(ns string) ReconcilerOption {
+	return func(r *Reconciler) {
+		if ns != "" {
+			r.namespace = ns
+		}
+	}
+}
+
 // Reconciler manages the lifecycle of PodBox instances, pre-attached PodWarmPools,
 // and dual Raw Block PVCs.
 type Reconciler struct {
@@ -22,16 +43,40 @@ type Reconciler struct {
 	templates   map[string]v1alpha1.PodTemplateSpec
 	warmPools   map[string]*warmPoolState
 	warmCounter int64
+	kubeClient  KubeClient
+	namespace   string
 }
 
 // NewReconciler creates a new in-memory/cluster Reconciler.
-func NewReconciler() *Reconciler {
-	return &Reconciler{
-		boxes:     make(map[string]*v1alpha1.PodBoxStatus),
-		specs:     make(map[string]v1alpha1.PodBoxSpec),
-		templates: make(map[string]v1alpha1.PodTemplateSpec),
-		warmPools: make(map[string]*warmPoolState),
+func NewReconciler(opts ...ReconcilerOption) *Reconciler {
+	r := &Reconciler{
+		boxes:      make(map[string]*v1alpha1.PodBoxStatus),
+		specs:      make(map[string]v1alpha1.PodBoxSpec),
+		templates:  make(map[string]v1alpha1.PodTemplateSpec),
+		warmPools:  make(map[string]*warmPoolState),
+		kubeClient: NewMemoryKubeClient(),
+		namespace:  "cubepod-workloads",
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
+}
+
+// SetKubeClient updates the Kubernetes API client.
+func (r *Reconciler) SetKubeClient(client KubeClient) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if client != nil {
+		r.kubeClient = client
+	}
+}
+
+// KubeClient returns the currently configured Kubernetes client.
+func (r *Reconciler) KubeClient() KubeClient {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.kubeClient
 }
 
 // RegisterTemplate saves or updates a reusable PodTemplateSpec.
@@ -72,9 +117,13 @@ func defaultTemplate(templateID string) v1alpha1.PodTemplateSpec {
 }
 
 // ReconcileWarmPool manages standby Kata MicroVM instances with pre-attached thin block PVCs.
-func (r *Reconciler) ReconcileWarmPool(_ context.Context, poolName string, spec v1alpha1.PodWarmPoolSpec) (*v1alpha1.PodWarmPoolStatus, error) {
+func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spec v1alpha1.PodWarmPoolSpec) (*v1alpha1.PodWarmPoolStatus, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	pool, exists := r.warmPools[poolName]
 	if !exists {
@@ -113,6 +162,12 @@ func (r *Reconciler) ReconcileWarmPool(_ context.Context, poolName string, spec 
 			}
 
 			rootfsPVC, wsPVC := BuildBlockPVCs(entryID, tpl, warmBoxSpec)
+			rootfsPVC.Namespace = r.namespace
+			wsPVC.Namespace = r.namespace
+
+			_ = r.kubeClient.EnsurePVC(ctx, rootfsPVC)
+			_ = r.kubeClient.EnsurePVC(ctx, wsPVC)
+
 			dummyStatus := v1alpha1.PodBoxStatus{
 				PodName:          fmt.Sprintf("%s-kata-pod", entryID),
 				RootfsPVCName:    rootfsPVC.Name,
@@ -120,6 +175,12 @@ func (r *Reconciler) ReconcileWarmPool(_ context.Context, poolName string, spec 
 				Phase:            v1alpha1.PodBoxPhaseRunning,
 			}
 			podManifest := BuildKataPod(entryID, tpl, warmBoxSpec, dummyStatus)
+			podManifest.Namespace = r.namespace
+
+			podIP, _ := r.kubeClient.EnsurePod(ctx, podManifest)
+			if podIP != "" {
+				dummyStatus.PodIP = podIP
+			}
 
 			entry := &WarmPodEntry{
 				ID:               entryID,
@@ -144,6 +205,9 @@ func (r *Reconciler) ReconcileWarmPool(_ context.Context, poolName string, spec 
 		for _, entry := range pool.entries {
 			if !entry.Claimed && removedCount < toRemove {
 				removedCount++
+				_ = r.kubeClient.DeletePod(ctx, r.namespace, entry.PodName)
+				_ = r.kubeClient.DeletePVC(ctx, r.namespace, entry.RootfsPVCName)
+				_ = r.kubeClient.DeletePVC(ctx, r.namespace, entry.WorkspacePVCName)
 				continue
 			}
 			filtered = append(filtered, entry)
@@ -216,12 +280,21 @@ func (r *Reconciler) GetWarmPoolStatus(poolName string) (*v1alpha1.PodWarmPoolSt
 // Reconcile drives a PodBox towards its DesiredState (Running or Paused),
 // preserving both RootFS Upper PVC and Workspace PVC across pause/resume cycles,
 // claiming from PodWarmPool if configured, and supporting CoW Fork cloning.
-func (r *Reconciler) Reconcile(_ context.Context, name string, spec v1alpha1.PodBoxSpec) (*v1alpha1.PodBoxStatus, error) {
+func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.PodBoxSpec) (*v1alpha1.PodBoxStatus, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	now := time.Now().UTC()
 	status, exists := r.boxes[name]
+
+	tpl, ok := r.templates[spec.TemplateRef]
+	if !ok {
+		tpl = defaultTemplate(spec.TemplateRef)
+	}
 
 	if !exists {
 		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set and no ForkFrom)
@@ -256,6 +329,11 @@ func (r *Reconciler) Reconcile(_ context.Context, name string, spec v1alpha1.Pod
 				Reason:            "ForkCloned",
 				Message:           fmt.Sprintf("Forked from parent sandbox %s", spec.ForkFrom.PodBoxName),
 			}
+			rootfsPVC, wsPVC := BuildBlockPVCs(name, tpl, spec)
+			rootfsPVC.Namespace = r.namespace
+			wsPVC.Namespace = r.namespace
+			_ = r.kubeClient.EnsurePVC(ctx, rootfsPVC)
+			_ = r.kubeClient.EnsurePVC(ctx, wsPVC)
 		} else {
 			// 3. Standard fresh sandbox provisioning
 			rootfsName := fmt.Sprintf("%s-rootfs-pvc", name)
@@ -271,6 +349,11 @@ func (r *Reconciler) Reconcile(_ context.Context, name string, spec v1alpha1.Pod
 				Reason:            "Provisioned",
 				Message:           "Provisioned fresh sandbox",
 			}
+			rootfsPVC, wsPVC := BuildBlockPVCs(name, tpl, spec)
+			rootfsPVC.Namespace = r.namespace
+			wsPVC.Namespace = r.namespace
+			_ = r.kubeClient.EnsurePVC(ctx, rootfsPVC)
+			_ = r.kubeClient.EnsurePVC(ctx, wsPVC)
 		}
 		r.boxes[name] = status
 	}
@@ -283,14 +366,26 @@ func (r *Reconciler) Reconcile(_ context.Context, name string, spec v1alpha1.Pod
 			"newGen", spec.RootfsGeneration,
 			"workspacePVC", status.WorkspacePVCName,
 		)
+		oldRootfsPVC := status.RootfsPVCName
 		status.ObservedRootfsGen = spec.RootfsGeneration
 		status.RootfsPVCName = fmt.Sprintf("%s-rootfs-gen%d-pvc", name, spec.RootfsGeneration)
 		status.Reason = "RootFSReset"
 		status.Message = fmt.Sprintf("RootFS reset to generation %d", spec.RootfsGeneration)
+
+		// Delete old RootFS PVC and apply new RootFS PVC.
+		if oldRootfsPVC != "" {
+			_ = r.kubeClient.DeletePVC(ctx, r.namespace, oldRootfsPVC)
+		}
+		newRootfsPVC, _ := BuildBlockPVCs(name, tpl, spec)
+		newRootfsPVC.Namespace = r.namespace
+		_ = r.kubeClient.EnsurePVC(ctx, newRootfsPVC)
 	}
 
 	switch spec.DesiredState {
 	case v1alpha1.DesiredStatePaused:
+		if status.PodName != "" {
+			_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
+		}
 		status.Phase = v1alpha1.PodBoxPhasePaused
 		status.PodName = ""
 		status.PodIP = ""
@@ -300,6 +395,13 @@ func (r *Reconciler) Reconcile(_ context.Context, name string, spec v1alpha1.Pod
 		if status.PodName == "" {
 			status.PodName = fmt.Sprintf("%s-kata-pod", name)
 		}
+		podManifest := BuildKataPod(name, tpl, spec, *status)
+		podManifest.Namespace = r.namespace
+		podIP, err := r.kubeClient.EnsurePod(ctx, podManifest)
+		if err == nil && podIP != "" {
+			status.PodIP = podIP
+		}
+		status.PodName = podManifest.Name
 		status.LastActivityAt = &now
 		status.PausedAt = nil
 	}
@@ -309,13 +411,46 @@ func (r *Reconciler) Reconcile(_ context.Context, name string, spec v1alpha1.Pod
 	return &cp, nil
 }
 
+// Delete tears down a PodBox, removing its compute Pod and dual Block PVCs.
+func (r *Reconciler) Delete(ctx context.Context, name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	status, ok := r.boxes[name]
+	if !ok {
+		return nil
+	}
+
+	if status.PodName != "" {
+		_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
+	}
+	if status.RootfsPVCName != "" {
+		_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.RootfsPVCName)
+	}
+	if status.WorkspacePVCName != "" {
+		_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.WorkspacePVCName)
+	}
+
+	delete(r.boxes, name)
+	delete(r.specs, name)
+	return nil
+}
+
 // ReapIdle inspects all managed sandboxes and enforces idle auto-pause and paused TTL expiration.
 // Running sandboxes are paused when LastActivityAt + IdleTimeoutSeconds <= now, provided
 // LeaseExpiresAt is unset or already expired. Paused sandboxes are terminated when
 // PausedAt + PausedTTLSeconds <= now.
-func (r *Reconciler) ReapIdle(_ context.Context, now time.Time) (paused []string, terminated []string) {
+func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []string, terminated []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -331,6 +466,9 @@ func (r *Reconciler) ReapIdle(_ context.Context, now time.Time) (paused []string
 					// Check active lease lock.
 					leaseActive := spec.Lifecycle.LeaseExpiresAt != nil && spec.Lifecycle.LeaseExpiresAt.After(now)
 					if !leaseActive {
+						if status.PodName != "" {
+							_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
+						}
 						status.Phase = v1alpha1.PodBoxPhasePaused
 						status.PodName = ""
 						status.PodIP = ""
@@ -347,6 +485,9 @@ func (r *Reconciler) ReapIdle(_ context.Context, now time.Time) (paused []string
 			if spec.Lifecycle.PausedTTLSeconds > 0 && status.PausedAt != nil {
 				ttlDeadline := status.PausedAt.Add(time.Duration(spec.Lifecycle.PausedTTLSeconds) * time.Second)
 				if !now.Before(ttlDeadline) {
+					if status.PodName != "" {
+						_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
+					}
 					status.Phase = v1alpha1.PodBoxPhaseTerminated
 					status.Reason = "PausedTTLExpired"
 					status.Message = "Terminated due to paused TTL expiration"
@@ -359,6 +500,58 @@ func (r *Reconciler) ReapIdle(_ context.Context, now time.Time) (paused []string
 	slices.Sort(paused)
 	slices.Sort(terminated)
 	return paused, terminated
+}
+
+// ActiveSandboxesCount returns the number of Running sandboxes.
+func (r *Reconciler) ActiveSandboxesCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	count := 0
+	for _, status := range r.boxes {
+		if status.Phase == v1alpha1.PodBoxPhaseRunning {
+			count++
+		}
+	}
+	return count
+}
+
+// PausedSandboxesCount returns the number of Paused sandboxes.
+func (r *Reconciler) PausedSandboxesCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	count := 0
+	for _, status := range r.boxes {
+		if status.Phase == v1alpha1.PodBoxPhasePaused {
+			count++
+		}
+	}
+	return count
+}
+
+// WarmPoolReadyCount returns the total number of ready warm standby sandboxes across all pools.
+func (r *Reconciler) WarmPoolReadyCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	total := 0
+	for _, pool := range r.warmPools {
+		for _, entry := range pool.entries {
+			if !entry.Claimed {
+				total++
+			}
+		}
+	}
+	return total
+}
+
+// GetWarmPoolSpecs returns a snapshot of registered warm pool specs for background replenishment.
+func (r *Reconciler) GetWarmPoolSpecs() map[string]v1alpha1.PodWarmPoolSpec {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	specs := make(map[string]v1alpha1.PodWarmPoolSpec, len(r.warmPools))
+	for name, pool := range r.warmPools {
+		specs[name] = pool.spec
+	}
+	return specs
 }
 
 // GetBox returns a copy of the observed status for a PodBox.
