@@ -1,0 +1,16 @@
+title: "Dual-StorageMode Kubernetes Provisioning (Block + Filesystem), Pod Readiness Polling, and Live Gateway-to-Pod Routing"
+cep-number: 11
+authors:
+  - "@cubepod-maintainers"
+status: implementable
+creation-date: 2026-11-10
+last-updated: 2026-11-10
+target-version: v0.3.0
+stage: alpha
+latest-milestone: v0.3.0
+milestone:
+  alpha: v0.3.0
+  beta: v0.4.0
+  stable: v1.0.0
+replaces: []
+superseded-by: []
