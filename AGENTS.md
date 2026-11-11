@@ -9,7 +9,7 @@ CubePod is an open-source, cloud-native **Persistent Writable RootFS MicroVM Exe
 | Path | Responsibility | Tech Stack |
 | :--- | :--- | :--- |
 | [`docs/architecture.md`](docs/architecture.md) | North-star platform architecture & CubePlex integration blueprint | Markdown / Mermaid |
-| [`docs/enhancements/`](docs/enhancements/README.md) | **CubePod Enhancement Proposals (CEPs)** following the K8s KEP standard | KEP YAML + Markdown |
+| [`docs/enhancements/`](docs/enhancements/README.md) | **CubePod Enhancement Proposals (CEPs)** | CEP YAML + Markdown |
 | [`crates/podd-init/`](crates/podd-init/src/main.rs) | In-guest PID 1 raw block `ext4` healer/formatter & `OverlayFS` `pivot_root` mounter | Rust (single-threaded, zero-GC) |
 | [`crates/podd/`](crates/podd/src/main.rs) | In-guest execution, background process (`cursor` logs), and `tar.gz` file sync daemon | Rust |
 | [`api/v1alpha1/`](api/v1alpha1/types.go) | Kubernetes CRD schemas (`PodBox`, `PodTemplate`, `PodWarmPool`) | Go |
@@ -21,16 +21,16 @@ CubePod is an open-source, cloud-native **Persistent Writable RootFS MicroVM Exe
 
 ---
 
-## 2. Documentation & Design Workflow (KEP Standard — Mandatory)
+## 2. Documentation & Design Workflow (CEP Standard — Mandatory)
 
-All non-trivial features, architectural changes, CRD/API modifications, storage/runtime behaviors, and security designs MUST follow the **Kubernetes Enhancement Proposal (KEP)** specification before implementation.
+All non-trivial features, architectural changes, CRD/API modifications, storage/runtime behaviors, and security designs MUST follow the **CubePod Enhancement Proposal (CEP)** specification before implementation.
 
-- **Skill Reference**: Always activate and follow **[`kep-doc-spec`](.agent/skills/kep-doc-spec/SKILL.md)** when proposing, writing, or updating design documents.
+- **Skill Reference**: Always activate and follow **[`cep-doc-spec`](.agent/skills/cep-doc-spec/SKILL.md)** when proposing, writing, or updating design documents.
 - **Templates**:
-  - Metadata template: [`.agent/skills/kep-doc-spec/templates/kep.yaml.tmpl`](.agent/skills/kep-doc-spec/templates/kep.yaml.tmpl)
-  - Proposal body template: [`.agent/skills/kep-doc-spec/templates/README.md.tmpl`](.agent/skills/kep-doc-spec/templates/README.md.tmpl)
-- **Location**: Place every proposal under `docs/enhancements/NNNN-<short-kebab-slug>/` (`kep.yaml` + `README.md`) and register it in [`docs/enhancements/README.md`](docs/enhancements/README.md).
-- **Core KEP Invariants**:
+  - Metadata template: [`.agent/skills/cep-doc-spec/templates/cep.yaml.tmpl`](.agent/skills/cep-doc-spec/templates/cep.yaml.tmpl)
+  - Proposal body template: [`.agent/skills/cep-doc-spec/templates/README.md.tmpl`](.agent/skills/cep-doc-spec/templates/README.md.tmpl)
+- **Location**: Place every proposal under `docs/enhancements/NNNN-<short-kebab-slug>/` (`cep.yaml` + `README.md`) and register it in [`docs/enhancements/README.md`](docs/enhancements/README.md).
+- **Core CEP Invariants**:
   1. Every proposal must explicitly define **Summary**, **Motivation (Goals / Non-Goals)**, **Proposal (User Stories, Risks & Mitigations)**, **Design Details (API/CRD changes, Dual-Runtime behavior, Test Plan, Graduation Criteria, Upgrade/Downgrade Strategy)**, **Production Readiness Review (PRR)**, and **Alternatives Considered**.
   2. Use plain, direct technical language. State what literally happens in the kernel, VMM, CSI driver, or wire protocol and why.
   3. Every CEP must address both **Production Kubernetes (`Kata + CSI Raw Block`)** and **Local Development (`Docker + Loopback ext4`)**.

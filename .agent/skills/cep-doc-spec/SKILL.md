@@ -1,21 +1,17 @@
 ---
-name: kep-doc-spec
+name: cep-doc-spec
 description: >-
-  CubePod Enhancement Proposal (CEP / KEP-style) and technical documentation
-  writing specification modeled after Kubernetes KEPs. Activate this skill
-  whenever drafting, reviewing, or updating architectural proposals, feature
+  CubePod Enhancement Proposal (CEP) and technical documentation writing
+  specification modeled after Kubernetes KEPs. Activate this skill whenever
+  drafting, reviewing, or updating architectural proposals, feature
   enhancements, CRD/API changes, or technical design documents in CubePod.
 ---
 
-# CubePod KEP-Style Documentation Specification (`kep-doc-spec`)
+# CubePod Enhancement Proposal (CEP) Documentation Specification (`cep-doc-spec`)
 
-CubePod adopts the **Kubernetes Enhancement Proposal (KEP)** standard for all
-non-trivial architecture changes, CRD/API modifications, runtime/storage
-mechanisms, and security boundaries.
+CubePod adopts the **CubePod Enhancement Proposal (CEP)** standard (modeled after Kubernetes KEPs) for all non-trivial architecture changes, CRD/API modifications, runtime/storage mechanisms, and security boundaries.
 
-Every feature or architectural design in CubePod must be documented as a
-**CubePod Enhancement Proposal (CEP)** under `docs/enhancements/` before
-implementation begins.
+Every feature or architectural design in CubePod must be documented as a **CEP** under `docs/enhancements/` before implementation begins.
 
 ---
 
@@ -29,7 +25,7 @@ docs/
 └── enhancements/
     ├── README.md                                    # Index table of all CEPs (number, title, status, stage)
     └── NNNN-<short-kebab-slug>/                     # e.g., 0001-in-guest-overlayfs-pivot/
-        ├── kep.yaml                                 # Machine-readable KEP metadata
+        ├── cep.yaml                                 # Machine-readable CEP metadata
         └── README.md                                # The enhancement proposal body
 ```
 
@@ -40,17 +36,17 @@ docs/
 
 ---
 
-## 2. Metadata Specification (`kep.yaml`)
+## 2. Metadata Specification (`cep.yaml`)
 
-Every proposal folder `docs/enhancements/NNNN-<slug>/` MUST contain a `kep.yaml` file with the following schema:
+Every proposal folder `docs/enhancements/NNNN-<slug>/` MUST contain a `cep.yaml` file with the following schema:
 
 ```yaml
 title: "<Concise Title of the Enhancement>"
-kep-number: "NNNN"
+cep-number: "NNNN"
 authors:
   - "@<github-handle>"
-owning-sig: "<area: runtime | storage | controller | gateway | egress | sdk>"
-participating-sigs:
+owning-area: "<area: runtime | storage | controller | gateway | egress | sdk>"
+participating-areas:
   - "<optional secondary areas>"
 status: "<provisional | implementable | implemented | deferred | rejected | withdrawn | replaced>"
 creation-date: "YYYY-MM-DD"
@@ -86,7 +82,7 @@ metrics:
 
 ## 3. Document Body Structure (`README.md`)
 
-Every `docs/enhancements/NNNN-<slug>/README.md` MUST follow the canonical Kubernetes KEP structure below (adapted from [`templates/README.md.tmpl`](./templates/README.md.tmpl)). Do not skip required sections; if a section does not apply, explicitly write `N/A — <brief reason>`.
+Every `docs/enhancements/NNNN-<slug>/README.md` MUST follow the canonical CEP structure below (adapted from [`templates/README.md.tmpl`](./templates/README.md.tmpl)). Do not skip required sections; if a section does not apply, explicitly write `N/A — <brief reason>`.
 
 ### Required Sections Checklist
 
