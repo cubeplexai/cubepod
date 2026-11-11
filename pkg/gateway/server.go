@@ -71,6 +71,7 @@ type Server struct {
 	vault            *egress.Vault
 	ca               *egress.CA
 	livePodRouting   bool
+	metrics          *Metrics
 }
 
 // NewServer constructs a new Gateway Server.
@@ -85,6 +86,7 @@ func NewServer(reconciler *controller.Reconciler) *Server {
 		workspaceBaseDir: filepath.Join(os.TempDir(), "cubepod-sandboxes"),
 		vault:            v,
 		ca:               ca,
+		metrics:          &Metrics{},
 	}
 }
 
@@ -139,6 +141,7 @@ func (s *Server) Handler() http.Handler {
 
 	// Control-Plane & Lifecycle routes
 	mux.HandleFunc("GET /health", s.handleHealth)
+	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("POST /sandboxes", s.handleCreateSandbox)
 	mux.HandleFunc("GET /sandboxes", s.handleListSandboxes)
 	mux.HandleFunc("GET /sandboxes/{sandboxID}", s.handleGetSandbox)
@@ -176,7 +179,7 @@ func (s *Server) Handler() http.Handler {
 	// Zero-Trust Egress Exchange route
 	mux.HandleFunc("POST /internal/v1/egress/exchange", s.handleEgressExchange)
 
-	return mux
+	return s.withMetrics(mux)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -340,38 +343,39 @@ func (s *Server) handleListWarmPools(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// TemplateInfo describes a sandbox template exposed by the gateway.
+type TemplateInfo struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Image       string `json:"image"`
+	Description string `json:"description"`
+}
+
+var defaultTemplates = []TemplateInfo{
+	{
+		ID:          "cubeplex-ubuntu24-desktop",
+		Name:        "CubePlex Ubuntu 24.04 Desktop",
+		Image:       "cubeplex-ubuntu24-desktop:latest",
+		Description: "Full desktop environment with XFCE, browser, WebRTC panel, and dev tools",
+	},
+	{
+		ID:          "ubuntu:24.04",
+		Name:        "Ubuntu 24.04 Standard",
+		Image:       "ubuntu:24.04",
+		Description: "Standard headless Linux agent sandbox",
+	},
+	{
+		ID:          "debian:12",
+		Name:        "Debian 12 Bookworm",
+		Image:       "debian:12",
+		Description: "Minimal Debian 12 sandbox",
+	},
+}
+
 func (s *Server) handleListTemplates(w http.ResponseWriter, _ *http.Request) {
-	type templateInfo struct {
-		ID          string `json:"id"`
-		Name        string `json:"name"`
-		Image       string `json:"image"`
-		Description string `json:"description"`
-	}
-
-	templates := []templateInfo{
-		{
-			ID:          "cubeplex-ubuntu24-desktop",
-			Name:        "CubePlex Ubuntu 24.04 Desktop",
-			Image:       "cubeplex-ubuntu24-desktop:latest",
-			Description: "Full desktop environment with XFCE, browser, WebRTC panel, and dev tools",
-		},
-		{
-			ID:          "ubuntu:24.04",
-			Name:        "Ubuntu 24.04 Standard",
-			Image:       "ubuntu:24.04",
-			Description: "Standard headless Linux agent sandbox",
-		},
-		{
-			ID:          "debian:12",
-			Name:        "Debian 12 Bookworm",
-			Image:       "debian:12",
-			Description: "Minimal Debian 12 sandbox",
-		},
-	}
-
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"templates": templates,
+		"templates": defaultTemplates,
 	})
 }
 
