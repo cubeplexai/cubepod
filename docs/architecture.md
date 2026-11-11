@@ -152,18 +152,22 @@ flowchart TB
 在标准 Kubernetes 中，容器的初始 `/` 是由宿主机 `containerd` 准备的，而 `volumeDevices`（Raw Block PVC）是在容器 rootfs 就绪后才映射进容器内的（如 `/dev/cubepod-rootfs`）。
 为了**无需魔改 Kubelet 或强制要求宿主机编译自定义 containerd snapshotter**，CubePod 采用 **In-Guest RootFS Pivot** 技术：
 
-1. **Pod 启动**：K8s 将 `rootfs-pvc` 和 `workspace-pvc` 通过 `volumeDevices` 以 `virtio-blk` 直通进 Kata Guest VM，路径分别为 `/dev/cubepod-rootfs` 和 `/dev/cubepod-workspace`。
+1. **Pod 启动与二进制动态注入（不污染业务镜像）**：
+   - **`podd-init` 与 `podd` 绝不打入业务 Sandbox 镜像**：用户可直接指定任意标准 OCI 镜像（如 `ubuntu:24.04` 或现有的 `cubeplex-sandbox`）。
+   - `cubepod-controller` 在创建 Pod 时，自动挂载一个内存 `emptyDir` 卷到 `/opt/cubepod/bin`，并由极轻量的 `podd-installer` `initContainer`（镜像 `cubepod-podd`，体积 `< 1MB`）将纯静态编译的 Rust 二进制 `podd-init` 和 `podd` 拷贝至 `/opt/cubepod/bin/`，然后将主容器 `command` 覆写为 `["/opt/cubepod/bin/podd-init", "/opt/cubepod/bin/podd"]`。
+   - 同时，K8s 将 `rootfs-pvc` 和 `workspace-pvc` 通过 `volumeDevices` 以 `virtio-blk` 直通进 Kata Guest VM，路径分别为 `/dev/cubepod-rootfs` 和 `/dev/cubepod-workspace`。
 2. **`podd-init` (PID 1) 自动自愈与挂载**：
    - 检查两块块设备的 ext4 Superblock：若是首次挂载的空白盘，自动执行极速 `mkfs.ext4` 并初始化目录结构（在 rootfs 盘创建 `/upper` 与 `/work`，将 workspace 盘属主设为 `1000:1000`）；若检测到上次非正常断电留下的 dirty 标记，自动执行 `e2fsck -p` 毫秒级修复。
-   - 在 Kata Guest 内核中执行原生 OverlayFS 挂载与 `pivot_root`：
+   - 在 Kata Guest 内核中执行原生 OverlayFS 挂载与 `pivot_root`（同时将 `/opt/cubepod` `--rbind` 进新根，既保证 `pivot_root` 后能直接 `exec /opt/cubepod/bin/podd`，又不会把守护进程写入用户的持久化 `upperdir`）：
      ```bash
      mount -t ext4 -o noatime /dev/cubepod-rootfs /mnt/rootfs-upper
      mount -t overlay overlay \
        -o lowerdir=/,upperdir=/mnt/rootfs-upper/upper,workdir=/mnt/rootfs-upper/work \
        /mnt/newroot
      mount -t ext4 -o noatime /dev/cubepod-workspace /mnt/newroot/workspace
-     # 迁移 /proc, /sys, /dev, /run 及 K8s 注入的 /etc/resolv.conf, /etc/hosts
+     # 迁移 /proc, /sys, /dev, /run, /opt/cubepod 及 K8s 注入的 /etc/resolv.conf, /etc/hosts
      pivot_root /mnt/newroot /mnt/newroot/.old_root
+     exec /opt/cubepod/bin/podd
      ```
 3. **启动 `podd` 服务**：完成 `pivot_root` 后，后续所有的命令执行、`apt install`、浏览器与终端进程完全运行在由 `virtio-blk` 裸块设备支撑的持久化根文件系统之上！
 

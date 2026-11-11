@@ -6,13 +6,16 @@
 //! spawns multiple background OS threads before `main()` even starts, which can cause subtle
 //! `EINVAL` or leaked root references during `pivot_root`.
 //!
-//! `podd-init` runs as a tiny, zero-GC, single-threaded Rust binary at PID 1:
+//! `podd-init` runs as a tiny, zero-GC, single-threaded Rust binary at PID 1
+//! (injected at runtime into `/opt/cubepod/bin/podd-init` via an `initContainer` shared `emptyDir`
+//! volume, never baked into user sandbox images):
 //! 1. Verifies/formats (`mkfs.ext4`) or auto-heals (`e2fsck -p`) `/dev/cubepod-rootfs` and `/dev/cubepod-workspace`.
 //! 2. Mounts the persistent RootFS Upper block device and constructs a Guest Kernel `OverlayFS`
 //!    merging the read-only Base Image (`/`) with the persistent `upperdir` and `workdir`.
 //! 3. Mounts the persistent Workspace block device at `<merged>/workspace` and sets ownership (`1000:1000`).
-//! 4. Bind-mounts `/proc`, `/sys`, `/dev`, `/run`, and K8s `/etc/resolv.conf`, `/etc/hosts`, `/etc/hostname`.
-//! 5. Calls `pivot_root(2)`, detaches `/.old_root`, and `execvp(3)`s into `/usr/local/bin/podd`.
+//! 4. Bind-mounts `/proc`, `/sys`, `/dev`, `/run`, `/opt/cubepod` (the injected runtime binary volume),
+//!    and K8s `/etc/resolv.conf`, `/etc/hosts`, `/etc/hostname`.
+//! 5. Calls `pivot_root(2)`, detaches `/.old_root`, and `execvp(3)`s into `/opt/cubepod/bin/podd`.
 
 use std::env;
 use std::ffi::CString;
@@ -38,7 +41,7 @@ pub struct InitConfig {
 impl InitConfig {
     pub fn from_env_and_args(args: Vec<String>) -> Self {
         let next_argv = if args.is_empty() {
-            vec!["/usr/local/bin/podd".to_string()]
+            vec!["/opt/cubepod/bin/podd".to_string()]
         } else {
             args
         };
@@ -118,7 +121,7 @@ pub fn ensure_ext4(device: &Path, label: &str) -> Result<(), String> {
 
     // e2fsck exit code 0 = no errors, 1 = filesystem errors corrected, 2 = corrected (reboot suggested)
     match status.code() {
-        Some(0 | 1 | 2) => Ok(()),
+        Some(0..=2) => Ok(()),
         other => Err(format!(
             "e2fsck -p failed on {} with exit code {:?}",
             device.display(),
@@ -190,16 +193,20 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
     }
     chown_path(&merged_workspace, cfg.default_uid, cfg.default_gid)?;
 
-    // 5. Bind-mount virtual filesystems and K8s networking configs into the merged root.
-    for sys_dir in ["proc", "sys", "dev", "run"] {
+    // 5. Bind-mount virtual filesystems, the injected /opt/cubepod runtime volume,
+    // and K8s networking configs into the merged root so podd remains accessible after pivot_root
+    // without polluting the user's persistent RootFS upperdir.
+    for sys_dir in ["proc", "sys", "dev", "run", "opt/cubepod"] {
         let src = Path::new("/").join(sys_dir);
-        let dst = cfg.merged_root_path.join(sys_dir);
-        let _ = fs::create_dir_all(&dst);
-        let _ = Command::new("mount")
-            .arg("--rbind")
-            .arg(&src)
-            .arg(&dst)
-            .status();
+        if src.exists() {
+            let dst = cfg.merged_root_path.join(sys_dir);
+            let _ = fs::create_dir_all(&dst);
+            let _ = Command::new("mount")
+                .arg("--rbind")
+                .arg(&src)
+                .arg(&dst)
+                .status();
+        }
     }
 
     for etc_file in ["etc/resolv.conf", "etc/hosts", "etc/hostname"] {
@@ -209,7 +216,11 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
             if let Some(parent) = dst.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            let _ = fs::OpenOptions::new().create(true).write(true).open(&dst);
+            let _ = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&dst);
             let _ = Command::new("mount")
                 .arg("--bind")
                 .arg(&src)
@@ -261,8 +272,8 @@ fn mount_ext4(device: &Path, target: &Path) -> Result<(), String> {
 }
 
 fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
-    let c_path =
-        CString::new(path.to_string_lossy().as_bytes()).map_err(|e| format!("invalid path: {e}"))?;
+    let c_path = CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|e| format!("invalid path: {e}"))?;
     let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
     if rc != 0 {
         return Err(format!(
@@ -294,7 +305,10 @@ fn chroot(new_root: &Path) -> Result<(), String> {
         .map_err(|e| format!("invalid new_root: {e}"))?;
     let rc = unsafe { libc::chroot(c_new.as_ptr()) };
     if rc != 0 {
-        return Err(format!("chroot failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "chroot failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     env::set_current_dir("/").map_err(|e| format!("chdir / after chroot: {e}"))
 }
@@ -350,6 +364,6 @@ mod tests {
     #[test]
     fn default_next_argv_points_to_podd() {
         let cfg = InitConfig::from_env_and_args(vec![]);
-        assert_eq!(cfg.next_argv, vec!["/usr/local/bin/podd".to_string()]);
+        assert_eq!(cfg.next_argv, vec!["/opt/cubepod/bin/podd".to_string()]);
     }
 }

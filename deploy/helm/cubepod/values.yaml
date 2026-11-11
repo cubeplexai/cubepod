@@ -5,7 +5,10 @@ global:
 runtime:
   runtimeClassName: "kata-qemu"
   defaultTemplate: "cubeplex-ubuntu24-desktop"
-  baseImage: "ghcr.io/cubeplexai/cubepod-runtime:v0.1.0"
+  # Lightweight initContainer image that injects /opt/cubepod/bin/{podd-init,podd} at Pod startup
+  poddInjectorImage: "ghcr.io/cubeplexai/cubepod-podd:v0.1.0"
+  # Default workload sandbox image (clean OS/tooling image without podd baked in)
+  defaultSandboxImage: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.3.0"
 
 storage:
   # SPDK NVMe-oF Raw Block StorageClass (Longhorn V2 or OpenEBS Mayastor)

@@ -72,8 +72,14 @@ type PodTemplateSpec struct {
 	// RuntimeClassName specifies the Kubernetes RuntimeClass (default: "kata-qemu" or "kata-clh").
 	RuntimeClassName string `json:"runtimeClassName"`
 
-	// Image is the base OCI container image containing podd and optional desktop stack.
+	// Image is the user/workload OCI container image (e.g., ubuntu:24.04 or cubeplex-sandbox).
+	// Note: podd-init and podd are NOT baked into this image; they are injected at runtime
+	// via an initContainer into /opt/cubepod/bin.
 	Image string `json:"image"`
+
+	// PoddImage is the optional override for the initContainer image that injects
+	// /opt/cubepod/bin/podd-init and /opt/cubepod/bin/podd into the sandbox pod.
+	PoddImage string `json:"poddImage,omitempty"`
 
 	// Resources specifies CPU and memory bounds for the MicroVM.
 	Resources ResourceRequirements `json:"resources"`

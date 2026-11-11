@@ -41,8 +41,9 @@ All non-trivial features, architectural changes, CRD/API modifications, storage/
 
 1. **Dual-Volume Independence (`RootFS Upper` vs. `Workspace`)**:
    - Never couple the lifecycle of `/workspace` (`workspace-pvc`) to the container RootFS `upperdir` (`rootfs-pvc`). Resetting `rootfsGeneration` or upgrading the Base Image MUST preserve `/workspace` intact.
-2. **Single-Threaded Rust PID 1 for `pivot_root`**:
+2. **Single-Threaded Rust PID 1 & Runtime Binary Injection (`podd-init` / `podd`)**:
    - `podd-init` (`crates/podd-init`) must remain a tiny, single-threaded Rust binary prior to `pivot_root(2)` and `execvp(3)` to avoid multi-threaded runtime issues with Linux mount namespaces and root pivoting.
+   - **Never bake `podd-init` or `podd` into user sandbox images.** They must be packaged in the dedicated `cubepod-podd` injector image (`images/podd/Dockerfile`) and injected at Pod startup via an `initContainer` shared `emptyDir` volume mounted at `/opt/cubepod/bin` (or read-only host bind-mount in local Docker mode). `podd-init` bind-mounts `/opt/cubepod` across `pivot_root` so any stock OCI image works out-of-the-box without polluting the user's persistent RootFS `upperdir`.
 3. **Zero-Trust Egress Secret Safety**:
    - Real external API secrets must **never** enter the sandbox environment, filesystem, or process memory. Only `cbxref_` placeholders may be injected into the sandbox, swapped at the egress boundary over per-sandbox mTLS.
 4. **UID/GID Privilege Separation**:
