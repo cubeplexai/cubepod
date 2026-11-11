@@ -13,9 +13,12 @@ import httpx
 
 from cubepod import (
     AsyncCubePod,
+    CubePod,
+    SyncCubePod,
     CommandInfo,
     CommandLogs,
     ExecutionResult,
+    FileEntry,
     PanelEndpoint,
     SandboxInfo,
 )
@@ -337,6 +340,219 @@ class TestAsyncCubePod(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(res["status"], "extracted")
             self.assertEqual(res["filesExtracted"], 2)
+
+    async def test_file_and_command_extensions(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            url_str = str(request.url)
+            method = request.method
+            if method == "GET" and "/sandboxes/cpod-1/files/list" in url_str:
+                self.assertEqual(request.url.params.get("path"), "/workspace")
+                return httpx.Response(
+                    200,
+                    json={
+                        "entries": [
+                            {"name": "test.txt", "path": "/workspace/test.txt", "is_dir": False, "size": 12, "mode": "0644"},
+                            {"name": "src", "path": "/workspace/src", "is_dir": True, "size": 4096, "mode": "0755"},
+                        ]
+                    },
+                )
+            if method == "DELETE" and "/sandboxes/cpod-1/files" in url_str:
+                self.assertEqual(request.url.params.get("path"), "/workspace/old.txt")
+                return httpx.Response(200, json={"status": "deleted", "path": "/workspace/old.txt"})
+            if method == "GET" and "/sandboxes/cpod-1/commands/cmd-abc/status" in url_str:
+                return httpx.Response(
+                    200,
+                    json={"id": "cmd-abc", "pid": 1234, "running": False, "exit_code": 0, "cursor": 50, "output": "done"},
+                )
+            if method == "GET" and "/sandboxes/cpod-1/commands/cmd-stream/logs" in url_str:
+                cursor = int(request.url.params.get("cursor", 0))
+                if cursor == 0:
+                    return httpx.Response(200, json={"id": "cmd-stream", "content": "part1\n", "cursor": 6, "running": True})
+                return httpx.Response(200, json={"id": "cmd-stream", "content": "part2\n", "cursor": 12, "running": False, "exit_code": 0})
+            if method == "POST" and url_str.endswith("/warmpools"):
+                data = json.loads(request.content)
+                self.assertEqual(data["name"], "wp-test")
+                return httpx.Response(201, json={"name": "wp-test", "replicas": 2, "readyReplicas": 2})
+            if method == "GET" and url_str.endswith("/warmpools"):
+                return httpx.Response(200, json=[{"name": "wp-test", "replicas": 2, "readyReplicas": 2}])
+            if method == "GET" and url_str.endswith("/templates"):
+                return httpx.Response(200, json=[{"id": "cubeplex-desktop", "image": "ubuntu:24.04"}])
+            return httpx.Response(404)
+
+        async with AsyncCubePod(transport=httpx.MockTransport(handler)) as client:
+            entries = await client.list_files("cpod-1", "/workspace")
+            self.assertEqual(len(entries), 2)
+            self.assertEqual(entries[0].name, "test.txt")
+            self.assertFalse(entries[0].is_dir)
+            self.assertTrue(entries[1].is_dir)
+
+            del_res = await client.delete_file("cpod-1", "/workspace/old.txt")
+            self.assertEqual(del_res["status"], "deleted")
+
+            status = await client.get_command_status("cpod-1", "cmd-abc")
+            self.assertEqual(status.id, "cmd-abc")
+            self.assertEqual(status.exit_code, 0)
+            self.assertFalse(status.running)
+
+            chunks = []
+            async for chunk in client.stream_command("cpod-1", "cmd-stream", poll_interval=0.01):
+                chunks.append(chunk.content)
+            self.assertEqual(chunks, ["part1\n", "part2\n"])
+
+            wp = await client.create_warmpool("wp-test", replicas=2)
+            self.assertEqual(wp["name"], "wp-test")
+
+            wps = await client.list_warmpools()
+            self.assertEqual(len(wps), 1)
+
+            tpls = await client.list_templates()
+            self.assertEqual(len(tpls), 1)
+
+    async def test_transient_retry(self) -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return httpx.Response(503, text="Service Unavailable")
+            return httpx.Response(200, json={"sandboxID": "cpod-retry", "templateID": "t1", "state": "Running"})
+
+        async with AsyncCubePod(transport=httpx.MockTransport(handler), max_retries=2) as client:
+            info = await client.get("cpod-retry")
+            self.assertEqual(info.sandbox_id, "cpod-retry")
+            self.assertEqual(attempts, 2)
+
+
+class TestSyncCubePod(unittest.TestCase):
+    def test_sync_client_complete(self) -> None:
+        attempts = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            url_str = str(request.url)
+            method = request.method
+
+            if method == "POST" and url_str.endswith("/sandboxes"):
+                return httpx.Response(
+                    201,
+                    json={"sandboxID": "cpod-sync-1", "templateID": "cubeplex-desktop", "state": "Running", "envdPort": 49983, "rootfsGeneration": 1},
+                )
+            if method == "GET" and url_str.endswith("/sandboxes"):
+                return httpx.Response(
+                    200,
+                    json=[{"sandboxID": "cpod-sync-1", "templateID": "cubeplex-desktop", "state": "Running", "envdPort": 49983, "rootfsGeneration": 1}],
+                )
+            if method == "GET" and url_str.endswith("/sandboxes/cpod-sync-1"):
+                attempts += 1
+                if attempts == 1:
+                    return httpx.Response(502, text="Bad Gateway")
+                return httpx.Response(
+                    200,
+                    json={"sandboxID": "cpod-sync-1", "templateID": "cubeplex-desktop", "state": "Running", "envdPort": 49983, "rootfsGeneration": 1},
+                )
+            if method == "POST" and url_str.endswith("/sandboxes/cpod-sync-1/pause"):
+                return httpx.Response(200, json={"sandboxID": "cpod-sync-1", "templateID": "cubeplex-desktop", "state": "Paused"})
+            if method == "POST" and url_str.endswith("/sandboxes/cpod-sync-1/connect"):
+                return httpx.Response(200, json={"sandboxID": "cpod-sync-1", "templateID": "cubeplex-desktop", "state": "Running"})
+            if method == "POST" and url_str.endswith("/sandboxes/cpod-sync-1/reset-rootfs"):
+                return httpx.Response(200, json={"sandboxID": "cpod-sync-1", "templateID": "cubeplex-desktop", "state": "Running", "rootfsGeneration": 2})
+            if method == "POST" and url_str.endswith("/sandboxes/cpod-sync-1/fork"):
+                return httpx.Response(201, json={"sandboxID": "cpod-sync-fork", "templateID": "cubeplex-desktop", "state": "Running"})
+            if method == "POST" and url_str.endswith("/sandboxes/cpod-sync-1/timeout"):
+                return httpx.Response(200, json={"status": "ok", "timeoutSeconds": 3600})
+            if method == "POST" and url_str.endswith("/sandboxes/cpod-sync-1/lease"):
+                return httpx.Response(200, json={"status": "ok", "leaseSeconds": 300})
+            if method == "POST" and "/sandboxes/cpod-sync-1/endpoints/8080" in url_str:
+                return httpx.Response(200, json={"url": "http://proxy/panel/tok", "token": "tok"})
+            if method == "POST" and url_str.endswith("/sandboxes/cpod-sync-1/commands/run"):
+                return httpx.Response(200, json={"id": "cmd-1", "output": "hello world", "exit_code": 0, "running": False})
+            if method == "GET" and "/sandboxes/cpod-sync-1/commands/cmd-1/status" in url_str:
+                return httpx.Response(200, json={"id": "cmd-1", "exit_code": 0, "running": False})
+            if method == "GET" and "/sandboxes/cpod-sync-1/commands/cmd-1/logs" in url_str:
+                return httpx.Response(200, json={"id": "cmd-1", "content": "logs", "cursor": 4, "running": False})
+            if method == "POST" and "/sandboxes/cpod-sync-1/commands/cmd-1/kill" in url_str:
+                return httpx.Response(200, json={"status": "killed"})
+            if method == "PUT" and "/sandboxes/cpod-sync-1/files" in url_str:
+                return httpx.Response(200, json={"status": "ok"})
+            if method == "GET" and "/sandboxes/cpod-sync-1/files/list" in url_str:
+                return httpx.Response(200, json={"entries": [{"name": "app.py", "path": "/workspace/app.py", "is_dir": False, "size": 100}]})
+            if method == "GET" and "/sandboxes/cpod-sync-1/files" in url_str:
+                return httpx.Response(200, content=b"code content")
+            if method == "DELETE" and "/sandboxes/cpod-sync-1/files" in url_str:
+                return httpx.Response(200, json={"status": "ok"})
+            if method == "POST" and "/sandboxes/cpod-sync-1/files/archive-sync" in url_str:
+                return httpx.Response(200, json={"status": "extracted"})
+            if method == "POST" and url_str.endswith("/warmpools"):
+                return httpx.Response(201, json={"name": "wp1", "replicas": 3})
+            if method == "GET" and url_str.endswith("/warmpools"):
+                return httpx.Response(200, json=[{"name": "wp1", "replicas": 3}])
+            if method == "GET" and url_str.endswith("/templates"):
+                return httpx.Response(200, json=[{"id": "cubeplex-desktop"}])
+            if method == "DELETE" and url_str.endswith("/sandboxes/cpod-sync-1"):
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        # Test SyncCubePod alias as well
+        self.assertIs(CubePod, SyncCubePod)
+
+        with CubePod(transport=httpx.MockTransport(handler), max_retries=2) as client:
+            sb = client.create("cubeplex-desktop")
+            self.assertEqual(sb.sandbox_id, "cpod-sync-1")
+
+            sbs = client.list()
+            self.assertEqual(len(sbs), 1)
+
+            # Test retry logic on 502
+            sb_get = client.get("cpod-sync-1")
+            self.assertEqual(sb_get.sandbox_id, "cpod-sync-1")
+            self.assertEqual(attempts, 2)
+
+            client.pause("cpod-sync-1")
+            client.connect("cpod-sync-1")
+            client.reset_rootfs("cpod-sync-1")
+            client.fork("cpod-sync-1")
+            client.renew_timeout("cpod-sync-1", 3600)
+            client.acquire_lease("cpod-sync-1", 300)
+
+            panel = client.get_panel_endpoint("cpod-sync-1", 8080)
+            self.assertEqual(panel.token, "tok")
+
+            res = client.execute("cpod-sync-1", "echo hi")
+            self.assertEqual(res.output, "hello world")
+
+            cmd_info = client.get_command_status("cpod-sync-1", "cmd-1")
+            self.assertEqual(cmd_info.exit_code, 0)
+
+            logs = client.poll_command("cpod-sync-1", "cmd-1")
+            self.assertEqual(logs.content, "logs")
+
+            chunks = list(client.stream_command("cpod-sync-1", "cmd-1"))
+            self.assertEqual(len(chunks), 1)
+
+            client.kill_command("cpod-sync-1", "cmd-1")
+
+            client.write_file("cpod-sync-1", "/workspace/test", b"content")
+            data = client.read_file("cpod-sync-1", "/workspace/test")
+            self.assertEqual(data, b"code content")
+
+            files = client.list_files("cpod-sync-1", "/workspace")
+            self.assertEqual(len(files), 1)
+            self.assertEqual(files[0].name, "app.py")
+
+            client.delete_file("cpod-sync-1", "/workspace/test")
+            client.archive_sync("cpod-sync-1", {"test.txt": "abc"})
+
+            wp = client.create_warmpool("wp1", replicas=3)
+            self.assertEqual(wp["name"], "wp1")
+
+            wps = client.list_warmpools()
+            self.assertEqual(len(wps), 1)
+
+            tpls = client.list_templates()
+            self.assertEqual(len(tpls), 1)
+
+            client.delete("cpod-sync-1")
 
 
 if __name__ == "__main__":
