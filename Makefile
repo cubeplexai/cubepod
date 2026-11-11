@@ -1,4 +1,4 @@
-.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress test test-rust test-go test-e2e fmt vet clean
+.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress test test-rust test-go test-e2e test-k8s-e2e fmt vet clean
 
 GO ?= go
 CARGO ?= $(shell which cargo 2>/dev/null || echo "$(HOME)/.cargo/bin/cargo")
@@ -55,6 +55,9 @@ test-go:
 
 test-e2e: build
 	$(GO) test -v -race ./test/e2e/...
+
+test-k8s-e2e:
+	CUBEPOD_K8S_E2E=1 $(GO) test -v -timeout 5m ./test/k8s-e2e/...
 
 fmt:
 	$(CARGO) fmt --all

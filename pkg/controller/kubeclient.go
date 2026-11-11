@@ -501,10 +501,66 @@ func (c *RESTKubeClient) WaitForRunning() bool {
 	return c.waitForRunning
 }
 
+// GetPod retrieves a Pod manifest as a generic map.
+func (c *RESTKubeClient) GetPod(ctx context.Context, namespace, name string) (map[string]any, error) {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s", c.baseURL, ns, name)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GetPod failed: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var res map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// GetPVC retrieves a PersistentVolumeClaim manifest as a generic map.
+func (c *RESTKubeClient) GetPVC(ctx context.Context, namespace, name string) (map[string]any, error) {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/api/v1/namespaces/%s/persistentvolumeclaims/%s", c.baseURL, ns, name)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GetPVC failed: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var res map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
 // DeletePod deletes a Pod by namespace and name.
 func (c *RESTKubeClient) DeletePod(ctx context.Context, namespace, name string) error {
 	ns := c.resolveNamespace(namespace)
-	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s", c.baseURL, ns, name)
+	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s?gracePeriodSeconds=0", c.baseURL, ns, name)
 
 	resp, err := c.doRequest(ctx, http.MethodDelete, url, nil)
 	if err != nil {
@@ -512,10 +568,30 @@ func (c *RESTKubeClient) DeletePod(ctx context.Context, namespace, name string) 
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted ||
-		resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
-		return nil
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted &&
+		resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("DeletePod failed: status %d (%s)", resp.StatusCode, string(respBody))
 	}
-	respBody, _ := io.ReadAll(resp.Body)
-	return fmt.Errorf("DeletePod failed: status %d (%s)", resp.StatusCode, string(respBody))
+
+	if c.waitForRunning {
+		pollTimeout := 15 * time.Second
+		pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
+		defer cancel()
+		ticker := time.NewTicker(c.pollInterval)
+		defer ticker.Stop()
+		for {
+			_, _, err := c.getPodStatus(pollCtx, ns, name)
+			if err != nil {
+				// Pod is gone
+				break
+			}
+			select {
+			case <-pollCtx.Done():
+				return nil
+			case <-ticker.C:
+			}
+		}
+	}
+	return nil
 }

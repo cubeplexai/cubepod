@@ -24,10 +24,12 @@ type SandboxRecord struct {
 	TemplateID       string            `json:"templateID"`
 	State            string            `json:"state"`
 	EnvdPort         int               `json:"envdPort"`
+	PoddURL          string            `json:"poddURL,omitempty"`
 	RootfsGeneration int64             `json:"rootfsGeneration"`
 	VolumeKey        string            `json:"volumeKey,omitempty"`
 	Metadata         map[string]string `json:"metadata,omitempty"`
 	CreatedAt        time.Time         `json:"createdAt,omitempty"`
+	AutoResumeCount  int               `json:"autoResumeCount,omitempty"`
 }
 
 // CreateSandboxRequest specifies the parameters for provisioning a sandbox.
@@ -181,7 +183,7 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 }
 
 // Health checks Gateway server availability.
-func (c *Client) Health(ctx context.Context) (map[string]string, error) {
+func (c *Client) Health(ctx context.Context) (map[string]any, error) {
 	req, err := c.newRequest(ctx, http.MethodGet, "/health", nil)
 	if err != nil {
 		return nil, err
@@ -191,7 +193,7 @@ func (c *Client) Health(ctx context.Context) (map[string]string, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	var res map[string]string
+	var res map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return nil, err
 	}
@@ -275,9 +277,18 @@ func (c *Client) ListSandboxes(ctx context.Context, templateID string) ([]*Sandb
 	return list, nil
 }
 
-// DeleteSandbox terminates a sandbox and permanently removes its PVCs.
+// DeleteSandbox terminates a sandbox and its compute Pod.
 func (c *Client) DeleteSandbox(ctx context.Context, sandboxID string) error {
-	req, err := c.newRequest(ctx, http.MethodDelete, fmt.Sprintf("/sandboxes/%s", sandboxID), nil)
+	return c.DeleteSandboxWithOptions(ctx, sandboxID, false)
+}
+
+// DeleteSandboxWithOptions terminates a sandbox with optional volume deletion.
+func (c *Client) DeleteSandboxWithOptions(ctx context.Context, sandboxID string, deleteVolumes bool) error {
+	path := fmt.Sprintf("/sandboxes/%s", sandboxID)
+	if deleteVolumes {
+		path += "?deleteVolumes=true"
+	}
+	req, err := c.newRequest(ctx, http.MethodDelete, path, nil)
 	if err != nil {
 		return err
 	}

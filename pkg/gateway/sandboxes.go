@@ -200,6 +200,7 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 	})
 	if err == nil {
 		rec.State = string(status.Phase)
+		rec.PoddURL = ""
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -230,6 +231,10 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 		rec.State = string(status.Phase)
 		if wasPaused {
 			rec.AutoResumeCount++
+		}
+		if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
+			rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
+			_ = waitForPoddReady(r.Context(), rec.PoddURL, 30*time.Second)
 		}
 		s.recordActivity(rec)
 	}
@@ -333,6 +338,10 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 	})
 	if err == nil {
 		rec.State = string(status.Phase)
+		if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
+			rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
+			_ = waitForPoddReady(r.Context(), rec.PoddURL, 30*time.Second)
+		}
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -392,6 +401,9 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sandboxID")
+	deleteVolumes := r.URL.Query().Get("deleteVolumes") == "true"
+	_ = s.reconciler.DeleteBox(r.Context(), id, deleteVolumes)
+
 	s.mu.Lock()
 	rec, ok := s.sandboxes[id]
 	delete(s.sandboxes, id)

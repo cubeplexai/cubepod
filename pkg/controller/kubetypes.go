@@ -76,24 +76,31 @@ type coreV1Volume struct {
 	Secret                *coreV1SecretVolumeSource                `json:"secret,omitempty"`
 }
 
+// coreV1LocalObjectReference contains enough information to let you locate the referenced object inside the same namespace.
+type coreV1LocalObjectReference struct {
+	Name string `json:"name"`
+}
+
 // coreV1Container represents a single container that is expected to be run on the host.
 type coreV1Container struct {
-	Name          string                      `json:"name"`
-	Image         string                      `json:"image"`
-	Command       []string                    `json:"command,omitempty"`
-	Args          []string                    `json:"args,omitempty"`
-	VolumeMounts  []coreV1VolumeMount         `json:"volumeMounts,omitempty"`
-	VolumeDevices []coreV1VolumeDevice        `json:"volumeDevices,omitempty"`
-	Resources     *coreV1ResourceRequirements `json:"resources,omitempty"`
-	Env           []coreV1EnvVar              `json:"env,omitempty"`
+	Name            string                      `json:"name"`
+	Image           string                      `json:"image"`
+	ImagePullPolicy string                      `json:"imagePullPolicy,omitempty"`
+	Command         []string                    `json:"command,omitempty"`
+	Args            []string                    `json:"args,omitempty"`
+	VolumeMounts    []coreV1VolumeMount         `json:"volumeMounts,omitempty"`
+	VolumeDevices   []coreV1VolumeDevice        `json:"volumeDevices,omitempty"`
+	Resources       *coreV1ResourceRequirements `json:"resources,omitempty"`
+	Env             []coreV1EnvVar              `json:"env,omitempty"`
 }
 
 // coreV1PodSpec is a description of a pod.
 type coreV1PodSpec struct {
-	InitContainers   []coreV1Container `json:"initContainers,omitempty"`
-	Containers       []coreV1Container `json:"containers,omitempty"`
-	Volumes          []coreV1Volume    `json:"volumes,omitempty"`
-	RuntimeClassName string            `json:"runtimeClassName,omitempty"`
+	InitContainers   []coreV1Container            `json:"initContainers,omitempty"`
+	Containers       []coreV1Container            `json:"containers,omitempty"`
+	Volumes          []coreV1Volume               `json:"volumes,omitempty"`
+	RuntimeClassName string                       `json:"runtimeClassName,omitempty"`
+	ImagePullSecrets []coreV1LocalObjectReference `json:"imagePullSecrets,omitempty"`
 }
 
 // coreV1Pod represents a Kubernetes v1 Pod JSON payload.
@@ -139,10 +146,11 @@ func toCoreV1PVC(pvc BlockPVCManifest, namespace string) coreV1PVC {
 // toCoreV1Container converts an internal ContainerManifest into a Kubernetes core/v1 container.
 func toCoreV1Container(c ContainerManifest) coreV1Container {
 	res := coreV1Container{
-		Name:    c.Name,
-		Image:   c.Image,
-		Command: c.Command,
-		Args:    c.Args,
+		Name:            c.Name,
+		Image:           c.Image,
+		ImagePullPolicy: c.ImagePullPolicy,
+		Command:         c.Command,
+		Args:            c.Args,
 	}
 	for _, vm := range c.VolumeMounts {
 		res.VolumeMounts = append(res.VolumeMounts, coreV1VolumeMount{
@@ -227,6 +235,18 @@ func toCoreV1Pod(pod PodManifest, namespace string) coreV1Pod {
 		containers = append(containers, toCoreV1Container(cn))
 	}
 
+	var imagePullSecrets []coreV1LocalObjectReference
+	if len(pod.ImagePullSecrets) > 0 {
+		for _, s := range pod.ImagePullSecrets {
+			imagePullSecrets = append(imagePullSecrets, coreV1LocalObjectReference{Name: s})
+		}
+	} else {
+		imagePullSecrets = []coreV1LocalObjectReference{
+			{Name: "regcred"},
+			{Name: "hub.sensedeal.vip"},
+		}
+	}
+
 	return coreV1Pod{
 		APIVersion: "v1",
 		Kind:       "Pod",
@@ -240,6 +260,7 @@ func toCoreV1Pod(pod PodManifest, namespace string) coreV1Pod {
 			Containers:       containers,
 			Volumes:          volumes,
 			RuntimeClassName: pod.RuntimeClassName,
+			ImagePullSecrets: imagePullSecrets,
 		},
 	}
 }
