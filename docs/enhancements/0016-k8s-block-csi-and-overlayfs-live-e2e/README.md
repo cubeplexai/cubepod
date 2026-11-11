@@ -49,7 +49,8 @@ Deploys a real **Block CSI Driver** (**OpenEBS LVM-LocalPV** backed by an LVM Vo
   - Respect explicit `RuntimeClassName` configuration (do not force `"kata-qemu"` when the cluster operator explicitly configures `--runtime-class=""` on a non-Kata test cluster).
 
 ### 4.2 OpenEBS LVM-LocalPV Block CSI Setup (`deploy/k8s/`)
-- Create a 50GiB loopback-backed LVM Volume Group (`cubepod-vg`) on the worker node (`gpu-214`).
+- Create a 50GiB loopback-backed LVM Volume Group (`cubepod-vg`) on the worker node (`gpu-214`) located under the dedicated directory `/storage/cubepod/` (`/storage/cubepod/cubepod-lvm-loop.img` on the worker's 28TB `/storage` RAID partition).
+- Configure a persistent systemd service (`/etc/systemd/system/cubepod-loop.service`) on `gpu-214` to automatically attach `/dev/loop0` and activate `cubepod-vg` on system boots.
 - Deploy OpenEBS LVM-LocalPV (`lvm.csi.openebs.io`) and `StorageClass` `cubepod-lvm-block` (`volgroup: cubepod-vg`, `volumeBindingMode: Immediate`).
 
 ### 4.3 Dual-Runtime Behavior
