@@ -1,0 +1,10 @@
+title: "Kubernetes API Client, CRD Sync Loop, and Background Reap Worker"
+cep-number: 8
+authors:
+  - "@cubeplex-arch"
+status: implementable
+creation-date: 2026-11-10
+last-updated: 2026-11-10
+version: v0.2.0
+see-also:
+  - "/docs/enhancements/0003-controller-warmpool-and-fork"
