@@ -2,4 +2,4 @@
 package version
 
 // Version is populated at build time via -ldflags.
-var Version = "v0.1.0-dev"
+var Version = "v0.2.0"

@@ -2,7 +2,7 @@ title: "Gateway Live podd Proxy Engine and Zero-Trust Egress Sidecar Daemon"
 cep-number: 9
 authors:
   - "@cubeplex-arch"
-status: implementable
+status: implemented
 creation-date: 2026-11-10
 last-updated: 2026-11-10
 version: v0.2.0

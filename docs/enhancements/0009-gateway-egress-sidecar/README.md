@@ -5,7 +5,7 @@
 | **CEP Number** | `0009` |
 | **Title** | Gateway Live `podd` Proxy Engine and Zero-Trust Egress Sidecar Daemon |
 | **Authors** | `@cubeplex-arch` |
-| **Status** | `implementable` |
+| **Status** | `implemented` |
 | **Target Version** | `v0.2.0` |
 | **Created** | `2026-11-10` |
 | **Last Updated** | `2026-11-10` |

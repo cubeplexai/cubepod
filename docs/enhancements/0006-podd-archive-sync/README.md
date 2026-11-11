@@ -5,7 +5,7 @@
 | **CEP Number** | `0006` |
 | **Title** | `podd` Native Streaming `archive-sync` and Process Output Tail Enhancements |
 | **Authors** | `@cubeplex-arch` |
-| **Status** | `implementable` |
+| **Status** | `implemented` |
 | **Target Version** | `v0.2.0` |
 | **Created** | `2026-11-10` |
 | **Last Updated** | `2026-11-10` |

@@ -1224,6 +1224,7 @@ fn handle_archive_sync(
     let dest_str = query_params
         .get("dest")
         .or_else(|| query_params.get("destination"))
+        .or_else(|| query_params.get("path"))
         .map(|s| s.as_str())
         .unwrap_or(&config.workdir);
 

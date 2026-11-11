@@ -2,7 +2,7 @@ title: "End-to-End Real Daemon Integration Suite and CLI Tooling"
 cep-number: 10
 authors:
   - "@cubeplex-arch"
-status: implementable
+status: implemented
 creation-date: 2026-11-10
 last-updated: 2026-11-10
 version: v0.2.0

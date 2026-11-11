@@ -5,7 +5,7 @@
 | **CEP Number** | `0010` |
 | **Title** | End-to-End Real Daemon Integration Suite and CLI Tooling (`test/e2e`) |
 | **Authors** | `@cubeplex-arch` |
-| **Status** | `implementable` |
+| **Status** | `implemented` |
 | **Target Version** | `v0.2.0` |
 | **Created** | `2026-11-10` |
 | **Last Updated** | `2026-11-10` |

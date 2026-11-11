@@ -570,7 +570,7 @@ func TestE2E_LivePoddBackendAndZeroTrustEgress(t *testing.T) {
 
 	tmpDir := t.TempDir()
 	backend, err := runtime.NewPoddProcessBackend(runtime.PoddProcessBackendConfig{
-		PoddBinPath:   binPodd,
+		BinaryPath:    binPodd,
 		BaseDir:       tmpDir,
 		HealthTimeout: 5 * time.Second,
 	})
@@ -582,20 +582,11 @@ func TestE2E_LivePoddBackendAndZeroTrustEgress(t *testing.T) {
 	reconciler := controller.NewReconciler()
 	srv := gateway.NewServer(reconciler)
 
-	// Configure Zero-Trust Egress CA & Vault on the Gateway
-	ca, err := egress.NewCA()
-	if err != nil {
-		t.Fatalf("NewCA failed: %v", err)
-	}
-	vault := egress.NewVault(ca)
-	srv.SetEgressVault(vault)
+	ca := srv.CA()
+	vault := srv.Vault()
 
 	// Start mTLS Gateway server for both E2B API and /internal/v1/egress/exchange
-	serverCert, serverKey, err := ca.MintServerCert([]string{"127.0.0.1", "localhost"}, time.Hour)
-	if err != nil {
-		t.Fatalf("MintServerCert failed: %v", err)
-	}
-	serverTLS, err := ca.ServerTLSConfig(serverCert, serverKey)
+	serverTLS, err := ca.ServerTLSConfig("127.0.0.1", "localhost")
 	if err != nil {
 		t.Fatalf("ServerTLSConfig failed: %v", err)
 	}
@@ -671,9 +662,9 @@ func TestE2E_LivePoddBackendAndZeroTrustEgress(t *testing.T) {
 		AllowHosts:    []string{upstreamURL.Hostname()},
 	}
 	realSecret := "Bearer sk-real-production-secret-999"
-	placeholder, err := vault.RegisterSecret(sbRec.SandboxID, "OPENAI_API_KEY", realSecret, policy)
+	placeholder, err := vault.BindSecret(sbRec.SandboxID, "OPENAI_API_KEY", realSecret, []string{upstreamURL.Hostname()}, []string{"Authorization"})
 	if err != nil {
-		t.Fatalf("RegisterSecret failed: %v", err)
+		t.Fatalf("BindSecret failed: %v", err)
 	}
 
 	sbCert, sbKey, err := ca.MintSandboxCert(sbRec.SandboxID, time.Hour)

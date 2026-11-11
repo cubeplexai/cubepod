@@ -5,7 +5,7 @@
 | **CEP Number** | `0008` |
 | **Title** | Kubernetes API Client, CRD Sync Loop, and Background Reap Worker (`pkg/controller`) |
 | **Authors** | `@cubeplex-arch` |
-| **Status** | `implementable` |
+| **Status** | `implemented` |
 | **Target Version** | `v0.2.0` |
 | **Created** | `2026-11-10` |
 | **Last Updated** | `2026-11-10` |

@@ -5,7 +5,7 @@
 | **CEP Number** | `0007` |
 | **Title** | Local Docker and Sparse Loopback `ext4` Runtime Driver (`pkg/runtime`) |
 | **Authors** | `@cubeplex-arch` |
-| **Status** | `implementable` |
+| **Status** | `implemented` |
 | **Target Version** | `v0.2.0` |
 | **Created** | `2026-11-10` |
 | **Last Updated** | `2026-11-10` |

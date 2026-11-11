@@ -192,7 +192,16 @@ func (s *Server) forwardToPodd(w http.ResponseWriter, r *http.Request, targetURL
 			targetURL += "?" + r.URL.RawQuery
 		}
 	}
-	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
+	var bodyReader io.Reader
+	if r.Body != nil {
+		bodyBytes, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, bodyReader)
 	if err != nil {
 		http.Error(w, "failed to create forward request: "+err.Error(), http.StatusInternalServerError)
 		return

@@ -1,6 +1,6 @@
 [project]
 name = "cubepod"
-version = "0.1.0"
+version = "0.2.0"
 description = "Async-first Python SDK for CubePod (E2B-compatible persistent MicroVM sandboxes)"
 readme = "README.md"
 requires-python = ">=3.11"
