@@ -1,5 +1,7 @@
 """Synchronous client for CubePod Control & Data Plane."""
 
+from __future__ import annotations
+
 from collections.abc import Iterator
 import time
 from typing import Any

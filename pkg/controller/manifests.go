@@ -41,14 +41,15 @@ type EnvVar struct {
 
 // ContainerManifest represents a container specification within a Pod.
 type ContainerManifest struct {
-	Name          string                        `json:"name"`
-	Image         string                        `json:"image"`
-	Command       []string                      `json:"command,omitempty"`
-	Args          []string                      `json:"args,omitempty"`
-	VolumeMounts  []VolumeMount                 `json:"volumeMounts,omitempty"`
-	VolumeDevices []VolumeDevice                `json:"volumeDevices,omitempty"`
-	Resources     v1alpha1.ResourceRequirements `json:"resources,omitempty"`
-	Env           []EnvVar                      `json:"env,omitempty"`
+	Name            string                        `json:"name"`
+	Image           string                        `json:"image"`
+	ImagePullPolicy string                        `json:"imagePullPolicy,omitempty"`
+	Command         []string                      `json:"command,omitempty"`
+	Args            []string                      `json:"args,omitempty"`
+	VolumeMounts    []VolumeMount                 `json:"volumeMounts,omitempty"`
+	VolumeDevices   []VolumeDevice                `json:"volumeDevices,omitempty"`
+	Resources       v1alpha1.ResourceRequirements `json:"resources,omitempty"`
+	Env             []EnvVar                      `json:"env,omitempty"`
 }
 
 // VolumeManifest represents a Pod volume definition.
@@ -68,6 +69,7 @@ type PodManifest struct {
 	InitContainers   []ContainerManifest `json:"initContainers"`
 	Containers       []ContainerManifest `json:"containers"`
 	Volumes          []VolumeManifest    `json:"volumes"`
+	ImagePullSecrets []string            `json:"imagePullSecrets,omitempty"`
 }
 
 // BuildBlockPVCs generates volumeMode: Block or Filesystem PVC specifications for RootFS Upper and Workspace.
@@ -202,12 +204,13 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 
 	initContainers := []ContainerManifest{
 		{
-			Name:  "podd-installer",
-			Image: poddImg,
+			Name:            "podd-installer",
+			Image:           poddImg,
+			ImagePullPolicy: "IfNotPresent",
 			Command: []string{
 				"/bin/sh",
 				"-c",
-				"cp /podd-init /podd /opt/cubepod/bin/ 2>/dev/null || cp /usr/local/bin/podd* /opt/cubepod/bin/",
+				"cp -f /opt/cubepod/dist/podd-init /opt/cubepod/dist/podd /opt/cubepod/bin/ 2>/dev/null || cp -f /podd-init /podd /opt/cubepod/bin/ 2>/dev/null || cp -f /usr/local/bin/podd* /opt/cubepod/bin/ 2>/dev/null || true; chmod 0755 /opt/cubepod/bin/podd-init /opt/cubepod/bin/podd 2>/dev/null || true",
 			},
 			VolumeMounts: []VolumeMount{
 				{
@@ -219,8 +222,9 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 	}
 
 	mainContainer := ContainerManifest{
-		Name:  "sandbox",
-		Image: mainImg,
+		Name:            "sandbox",
+		Image:           mainImg,
+		ImagePullPolicy: "IfNotPresent",
 		Command: []string{
 			"/opt/cubepod/bin/podd-init",
 			"/opt/cubepod/bin/podd",
@@ -317,8 +321,9 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 			"app.kubernetes.io/name": "cubepod",
 			"pod.cubeplex.ai/box":    boxName,
 		},
-		InitContainers: initContainers,
-		Containers:     containers,
-		Volumes:        volumes,
+		InitContainers:   initContainers,
+		Containers:       containers,
+		Volumes:          volumes,
+		ImagePullSecrets: []string{"regcred", "hub.sensedeal.vip"},
 	}
 }

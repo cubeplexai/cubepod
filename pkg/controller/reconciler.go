@@ -481,6 +481,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		status.Reason = "RootFSReset"
 		status.Message = fmt.Sprintf("RootFS reset to generation %d", spec.RootfsGeneration)
 
+		// Delete old compute Pod first so it unmounts the old RootFS PVC and allows a new Pod to be created
+		if status.PodName != "" {
+			_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
+			status.PodName = ""
+			status.PodIP = ""
+		}
+
 		// Delete old RootFS PVC and apply new RootFS PVC.
 		if oldRootfsPVC != "" {
 			_ = r.kubeClient.DeletePVC(ctx, r.namespace, oldRootfsPVC)

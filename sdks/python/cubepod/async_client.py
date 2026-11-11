@@ -1,5 +1,7 @@
 """Async client for CubePod Control & Data Plane."""
 
+from __future__ import annotations
+
 import asyncio
 from collections.abc import AsyncIterator
 from typing import Any

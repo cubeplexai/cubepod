@@ -226,6 +226,9 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
                 cfg.rootfs_device.display()
             );
         }
+        let _ = fs::create_dir_all(&cfg.workspace_dir);
+        let _ = chown_path(&cfg.workspace_dir, cfg.default_uid, cfg.default_gid);
+        let _ = fs::set_permissions(&cfg.workspace_dir, fs::Permissions::from_mode(0o777));
         let state = InitState {
             pivoted: false,
             rootfs_device: cfg.rootfs_device.to_string_lossy().to_string(),

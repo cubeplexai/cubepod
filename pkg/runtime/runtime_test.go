@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -22,6 +23,9 @@ func TestPoddProcessBackend_LifecycleAndPersistence(t *testing.T) {
 		HealthTimeout:    5 * time.Second,
 	})
 	if err != nil {
+		if strings.Contains(err.Error(), "podd binary not found") {
+			t.Skip("skipping test: podd binary not found (run make build-podd first)")
+		}
 		t.Fatalf("failed to create PoddProcessBackend: %v", err)
 	}
 	defer backend.Close()
@@ -130,6 +134,9 @@ func TestPoddProcessBackend_ResetRootFSPreservesWorkspace(t *testing.T) {
 		EnableSparseExt4: true,
 	})
 	if err != nil {
+		if strings.Contains(err.Error(), "podd binary not found") {
+			t.Skip("skipping test: podd binary not found (run make build-podd first)")
+		}
 		t.Fatalf("failed to create PoddProcessBackend: %v", err)
 	}
 	defer backend.Close()
@@ -185,6 +192,9 @@ func TestPoddProcessBackend_CoWFork(t *testing.T) {
 		EnableSparseExt4: true,
 	})
 	if err != nil {
+		if strings.Contains(err.Error(), "podd binary not found") {
+			t.Skip("skipping test: podd binary not found (run make build-podd first)")
+		}
 		t.Fatalf("failed to create PoddProcessBackend: %v", err)
 	}
 	defer backend.Close()
@@ -325,6 +335,9 @@ func TestPoddProcessBackend_DeleteAndInspect(t *testing.T) {
 		BaseDir: tmpDir,
 	})
 	if err != nil {
+		if strings.Contains(err.Error(), "podd binary not found") {
+			t.Skip("skipping test: podd binary not found (run make build-podd first)")
+		}
 		t.Fatalf("create backend: %v", err)
 	}
 	defer backend.Close()
