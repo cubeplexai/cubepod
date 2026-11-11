@@ -736,6 +736,20 @@ users:
 	if !client.WaitForRunning() {
 		t.Fatal("expected WaitForRunning to be true")
 	}
+
+	// Verify NewRESTKubeClientFromKubeconfig with token-based kubeconfig
+	tokenInfo := &controller.KubeconfigInfo{
+		Server:    info.Server,
+		Namespace: info.Namespace,
+		Token:     info.Token,
+	}
+	clientFromKubeconfig, err := controller.NewRESTKubeClientFromKubeconfig(tokenInfo)
+	if err != nil {
+		t.Fatalf("NewRESTKubeClientFromKubeconfig failed: %v", err)
+	}
+	if clientFromKubeconfig == nil {
+		t.Fatal("expected non-nil client from NewRESTKubeClientFromKubeconfig")
+	}
 }
 
 func TestWaitForRunning_Polling(t *testing.T) {
