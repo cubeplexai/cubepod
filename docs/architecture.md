@@ -3,8 +3,8 @@
 > **项目定位**：**CubePod** 是由 CubePlex 团队打造的开源、云原生、硬件级强隔离（Kata MicroVM）、全盘可写层持久化（Persistent Writable RootFS）且内置零信任出网网关（Zero-Trust Egress & Secret Vault）的 **全功能 AI Agent 持久化执行舱（Agent Execution Pod）平台**。
 >
 > **CubePlex 开源矩阵三剑客**：
-> - **CubePlex**：面向团队工作空间的托管式 Agent 协同平台（The Workspace Platform）
-> - **CubeLoop**：异步原生的多模型 Agent 运行时与检查点框架（The Brain / Agent Loop）
+> - [**CubePlex**](https://github.com/cubeplexai/cubeplex)：面向团队工作空间的托管式 Agent 协同平台（The Agent Workspace Platform）
+> - [**CubeLoop**](https://github.com/cubeplexai/cubeloop)：异步原生的多模型 Agent 运行时与检查点框架（The Brain / Agent Loop）
 > - **CubePod**：秒级冬眠唤醒、全系统持久化的 MicroVM 安全执行环境（The Body / Execution Pod）
 
 ---
