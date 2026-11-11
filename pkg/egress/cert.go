@@ -6,12 +6,14 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"time"
 )
 
@@ -147,6 +149,109 @@ func (ca *CA) MintSandboxCert(sandboxID string, ttl time.Duration) (certPEM, key
 	})
 
 	return certPEM, keyPEM, nil
+}
+
+// MintServerCert issues an ECDSA P-256 server certificate for the given DNS names and IP addresses.
+func (ca *CA) MintServerCert(hosts []string, ttl time.Duration) (certPEM, keyPEM []byte, err error) {
+	if len(hosts) == 0 {
+		hosts = []string{"localhost", "127.0.0.1"}
+	}
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+
+	serverKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate server key: %w", err)
+	}
+
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to generate server serial number: %w", err)
+	}
+
+	notBefore := time.Now().Add(-5 * time.Minute)
+	notAfter := notBefore.Add(ttl)
+
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: hosts[0],
+		},
+		NotBefore:             notBefore,
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+	}
+
+	for _, h := range hosts {
+		if ip := net.ParseIP(h); ip != nil {
+			template.IPAddresses = append(template.IPAddresses, ip)
+		} else {
+			template.DNSNames = append(template.DNSNames, h)
+		}
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, ca.caCert, &serverKey.PublicKey, ca.caKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to issue server certificate: %w", err)
+	}
+
+	certPEM = pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: certDER,
+	})
+
+	keyDER, err := x509.MarshalECPrivateKey(serverKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal server EC private key: %w", err)
+	}
+
+	keyPEM = pem.EncodeToMemory(&pem.Block{
+		Type:  "EC PRIVATE KEY",
+		Bytes: keyDER,
+	})
+
+	return certPEM, keyPEM, nil
+}
+
+// ServerTLSConfig returns a *tls.Config for an mTLS server requiring and verifying client certs against ca.
+func (ca *CA) ServerTLSConfig(hosts ...string) (*tls.Config, error) {
+	if len(hosts) == 0 {
+		hosts = []string{"localhost", "127.0.0.1"}
+	}
+	certPEM, keyPEM, err := ca.MintServerCert(hosts, 24*time.Hour)
+	if err != nil {
+		return nil, err
+	}
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load server keypair: %w", err)
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    ca.certPool,
+		MinVersion:   tls.VersionTLS12,
+	}, nil
+}
+
+// ClientTLSConfig returns a *tls.Config configured with the client cert and trusted CA root pool.
+func (ca *CA) ClientTLSConfig(certPEM, keyPEM []byte) (*tls.Config, error) {
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load client keypair: %w", err)
+	}
+
+	return &tls.Config{
+		RootCAs:      ca.certPool,
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+	}, nil
 }
 
 // VerifySandboxCert parses and validates a client certificate PEM against the CA,

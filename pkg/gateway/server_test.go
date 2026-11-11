@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -539,5 +540,198 @@ func TestSignedPanelTokenAndReverseProxy(t *testing.T) {
 	getResp2.Body.Close()
 	if rec.State != "Running" || rec.AutoResumeCount < 1 {
 		t.Fatalf("expected sandbox state Running and AutoResumeCount >= 1, got state=%s count=%d", rec.State, rec.AutoResumeCount)
+	}
+}
+
+func TestPoddDataPlaneForwardingAndPrepareStopOnPause(t *testing.T) {
+	var (
+		runCalled         bool
+		logsCalled        bool
+		killCalled        bool
+		putFileCalled     bool
+		getFileCalled     bool
+		archiveSyncCalled bool
+		prepareStopCalled bool
+	)
+
+	mockPodd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/commands/run":
+			runCalled = true
+			_, _ = w.Write([]byte(`{"id":"podd-cmd-1","cmdID":"podd-cmd-1","stdout":"forwarded-podd-out\n","exitCode":0}`))
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/commands/") && strings.HasSuffix(r.URL.Path, "/logs"):
+			logsCalled = true
+			cursor := r.URL.Query().Get("cursor")
+			_, _ = fmt.Fprintf(w, `{"id":"podd-cmd-1","content":"podd-log-cursor-%s","cursor":10,"running":false}`, cursor)
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/commands/") && strings.HasSuffix(r.URL.Path, "/kill"):
+			killCalled = true
+			_, _ = w.Write([]byte(`{"id":"podd-cmd-1","killed":true}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/files":
+			putFileCalled = true
+			p := r.URL.Query().Get("path")
+			_, _ = fmt.Fprintf(w, `{"status":"ok","path":"%s","writtenBy":"podd"}`, p)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/files":
+			getFileCalled = true
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = w.Write([]byte("podd file content"))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/files/archive-sync":
+			archiveSyncCalled = true
+			_, _ = w.Write([]byte(`{"status":"ok","extracted":3,"daemon":"podd"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/lifecycle/prepare-stop":
+			prepareStopCalled = true
+			_, _ = w.Write([]byte(`{"status":"synced"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockPodd.Close()
+
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Create sandbox
+	resp, err := http.Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader([]byte(`{"templateID":"kata-pod"}`)))
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(resp.Body).Decode(&rec)
+	resp.Body.Close()
+
+	// 2. Register live podd daemon URL
+	srv.SetPoddURL(rec.SandboxID, mockPodd.URL)
+
+	// 3. Test /commands/run forwarding
+	runResp, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/commands/run", "application/json", bytes.NewReader([]byte(`{"cmd":"ls"}`)))
+	if err != nil || runResp.StatusCode != http.StatusOK {
+		t.Fatalf("run failed: status=%d err=%v", runResp.StatusCode, err)
+	}
+	runBody, _ := io.ReadAll(runResp.Body)
+	runResp.Body.Close()
+	if !strings.Contains(string(runBody), "forwarded-podd-out") || !runCalled {
+		t.Fatalf("expected podd command response, got: %s", string(runBody))
+	}
+
+	// 4. Test /commands/{cmdID}/logs forwarding
+	logResp, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/commands/podd-cmd-1/logs?cursor=5")
+	if err != nil || logResp.StatusCode != http.StatusOK {
+		t.Fatalf("logs failed: status=%d err=%v", logResp.StatusCode, err)
+	}
+	logBody, _ := io.ReadAll(logResp.Body)
+	logResp.Body.Close()
+	if !strings.Contains(string(logBody), "podd-log-cursor-5") || !logsCalled {
+		t.Fatalf("expected podd logs, got: %s", string(logBody))
+	}
+
+	// 5. Test /commands/{cmdID}/kill forwarding
+	killResp, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/commands/podd-cmd-1/kill", "application/json", nil)
+	if err != nil || killResp.StatusCode != http.StatusOK {
+		t.Fatalf("kill failed: status=%d err=%v", killResp.StatusCode, err)
+	}
+	killBody, _ := io.ReadAll(killResp.Body)
+	killResp.Body.Close()
+	if !strings.Contains(string(killBody), "killed") || !killCalled {
+		t.Fatalf("expected podd kill, got: %s", string(killBody))
+	}
+
+	// 6. Test PUT /files forwarding
+	reqPut, _ := http.NewRequest(http.MethodPut, ts.URL+"/sandboxes/"+rec.SandboxID+"/files?path=/workspace/test.py", bytes.NewReader([]byte("code")))
+	putResp, err := http.DefaultClient.Do(reqPut)
+	if err != nil || putResp.StatusCode != http.StatusOK {
+		t.Fatalf("put file failed: status=%d err=%v", putResp.StatusCode, err)
+	}
+	putBody, _ := io.ReadAll(putResp.Body)
+	putResp.Body.Close()
+	if !strings.Contains(string(putBody), "podd") || !putFileCalled {
+		t.Fatalf("expected podd put file, got: %s", string(putBody))
+	}
+
+	// 7. Test GET /files forwarding
+	getResp, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/files?path=/workspace/test.py")
+	if err != nil || getResp.StatusCode != http.StatusOK {
+		t.Fatalf("get file failed: status=%d err=%v", getResp.StatusCode, err)
+	}
+	getBody, _ := io.ReadAll(getResp.Body)
+	getResp.Body.Close()
+	if string(getBody) != "podd file content" || !getFileCalled {
+		t.Fatalf("expected podd get file, got: %s", string(getBody))
+	}
+
+	// 8. Test POST /files/archive-sync forwarding
+	syncResp, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/files/archive-sync", "application/gzip", bytes.NewReader([]byte("fake-tar")))
+	if err != nil || syncResp.StatusCode != http.StatusOK {
+		t.Fatalf("archive-sync failed: status=%d err=%v", syncResp.StatusCode, err)
+	}
+	syncBody, _ := io.ReadAll(syncResp.Body)
+	syncResp.Body.Close()
+	if !strings.Contains(string(syncBody), `"daemon":"podd"`) || !archiveSyncCalled {
+		t.Fatalf("expected podd archive-sync, got: %s", string(syncBody))
+	}
+
+	// 9. Test POST /pause calls <PoddURL>/v1/lifecycle/prepare-stop
+	pResp, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/pause", "application/json", nil)
+	if err != nil || pResp.StatusCode != http.StatusOK {
+		t.Fatalf("pause failed: status=%d err=%v", pResp.StatusCode, err)
+	}
+	pResp.Body.Close()
+	if !prepareStopCalled {
+		t.Fatalf("expected /v1/lifecycle/prepare-stop to be called during pause, but was not")
+	}
+}
+
+func TestGatewayEgressExchangeEndpoint(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	sandboxID := "sbx-gw-egress-01"
+	rawSecret := "sk-live-gateway-secret-42"
+	placeholder, err := srv.Vault().BindSecret(
+		sandboxID,
+		"OPENAI_KEY",
+		rawSecret,
+		[]string{"api.openai.com"},
+		[]string{"Authorization"},
+	)
+	if err != nil {
+		t.Fatalf("BindSecret failed: %v", err)
+	}
+
+	// 1. Authorized exchange
+	body := fmt.Sprintf(`{"sandboxID":"%s","placeholder":"%s","sniHost":"api.openai.com","headerName":"Authorization"}`, sandboxID, placeholder)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/internal/v1/egress/exchange", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-CubePod-Sandbox-ID", sandboxID)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("exchange failed: status=%d err=%v", resp.StatusCode, err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	var exResp map[string]string
+	_ = json.Unmarshal(respBody, &exResp)
+	if exResp["secret"] != rawSecret {
+		t.Fatalf("expected secret %q, got %+v", rawSecret, exResp)
+	}
+
+	// 2. Forbidden host
+	badHostReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/internal/v1/egress/exchange", strings.NewReader(
+		fmt.Sprintf(`{"sandboxID":"%s","placeholder":"%s","sniHost":"evil.com","headerName":"Authorization"}`, sandboxID, placeholder),
+	))
+	badHostReq.Header.Set("Content-Type", "application/json")
+	badHostReq.Header.Set("X-CubePod-Sandbox-ID", sandboxID)
+	badHostResp, err := http.DefaultClient.Do(badHostReq)
+	if err != nil {
+		t.Fatalf("bad host request failed: %v", err)
+	}
+	defer badHostResp.Body.Close()
+	if badHostResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for unallowed host, got %d", badHostResp.StatusCode)
 	}
 }
