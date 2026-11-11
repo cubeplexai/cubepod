@@ -1,0 +1,224 @@
+openapi: 3.1.0
+info:
+  title: CubePod Canonical API (E2B-Compatible Superset)
+  version: 0.1.0
+  description: |
+    Unified Control & Data Plane API for CubePod.
+    - 100% wire-compatible with E2B Control Plane (`/sandboxes`) and Data Plane (`podd` on `:49983`).
+    - Extends E2B with dual-block-volume persistence (`rootfs` + `workspace`), 1s CoW `fork`,
+      stateless background command `cursor` logs, atomic `archive-sync` for Skills,
+      zero-trust `cbxref_` egress secret bindings, and signed HTTP/WS/WebRTC panel proxying.
+
+paths:
+  /sandboxes:
+    post:
+      summary: Create or claim a CubePod sandbox (E2B compatible + CubePod extensions)
+      operationId: createSandbox
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSandboxRequest"
+      responses:
+        "201":
+          description: Sandbox created and ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxInfo"
+
+  /sandboxes/{sandboxID}:
+    get:
+      summary: Get sandbox status and endpoints
+      operationId: getSandbox
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Sandbox details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxInfo"
+    delete:
+      summary: Kill / delete sandbox
+      operationId: deleteSandbox
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: deleteVolumes
+          in: query
+          description: Whether to also delete persistent RootFS and Workspace PVCs (default false on soft-terminate, true on purge)
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "204":
+          description: Sandbox deleted
+
+  /sandboxes/{sandboxID}/pause:
+    post:
+      summary: Suspend sandbox (flush filesystem, delete MicroVM pod, retain RootFS & Workspace Block PVCs)
+      operationId: pauseSandbox
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Sandbox paused (0 CPU/RAM consumed)
+
+  /sandboxes/{sandboxID}/connect:
+    post:
+      summary: Connect to sandbox, automatically resuming from Paused state if needed (E2B compatible)
+      operationId: connectSandbox
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Sandbox is running and ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxInfo"
+
+  /sandboxes/{sandboxID}/reset-rootfs:
+    post:
+      summary: Reset the persistent RootFS Upper PVC to a clean Base Image state while preserving /workspace
+      operationId: resetRootfs
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: RootFS reset complete, /workspace intact
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxInfo"
+
+  /sandboxes/{sandboxID}/fork:
+    post:
+      summary: Clone an existing sandbox in ~1s via CSI Copy-on-Write block snapshots (both RootFS and Workspace)
+      operationId: forkSandbox
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                volumeKey:
+                  type: string
+                metadata:
+                  type: object
+                  additionalProperties:
+                    type: string
+      responses:
+        "201":
+          description: Forked sandbox ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxInfo"
+
+components:
+  schemas:
+    CreateSandboxRequest:
+      type: object
+      properties:
+        templateID:
+          type: string
+          default: "cubeplex-ubuntu24-desktop"
+        timeout:
+          type: integer
+          default: 1800
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+        envVars:
+          type: object
+          additionalProperties:
+            type: string
+        extension:
+          type: object
+          description: CubePod enterprise extensions
+          properties:
+            volumeKey:
+              type: string
+              description: Deterministic persistent storage key (e.g. ws-01-user-99)
+            rootfsSize:
+              type: string
+              default: "10Gi"
+            workspaceSize:
+              type: string
+              default: "20Gi"
+            networkPolicy:
+              type: object
+              properties:
+                defaultAction:
+                  type: string
+                  enum: [Allow, Deny]
+                allowHosts:
+                  type: array
+                  items:
+                    type: string
+                upstreamProxy:
+                  type: string
+                secretBindings:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      envName:
+                        type: string
+                      placeholder:
+                        type: string
+                      allowedHosts:
+                        type: array
+                        items:
+                          type: string
+
+    SandboxInfo:
+      type: object
+      required:
+        - sandboxID
+        - templateID
+        - state
+      properties:
+        sandboxID:
+          type: string
+        templateID:
+          type: string
+        state:
+          type: string
+          enum: [Running, Paused, Provisioning, Pausing, Resuming, Failed, Terminated]
+        envdPort:
+          type: integer
+          default: 49983
+        rootfsGeneration:
+          type: integer
+          default: 1

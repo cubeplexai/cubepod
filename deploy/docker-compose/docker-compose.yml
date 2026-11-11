@@ -1,0 +1,15 @@
+services:
+  cubepod-gateway:
+    build:
+      context: ../..
+      dockerfile: images/base/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - CUBEPOD_RUNTIME_MODE=docker-loopback
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - cubepod-volumes:/var/lib/cubepod/volumes
+
+volumes:
+  cubepod-volumes:

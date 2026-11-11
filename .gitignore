@@ -1,0 +1,58 @@
+# Binaries and build artifacts
+bin/
+dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.txt
+coverage.xml
+
+# Go workspace / vendor
+go.work
+go.work.sum
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.eggs/
+
+# Node / TypeScript
+node_modules/
+.pnpm-store/
+*.tsbuildinfo
+
+# Local development & runtime artifacts
+.env
+.env.*
+!.env.example
+*.img
+*.qcow2
+*.raw
+tmp/
+logs/
+.cubepod-data/
+
+# Kubernetes / Helm secrets
+deploy/helm/cubepod/values.local.yaml
+*ca-secret.yaml
+*.pem
+*.key
+*.crt
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store

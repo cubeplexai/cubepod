@@ -1,0 +1,30 @@
+global:
+  imageRegistry: "ghcr.io"
+  repository: "cubeplexai"
+
+runtime:
+  runtimeClassName: "kata-qemu"
+  defaultTemplate: "cubeplex-ubuntu24-desktop"
+  baseImage: "ghcr.io/cubeplexai/cubepod-runtime:v0.1.0"
+
+storage:
+  # SPDK NVMe-oF Raw Block StorageClass (Longhorn V2 or OpenEBS Mayastor)
+  storageClassName: "longhorn-v2-block-thin"
+  rootfsSize: "10Gi"
+  workspaceSize: "20Gi"
+
+warmPool:
+  enabled: true
+  replicas: 3
+
+gateway:
+  replicaCount: 2
+  port: 8080
+
+controller:
+  replicaCount: 1
+  workloadNamespace: "cubepod-workloads"
+
+egress:
+  enabled: true
+  exchangeUrl: "https://cubeplex-backend.cubeplex.svc:8443/api/v1/internal/egress/exchange"
