@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/podd-init",
+    "crates/podd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/cubeplexai/cubepod"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

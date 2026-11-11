@@ -1,0 +1,13 @@
+[package]
+name = "podd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CubePod in-guest execution, process, and file synchronization daemon"
+
+[[bin]]
+name = "podd"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"

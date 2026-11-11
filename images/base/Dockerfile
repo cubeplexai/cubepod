@@ -1,11 +1,10 @@
-FROM golang:1.26-bookworm AS builder
+FROM rust:1.85-bookworm AS builder
 WORKDIR /src
-COPY go.mod ./
-COPY api ./api
-COPY pkg ./pkg
-COPY cmd ./cmd
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/podd-init ./cmd/podd-init \
-    && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/podd ./cmd/podd
+COPY Cargo.toml ./
+COPY crates ./crates
+RUN cargo build --release --workspace \
+    && cp target/release/podd-init /usr/local/bin/podd-init \
+    && cp target/release/podd /usr/local/bin/podd
 
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
@@ -15,8 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && useradd -m -u 1000 -s /bin/bash cubeplex \
     && mkdir -p /workspace && chown 1000:1000 /workspace
 
-COPY --from=builder /out/podd-init /usr/local/bin/podd-init
-COPY --from=builder /out/podd /usr/local/bin/podd
+COPY --from=builder /usr/local/bin/podd-init /usr/local/bin/podd-init
+COPY --from=builder /usr/local/bin/podd /usr/local/bin/podd
 WORKDIR /workspace
 EXPOSE 49983
 ENTRYPOINT ["/usr/local/bin/podd-init", "/usr/local/bin/podd"]

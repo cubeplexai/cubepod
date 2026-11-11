@@ -1,0 +1,13 @@
+[package]
+name = "podd-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CubePod PID 1 in-guest persistent OverlayFS mounter and pivot_root initializer"
+
+[[bin]]
+name = "podd-init"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
