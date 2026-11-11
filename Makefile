@@ -1,4 +1,4 @@
-.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress test test-rust test-go test-e2e test-k8s-e2e fmt vet clean
+.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress test test-rust test-go test-e2e test-k8s-e2e test-k8s-block test-k8s-longhorn-v2 fmt vet clean
 
 GO ?= go
 CARGO ?= $(shell which cargo 2>/dev/null || echo "$(HOME)/.cargo/bin/cargo")
@@ -18,6 +18,9 @@ help:
 	@echo "  make build-egress       Build Go Zero-Trust Egress Sidecar Proxy (cmd/cubepod-egress)"
 	@echo "  make test               Run all Rust and Go unit tests"
 	@echo "  make test-e2e           Run full multi-process end-to-end integration tests"
+	@echo "  make test-k8s-e2e         Live CubePod lifecycle. Uses deploy/k8s/env.local or the current kubeconfig"
+	@echo "  make test-k8s-block       Live volumeMode Block attach check for the discovered StorageClass"
+	@echo "  make test-k8s-longhorn-v2 Same as test-k8s-block"
 	@echo "  make fmt                Format Rust and Go source code"
 	@echo "  make clean              Remove build artifacts"
 
@@ -56,8 +59,14 @@ test-go:
 test-e2e: build
 	$(GO) test -v -race ./test/e2e/...
 
+# Optional deploy/k8s/env.local overrides discovery. See deploy/k8s/env.example.
+K8S_ENV := set -a; if [ -f deploy/k8s/env.local ]; then . deploy/k8s/env.local; fi; set +a;
+
 test-k8s-e2e:
-	CUBEPOD_K8S_E2E=1 $(GO) test -v -timeout 5m ./test/k8s-e2e/...
+	$(K8S_ENV); CUBEPOD_K8S_E2E=1 $(GO) test -v -timeout 15m ./test/k8s-e2e/ -run 'TestK8sLiveE2E|TestLoadClusterConfigLive'
+
+test-k8s-block test-k8s-longhorn-v2:
+	$(K8S_ENV); CUBEPOD_K8S_BLOCK=1 $(GO) test -v -timeout 10m ./test/k8s-e2e/ -run TestK8sBlockPublish
 
 fmt:
 	$(CARGO) fmt --all

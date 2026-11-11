@@ -1,0 +1,47 @@
+# ConfigMap cubepod-longhorn-v2-prep is created by install.sh from prep-node.sh.
+# install.sh replaces the __CUBEPOD_* tokens. Do not kubectl apply this file directly.
+# The container reads the script before nsenter, because the host mount namespace
+# does not see the ConfigMap mount. The env vars survive nsenter and override
+# prep-node.sh defaults.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cubepod-longhorn-v2-prep
+  namespace: kube-system
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      __CUBEPOD_PULL_SECRETS__
+      nodeSelector:
+        cubepod.io/longhorn-v2: "true"
+      hostPID: true
+      containers:
+        - name: prep
+          image: __CUBEPOD_PREP_IMAGE__
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: CUBEPOD_LONGHORN_IMG
+              value: "__CUBEPOD_LONGHORN_IMG__"
+            - name: CUBEPOD_LONGHORN_DEV
+              value: "__CUBEPOD_LONGHORN_DEV__"
+            - name: CUBEPOD_LONGHORN_SIZE
+              value: "__CUBEPOD_LONGHORN_SIZE__"
+            - name: CUBEPOD_HUGEPAGES
+              value: "__CUBEPOD_HUGEPAGES__"
+          securityContext:
+            privileged: true
+            runAsUser: 0
+          command: ["bash", "-c"]
+          args:
+            - cat /prep/prep-node.sh | nsenter -t 1 -m -u -i -n -- bash -s
+          volumeMounts:
+            - name: prep
+              mountPath: /prep
+      volumes:
+        - name: prep
+          configMap:
+            name: cubepod-longhorn-v2-prep
+            defaultMode: 0755

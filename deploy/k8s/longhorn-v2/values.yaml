@@ -1,0 +1,53 @@
+# Longhorn v1.8.2 values for a CubePod block verification.
+# Chart: longhorn/longhorn --version 1.8.2
+# install.sh labels one node cubepod.io/longhorn-v2=true. Only that node runs Longhorn pods.
+# The chart's built-in StorageClass is disabled so the cluster default class stays as it is.
+# deploy/k8s/longhorn-v2/storageclass.yaml creates longhorn-v2-block-thin.
+
+global:
+  nodeSelector:
+    cubepod.io/longhorn-v2: "true"
+
+image:
+  pullPolicy: IfNotPresent
+
+longhornManager:
+  nodeSelector:
+    cubepod.io/longhorn-v2: "true"
+
+longhornDriver:
+  nodeSelector:
+    cubepod.io/longhorn-v2: "true"
+
+longhornUI:
+  replicas: 1
+  nodeSelector:
+    cubepod.io/longhorn-v2: "true"
+
+csi:
+  attacherReplicaCount: 1
+  provisionerReplicaCount: 1
+  resizerReplicaCount: 1
+  snapshotterReplicaCount: 1
+
+persistence:
+  defaultClass: false
+  defaultClassReplicaCount: 1
+  defaultDataLocality: best-effort
+  reclaimPolicy: Delete
+  dataEngine: v2
+
+defaultSettings:
+  createDefaultDiskLabeledNodes: true
+  defaultReplicaCount: 1
+  defaultDataLocality: best-effort
+  replicaSoftAntiAffinity: true
+  storageMinimalAvailablePercentage: 10
+  upgradeChecker: false
+  allowCollectingLonghornUsageMetrics: false
+  v1DataEngine: false
+  v2DataEngine: true
+  v2DataEngineGuaranteedInstanceManagerCPU: 1000
+  v2DataEngineCPUMask: "0x1"
+  systemManagedComponentsNodeSelector: "cubepod.io/longhorn-v2:true"
+  deletingConfirmationFlag: true

@@ -23,34 +23,30 @@ type InitState struct {
 	DurationMs      uint64 `json:"duration_ms"`
 }
 
-// TestK8sLiveE2E executes the end-to-end verification of CubePod against a live
-// Kubernetes cluster with OpenEBS LVM-LocalPV Block CSI, in-guest ext4 formatting/healing,
-// OverlayFS root pivot, and container execution.
+// TestK8sLiveE2E runs the CubePod sandbox lifecycle against whatever cluster
+// the current kubeconfig and deploy/k8s/env.local point at. Gateway URL, sandbox
+// image, namespace, and storage class are not tied to one environment.
 func TestK8sLiveE2E(t *testing.T) {
 	if os.Getenv("CUBEPOD_K8S_E2E") != "1" {
 		t.Skip("Skipping live Kubernetes E2E tests: set CUBEPOD_K8S_E2E=1 to run against live cluster")
 	}
 
-	gatewayURL := os.Getenv("CUBEPOD_GATEWAY_URL")
-	if gatewayURL == "" {
-		gatewayURL = "http://192.168.1.207:32380"
+	cfg := loadClusterConfig(t)
+	if cfg.GatewayURL == "" {
+		t.Fatal("set CUBEPOD_GATEWAY_URL, or expose svc/cubepod-gateway as NodePort or LoadBalancer. For NodePort set CUBEPOD_NODE_IP when no Ready node has an InternalIP")
 	}
-
-	workloadsNamespace := os.Getenv("CUBEPOD_WORKLOADS_NAMESPACE")
-	if workloadsNamespace == "" {
-		workloadsNamespace = "cubepod-workloads"
+	if cfg.SandboxImage == "" {
+		t.Fatal("set CUBEPOD_SANDBOX_IMAGE, or pass -sandbox-image on the cubepod-gateway Deployment")
 	}
+	gatewayURL := cfg.GatewayURL
+	workloadsNamespace := cfg.Namespace
+	sandboxImage := cfg.SandboxImage
 
-	sandboxImage := os.Getenv("CUBEPOD_SANDBOX_IMAGE")
-	if sandboxImage == "" {
-		sandboxImage = "hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917"
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
 	defer cancel()
 
-	// 1. Initialize API client and Kubernetes REST client
-	c := client.New(gatewayURL, client.WithTimeout(60*time.Second))
+	// Longhorn V2 attach plus ext4 format can outlast the default minute.
+	c := client.New(gatewayURL, client.WithTimeout(3*time.Minute))
 	kubeClient, err := controller.NewRESTKubeClientFromEnv()
 	if err != nil {
 		t.Fatalf("failed to initialize RESTKubeClient from environment/kubeconfig: %v", err)
@@ -137,7 +133,7 @@ func TestK8sLiveE2E(t *testing.T) {
 	}
 	t.Logf("[K8s-E2E] Verified volumeDevices (/dev/cubepod-rootfs and /dev/cubepod-workspace) attached to sandbox container")
 
-	// Verify 2 Bound PVCs (rootfs-pvc and workspace-pvc) with volumeMode: Block on cubepod-lvm-block
+	// Verify 2 Bound PVCs (rootfs-pvc and workspace-pvc) with volumeMode: Block.
 	rfPVC, err := kubeClient.GetPVC(ctx, workloadsNamespace, rootfsPVCName)
 	if err != nil {
 		t.Fatalf("failed to get rootfs PVC %s: %v", rootfsPVCName, err)
@@ -161,7 +157,15 @@ func TestK8sLiveE2E(t *testing.T) {
 	if vm, _ := wsSpec["volumeMode"].(string); vm != "Block" {
 		t.Fatalf("expected workspace PVC volumeMode Block, got %v", vm)
 	}
-	t.Logf("[K8s-E2E] Verified dual Bound Block PVCs on cubepod-lvm-block: %s and %s", rootfsPVCName, workspacePVCName)
+	if cfg.StorageClass != "" {
+		if got, _ := rfSpec["storageClassName"].(string); got != cfg.StorageClass {
+			t.Fatalf("expected rootfs PVC storageClass %s, got %q", cfg.StorageClass, got)
+		}
+		if got, _ := wsSpec["storageClassName"].(string); got != cfg.StorageClass {
+			t.Fatalf("expected workspace PVC storageClass %s, got %q", cfg.StorageClass, got)
+		}
+	}
+	t.Logf("[K8s-E2E] Verified dual Bound Block PVCs %s and %s (class=%v)", rootfsPVCName, workspacePVCName, rfSpec["storageClassName"])
 
 	// Step b: Verify /run/cubepod/init-state.json inside sandbox reports pivoted=true & rootfs_action=formatted
 	t.Logf("[K8s-E2E] Step b: Verifying in-guest init-state.json (OverlayFS pivot & block formatting)...")
@@ -462,13 +466,13 @@ func TestK8sLiveE2E(t *testing.T) {
 	}
 
 	wsCleaned := false
-	for i := 0; i < 40; i++ {
+	for i := 0; i < 90; i++ {
 		_, err := kubeClient.GetPVC(ctx, workloadsNamespace, workspacePVCName)
 		if err != nil && (strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "NotFound")) {
 			wsCleaned = true
 			break
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(2 * time.Second)
 	}
 	if !wsCleaned {
 		t.Fatalf("expected workspace PVC %s to be deleted after teardown", workspacePVCName)

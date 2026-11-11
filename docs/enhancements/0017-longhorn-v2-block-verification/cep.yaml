@@ -1,0 +1,20 @@
+title: "Longhorn V2 SPDK Block CSI Deployment and Live volumeMode Block Verification"
+cep-number: "0017"
+authors:
+  - "@cubepod-maintainers"
+owning-area: "storage"
+participating-areas:
+  - "controller"
+status: "implementable"
+creation-date: "2026-11-11"
+reviewers: []
+approvers: []
+stage: "alpha"
+latest-milestone: "v0.3.1"
+milestone:
+  alpha: "v0.3.1"
+  beta: "v0.4.0"
+  stable: "v1.0.0"
+feature-gates: []
+disable-supported: true
+metrics: []

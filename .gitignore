@@ -37,6 +37,7 @@ node_modules/
 .env
 .env.*
 !.env.example
+deploy/k8s/env.local
 *.img
 *.qcow2
 *.raw
