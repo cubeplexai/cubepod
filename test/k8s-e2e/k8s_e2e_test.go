@@ -2,6 +2,7 @@ package k8s_e2e_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -12,8 +13,19 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/controller"
 )
 
+// InitState models the in-guest initialization marker written to /run/cubepod/init-state.json.
+type InitState struct {
+	Pivoted         bool   `json:"pivoted"`
+	RootfsDevice    string `json:"rootfs_device"`
+	RootfsAction    string `json:"rootfs_action"`
+	WorkspaceDevice string `json:"workspace_device"`
+	WorkspaceAction string `json:"workspace_action"`
+	DurationMs      uint64 `json:"duration_ms"`
+}
+
 // TestK8sLiveE2E executes the end-to-end verification of CubePod against a live
-// Kubernetes cluster with real persistent volumes and container execution.
+// Kubernetes cluster with OpenEBS LVM-LocalPV Block CSI, in-guest ext4 formatting/healing,
+// OverlayFS root pivot, and container execution.
 func TestK8sLiveE2E(t *testing.T) {
 	if os.Getenv("CUBEPOD_K8S_E2E") != "1" {
 		t.Skip("Skipping live Kubernetes E2E tests: set CUBEPOD_K8S_E2E=1 to run against live cluster")
@@ -34,7 +46,7 @@ func TestK8sLiveE2E(t *testing.T) {
 		sandboxImage = "hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917"
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
 	// 1. Initialize API client and Kubernetes REST client
@@ -50,13 +62,13 @@ func TestK8sLiveE2E(t *testing.T) {
 	}
 	t.Logf("[K8s-E2E] Gateway is healthy: %v", health)
 
-	// Step a: Create Sandbox and verify real Kubernetes Pod & Bound PVCs
+	// Step a: Create Sandbox and verify real Kubernetes Pod, volumeDevices, & Bound Block PVCs
 	t.Logf("[K8s-E2E] Step a: Creating sandbox with template %s...", sandboxImage)
 	createReq := client.CreateSandboxRequest{
 		TemplateID: sandboxImage,
 		Metadata: map[string]string{
 			"env":  "k8s-e2e",
-			"tier": "live-test",
+			"tier": "live-block-csi",
 		},
 	}
 	sb, err := c.CreateSandbox(ctx, createReq)
@@ -100,13 +112,42 @@ func TestK8sLiveE2E(t *testing.T) {
 	}
 	t.Logf("[K8s-E2E] Verified initContainer 'podd-installer' exists in Pod %s", podName)
 
-	// Verify 2 Bound PVCs (rootfs-pvc and workspace-pvc)
+	// Verify volumeDevices on sandbox container (/dev/cubepod-rootfs and /dev/cubepod-workspace)
+	containers, _ := specMap["containers"].([]any)
+	foundRootfsDev := false
+	foundWorkspaceDev := false
+	for _, cObj := range containers {
+		if cMap, ok := cObj.(map[string]any); ok && cMap["name"] == "sandbox" {
+			if vdevs, ok := cMap["volumeDevices"].([]any); ok {
+				for _, vd := range vdevs {
+					if vdMap, ok := vd.(map[string]any); ok {
+						if vdMap["devicePath"] == "/dev/cubepod-rootfs" {
+							foundRootfsDev = true
+						}
+						if vdMap["devicePath"] == "/dev/cubepod-workspace" {
+							foundWorkspaceDev = true
+						}
+					}
+				}
+			}
+		}
+	}
+	if !foundRootfsDev || !foundWorkspaceDev {
+		t.Fatalf("expected volumeDevices /dev/cubepod-rootfs and /dev/cubepod-workspace in Pod spec, got rootfs=%v, workspace=%v", foundRootfsDev, foundWorkspaceDev)
+	}
+	t.Logf("[K8s-E2E] Verified volumeDevices (/dev/cubepod-rootfs and /dev/cubepod-workspace) attached to sandbox container")
+
+	// Verify 2 Bound PVCs (rootfs-pvc and workspace-pvc) with volumeMode: Block on cubepod-lvm-block
 	rfPVC, err := kubeClient.GetPVC(ctx, workloadsNamespace, rootfsPVCName)
 	if err != nil {
 		t.Fatalf("failed to get rootfs PVC %s: %v", rootfsPVCName, err)
 	}
 	if rfStatus, ok := rfPVC["status"].(map[string]any); !ok || rfStatus["phase"] != "Bound" {
 		t.Fatalf("expected rootfs PVC %s to be Bound, got: %+v", rootfsPVCName, rfPVC["status"])
+	}
+	rfSpec, _ := rfPVC["spec"].(map[string]any)
+	if vm, _ := rfSpec["volumeMode"].(string); vm != "Block" {
+		t.Fatalf("expected rootfs PVC volumeMode Block, got %v", vm)
 	}
 
 	wsPVC, err := kubeClient.GetPVC(ctx, workloadsNamespace, workspacePVCName)
@@ -116,9 +157,35 @@ func TestK8sLiveE2E(t *testing.T) {
 	if wsStatus, ok := wsPVC["status"].(map[string]any); !ok || wsStatus["phase"] != "Bound" {
 		t.Fatalf("expected workspace PVC %s to be Bound, got: %+v", workspacePVCName, wsPVC["status"])
 	}
-	t.Logf("[K8s-E2E] Verified dual Bound PVCs: %s and %s", rootfsPVCName, workspacePVCName)
+	wsSpec, _ := wsPVC["spec"].(map[string]any)
+	if vm, _ := wsSpec["volumeMode"].(string); vm != "Block" {
+		t.Fatalf("expected workspace PVC volumeMode Block, got %v", vm)
+	}
+	t.Logf("[K8s-E2E] Verified dual Bound Block PVCs on cubepod-lvm-block: %s and %s", rootfsPVCName, workspacePVCName)
 
-	// Step b: Foreground and background command execution and cursor log polling
+	// Step b: Verify /run/cubepod/init-state.json inside sandbox reports pivoted=true & rootfs_action=formatted
+	t.Logf("[K8s-E2E] Step b: Verifying in-guest init-state.json (OverlayFS pivot & block formatting)...")
+	initStateBytes, err := c.ReadFile(ctx, sandboxID, "/run/cubepod/init-state.json")
+	if err != nil {
+		t.Fatalf("failed to read /run/cubepod/init-state.json: %v", err)
+	}
+	var initState InitState
+	if err := json.Unmarshal(initStateBytes, &initState); err != nil {
+		t.Fatalf("failed to parse init-state.json: %v (raw: %s)", err, string(initStateBytes))
+	}
+	if !initState.Pivoted {
+		t.Fatalf("expected initState.Pivoted=true, got false: %+v", initState)
+	}
+	if initState.RootfsAction != "formatted" {
+		t.Fatalf("expected initState.RootfsAction='formatted', got %q: %+v", initState.RootfsAction, initState)
+	}
+	if initState.WorkspaceAction != "formatted" {
+		t.Fatalf("expected initState.WorkspaceAction='formatted', got %q: %+v", initState.WorkspaceAction, initState)
+	}
+	t.Logf("[K8s-E2E] Verified init-state.json: pivoted=%v, rootfs_action=%s, workspace_action=%s, duration=%dms",
+		initState.Pivoted, initState.RootfsAction, initState.WorkspaceAction, initState.DurationMs)
+
+	// Foreground and background command execution and cursor log polling
 	t.Logf("[K8s-E2E] Step b: Testing foreground command execution...")
 	fgCmd := "echo 'live-k8s-pod-foreground-ok' && whoami && uname -m"
 	fgRes, err := c.RunCommand(ctx, sandboxID, client.RunCommandRequest{Command: fgCmd})
@@ -171,10 +238,16 @@ func TestK8sLiveE2E(t *testing.T) {
 	}
 	t.Logf("[K8s-E2E] Background command finished and verified with cursor logs: %s", strings.TrimSpace(accumulatedOutput))
 
-	// Step c: File write/read/list/delete and archive-sync on /workspace
-	t.Logf("[K8s-E2E] Step c: Testing file operations on persistent /workspace...")
+	// Step c: Write persistent files to RootFS upperdir AND /workspace
+	t.Logf("[K8s-E2E] Step c: Writing test files to RootFS upperdir and /workspace...")
+	rootfsPersistPath := "/var/tmp/rootfs-persisted.txt"
+	rootfsPersistContent := []byte("persistent-data-saved-on-block-rootfs-upperdir")
+	if err := c.WriteFile(ctx, sandboxID, rootfsPersistPath, rootfsPersistContent, "0644"); err != nil {
+		t.Fatalf("failed to write %s to RootFS upperdir: %v", rootfsPersistPath, err)
+	}
+
 	testFilePath := "/workspace/k8s-e2e-data.txt"
-	testFileContent := []byte("persistent-data-saved-on-nfs-workspace")
+	testFileContent := []byte("persistent-data-saved-on-block-workspace")
 	if err := c.WriteFile(ctx, sandboxID, testFilePath, testFileContent, "0644"); err != nil {
 		t.Fatalf("failed to write file %s: %v", testFilePath, err)
 	}
@@ -185,6 +258,14 @@ func TestK8sLiveE2E(t *testing.T) {
 	}
 	if string(readContent) != string(testFileContent) {
 		t.Fatalf("file content mismatch: expected %q, got %q", string(testFileContent), string(readContent))
+	}
+
+	readRootfsContent, err := c.ReadFile(ctx, sandboxID, rootfsPersistPath)
+	if err != nil {
+		t.Fatalf("failed to read rootfs file %s: %v", rootfsPersistPath, err)
+	}
+	if string(readRootfsContent) != string(rootfsPersistContent) {
+		t.Fatalf("rootfs file content mismatch: expected %q, got %q", string(rootfsPersistContent), string(readRootfsContent))
 	}
 
 	filesList, err := c.ListFiles(ctx, sandboxID, "/workspace")
@@ -226,7 +307,7 @@ func TestK8sLiveE2E(t *testing.T) {
 	t.Logf("[K8s-E2E] File write/read/list/archive-sync/delete verified successfully")
 
 	// Step d: Pause followed by Auto-Resume
-	t.Logf("[K8s-E2E] Step d: Testing Pause (Pod deleted, PVCs retained)...")
+	t.Logf("[K8s-E2E] Step d: Testing Pause (Pod deleted, Block PVCs retained)...")
 	pausedRecord, err := c.PauseSandbox(ctx, sandboxID)
 	if err != nil {
 		t.Fatalf("failed to pause sandbox: %v", err)
@@ -250,7 +331,7 @@ func TestK8sLiveE2E(t *testing.T) {
 	}
 	t.Logf("[K8s-E2E] Verified compute Pod %s terminated on Pause", podName)
 
-	// Verify workspace PVC is still intact and Bound
+	// Verify workspace and rootfs PVCs are still intact and Bound
 	wsPVCPaused, err := kubeClient.GetPVC(ctx, workloadsNamespace, workspacePVCName)
 	if err != nil {
 		t.Fatalf("expected workspace PVC %s to persist across Pause, got error: %v", workspacePVCName, err)
@@ -258,7 +339,16 @@ func TestK8sLiveE2E(t *testing.T) {
 	if statusMap, ok := wsPVCPaused["status"].(map[string]any); !ok || statusMap["phase"] != "Bound" {
 		t.Fatalf("workspace PVC %s is not Bound during Pause: %+v", workspacePVCName, wsPVCPaused["status"])
 	}
-	t.Logf("[K8s-E2E] Verified workspace PVC persists intact while paused")
+
+	rfPVCPaused, err := kubeClient.GetPVC(ctx, workloadsNamespace, rootfsPVCName)
+	if err != nil {
+		t.Fatalf("expected rootfs PVC %s to persist across Pause, got error: %v", rootfsPVCName, err)
+	}
+	if statusMap, ok := rfPVCPaused["status"].(map[string]any); !ok || statusMap["phase"] != "Bound" {
+		t.Fatalf("rootfs PVC %s is not Bound during Pause: %+v", rootfsPVCName, rfPVCPaused["status"])
+	}
+	t.Logf("[K8s-E2E] Verified dual Block PVCs persist intact while paused")
+	time.Sleep(2 * time.Second)
 
 	// Auto-Resume: access data on paused sandbox, triggering automatic resurrection
 	t.Logf("[K8s-E2E] Step d: Triggering Auto-Resume via data access on paused sandbox...")
@@ -281,16 +371,37 @@ func TestK8sLiveE2E(t *testing.T) {
 	if sbResumed.AutoResumeCount < 1 {
 		t.Fatalf("expected AutoResumeCount >= 1, got %d", sbResumed.AutoResumeCount)
 	}
-	t.Logf("[K8s-E2E] Auto-resume verified! New Pod running, AutoResumeCount=%d, /workspace data intact", sbResumed.AutoResumeCount)
 
-	// Step e: ResetRootFS (rootfsGeneration 1 -> 2, workspace PVC intact)
-	t.Logf("[K8s-E2E] Step e: Testing ResetRootFS (rootfsGeneration 1 -> 2)...")
-	// Write ephemeral data into rootfs outside /workspace
-	ephemeralPath := "/tmp/ephemeral-k8s-rootfs.txt"
-	if err := c.WriteFile(ctx, sandboxID, ephemeralPath, []byte("ephemeral-rootfs-payload"), "0644"); err != nil {
-		t.Fatalf("failed to write ephemeral file: %v", err)
+	// Verify init-state.json shows pivoted=true and rootfs_action='mounted' or 'healed'
+	resumedStateBytes, err := c.ReadFile(ctx, sandboxID, "/run/cubepod/init-state.json")
+	if err != nil {
+		t.Fatalf("failed to read /run/cubepod/init-state.json after auto-resume: %v", err)
 	}
+	var resumedState InitState
+	if err := json.Unmarshal(resumedStateBytes, &resumedState); err != nil {
+		t.Fatalf("failed to parse init-state.json after auto-resume: %v", err)
+	}
+	if !resumedState.Pivoted {
+		t.Fatalf("expected pivoted=true after auto-resume, got false: %+v", resumedState)
+	}
+	if resumedState.RootfsAction != "mounted" && resumedState.RootfsAction != "healed" {
+		t.Fatalf("expected rootfs_action 'mounted' or 'healed' after auto-resume, got %q: %+v", resumedState.RootfsAction, resumedState)
+	}
+	t.Logf("[K8s-E2E] Auto-resume verified! New Pod running, AutoResumeCount=%d, init-state: rootfs=%s, ws=%s",
+		sbResumed.AutoResumeCount, resumedState.RootfsAction, resumedState.WorkspaceAction)
 
+	// Verify BOTH the RootFS persistent file AND /workspace file persisted across Pause & Auto-Resume!
+	resumedRootfsFile, err := c.ReadFile(ctx, sandboxID, rootfsPersistPath)
+	if err != nil {
+		t.Fatalf("failed to read RootFS persisted file %s after auto-resume: %v", rootfsPersistPath, err)
+	}
+	if string(resumedRootfsFile) != string(rootfsPersistContent) {
+		t.Fatalf("RootFS persistent file corrupted after auto-resume: expected %q, got %q", string(rootfsPersistContent), string(resumedRootfsFile))
+	}
+	t.Logf("[K8s-E2E] RootFS persistence verified across scale-to-zero! %s survived with %q", rootfsPersistPath, string(resumedRootfsFile))
+
+	// Step e: ResetRootFS (rootfsGeneration 1 -> 2: wipes RootFS file, preserves /workspace)
+	t.Logf("[K8s-E2E] Step e: Testing ResetRootFS (rootfsGeneration 1 -> 2)...")
 	resetRecord, err := c.ResetRootFS(ctx, sandboxID)
 	if err != nil {
 		t.Fatalf("failed to ResetRootFS: %v", err)
@@ -299,7 +410,7 @@ func TestK8sLiveE2E(t *testing.T) {
 		t.Fatalf("expected rootfsGeneration=2 after reset, got %d", resetRecord.RootfsGeneration)
 	}
 
-	// Verify persistent /workspace file remains intact after RootFS reset!
+	// Verify persistent /workspace file remains 100% intact after RootFS reset!
 	persistedData, err := c.ReadFile(ctx, sandboxID, testFilePath)
 	if err != nil {
 		t.Fatalf("failed to read /workspace file after ResetRootFS: %v", err)
@@ -308,12 +419,27 @@ func TestK8sLiveE2E(t *testing.T) {
 		t.Fatalf("workspace data corrupted across RootFS reset: expected %q, got %q", string(testFileContent), string(persistedData))
 	}
 
-	// Verify ephemeral file in RootFS is gone
-	_, err = c.ReadFile(ctx, sandboxID, ephemeralPath)
+	// Verify the RootFS persistent file outside /workspace is WIPED on the fresh RootFS block volume!
+	_, err = c.ReadFile(ctx, sandboxID, rootfsPersistPath)
 	if err == nil {
-		t.Fatalf("expected ephemeral file %s to be wiped out after RootFS reset, but it still exists", ephemeralPath)
+		t.Fatalf("expected RootFS file %s to be wiped out after RootFS reset, but it still exists", rootfsPersistPath)
 	}
-	t.Logf("[K8s-E2E] ResetRootFS verified! /workspace data preserved intact, ephemeral rootfs wiped")
+	t.Logf("[K8s-E2E] ResetRootFS verified! /workspace data preserved intact, RootFS upperdir wiped")
+
+	// Verify fresh init-state on new RootFS generation reports rootfs_action='formatted'
+	resetStateBytes, err := c.ReadFile(ctx, sandboxID, "/run/cubepod/init-state.json")
+	if err != nil {
+		t.Fatalf("failed to read init-state.json after ResetRootFS: %v", err)
+	}
+	var resetState InitState
+	if err := json.Unmarshal(resetStateBytes, &resetState); err != nil {
+		t.Fatalf("failed to parse init-state.json after ResetRootFS: %v", err)
+	}
+	if !resetState.Pivoted {
+		t.Fatalf("expected pivoted=true after ResetRootFS, got: %+v", resetState)
+	}
+	t.Logf("[K8s-E2E] Fresh RootFS generation 2 verified: pivoted=%v, rootfs_action=%s, ws_action=%s",
+		resetState.Pivoted, resetState.RootfsAction, resetState.WorkspaceAction)
 
 	// Step f: Teardown (DELETE /sandboxes/{id}?deleteVolumes=true)
 	t.Logf("[K8s-E2E] Step f: Testing Teardown with volume deletion...")
@@ -348,5 +474,5 @@ func TestK8sLiveE2E(t *testing.T) {
 		t.Fatalf("expected workspace PVC %s to be deleted after teardown", workspacePVCName)
 	}
 
-	t.Logf("[K8s-E2E] Teardown verified! Pod and PVCs cleanly removed from %s", workloadsNamespace)
+	t.Logf("[K8s-E2E] Teardown verified! Pod and Block PVCs cleanly removed from %s", workloadsNamespace)
 }

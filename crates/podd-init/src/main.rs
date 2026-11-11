@@ -196,22 +196,46 @@ pub fn ensure_ext4(device: &Path, label: &str) -> Result<VolumeAction, String> {
         "[podd-init] verifying existing ext4 volume {} with e2fsck -p",
         device.display()
     );
-    let status = Command::new("e2fsck")
-        .arg("-p")
-        .arg(device)
-        .status()
-        .map_err(|e| format!("failed to spawn e2fsck: {e}"))?;
+    let mut last_code = None;
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let status = Command::new("e2fsck")
+            .arg("-p")
+            .arg(device)
+            .status()
+            .map_err(|e| format!("failed to spawn e2fsck: {e}"))?;
 
-    // e2fsck exit code 0 = no errors, 1 = filesystem errors corrected, 2 = corrected (reboot suggested)
-    match status.code() {
-        Some(0) => Ok(VolumeAction::Mounted),
-        Some(1..=2) => Ok(VolumeAction::Healed),
-        other => Err(format!(
-            "e2fsck -p failed on {} with exit code {:?}",
-            device.display(),
-            other
-        )),
+        // e2fsck exit code 0 = no errors, 1 = filesystem errors corrected, 2 = corrected (reboot suggested)
+        match status.code() {
+            Some(0) => return Ok(VolumeAction::Mounted),
+            Some(1..=2) => return Ok(VolumeAction::Healed),
+            Some(8) => {
+                // Operational error, often EBUSY / device in use while udev or previous container finishes releasing device
+                eprintln!(
+                    "[podd-init] e2fsck reported device in use on {} (attempt {}), retrying...",
+                    device.display(),
+                    attempt + 1
+                );
+                last_code = Some(8);
+                continue;
+            }
+            other => {
+                return Err(format!(
+                    "e2fsck -p failed on {} with exit code {:?}",
+                    device.display(),
+                    other
+                ));
+            }
+        }
     }
+
+    Err(format!(
+        "e2fsck -p failed on {} after retries with exit code {:?}",
+        device.display(),
+        last_code
+    ))
 }
 
 pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {

@@ -439,12 +439,12 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 		rec.AutoResumeCount++
 		if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
 			rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
-			_ = waitForPoddReady(ctx, rec.PoddURL, 15*time.Second)
+			_ = waitForPoddReady(ctx, rec.PoddURL, 45*time.Second)
 		}
 	} else if s.livePodRouting && rec.PoddURL == "" {
 		if boxStatus, ok := s.reconciler.GetBox(rec.SandboxID); ok && boxStatus.PodIP != "" && boxStatus.PodIP != "10.244.0.42" {
 			rec.PoddURL = fmt.Sprintf("http://%s:%d", boxStatus.PodIP, rec.EnvdPort)
-			_ = waitForPoddReady(ctx, rec.PoddURL, 15*time.Second)
+			_ = waitForPoddReady(ctx, rec.PoddURL, 45*time.Second)
 		}
 	}
 	return nil
