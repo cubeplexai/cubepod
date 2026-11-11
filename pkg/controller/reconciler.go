@@ -524,7 +524,62 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 
 	r.specs[name] = spec
 	cp := *status
+
+	box := v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      name,
+			Namespace: r.namespace,
+		},
+		Spec:   spec,
+		Status: cp,
+	}
+	_ = r.kubeClient.UpsertPodBox(ctx, box)
+
 	return &cp, nil
+}
+
+// Pause pauses a running PodBox by updating its DesiredState to Paused and reconciling.
+func (r *Reconciler) Pause(ctx context.Context, name string) (*v1alpha1.PodBoxStatus, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	r.mu.RLock()
+	spec, ok := r.specs[name]
+	statusVal, statusOk := r.boxes[name]
+	r.mu.RUnlock()
+	if !ok && !statusOk {
+		return nil, fmt.Errorf("podbox %s not found", name)
+	}
+	if !ok && statusOk {
+		spec = v1alpha1.PodBoxSpec{
+			DesiredState:     v1alpha1.DesiredStatePaused,
+			RootfsGeneration: statusVal.ObservedRootfsGen,
+		}
+	} else {
+		spec.DesiredState = v1alpha1.DesiredStatePaused
+	}
+
+	status, err := r.Reconcile(ctx, name, spec)
+	if err != nil {
+		return nil, err
+	}
+
+	box := v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      name,
+			Namespace: r.namespace,
+		},
+		Spec:   spec,
+		Status: *status,
+	}
+	_ = r.kubeClient.UpsertPodBox(ctx, box)
+
+	return status, nil
 }
 
 // DeleteBox terminates a PodBox compute Pod and optionally deletes its underlying PVCs.
@@ -535,6 +590,8 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
+	_ = r.kubeClient.DeletePodBox(ctx, r.namespace, name)
 
 	status, ok := r.boxes[name]
 	if !ok {
@@ -556,6 +613,36 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 	delete(r.boxes, name)
 	delete(r.specs, name)
 	return nil
+}
+
+// SyncFromKube recovers PodBox states from the Kubernetes API into memory.
+// It queries the APIServer for all PodBoxes in the reconciler's namespace,
+// populates r.boxes and r.specs in memory, and returns the count of recovered PodBoxes.
+func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	boxes, err := r.kubeClient.ListPodBoxes(ctx, r.namespace)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list PodBoxes from Kubernetes: %w", err)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	recovered := 0
+	for _, box := range boxes {
+		name := box.Metadata.Name
+		if name == "" {
+			continue
+		}
+		st := box.Status
+		r.boxes[name] = &st
+		r.specs[name] = box.Spec
+		recovered++
+	}
+	return recovered, nil
 }
 
 // Delete tears down a PodBox, removing its compute Pod and dual Block PVCs.

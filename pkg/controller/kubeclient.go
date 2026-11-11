@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
 
 // KubeClient abstracts Kubernetes resource operations for PodBox workloads.
@@ -19,23 +21,29 @@ type KubeClient interface {
 	DeletePVC(ctx context.Context, namespace, name string) error
 	EnsurePod(ctx context.Context, pod PodManifest) (podIP string, err error)
 	DeletePod(ctx context.Context, namespace, name string) error
+	UpsertPodBox(ctx context.Context, box v1alpha1.PodBox) error
+	GetPodBox(ctx context.Context, namespace, name string) (*v1alpha1.PodBox, error)
+	ListPodBoxes(ctx context.Context, namespace string) ([]v1alpha1.PodBox, error)
+	DeletePodBox(ctx context.Context, namespace, name string) error
 }
 
 // MemoryKubeClient is an in-memory, thread-safe implementation of KubeClient
 // for unit testing and offline development.
 type MemoryKubeClient struct {
-	mu   sync.RWMutex
-	PVCs map[string]BlockPVCManifest
-	Pods map[string]PodManifest
-	IPs  map[string]string
+	mu    sync.RWMutex
+	PVCs  map[string]BlockPVCManifest
+	Pods  map[string]PodManifest
+	IPs   map[string]string
+	Boxes map[string]v1alpha1.PodBox
 }
 
 // NewMemoryKubeClient creates a new in-memory KubeClient.
 func NewMemoryKubeClient() *MemoryKubeClient {
 	return &MemoryKubeClient{
-		PVCs: make(map[string]BlockPVCManifest),
-		Pods: make(map[string]PodManifest),
-		IPs:  make(map[string]string),
+		PVCs:  make(map[string]BlockPVCManifest),
+		Pods:  make(map[string]PodManifest),
+		IPs:   make(map[string]string),
+		Boxes: make(map[string]v1alpha1.PodBox),
 	}
 }
 
@@ -51,6 +59,68 @@ func podKey(namespace, name string) string {
 		namespace = "default"
 	}
 	return fmt.Sprintf("%s/%s", namespace, name)
+}
+
+func boxKey(namespace, name string) string {
+	if namespace == "" {
+		namespace = "default"
+	}
+	return fmt.Sprintf("%s/%s", namespace, name)
+}
+
+// UpsertPodBox records or updates the PodBox in memory.
+func (m *MemoryKubeClient) UpsertPodBox(_ context.Context, box v1alpha1.PodBox) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ns := box.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	m.Boxes[boxKey(ns, box.Metadata.Name)] = box
+	return nil
+}
+
+// GetPodBox retrieves a stored PodBox by namespace and name.
+func (m *MemoryKubeClient) GetPodBox(_ context.Context, namespace, name string) (*v1alpha1.PodBox, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	box, ok := m.Boxes[boxKey(namespace, name)]
+	if !ok {
+		return nil, fmt.Errorf("podbox %s/%s not found", namespace, name)
+	}
+	cp := box
+	return &cp, nil
+}
+
+// ListPodBoxes returns all PodBox instances matching the given namespace (or all if namespace is empty).
+func (m *MemoryKubeClient) ListPodBoxes(_ context.Context, namespace string) ([]v1alpha1.PodBox, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	res := make([]v1alpha1.PodBox, 0, len(m.Boxes))
+	for _, box := range m.Boxes {
+		boxNs := box.Metadata.Namespace
+		if boxNs == "" {
+			boxNs = "default"
+		}
+		if namespace == "" || boxNs == namespace {
+			res = append(res, box)
+		}
+	}
+	return res, nil
+}
+
+// DeletePodBox removes the PodBox from memory.
+func (m *MemoryKubeClient) DeletePodBox(_ context.Context, namespace, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	delete(m.Boxes, boxKey(namespace, name))
+	return nil
 }
 
 // EnsurePVC records the PVC manifest in memory.
