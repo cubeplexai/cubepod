@@ -2,9 +2,9 @@ title: "Complete Gateway API Surface and Canonical OpenAPI 3.1 Specification"
 cep-number: 12
 authors:
   - "@cubepod-maintainers"
-status: implementable
+status: implemented
 creation-date: 2026-11-10
-last-updated: 2026-11-10
+last-updated: 2026-11-11
 target-version: v0.3.0
 stage: alpha
 latest-milestone: v0.3.0

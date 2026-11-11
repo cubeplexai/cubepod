@@ -57,6 +57,19 @@ All non-trivial features, architectural changes, CRD/API modifications, storage/
 
 When operating as the **Controller Agent**, follow this strict multi-agent delegation workflow:
 
+### 4.1 Domain-Classified `herdr` Agent Roster (Workspace `w5`)
+
+| Pane ID | Agent Name | Role & Architectural Domain | Owned Paths |
+| :--- | :--- | :--- | :--- |
+| `w5:p1` | **`cubepod-lead`** | **Controller / Lead Architect**: CEP authoring, task decomposition, worktree orchestration, PR review (`gh pr diff`/`comment`), merge, and release publishing | `docs/enhancements/`, `AGENTS.md`, `README.md` |
+| `w5:p2` | **`cubepod-runtime`** | **In-Guest Runtime & Local Driver**: Rust `podd-init` (PID 1 `OverlayFS`/`ext4`), Rust `podd` execution/archive daemon, and local/Docker runtime driver | `crates/podd-init/`, `crates/podd/`, `pkg/runtime/` |
+| `w5:p3` | **`cubepod-gateway`** | **Control Plane Gateway, Panel Proxy & Zero-Trust Egress**: E2B-compatible HTTP/SSE router, `/panel/{token}/` proxy, `cbxref_` mTLS Egress, and OpenAPI 3.1 contract | `pkg/gateway/`, `pkg/egress/`, `cmd/cubepod-gateway/`, `cmd/cubepod-egress/`, `api/openapi/` |
+| `w5:p4` | **`cubepod-sdk`** | **Client SDKs & CLI**: Sync/Async Python SDK, Go Client SDK, and `cubepod` CLI | `sdks/python/`, `pkg/client/`, `cmd/cubepod/` |
+| `w5:p5` | **`cubepod-operator`** | **Kubernetes Operator, Packaging & CI/CD**: `PodBox`/`PodWarmPool` reconciler, `RESTKubeClient`, Helm chart, CRDs, Dockerfiles, and GitHub Actions | `pkg/controller/`, `cmd/cubepod-controller/`, `api/v1alpha1/`, `deploy/helm/`, `images/`, `.github/workflows/` |
+| `w5:p6` | **`cubepod-k8s-qa`** | **Kubernetes Cluster Deployment & E2E Verification**: Live `kubectl` cluster deployment, image builds/pushes, multi-process E2E, and live K8s E2E suites | `deploy/k8s/`, `test/e2e/`, `test/k8s-e2e/`, `Makefile` |
+
+### 4.2 Orchestration Rules
+
 1. **Strict Role Separation (Controller vs. `herdr` Workers)**:
    - **Controller Agent Responsibilities**: Authoring CEPs (`docs/enhancements/NNNN-*/`), decomposing milestones into parallelizable tasks with non-overlapping file ownership, creating isolated Git worktrees, dispatching `herdr` workers (`agy --model gemini-3.8-flash-medium --mode auto --dangerously-skip-permissions`), reviewing PRs (`gh pr diff` / `gh pr comment`), merging PRs (`gh pr merge --squash`), and cutting releases.
    - **Delegate All Execution & K8s Verification Details to Workers**: Never perform low-level coding, container image builds, or interactive Kubernetes cluster (`kubectl`) debugging directly inside the Controller session. Always assign a `herdr` worker session to execute implementation details, build/push test images, deploy manifests to the Kubernetes test cluster, and run `test/k8s-e2e`.
@@ -65,7 +78,7 @@ When operating as the **Controller Agent**, follow this strict multi-agent deleg
    - Whenever reusing an existing `herdr` worker pane for a new task or CEP that is unrelated to its previous conversation turn, **you MUST first reset its session with `/new`** before sending the new prompt. Failing to run `/new` carries over the entire prior conversation context and wastes massive amounts of tokens:
      ```bash
      # 1. Reset worker conversation history before a new unrelated task
-     herdr agent send <worker-name> "/new" --submit
+     herdr agent prompt <worker-name> "/new"
      sleep 2
 
      # 2. Dispatch the new self-contained task prompt

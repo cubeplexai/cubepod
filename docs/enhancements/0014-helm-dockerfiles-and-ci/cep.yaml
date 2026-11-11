@@ -2,9 +2,9 @@ title: "Production Helm Chart, CRD Manifests, Multi-Component Dockerfiles, and G
 cep-number: 14
 authors:
   - "@cubepod-maintainers"
-status: implementable
+status: implemented
 creation-date: 2026-11-10
-last-updated: 2026-11-10
+last-updated: 2026-11-11
 target-version: v0.3.0
 stage: alpha
 latest-milestone: v0.3.0
