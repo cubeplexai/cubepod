@@ -1,0 +1,161 @@
+# CEP-NNNN: <Enhancement Title>
+
+| Field | Value |
+| :--- | :--- |
+| **CEP Number** | `NNNN` |
+| **Status** | `provisional` (`alpha` / `beta` / `stable`) |
+| **Owning Area** | `runtime` / `storage` / `controller` / `gateway` / `egress` / `sdk` |
+| **Authors** | @github-handle |
+| **Created** | YYYY-MM-DD |
+| **Last Updated** | YYYY-MM-DD |
+
+<!-- toc -->
+- [Release Signoff Checklist](#release-signoff-checklist)
+- [Summary](#summary)
+- [Motivation](#motivation)
+  - [Goals](#goals)
+  - [Non-Goals](#non-goals)
+- [Proposal](#proposal)
+  - [User Stories](#user-stories)
+  - [Notes / Constraints / Caveats](#notes--constraints--caveats)
+  - [Risks and Mitigations](#risks-and-mitigations)
+- [Design Details](#design-details)
+  - [API / CRD / Wire Changes](#api--crd--wire-changes)
+  - [Architecture & State Machine](#architecture--state-machine)
+  - [Dual-Runtime Behavior (K8s Kata vs. Local Docker)](#dual-runtime-behavior-k8s-kata-vs-local-docker)
+  - [Test Plan](#test-plan)
+  - [Graduation Criteria](#graduation-criteria)
+  - [Upgrade / Downgrade Strategy](#upgrade--downgrade-strategy)
+- [Production Readiness Review Questionnaire (PRR)](#production-readiness-review-questionnaire-prr)
+- [Implementation History](#implementation-history)
+- [Drawbacks](#drawbacks)
+- [Alternatives](#alternatives)
+<!-- /toc -->
+
+---
+
+## Release Signoff Checklist
+
+- [ ] Enhancement scope, Goals, and Non-Goals are agreed upon (`provisional` -> `implementable`)
+- [ ] API / CRD (`pod.cubeplex.ai/v1alpha1`) and E2B-superset OpenAPI changes are specified
+- [ ] Dual-runtime behavior (Kubernetes Kata + CSI Block AND Local Docker Loopback) is defined
+- [ ] Security boundary (MicroVM isolation, UID/GID privilege separation, Egress secret safety) is reviewed
+- [ ] Test plan includes unit tests (`cargo test` / `go test`) and real invariant E2E tests
+- [ ] Production Readiness Review (PRR) section is complete
+
+---
+
+## Summary
+
+<1–2 concise paragraphs explaining what this enhancement does and why it is needed.>
+
+---
+
+## Motivation
+
+<Concrete problem statement and context.>
+
+### Goals
+
+- <Goal 1: Specific, measurable outcome>
+- <Goal 2>
+
+### Non-Goals
+
+- <Non-Goal 1: Explicit out-of-scope item>
+- <Non-Goal 2>
+
+---
+
+## Proposal
+
+<High-level explanation of how the enhancement solves the problem.>
+
+### User Stories
+
+#### Story 1: <Title>
+As a <CubePlex user / agent / cluster operator>, I want <capability> so that <benefit>.
+
+### Notes / Constraints / Caveats
+
+- <Kernel, VMM, CSI, or containerd constraints>
+
+### Risks and Mitigations
+
+| Risk | Impact | Likelihood | Mitigation |
+| :--- | :--- | :--- | :--- |
+| <Risk description> | High / Med / Low | High / Med / Low | <Concrete engineering mitigation> |
+
+---
+
+## Design Details
+
+### API / CRD / Wire Changes
+
+<Exact Go structs, OpenAPI YAML, or CLI/daemon flags.>
+
+### Architecture & State Machine
+
+```mermaid
+flowchart LR
+    A["Client"] --> B["Gateway"]
+```
+
+### Dual-Runtime Behavior (K8s Kata vs. Local Docker)
+
+- **Kubernetes Production (`Kata + CSI Raw Block`)**: <How it works>
+- **Local Development (`Docker + Loopback ext4`)**: <How it works>
+
+### Test Plan
+
+- **Unit Tests**:
+  - <Rust `crates/*` and Go `pkg/*` unit test coverage>
+- **Integration / E2E Tests**:
+  - <End-to-end invariant verification>
+
+### Graduation Criteria
+
+- **Alpha**: <Criteria>
+- **Beta**: <Criteria>
+- **Stable (GA)**: <Criteria>
+
+### Upgrade / Downgrade Strategy
+
+<How existing `RootFS Upper PVC` and `Workspace PVC` volumes and running/paused sandboxes are handled across upgrades.>
+
+---
+
+## Production Readiness Review Questionnaire (PRR)
+
+### Feature Enablement and Rollback
+- **How can this feature be enabled / disabled in a live cluster?**
+- **Does disabling or rolling back corrupt `/workspace` or `RootFS` block volumes?**
+
+### Monitoring Requirements
+- **How can an operator determine if this feature is working or failing?**
+
+### Dependencies
+- **Does this feature depend on specific Linux kernel features, Kata versions, or CSI capabilities (e.g., `volumeMode: Block`, `VolumeSnapshot`)?**
+
+### Troubleshooting
+- **What are the known failure modes and recovery steps?**
+
+---
+
+## Implementation History
+
+- `YYYY-MM-DD`: Initial CEP drafted.
+
+---
+
+## Drawbacks
+
+<Why should this CEP *not* be implemented?>
+
+---
+
+## Alternatives
+
+### Alternative 1: <Name>
+- **Description**: <How it works>
+- **Reason for Rejection**: <Concrete technical reason>
