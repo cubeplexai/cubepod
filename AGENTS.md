@@ -23,9 +23,10 @@ CubePod is an open-source, cloud-native **Persistent Writable RootFS MicroVM Exe
 
 ---
 
-## 2. Documentation & Design Workflow (CEP Standard — Mandatory)
+## 2. Documentation & Design Workflow (CEP Standard — Feature Designs Only)
 
-All non-trivial features, architectural changes, CRD/API modifications, storage/runtime behaviors, and security designs MUST follow the **CubePod Enhancement Proposal (CEP)** specification before implementation.
+New product features, architectural changes, CRD/API modifications, and security subsystem designs MUST follow the **CubePod Enhancement Proposal (CEP)** specification before implementation.
+- **When NOT to write a CEP**: Routine engineering tasks, bug fixes, code refactoring, test/verification additions, or wiring up already-designed features do **not** require a new CEP—decompose and dispatch them directly to `herdr` workers.
 
 - **Skill Reference**: Always activate and follow **[`cep-doc-spec`](.agent/skills/cep-doc-spec/SKILL.md)** when proposing, writing, or updating design documents.
 - **Templates**:
