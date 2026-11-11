@@ -158,11 +158,15 @@ class AsyncCubePod:
         port: int = 8080,
         *,
         expires_in_seconds: int = 3600,
+        target_url: str | None = None,
     ) -> PanelEndpoint:
         """Request an HMAC-SHA256 signed panel proxy URL for browser live-view or web terminal."""
+        payload: dict[str, Any] = {"expiresInSeconds": expires_in_seconds}
+        if target_url is not None:
+            payload["targetUrl"] = target_url
         resp = await self._client.post(
             f"/sandboxes/{sandbox_id}/endpoints/{port}",
-            json={"expiresInSeconds": expires_in_seconds},
+            json=payload,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -197,10 +201,13 @@ class AsyncCubePod:
         resp = await self._client.post(f"/sandboxes/{sandbox_id}/commands/run", json=payload)
         resp.raise_for_status()
         data = resp.json()
+        exit_code = data.get("exit_code") if "exit_code" in data else data.get("exitCode")
+        output = data.get("output", "") or data.get("stdout", "")
+        cmd_id = data.get("id") or data.get("cmdID", "")
         return ExecutionResult(
-            id=data.get("id", ""),
-            exit_code=data.get("exit_code"),
-            output=data.get("output", ""),
+            id=cmd_id,
+            exit_code=exit_code,
+            output=output,
             running=data.get("running", False),
             pid=data.get("pid"),
             cursor=data.get("cursor", 0),
@@ -231,13 +238,16 @@ class AsyncCubePod:
         resp = await self._client.post(f"/sandboxes/{sandbox_id}/commands/run", json=payload)
         resp.raise_for_status()
         data = resp.json()
+        cmd_id = data.get("id") or data.get("cmdID", "")
+        exit_code = data.get("exit_code") if "exit_code" in data else data.get("exitCode")
+        output = data.get("output", "") or data.get("stdout", "")
         return CommandInfo(
-            id=data.get("id", ""),
+            id=cmd_id,
             pid=data.get("pid"),
             running=data.get("running", True),
-            exit_code=data.get("exit_code"),
+            exit_code=exit_code,
             cursor=data.get("cursor", 0),
-            output=data.get("output", ""),
+            output=output,
         )
 
     async def poll_command(
@@ -254,12 +264,14 @@ class AsyncCubePod:
         )
         resp.raise_for_status()
         data = resp.json()
+        cmd_id = data.get("id") or data.get("cmdID", command_id)
+        exit_code = data.get("exit_code") if "exit_code" in data else data.get("exitCode")
         return CommandLogs(
-            id=data.get("id", command_id),
+            id=cmd_id,
             content=data.get("content", ""),
             cursor=data.get("cursor", cursor),
             running=data.get("running", False),
-            exit_code=data.get("exit_code"),
+            exit_code=exit_code,
         )
 
     async def kill_command(self, sandbox_id: str, command_id: str) -> dict[str, Any]:

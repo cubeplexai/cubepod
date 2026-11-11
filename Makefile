@@ -1,4 +1,4 @@
-.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway test test-rust test-go fmt vet clean
+.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway test test-rust test-go test-e2e fmt vet clean
 
 GO ?= go
 CARGO ?= $(shell which cargo 2>/dev/null || echo "$(HOME)/.cargo/bin/cargo")
@@ -16,6 +16,7 @@ help:
 	@echo "  make build-controller   Build Go Kubernetes Operator (cmd/cubepod-controller)"
 	@echo "  make build-gateway      Build Go Unified API & Panel Proxy Gateway (cmd/cubepod-gateway)"
 	@echo "  make test               Run all Rust and Go unit tests"
+	@echo "  make test-e2e           Run full multi-process end-to-end integration tests"
 	@echo "  make fmt                Format Rust and Go source code"
 	@echo "  make clean              Remove build artifacts"
 
@@ -46,6 +47,9 @@ test-rust:
 
 test-go:
 	$(GO) test -v -race ./...
+
+test-e2e: build
+	$(GO) test -v -race ./test/e2e/...
 
 fmt:
 	$(CARGO) fmt --all
