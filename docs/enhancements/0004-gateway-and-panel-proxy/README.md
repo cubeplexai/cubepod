@@ -3,7 +3,7 @@
 | Field | Value |
 | :--- | :--- |
 | **CEP Number** | `0004` |
-| **Status** | `implementable` (`alpha`) |
+| **Status** | `implemented` (`alpha`) |
 | **Owning Area** | `gateway` |
 | **Authors** | @xfgong |
 | **Created** | 2026-11-10 |
@@ -36,7 +36,7 @@
 
 ## Release Signoff Checklist
 
-- [x] Enhancement scope, Goals, and Non-Goals are agreed upon (`provisional` -> `implementable`)
+- [x] Enhancement scope, Goals, and Non-Goals are agreed upon (`provisional` -> `implemented`)
 - [x] API / CRD (`pod.cubeplex.ai/v1alpha1`) and E2B-superset OpenAPI changes are specified
 - [x] Dual-runtime behavior (Kubernetes Kata + CSI Block AND Local Docker Loopback) is defined
 - [x] Security boundary (MicroVM isolation, UID/GID privilege separation, Egress secret safety) is reviewed
@@ -171,7 +171,7 @@ HTTP `401` on `/panel/` logs exact token rejection reason (expired vs. invalid s
 
 ## Implementation History
 
-- `2026-11-10`: CEP-0004 drafted and marked `implementable`.
+- `2026-11-10`: CEP-0004 drafted and marked `implemented`.
 
 ---
 

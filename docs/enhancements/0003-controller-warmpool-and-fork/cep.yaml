@@ -6,7 +6,7 @@ owning-area: "controller"
 participating-areas:
   - "storage"
   - "runtime"
-status: "implementable"
+status: "implemented"
 creation-date: "2026-11-10"
 reviewers:
   - "@xfgong"

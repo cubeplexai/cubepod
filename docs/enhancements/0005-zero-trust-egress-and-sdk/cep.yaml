@@ -5,7 +5,7 @@ authors:
 owning-area: "egress"
 participating-areas:
   - "sdk"
-status: "implementable"
+status: "implemented"
 creation-date: "2026-11-10"
 reviewers:
   - "@xfgong"
