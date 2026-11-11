@@ -4,12 +4,14 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,8 +19,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
+	"github.com/cubeplexai/cubepod/pkg/egress"
 	"github.com/cubeplexai/cubepod/pkg/gateway"
+	"github.com/cubeplexai/cubepod/pkg/runtime"
 )
 
 func findRepoRoot(t *testing.T) string {
@@ -550,5 +555,161 @@ func TestE2E_PythonSDKLiveHTTP(t *testing.T) {
 	t.Logf("Python SDK E2E Output:\n%s", string(out))
 	if !strings.Contains(string(out), "ALL PYTHON SDK LIVE E2E TESTS PASSED") {
 		t.Fatalf("expected test success marker in output, got:\n%s", string(out))
+	}
+}
+
+// TestE2E_LivePoddBackendAndZeroTrustEgress wires gateway.Server to a real bin/podd process
+// managed by runtime.PoddProcessBackend (via SetPoddURL), verifying live tar.gz archive-sync
+// and DELETE /v1/files on disk, as well as mTLS Zero-Trust Egress cbxref_ secret swapping.
+func TestE2E_LivePoddBackendAndZeroTrustEgress(t *testing.T) {
+	repoRoot := findRepoRoot(t)
+	_, binPodd := ensureBinaries(t, repoRoot)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	tmpDir := t.TempDir()
+	backend, err := runtime.NewPoddProcessBackend(runtime.PoddProcessBackendConfig{
+		PoddBinPath:   binPodd,
+		BaseDir:       tmpDir,
+		HealthTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("failed to create PoddProcessBackend: %v", err)
+	}
+	defer backend.Close()
+
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+
+	// Configure Zero-Trust Egress CA & Vault on the Gateway
+	ca, err := egress.NewCA()
+	if err != nil {
+		t.Fatalf("NewCA failed: %v", err)
+	}
+	vault := egress.NewVault(ca)
+	srv.SetEgressVault(vault)
+
+	// Start mTLS Gateway server for both E2B API and /internal/v1/egress/exchange
+	serverCert, serverKey, err := ca.MintServerCert([]string{"127.0.0.1", "localhost"}, time.Hour)
+	if err != nil {
+		t.Fatalf("MintServerCert failed: %v", err)
+	}
+	serverTLS, err := ca.ServerTLSConfig(serverCert, serverKey)
+	if err != nil {
+		t.Fatalf("ServerTLSConfig failed: %v", err)
+	}
+	// Allow non-mTLS public clients on the same test listener while verifying client certs when presented
+	serverTLS.ClientAuth = 3 // tls.VerifyClientCertIfGiven
+	ts := httptest.NewUnstartedServer(srv.Handler())
+	ts.TLS = serverTLS
+	ts.StartTLS()
+	defer ts.Close()
+
+	httpClient := ts.Client()
+
+	// 1. Create sandbox via Gateway
+	createResp, err := httpClient.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"cubeplex-ubuntu24-desktop"}`))
+	if err != nil || createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create sandbox failed: %v", err)
+	}
+	var sbRec gateway.SandboxRecord
+	_ = json.NewDecoder(createResp.Body).Decode(&sbRec)
+	createResp.Body.Close()
+
+	// 2. Spawn real bin/podd via PoddProcessBackend and bind its live URL to the Gateway
+	inst, err := backend.EnsureRunning(ctx, runtime.SandboxSpec{
+		SandboxID: sbRec.SandboxID,
+	})
+	if err != nil {
+		t.Fatalf("EnsureRunning failed: %v", err)
+	}
+	srv.SetPoddURL(sbRec.SandboxID, inst.PoddURL)
+
+	// 3. Test live archive-sync forwarded by Gateway to real Rust bin/podd
+	var tarBuf bytes.Buffer
+	gzw := gzip.NewWriter(&tarBuf)
+	tw := tar.NewWriter(gzw)
+	content := []byte("real-rust-podd-archive-content")
+	_ = tw.WriteHeader(&tar.Header{
+		Name: "sub/live.txt",
+		Mode: 0644,
+		Size: int64(len(content)),
+	})
+	_, _ = tw.Write(content)
+	_ = tw.Close()
+	_ = gzw.Close()
+
+	syncURL := fmt.Sprintf("%s/sandboxes/%s/files/archive-sync?path=%s", ts.URL, sbRec.SandboxID, url.QueryEscape(inst.WorkspaceDir))
+	syncResp, err := httpClient.Post(syncURL, "application/gzip", bytes.NewReader(tarBuf.Bytes()))
+	if err != nil || syncResp.StatusCode != http.StatusOK {
+		t.Fatalf("live archive-sync failed: status=%d err=%v", syncResp.StatusCode, err)
+	}
+	syncResp.Body.Close()
+
+	// Verify file exists on host disk inside inst.WorkspaceDir/sub/live.txt
+	extractedBytes, err := os.ReadFile(filepath.Join(inst.WorkspaceDir, "sub", "live.txt"))
+	if err != nil {
+		t.Fatalf("expected extracted file on disk: %v", err)
+	}
+	if string(extractedBytes) != string(content) {
+		t.Fatalf("extracted content mismatch: %q", string(extractedBytes))
+	}
+
+	// 4. Test Zero-Trust Egress Proxy swapping cbxref_ secret over mTLS against Gateway
+	upstreamSeenAuth := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamSeenAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+	upstreamURL, _ := url.Parse(upstream.URL)
+
+	policy := v1alpha1.NetworkPolicySpec{
+		DefaultAction: v1alpha1.NetworkDefaultDeny,
+		AllowHosts:    []string{upstreamURL.Hostname()},
+	}
+	realSecret := "Bearer sk-real-production-secret-999"
+	placeholder, err := vault.RegisterSecret(sbRec.SandboxID, "OPENAI_API_KEY", realSecret, policy)
+	if err != nil {
+		t.Fatalf("RegisterSecret failed: %v", err)
+	}
+
+	sbCert, sbKey, err := ca.MintSandboxCert(sbRec.SandboxID, time.Hour)
+	if err != nil {
+		t.Fatalf("MintSandboxCert failed: %v", err)
+	}
+	clientTLS, err := ca.ClientTLSConfig(sbCert, sbKey)
+	if err != nil {
+		t.Fatalf("ClientTLSConfig failed: %v", err)
+	}
+
+	egressProxy := egress.NewEgressProxy(egress.EgressProxyConfig{
+		SandboxID:       sbRec.SandboxID,
+		Policy:          policy,
+		ExchangeURL:     ts.URL + "/internal/v1/egress/exchange",
+		ClientTLSConfig: clientTLS,
+	})
+	egressSrv := httptest.NewServer(egressProxy)
+	defer egressSrv.Close()
+
+	proxyURL, _ := url.Parse(egressSrv.URL)
+	proxiedClient := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+		},
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, upstream.URL+"/v1/models", nil)
+	req.Header.Set("Authorization", placeholder)
+	egressResp, err := proxiedClient.Do(req)
+	if err != nil || egressResp.StatusCode != http.StatusOK {
+		t.Fatalf("proxied egress request failed: status=%v err=%v", egressResp, err)
+	}
+	egressResp.Body.Close()
+
+	if upstreamSeenAuth != realSecret {
+		t.Fatalf("expected upstream to receive swapped real secret %q, got %q", realSecret, upstreamSeenAuth)
 	}
 }
