@@ -1,6 +1,9 @@
 """CubePod Python SDK — Async-first client for persistent MicroVM agent sandboxes."""
 
 from dataclasses import dataclass
+import io
+import tarfile
+import time
 from typing import Any
 
 import httpx
@@ -15,12 +18,64 @@ class SandboxInfo:
     rootfs_generation: int = 1
 
 
+@dataclass
+class ExecutionResult:
+    id: str
+    exit_code: int | None
+    output: str
+    running: bool = False
+    pid: int | None = None
+    cursor: int = 0
+
+
+@dataclass
+class CommandInfo:
+    id: str
+    pid: int | None = None
+    running: bool = True
+    exit_code: int | None = None
+    cursor: int = 0
+    output: str = ""
+
+
+@dataclass
+class CommandLogs:
+    id: str
+    content: str
+    cursor: int
+    running: bool
+    exit_code: int | None = None
+
+
+@dataclass
+class PanelEndpoint:
+    url: str
+    token: str
+    expires_at: str | None = None
+
+
 class AsyncCubePod:
     """Async client for CubePod Control & Data Plane."""
 
-    def __init__(self, base_url: str = "http://localhost:8080", api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8080",
+        api_key: str | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        self._client = httpx.AsyncClient(base_url=base_url.rstrip("/"), headers=headers, timeout=60.0)
+        self._client = httpx.AsyncClient(
+            base_url=base_url.rstrip("/"),
+            headers=headers,
+            timeout=60.0,
+            transport=transport,
+        )
+
+    async def __aenter__(self) -> "AsyncCubePod":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()
 
     async def create(
         self,
@@ -28,11 +83,25 @@ class AsyncCubePod:
         *,
         volume_key: str | None = None,
         metadata: dict[str, str] | None = None,
+        network_policy: dict[str, Any] | None = None,
+        secret_bindings: list[dict[str, Any]] | None = None,
     ) -> SandboxInfo:
         payload: dict[str, Any] = {"templateID": template_id, "metadata": metadata or {}}
         if volume_key:
             payload["extension"] = {"volumeKey": volume_key}
+        if network_policy is not None:
+            payload["networkPolicy"] = network_policy
+        if secret_bindings is not None:
+            if "networkPolicy" not in payload:
+                payload["networkPolicy"] = {}
+            payload["networkPolicy"]["secretBindings"] = secret_bindings
         resp = await self._client.post("/sandboxes", json=payload)
+        resp.raise_for_status()
+        return self._parse_info(resp.json())
+
+    async def get(self, sandbox_id: str) -> SandboxInfo:
+        """Fetch status and metadata for an existing sandbox."""
+        resp = await self._client.get(f"/sandboxes/{sandbox_id}")
         resp.raise_for_status()
         return self._parse_info(resp.json())
 
@@ -60,7 +129,211 @@ class AsyncCubePod:
         resp.raise_for_status()
         return self._parse_info(resp.json())
 
+    async def delete(self, sandbox_id: str) -> None:
+        """Terminate and permanently delete a sandbox."""
+        resp = await self._client.delete(f"/sandboxes/{sandbox_id}")
+        resp.raise_for_status()
+
+    async def renew_timeout(self, sandbox_id: str, timeout_seconds: int = 3600) -> dict[str, Any]:
+        """Renew the idle auto-pause timeout for a running sandbox."""
+        resp = await self._client.post(
+            f"/sandboxes/{sandbox_id}/timeout",
+            json={"timeoutSeconds": timeout_seconds},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def acquire_lease(self, sandbox_id: str, lease_seconds: int = 300) -> dict[str, Any]:
+        """Acquire or renew an exclusive active lease on the sandbox."""
+        resp = await self._client.post(
+            f"/sandboxes/{sandbox_id}/lease",
+            json={"leaseSeconds": lease_seconds},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_panel_endpoint(
+        self,
+        sandbox_id: str,
+        port: int = 8080,
+        *,
+        expires_in_seconds: int = 3600,
+    ) -> PanelEndpoint:
+        """Request an HMAC-SHA256 signed panel proxy URL for browser live-view or web terminal."""
+        resp = await self._client.post(
+            f"/sandboxes/{sandbox_id}/endpoints/{port}",
+            json={"expiresInSeconds": expires_in_seconds},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return PanelEndpoint(
+            url=data["url"],
+            token=data["token"],
+            expires_at=data.get("expiresAt"),
+        )
+
+    async def execute(
+        self,
+        sandbox_id: str,
+        command: str,
+        *,
+        workdir: str | None = None,
+        envs: dict[str, str] | None = None,
+        uid: int = 1000,
+        gid: int = 1000,
+    ) -> ExecutionResult:
+        """Execute a foreground command and wait for completion."""
+        payload: dict[str, Any] = {
+            "command": command,
+            "background": False,
+            "uid": uid,
+            "gid": gid,
+        }
+        if workdir is not None:
+            payload["workdir"] = workdir
+        if envs is not None:
+            payload["envs"] = envs
+
+        resp = await self._client.post(f"/sandboxes/{sandbox_id}/commands/run", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        return ExecutionResult(
+            id=data.get("id", ""),
+            exit_code=data.get("exit_code"),
+            output=data.get("output", ""),
+            running=data.get("running", False),
+            pid=data.get("pid"),
+            cursor=data.get("cursor", 0),
+        )
+
+    async def start_command(
+        self,
+        sandbox_id: str,
+        command: str,
+        *,
+        workdir: str | None = None,
+        envs: dict[str, str] | None = None,
+        uid: int = 1000,
+        gid: int = 1000,
+    ) -> CommandInfo:
+        """Launch an asynchronous background command."""
+        payload: dict[str, Any] = {
+            "command": command,
+            "background": True,
+            "uid": uid,
+            "gid": gid,
+        }
+        if workdir is not None:
+            payload["workdir"] = workdir
+        if envs is not None:
+            payload["envs"] = envs
+
+        resp = await self._client.post(f"/sandboxes/{sandbox_id}/commands/run", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+        return CommandInfo(
+            id=data.get("id", ""),
+            pid=data.get("pid"),
+            running=data.get("running", True),
+            exit_code=data.get("exit_code"),
+            cursor=data.get("cursor", 0),
+            output=data.get("output", ""),
+        )
+
+    async def poll_command(
+        self,
+        sandbox_id: str,
+        command_id: str,
+        *,
+        cursor: int = 0,
+    ) -> CommandLogs:
+        """Read incremental stdout/stderr output from a background command using byte-offset cursor."""
+        resp = await self._client.get(
+            f"/sandboxes/{sandbox_id}/commands/{command_id}/logs",
+            params={"cursor": cursor},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return CommandLogs(
+            id=data.get("id", command_id),
+            content=data.get("content", ""),
+            cursor=data.get("cursor", cursor),
+            running=data.get("running", False),
+            exit_code=data.get("exit_code"),
+        )
+
+    async def kill_command(self, sandbox_id: str, command_id: str) -> dict[str, Any]:
+        """Terminate a background command process group."""
+        resp = await self._client.post(f"/sandboxes/{sandbox_id}/commands/{command_id}/kill")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def write_file(
+        self,
+        sandbox_id: str,
+        path: str,
+        content: str | bytes,
+        *,
+        uid: int = 1000,
+        gid: int = 1000,
+        mode: str = "0644",
+    ) -> dict[str, Any]:
+        """Write a file directly inside the sandbox with specified UID/GID and mode."""
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        resp = await self._client.put(
+            f"/sandboxes/{sandbox_id}/files",
+            params={"path": path, "uid": str(uid), "gid": str(gid), "mode": mode},
+            content=data,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def read_file(self, sandbox_id: str, path: str) -> bytes:
+        """Read a file from inside the sandbox."""
+        resp = await self._client.get(
+            f"/sandboxes/{sandbox_id}/files",
+            params={"path": path},
+        )
+        resp.raise_for_status()
+        return resp.content
+
+    async def archive_sync(
+        self,
+        sandbox_id: str,
+        files: dict[str, str | bytes],
+        *,
+        dest: str = "/workspace",
+        uid: int = 1000,
+        gid: int = 1000,
+    ) -> dict[str, Any]:
+        """Pack files into an in-memory tar.gz archive and extract inside the sandbox in a single HTTP request."""
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for file_path, content in files.items():
+                data = content.encode("utf-8") if isinstance(content, str) else content
+                rel_name = file_path.lstrip("/")
+                ti = tarfile.TarInfo(name=rel_name)
+                ti.size = len(data)
+                ti.mtime = int(time.time())
+                ti.mode = 0o644
+                ti.uid = uid
+                ti.gid = gid
+                tar.addfile(ti, io.BytesIO(data))
+        buf.seek(0)
+        tar_bytes = buf.getvalue()
+
+        resp = await self._client.post(
+            f"/sandboxes/{sandbox_id}/files/archive-sync",
+            params={"dest": dest},
+            content=tar_bytes,
+            headers={"Content-Type": "application/gzip"},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def close(self) -> None:
+        """Close the underlying HTTP client session."""
         await self._client.aclose()
 
     @staticmethod
