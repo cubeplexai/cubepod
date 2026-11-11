@@ -195,15 +195,15 @@ spec:
         - name: hub.sensedeal.vip
       containers:
         - name: controller
-          image: hub.sensedeal.vip/library/cubepod-controller:v0.3.0-k8s
+          image: hub.sensedeal.vip/library/cubepod-controller:v0.3.1-k8s
           imagePullPolicy: IfNotPresent
           args:
             - "-namespace=cubepod-workloads"
             - "-addr=:8081"
-            - "-volume-mode=Filesystem"
-            - "-storage-class=nfs-storage"
-            - "-runtime-class="
-            - "-podd-image=hub.sensedeal.vip/library/cubepod-podd:v0.3.0-k8s"
+            - "-volume-mode=Block"
+            - "-storage-class=cubepod-lvm-block"
+            - "-runtime-class=none"
+            - "-podd-image=hub.sensedeal.vip/library/cubepod-podd:v0.3.1-k8s"
             - "-sandbox-image=hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917"
           ports:
             - containerPort: 8081
@@ -256,15 +256,15 @@ spec:
         - name: hub.sensedeal.vip
       containers:
         - name: gateway
-          image: hub.sensedeal.vip/library/cubepod-gateway:v0.3.0-k8s
+          image: hub.sensedeal.vip/library/cubepod-gateway:v0.3.1-k8s
           imagePullPolicy: IfNotPresent
           args:
             - "-addr=:8080"
             - "-namespace=cubepod-workloads"
-            - "-volume-mode=Filesystem"
-            - "-storage-class=nfs-storage"
-            - "-runtime-class="
-            - "-podd-image=hub.sensedeal.vip/library/cubepod-podd:v0.3.0-k8s"
+            - "-volume-mode=Block"
+            - "-storage-class=cubepod-lvm-block"
+            - "-runtime-class=none"
+            - "-podd-image=hub.sensedeal.vip/library/cubepod-podd:v0.3.1-k8s"
             - "-sandbox-image=hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917"
             - "-live-pod-routing=true"
           ports:

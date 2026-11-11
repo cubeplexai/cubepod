@@ -1,0 +1,10 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: cubepod-lvm-block
+provisioner: lvm.csi.openebs.io
+parameters:
+  storage: "lvm"
+  volgroup: "cubepod-vg"
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
