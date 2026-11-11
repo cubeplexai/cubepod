@@ -1,12 +1,18 @@
 package controller
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -130,28 +136,369 @@ func (m *MemoryKubeClient) ListPods() []PodManifest {
 	return res
 }
 
+// KubeconfigInfo holds parsed Kubernetes authentication and endpoint details.
+type KubeconfigInfo struct {
+	Server                string
+	Namespace             string
+	Token                 string
+	ClientCertificateData []byte
+	ClientKeyData         []byte
+	CACertificateData     []byte
+	InsecureSkipTLSVerify bool
+}
+
+// ParseKubeconfig parses kubeconfig YAML bytes into KubeconfigInfo using standard library line parsing and regexes.
+func ParseKubeconfig(content []byte) (*KubeconfigInfo, error) {
+	info := &KubeconfigInfo{}
+	scanner := bufio.NewScanner(bytes.NewReader(content))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		if cIdx := strings.Index(val, " #"); cIdx != -1 {
+			val = strings.TrimSpace(val[:cIdx])
+		}
+		val = strings.Trim(val, `"'`)
+
+		switch key {
+		case "server":
+			if info.Server == "" {
+				info.Server = val
+			}
+		case "namespace":
+			if info.Namespace == "" {
+				info.Namespace = val
+			}
+		case "token":
+			if info.Token == "" {
+				info.Token = val
+			}
+		case "insecure-skip-tls-verify":
+			info.InsecureSkipTLSVerify = strings.EqualFold(val, "true")
+		case "certificate-authority-data":
+			if len(info.CACertificateData) == 0 {
+				if data, err := base64.StdEncoding.DecodeString(val); err == nil {
+					info.CACertificateData = data
+				}
+			}
+		case "certificate-authority":
+			if len(info.CACertificateData) == 0 {
+				if data, err := os.ReadFile(val); err == nil {
+					info.CACertificateData = data
+				}
+			}
+		case "client-certificate-data":
+			if len(info.ClientCertificateData) == 0 {
+				if data, err := base64.StdEncoding.DecodeString(val); err == nil {
+					info.ClientCertificateData = data
+				}
+			}
+		case "client-certificate":
+			if len(info.ClientCertificateData) == 0 {
+				if data, err := os.ReadFile(val); err == nil {
+					info.ClientCertificateData = data
+				}
+			}
+		case "client-key-data":
+			if len(info.ClientKeyData) == 0 {
+				if data, err := base64.StdEncoding.DecodeString(val); err == nil {
+					info.ClientKeyData = data
+				}
+			}
+		case "client-key":
+			if len(info.ClientKeyData) == 0 {
+				if data, err := os.ReadFile(val); err == nil {
+					info.ClientKeyData = data
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to scan kubeconfig: %w", err)
+	}
+	return info, nil
+}
+
+// LoadKubeconfig reads and parses a kubeconfig file from the specified path,
+// or defaults to $KUBECONFIG or ~/.kube/config.
+func LoadKubeconfig(path string) (*KubeconfigInfo, error) {
+	if path == "" {
+		path = os.Getenv("KUBECONFIG")
+	}
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("unable to determine home directory: %w", err)
+		}
+		path = filepath.Join(home, ".kube", "config")
+	} else if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			path = filepath.Join(home, path[2:])
+		}
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read kubeconfig at %s: %w", path, err)
+	}
+	return ParseKubeconfig(data)
+}
+
+// LoadInClusterConfig reads Kubernetes credentials provided by in-cluster service account secrets.
+func LoadInClusterConfig() (*KubeconfigInfo, error) {
+	tokenPath := "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	tokenBytes, err := os.ReadFile(tokenPath)
+	if err != nil {
+		return nil, fmt.Errorf("in-cluster token not found: %w", err)
+	}
+
+	host := os.Getenv("KUBERNETES_SERVICE_HOST")
+	port := os.Getenv("KUBERNETES_SERVICE_PORT")
+	if host == "" {
+		host = "kubernetes.default.svc"
+	}
+	if port == "" {
+		port = "443"
+	}
+	serverURL := fmt.Sprintf("https://%s:%s", host, port)
+
+	info := &KubeconfigInfo{
+		Server: serverURL,
+		Token:  strings.TrimSpace(string(tokenBytes)),
+	}
+
+	if nsBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
+		info.Namespace = strings.TrimSpace(string(nsBytes))
+	}
+	if caBytes, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"); err == nil {
+		info.CACertificateData = caBytes
+	}
+
+	return info, nil
+}
+
+// RESTKubeClientConfig holds configuration options for initializing RESTKubeClient.
+type RESTKubeClientConfig struct {
+	APIServerURL          string
+	Namespace             string
+	BearerToken           string
+	InsecureTLS           bool
+	WaitForRunning        bool
+	PollInterval          time.Duration
+	PollTimeout           time.Duration
+	ClientCertificateData []byte
+	ClientKeyData         []byte
+	CACertificateData     []byte
+	HTTPClient            *http.Client
+}
+
+// RESTKubeClientOption configures a RESTKubeClient.
+type RESTKubeClientOption func(*RESTKubeClient)
+
+func WithAPIServerURL(baseURL string) RESTKubeClientOption {
+	return func(c *RESTKubeClient) {
+		c.baseURL = strings.TrimRight(baseURL, "/")
+	}
+}
+
+func WithKubeClientNamespace(ns string) RESTKubeClientOption {
+	return func(c *RESTKubeClient) {
+		if ns != "" {
+			c.defaultNamespace = ns
+		}
+	}
+}
+
+func WithBearerToken(token string) RESTKubeClientOption {
+	return func(c *RESTKubeClient) {
+		c.token = token
+	}
+}
+
+func WithInsecureTLS(insecure bool) RESTKubeClientOption {
+	return func(c *RESTKubeClient) {
+		if c.httpClient != nil {
+			if transport, ok := c.httpClient.Transport.(*http.Transport); ok && transport.TLSClientConfig != nil {
+				transport.TLSClientConfig.InsecureSkipVerify = insecure
+			} else if insecure {
+				c.httpClient.Transport = &http.Transport{
+					TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				}
+			}
+		}
+	}
+}
+
+func WithWaitForRunning(wait bool) RESTKubeClientOption {
+	return func(c *RESTKubeClient) {
+		c.waitForRunning = wait
+	}
+}
+
+func WithHTTPClient(client *http.Client) RESTKubeClientOption {
+	return func(c *RESTKubeClient) {
+		if client != nil {
+			c.httpClient = client
+		}
+	}
+}
+
+func WithPollInterval(d time.Duration) RESTKubeClientOption {
+	return func(c *RESTKubeClient) {
+		if d > 0 {
+			c.pollInterval = d
+		}
+	}
+}
+
+func WithPollTimeout(d time.Duration) RESTKubeClientOption {
+	return func(c *RESTKubeClient) {
+		if d > 0 {
+			c.pollTimeout = d
+		}
+	}
+}
+
 // RESTKubeClient communicates with standard Kubernetes v1 JSON REST endpoints.
 type RESTKubeClient struct {
 	baseURL          string
 	defaultNamespace string
 	token            string
 	httpClient       *http.Client
+	waitForRunning   bool
+	pollInterval     time.Duration
+	pollTimeout      time.Duration
 }
 
 // NewRESTKubeClient creates a new RESTKubeClient targeting a Kubernetes APIServer.
-func NewRESTKubeClient(baseURL, defaultNamespace, token string, client *http.Client) *RESTKubeClient {
+func NewRESTKubeClient(baseURL, defaultNamespace, token string, client *http.Client, opts ...RESTKubeClientOption) *RESTKubeClient {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	if defaultNamespace == "" {
 		defaultNamespace = "cubepod-workloads"
 	}
-	return &RESTKubeClient{
+	c := &RESTKubeClient{
 		baseURL:          strings.TrimRight(baseURL, "/"),
 		defaultNamespace: defaultNamespace,
 		token:            token,
 		httpClient:       client,
+		pollInterval:     500 * time.Millisecond,
+		pollTimeout:      60 * time.Second,
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// NewRESTKubeClientWithConfig creates a RESTKubeClient with full configuration including mTLS.
+func NewRESTKubeClientWithConfig(cfg RESTKubeClientConfig) (*RESTKubeClient, error) {
+	client := cfg.HTTPClient
+	if client == nil {
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: cfg.InsecureTLS,
+		}
+		if len(cfg.ClientCertificateData) > 0 && len(cfg.ClientKeyData) > 0 {
+			cert, err := tls.X509KeyPair(cfg.ClientCertificateData, cfg.ClientKeyData)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse client certificate/key: %w", err)
+			}
+			tlsConfig.Certificates = []tls.Certificate{cert}
+		}
+		if len(cfg.CACertificateData) > 0 && !cfg.InsecureTLS {
+			caPool := x509.NewCertPool()
+			if !caPool.AppendCertsFromPEM(cfg.CACertificateData) {
+				return nil, fmt.Errorf("failed to append CA certificate to pool")
+			}
+			tlsConfig.RootCAs = caPool
+		}
+
+		client = &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: tlsConfig,
+			},
+			Timeout: 30 * time.Second,
+		}
+	}
+
+	pollInterval := cfg.PollInterval
+	if pollInterval <= 0 {
+		pollInterval = 500 * time.Millisecond
+	}
+	pollTimeout := cfg.PollTimeout
+	if pollTimeout <= 0 {
+		pollTimeout = 60 * time.Second
+	}
+
+	ns := cfg.Namespace
+	if ns == "" {
+		ns = "cubepod-workloads"
+	}
+
+	return &RESTKubeClient{
+		baseURL:          strings.TrimRight(cfg.APIServerURL, "/"),
+		defaultNamespace: ns,
+		token:            cfg.BearerToken,
+		httpClient:       client,
+		waitForRunning:   cfg.WaitForRunning,
+		pollInterval:     pollInterval,
+		pollTimeout:      pollTimeout,
+	}, nil
+}
+
+// NewRESTKubeClientFromEnv initializes a RESTKubeClient by checking $KUBECONFIG, ~/.kube/config,
+// or in-cluster ServiceAccount credentials.
+func NewRESTKubeClientFromEnv(opts ...RESTKubeClientOption) (*RESTKubeClient, error) {
+	info, err := LoadKubeconfig("")
+	if err == nil && info.Server != "" {
+		cfg := RESTKubeClientConfig{
+			APIServerURL:          info.Server,
+			Namespace:             info.Namespace,
+			BearerToken:           info.Token,
+			InsecureTLS:           info.InsecureSkipTLSVerify,
+			ClientCertificateData: info.ClientCertificateData,
+			ClientKeyData:         info.ClientKeyData,
+			CACertificateData:     info.CACertificateData,
+		}
+		c, err := NewRESTKubeClientWithConfig(cfg)
+		if err == nil {
+			for _, opt := range opts {
+				opt(c)
+			}
+			return c, nil
+		}
+	}
+
+	inClusterInfo, inErr := LoadInClusterConfig()
+	if inErr == nil && inClusterInfo.Server != "" {
+		cfg := RESTKubeClientConfig{
+			APIServerURL:      inClusterInfo.Server,
+			Namespace:         inClusterInfo.Namespace,
+			BearerToken:       inClusterInfo.Token,
+			CACertificateData: inClusterInfo.CACertificateData,
+		}
+		c, err := NewRESTKubeClientWithConfig(cfg)
+		if err == nil {
+			for _, opt := range opts {
+				opt(c)
+			}
+			return c, nil
+		}
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize KubeClient from env: kubeconfig error (%w), in-cluster error (%v)", err, inErr)
+	}
+	return nil, fmt.Errorf("no valid Kubernetes configuration found in environment")
 }
 
 func (c *RESTKubeClient) pvcNamespace(pvc BlockPVCManifest) string {
@@ -391,10 +738,12 @@ func (c *RESTKubeClient) EnsurePod(ctx context.Context, pod PodManifest) (string
 	}
 
 	podSpec := map[string]any{
-		"runtimeClassName": pod.RuntimeClassName,
-		"initContainers":   initContainers,
-		"containers":       containers,
-		"volumes":          volumes,
+		"initContainers": initContainers,
+		"containers":     containers,
+		"volumes":        volumes,
+	}
+	if pod.RuntimeClassName != "" {
+		podSpec["runtimeClassName"] = pod.RuntimeClassName
 	}
 
 	body := map[string]any{
@@ -431,12 +780,19 @@ func (c *RESTKubeClient) EnsurePod(ctx context.Context, pod PodManifest) (string
 
 	if resp.StatusCode == http.StatusConflict {
 		// Idempotent success: fetch existing Pod IP if possible.
+		if c.waitForRunning {
+			return c.waitForPodRunning(ctx, ns, pod.Name)
+		}
 		return c.getPodIP(ctx, ns, pod.Name)
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		respBody, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("EnsurePod failed: status %d (%s)", resp.StatusCode, string(respBody))
+	}
+
+	if c.waitForRunning {
+		return c.waitForPodRunning(ctx, ns, pod.Name)
 	}
 
 	var podResp struct {
@@ -448,11 +804,47 @@ func (c *RESTKubeClient) EnsurePod(ctx context.Context, pod PodManifest) (string
 	return podResp.Status.PodIP, nil
 }
 
-func (c *RESTKubeClient) getPodIP(ctx context.Context, namespace, name string) (string, error) {
+func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name string) (string, error) {
+	interval := c.pollInterval
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	timeout := c.pollTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		ip, phase, err := c.getPodStatus(pollCtx, namespace, name)
+		if err == nil && phase == "Running" && ip != "" {
+			return ip, nil
+		}
+		if phase == "Failed" {
+			return "", fmt.Errorf("pod %s/%s entered Failed phase", namespace, name)
+		}
+
+		select {
+		case <-pollCtx.Done():
+			if ip != "" {
+				return ip, nil
+			}
+			return "", fmt.Errorf("timed out waiting for pod %s/%s to reach Running phase (last phase=%q, err=%v)", namespace, name, phase, err)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (c *RESTKubeClient) getPodStatus(ctx context.Context, namespace, name string) (string, string, error) {
 	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s", c.baseURL, namespace, name)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", nil
+		return "", "", fmt.Errorf("failed to create getPodStatus request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	if c.token != "" {
@@ -460,20 +852,43 @@ func (c *RESTKubeClient) getPodIP(ctx context.Context, namespace, name string) (
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", nil
+		return "", "", fmt.Errorf("getPodStatus request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK {
-		var podResp struct {
-			Status struct {
-				PodIP string `json:"podIP"`
-			} `json:"status"`
-		}
-		_ = json.NewDecoder(resp.Body).Decode(&podResp)
-		return podResp.Status.PodIP, nil
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("getPodStatus failed: status %d (%s)", resp.StatusCode, string(respBody))
 	}
-	return "", nil
+
+	var podResp struct {
+		Status struct {
+			Phase string `json:"phase"`
+			PodIP string `json:"podIP"`
+		} `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&podResp); err != nil {
+		return "", "", fmt.Errorf("failed to decode pod status: %w", err)
+	}
+	return podResp.Status.PodIP, podResp.Status.Phase, nil
+}
+
+func (c *RESTKubeClient) getPodIP(ctx context.Context, namespace, name string) (string, error) {
+	ip, _, err := c.getPodStatus(ctx, namespace, name)
+	if err != nil {
+		return "", nil
+	}
+	return ip, nil
+}
+
+// SetWaitForRunning enables or disables waiting for the Pod to reach Running phase.
+func (c *RESTKubeClient) SetWaitForRunning(wait bool) {
+	c.waitForRunning = wait
+}
+
+// WaitForRunning returns whether waiting for Running phase is enabled.
+func (c *RESTKubeClient) WaitForRunning() bool {
+	return c.waitForRunning
 }
 
 // DeletePod deletes a Pod by namespace and name.

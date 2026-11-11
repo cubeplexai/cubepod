@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,28 +35,84 @@ func WithNamespace(ns string) ReconcilerOption {
 	}
 }
 
+// WithVolumeMode configures the PVC storage volume mode ("Block" or "Filesystem", default "Block").
+func WithVolumeMode(mode string) ReconcilerOption {
+	return func(r *Reconciler) {
+		if mode != "" {
+			r.volumeMode = mode
+		}
+	}
+}
+
+// WithDefaultStorageClass configures the default CSI StorageClassName.
+func WithDefaultStorageClass(sc string) ReconcilerOption {
+	return func(r *Reconciler) {
+		if sc != "" {
+			r.defaultStorageClass = sc
+		}
+	}
+}
+
+// WithDefaultRuntimeClass configures the default container/microVM RuntimeClassName.
+// Passing "" explicitly unsets the runtimeClass for standard runc/containerd runtimes.
+func WithDefaultRuntimeClass(rc string) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.defaultRuntimeClass = rc
+		r.runtimeClassSet = true
+	}
+}
+
+// WithPoddInjectorImage configures the image used by the podd-installer initContainer.
+func WithPoddInjectorImage(img string) ReconcilerOption {
+	return func(r *Reconciler) {
+		if img != "" {
+			r.poddInjectorImage = img
+		}
+	}
+}
+
+// WithDefaultSandboxImage configures the default workload container image.
+func WithDefaultSandboxImage(img string) ReconcilerOption {
+	return func(r *Reconciler) {
+		if img != "" {
+			r.defaultSandboxImage = img
+		}
+	}
+}
+
 // Reconciler manages the lifecycle of PodBox instances, pre-attached PodWarmPools,
 // and dual Raw Block PVCs.
 type Reconciler struct {
-	mu          sync.RWMutex
-	boxes       map[string]*v1alpha1.PodBoxStatus
-	specs       map[string]v1alpha1.PodBoxSpec
-	templates   map[string]v1alpha1.PodTemplateSpec
-	warmPools   map[string]*warmPoolState
-	warmCounter int64
-	kubeClient  KubeClient
-	namespace   string
+	mu                  sync.RWMutex
+	boxes               map[string]*v1alpha1.PodBoxStatus
+	specs               map[string]v1alpha1.PodBoxSpec
+	templates           map[string]v1alpha1.PodTemplateSpec
+	warmPools           map[string]*warmPoolState
+	warmCounter         int64
+	kubeClient          KubeClient
+	namespace           string
+	volumeMode          string // "Block" or "Filesystem", default "Block"
+	defaultStorageClass string // default "standard"
+	defaultRuntimeClass string // default "kata-qemu"
+	runtimeClassSet     bool
+	poddInjectorImage   string // default "cubepod-podd:latest"
+	defaultSandboxImage string // default "ubuntu:24.04"
 }
 
 // NewReconciler creates a new in-memory/cluster Reconciler.
 func NewReconciler(opts ...ReconcilerOption) *Reconciler {
 	r := &Reconciler{
-		boxes:      make(map[string]*v1alpha1.PodBoxStatus),
-		specs:      make(map[string]v1alpha1.PodBoxSpec),
-		templates:  make(map[string]v1alpha1.PodTemplateSpec),
-		warmPools:  make(map[string]*warmPoolState),
-		kubeClient: NewMemoryKubeClient(),
-		namespace:  "cubepod-workloads",
+		boxes:               make(map[string]*v1alpha1.PodBoxStatus),
+		specs:               make(map[string]v1alpha1.PodBoxSpec),
+		templates:           make(map[string]v1alpha1.PodTemplateSpec),
+		warmPools:           make(map[string]*warmPoolState),
+		kubeClient:          NewMemoryKubeClient(),
+		namespace:           "cubepod-workloads",
+		volumeMode:          "Block",
+		defaultStorageClass: "standard",
+		defaultRuntimeClass: "kata-qemu",
+		poddInjectorImage:   "cubepod-podd:latest",
+		defaultSandboxImage: "ubuntu:24.04",
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -94,14 +151,36 @@ func (r *Reconciler) GetTemplate(name string) (v1alpha1.PodTemplateSpec, bool) {
 	return tpl, ok
 }
 
-func defaultTemplate(templateID string) v1alpha1.PodTemplateSpec {
-	if templateID == "" {
-		templateID = "ubuntu:24.04"
+func (r *Reconciler) defaultTemplate(templateID string) v1alpha1.PodTemplateSpec {
+	img := templateID
+	if img == "" {
+		img = r.defaultSandboxImage
 	}
+	if img == "" {
+		img = "ubuntu:24.04"
+	}
+
+	rtClass := "kata-qemu"
+	if r.runtimeClassSet {
+		rtClass = r.defaultRuntimeClass
+	} else if strings.EqualFold(r.volumeMode, "Filesystem") {
+		rtClass = ""
+	}
+
+	poddImg := r.poddInjectorImage
+	if poddImg == "" {
+		poddImg = "cubepod-podd:latest"
+	}
+
+	sc := r.defaultStorageClass
+	if sc == "" {
+		sc = "standard"
+	}
+
 	return v1alpha1.PodTemplateSpec{
-		RuntimeClassName: "kata-qemu",
-		Image:            templateID,
-		PoddImage:        "cubepod-podd:latest",
+		RuntimeClassName: rtClass,
+		Image:            img,
+		PoddImage:        poddImg,
 		Resources: v1alpha1.ResourceRequirements{
 			CPURequest:    "1",
 			CPULimit:      "2",
@@ -109,11 +188,15 @@ func defaultTemplate(templateID string) v1alpha1.PodTemplateSpec {
 			MemoryLimit:   "4Gi",
 		},
 		Storage: v1alpha1.StorageSpec{
-			StorageClassName: "standard",
+			StorageClassName: sc,
 			RootfsSize:       "10Gi",
 			WorkspaceSize:    "20Gi",
 		},
 	}
+}
+
+func defaultTemplate(templateID string) v1alpha1.PodTemplateSpec {
+	return NewReconciler().defaultTemplate(templateID)
 }
 
 // ReconcileWarmPool manages standby Kata MicroVM instances with pre-attached thin block PVCs.
@@ -137,7 +220,20 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 
 	tpl, ok := r.templates[spec.TemplateRef]
 	if !ok {
-		tpl = defaultTemplate(spec.TemplateRef)
+		tpl = r.defaultTemplate(spec.TemplateRef)
+	} else {
+		if tpl.RuntimeClassName == "" && r.runtimeClassSet {
+			tpl.RuntimeClassName = r.defaultRuntimeClass
+		}
+		if tpl.Storage.StorageClassName == "" && r.defaultStorageClass != "" {
+			tpl.Storage.StorageClassName = r.defaultStorageClass
+		}
+		if tpl.Image == "" && r.defaultSandboxImage != "" {
+			tpl.Image = r.defaultSandboxImage
+		}
+		if tpl.PoddImage == "" && r.poddInjectorImage != "" {
+			tpl.PoddImage = r.poddInjectorImage
+		}
 	}
 
 	// Count existing available (unclaimed) replicas.
@@ -161,7 +257,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				RootfsGeneration: 1,
 			}
 
-			rootfsPVC, wsPVC := BuildBlockPVCs(entryID, tpl, warmBoxSpec)
+			rootfsPVC, wsPVC := BuildBlockPVCs(entryID, tpl, warmBoxSpec, r.volumeMode)
 			rootfsPVC.Namespace = r.namespace
 			wsPVC.Namespace = r.namespace
 
@@ -174,7 +270,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				WorkspacePVCName: wsPVC.Name,
 				Phase:            v1alpha1.PodBoxPhaseRunning,
 			}
-			podManifest := BuildKataPod(entryID, tpl, warmBoxSpec, dummyStatus)
+			podManifest := BuildKataPod(entryID, tpl, warmBoxSpec, dummyStatus, r.volumeMode)
 			podManifest.Namespace = r.namespace
 
 			podIP, _ := r.kubeClient.EnsurePod(ctx, podManifest)
@@ -293,7 +389,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 
 	tpl, ok := r.templates[spec.TemplateRef]
 	if !ok {
-		tpl = defaultTemplate(spec.TemplateRef)
+		tpl = r.defaultTemplate(spec.TemplateRef)
+	} else {
+		if tpl.RuntimeClassName == "" && r.runtimeClassSet {
+			tpl.RuntimeClassName = r.defaultRuntimeClass
+		}
+		if tpl.Storage.StorageClassName == "" && r.defaultStorageClass != "" {
+			tpl.Storage.StorageClassName = r.defaultStorageClass
+		}
+		if tpl.Image == "" && r.defaultSandboxImage != "" {
+			tpl.Image = r.defaultSandboxImage
+		}
+		if tpl.PoddImage == "" && r.poddInjectorImage != "" {
+			tpl.PoddImage = r.poddInjectorImage
+		}
 	}
 
 	if !exists {
@@ -329,7 +438,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				Reason:            "ForkCloned",
 				Message:           fmt.Sprintf("Forked from parent sandbox %s", spec.ForkFrom.PodBoxName),
 			}
-			rootfsPVC, wsPVC := BuildBlockPVCs(name, tpl, spec)
+			rootfsPVC, wsPVC := BuildBlockPVCs(name, tpl, spec, r.volumeMode)
 			rootfsPVC.Namespace = r.namespace
 			wsPVC.Namespace = r.namespace
 			_ = r.kubeClient.EnsurePVC(ctx, rootfsPVC)
@@ -349,7 +458,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				Reason:            "Provisioned",
 				Message:           "Provisioned fresh sandbox",
 			}
-			rootfsPVC, wsPVC := BuildBlockPVCs(name, tpl, spec)
+			rootfsPVC, wsPVC := BuildBlockPVCs(name, tpl, spec, r.volumeMode)
 			rootfsPVC.Namespace = r.namespace
 			wsPVC.Namespace = r.namespace
 			_ = r.kubeClient.EnsurePVC(ctx, rootfsPVC)
@@ -376,7 +485,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		if oldRootfsPVC != "" {
 			_ = r.kubeClient.DeletePVC(ctx, r.namespace, oldRootfsPVC)
 		}
-		newRootfsPVC, _ := BuildBlockPVCs(name, tpl, spec)
+		newRootfsPVC, _ := BuildBlockPVCs(name, tpl, spec, r.volumeMode)
 		newRootfsPVC.Namespace = r.namespace
 		_ = r.kubeClient.EnsurePVC(ctx, newRootfsPVC)
 	}
@@ -395,7 +504,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		if status.PodName == "" {
 			status.PodName = fmt.Sprintf("%s-kata-pod", name)
 		}
-		podManifest := BuildKataPod(name, tpl, spec, *status)
+		podManifest := BuildKataPod(name, tpl, spec, *status, r.volumeMode)
 		podManifest.Namespace = r.namespace
 		podIP, err := r.kubeClient.EnsurePod(ctx, podManifest)
 		if err == nil && podIP != "" {
@@ -411,8 +520,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	return &cp, nil
 }
 
-// Delete tears down a PodBox, removing its compute Pod and dual Block PVCs.
-func (r *Reconciler) Delete(ctx context.Context, name string) error {
+// DeleteBox terminates a PodBox compute Pod and optionally deletes its underlying PVCs.
+func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -428,16 +537,23 @@ func (r *Reconciler) Delete(ctx context.Context, name string) error {
 	if status.PodName != "" {
 		_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
 	}
-	if status.RootfsPVCName != "" {
-		_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.RootfsPVCName)
-	}
-	if status.WorkspacePVCName != "" {
-		_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.WorkspacePVCName)
+	if deleteVolumes {
+		if status.RootfsPVCName != "" {
+			_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.RootfsPVCName)
+		}
+		if status.WorkspacePVCName != "" {
+			_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.WorkspacePVCName)
+		}
 	}
 
 	delete(r.boxes, name)
 	delete(r.specs, name)
 	return nil
+}
+
+// Delete tears down a PodBox, removing its compute Pod and dual Block PVCs.
+func (r *Reconciler) Delete(ctx context.Context, name string) error {
+	return r.DeleteBox(ctx, name, true)
 }
 
 // ReapIdle inspects all managed sandboxes and enforces idle auto-pause and paused TTL expiration.

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
@@ -69,9 +70,15 @@ type PodManifest struct {
 	Volumes          []VolumeManifest    `json:"volumes"`
 }
 
-// BuildBlockPVCs generates volumeMode: Block PVC specifications for RootFS Upper and Workspace.
-// When ForkFrom is specified in spec, DataSourcePVC is populated pointing to the parent sandbox's PVCs.
-func BuildBlockPVCs(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.PodBoxSpec) (rootfsPVC, workspacePVC BlockPVCManifest) {
+// BuildBlockPVCs generates volumeMode: Block or Filesystem PVC specifications for RootFS Upper and Workspace.
+// When ForkFrom is specified in spec, DataSourcePVC is populated pointing to the parent sandbox's PVCs (in Block mode).
+// When volumeMode is "Filesystem", DataSourcePVC cloning is skipped so NFS provisioners do not reject the PVC.
+func BuildBlockPVCs(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.PodBoxSpec, volumeMode ...string) (rootfsPVC, workspacePVC BlockPVCManifest) {
+	vm := "Block"
+	if len(volumeMode) > 0 && volumeMode[0] != "" {
+		vm = volumeMode[0]
+	}
+
 	storageClass := tpl.Storage.StorageClassName
 	if storageClass == "" {
 		storageClass = "standard"
@@ -93,10 +100,15 @@ func BuildBlockPVCs(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.
 	}
 	workspaceName := fmt.Sprintf("%s-workspace-pvc", boxName)
 
+	pvcVolMode := "Block"
+	if strings.EqualFold(vm, "Filesystem") {
+		pvcVolMode = "Filesystem"
+	}
+
 	rootfsPVC = BlockPVCManifest{
 		Name:             rootfsName,
 		StorageClassName: storageClass,
-		VolumeMode:       "Block",
+		VolumeMode:       pvcVolMode,
 		Size:             rootfsSize,
 		AccessModes:      []string{"ReadWriteOnce"},
 		Labels: map[string]string{
@@ -109,7 +121,7 @@ func BuildBlockPVCs(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.
 	workspacePVC = BlockPVCManifest{
 		Name:             workspaceName,
 		StorageClassName: storageClass,
-		VolumeMode:       "Block",
+		VolumeMode:       pvcVolMode,
 		Size:             workspaceSize,
 		AccessModes:      []string{"ReadWriteOnce"},
 		Labels: map[string]string{
@@ -120,27 +132,32 @@ func BuildBlockPVCs(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.
 	}
 
 	if spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != "" {
-		rootfsPVC.DataSourcePVC = fmt.Sprintf("%s-rootfs-pvc", spec.ForkFrom.PodBoxName)
-		workspacePVC.DataSourcePVC = fmt.Sprintf("%s-workspace-pvc", spec.ForkFrom.PodBoxName)
+		if !strings.EqualFold(vm, "Filesystem") {
+			rootfsPVC.DataSourcePVC = fmt.Sprintf("%s-rootfs-pvc", spec.ForkFrom.PodBoxName)
+			workspacePVC.DataSourcePVC = fmt.Sprintf("%s-workspace-pvc", spec.ForkFrom.PodBoxName)
+		}
 	}
 
 	return rootfsPVC, workspacePVC
 }
 
-// BuildKataPod synthesizes the complete Kubernetes Pod manifest for running a Kata MicroVM sandbox.
-// It injects:
-//  1. podd-installer initContainer copying podd-init and podd into /opt/cubepod/bin (emptyDir)
-//  2. Main container mounting /opt/cubepod/bin and mapping raw block devices /dev/cubepod-rootfs
-//     and /dev/cubepod-workspace
-//  3. Optional zero-trust Egress sidecar container and per-pod mTLS certificate secret volume
-func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.PodBoxSpec, status v1alpha1.PodBoxStatus) PodManifest {
+// BuildKataPod synthesizes the complete Kubernetes Pod manifest for running a Kata or container sandbox.
+// In volumeMode: Block, it maps raw block devices /dev/cubepod-rootfs and /dev/cubepod-workspace.
+// In volumeMode: Filesystem, it mounts rootfs-pvc at /mnt/cubepod/rootfs and workspace-pvc at /workspace
+// via ContainerManifest.VolumeMounts instead of VolumeDevices, and adds CUBEPOD_SKIP_PIVOT=1 when RuntimeClassName == "".
+func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.PodBoxSpec, status v1alpha1.PodBoxStatus, volumeMode ...string) PodManifest {
+	vm := "Block"
+	if len(volumeMode) > 0 && volumeMode[0] != "" {
+		vm = volumeMode[0]
+	}
+
 	podName := status.PodName
 	if podName == "" {
 		podName = fmt.Sprintf("%s-kata-pod", boxName)
 	}
 
 	rtClass := tpl.RuntimeClassName
-	if rtClass == "" {
+	if rtClass == "" && !strings.EqualFold(vm, "Filesystem") {
 		rtClass = "kata-qemu"
 	}
 
@@ -214,7 +231,28 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 				MountPath: "/opt/cubepod/bin",
 			},
 		},
-		VolumeDevices: []VolumeDevice{
+		Resources: tpl.Resources,
+	}
+
+	if strings.EqualFold(vm, "Filesystem") {
+		mainContainer.VolumeMounts = append(mainContainer.VolumeMounts,
+			VolumeMount{
+				Name:      "rootfs-volume",
+				MountPath: "/mnt/cubepod/rootfs",
+			},
+			VolumeMount{
+				Name:      "workspace-volume",
+				MountPath: "/workspace",
+			},
+		)
+		if rtClass == "" {
+			mainContainer.Env = append(mainContainer.Env, EnvVar{
+				Name:  "CUBEPOD_SKIP_PIVOT",
+				Value: "1",
+			})
+		}
+	} else {
+		mainContainer.VolumeDevices = []VolumeDevice{
 			{
 				Name:       "rootfs-volume",
 				DevicePath: "/dev/cubepod-rootfs",
@@ -223,8 +261,7 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 				Name:       "workspace-volume",
 				DevicePath: "/dev/cubepod-workspace",
 			},
-		},
-		Resources: tpl.Resources,
+		}
 	}
 
 	if spec.NetworkPolicy != nil {

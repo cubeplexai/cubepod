@@ -2,7 +2,9 @@ package controller_test
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -471,5 +473,351 @@ func TestControllerManager_BackgroundLoop(t *testing.T) {
 	}
 	if status.Reason != "IdlePaused" {
 		t.Fatalf("expected reason IdlePaused, got %s", status.Reason)
+	}
+}
+
+func TestFilesystemVolumeMode_PVCAndPodGeneration(t *testing.T) {
+	tpl := v1alpha1.PodTemplateSpec{
+		Image: "ubuntu:24.04",
+		Storage: v1alpha1.StorageSpec{
+			StorageClassName: "nfs-storage",
+			RootfsSize:       "20Gi",
+			WorkspaceSize:    "50Gi",
+		},
+		RuntimeClassName: "",
+	}
+	spec := v1alpha1.PodBoxSpec{
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}
+
+	// 1. BuildBlockPVCs with Filesystem mode
+	rootPVC, wsPVC := controller.BuildBlockPVCs("fs-box", tpl, spec, "Filesystem")
+	if rootPVC.VolumeMode != "Filesystem" {
+		t.Fatalf("expected rootPVC VolumeMode 'Filesystem', got %s", rootPVC.VolumeMode)
+	}
+	if wsPVC.VolumeMode != "Filesystem" {
+		t.Fatalf("expected wsPVC VolumeMode 'Filesystem', got %s", wsPVC.VolumeMode)
+	}
+
+	// 2. BuildBlockPVCs with ForkFrom in Filesystem mode -> DataSourcePVC suppressed
+	forkSpec := v1alpha1.PodBoxSpec{
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: "parent-box"},
+	}
+	rootForkPVC, wsForkPVC := controller.BuildBlockPVCs("fork-box", tpl, forkSpec, "Filesystem")
+	if rootForkPVC.DataSourcePVC != "" || wsForkPVC.DataSourcePVC != "" {
+		t.Fatalf("expected empty DataSourcePVC in Filesystem mode, got root=%q ws=%q", rootForkPVC.DataSourcePVC, wsForkPVC.DataSourcePVC)
+	}
+
+	// 3. BuildKataPod with Filesystem mode and empty RuntimeClassName
+	status := v1alpha1.PodBoxStatus{
+		PodName:          "fs-box-kata-pod",
+		RootfsPVCName:    rootPVC.Name,
+		WorkspacePVCName: wsPVC.Name,
+	}
+	pod := controller.BuildKataPod("fs-box", tpl, spec, status, "Filesystem")
+	if pod.RuntimeClassName != "" {
+		t.Fatalf("expected empty RuntimeClassName, got %q", pod.RuntimeClassName)
+	}
+
+	// Main sandbox container should have VolumeMounts for rootfs and workspace, and no VolumeDevices
+	if len(pod.Containers) == 0 {
+		t.Fatal("expected at least one container in pod")
+	}
+	mainC := pod.Containers[0]
+	if len(mainC.VolumeDevices) != 0 {
+		t.Fatalf("expected 0 volume devices in Filesystem mode, got %d", len(mainC.VolumeDevices))
+	}
+	var foundRootfsMount, foundWorkspaceMount, foundSkipPivot bool
+	for _, vm := range mainC.VolumeMounts {
+		if vm.MountPath == "/mnt/cubepod/rootfs" {
+			foundRootfsMount = true
+		}
+		if vm.MountPath == "/workspace" {
+			foundWorkspaceMount = true
+		}
+	}
+	if !foundRootfsMount || !foundWorkspaceMount {
+		t.Fatalf("expected /mnt/cubepod/rootfs and /workspace in VolumeMounts, got %+v", mainC.VolumeMounts)
+	}
+	for _, env := range mainC.Env {
+		if env.Name == "CUBEPOD_SKIP_PIVOT" && env.Value == "1" {
+			foundSkipPivot = true
+		}
+	}
+	if !foundSkipPivot {
+		t.Fatal("expected CUBEPOD_SKIP_PIVOT=1 when RuntimeClassName is empty")
+	}
+
+	// 4. Test EnsurePod omits runtimeClassName in JSON payload when empty
+	var capturedPodPayload map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_ = json.NewDecoder(r.Body).Decode(&capturedPodPayload)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"name": "fs-box-kata-pod"},
+				"status":   map[string]any{"podIP": "10.244.10.15"},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+	ip, err := client.EnsurePod(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("EnsurePod failed: %v", err)
+	}
+	if ip != "10.244.10.15" {
+		t.Fatalf("expected podIP 10.244.10.15, got %s", ip)
+	}
+
+	specMap, ok := capturedPodPayload["spec"].(map[string]any)
+	if !ok {
+		t.Fatalf("invalid spec in captured payload: %v", capturedPodPayload)
+	}
+	if _, exists := specMap["runtimeClassName"]; exists {
+		t.Fatalf("runtimeClassName must be omitted when empty, got %v", specMap["runtimeClassName"])
+	}
+}
+
+func TestReconciler_DeleteBox(t *testing.T) {
+	mock, ts := newMockK8sServer()
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+	r := controller.NewReconciler(
+		controller.WithKubeClient(client),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	ctx := context.Background()
+
+	// 1. Reconcile running box
+	spec := v1alpha1.PodBoxSpec{
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}
+	_, err := r.Reconcile(ctx, "box-keep-pvc", spec)
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+
+	// 2. DeleteBox with deleteVolumes=false
+	if err := r.DeleteBox(ctx, "box-keep-pvc", false); err != nil {
+		t.Fatalf("DeleteBox(deleteVolumes=false) failed: %v", err)
+	}
+
+	// Box should be removed from reconciler
+	if _, exists := r.GetBox("box-keep-pvc"); exists {
+		t.Fatal("expected box-keep-pvc to be removed from reconciler")
+	}
+
+	// Pod should be deleted
+	mock.mu.RLock()
+	var podDeleted bool
+	for _, p := range mock.deletedPods {
+		if p == "box-keep-pvc-kata-pod" {
+			podDeleted = true
+			break
+		}
+	}
+	if !podDeleted {
+		t.Fatal("expected box-keep-pvc-kata-pod to be deleted")
+	}
+	// PVCs should NOT be deleted
+	for _, p := range mock.deletedPVCs {
+		if p == "box-keep-pvc-rootfs-pvc" || p == "box-keep-pvc-workspace-pvc" {
+			t.Fatalf("PVC %s should not have been deleted when deleteVolumes=false", p)
+		}
+	}
+	mock.mu.RUnlock()
+
+	// 3. Reconcile another box and DeleteBox with deleteVolumes=true
+	_, err = r.Reconcile(ctx, "box-delete-pvc", spec)
+	if err != nil {
+		t.Fatalf("reconcile failed: %v", err)
+	}
+
+	if err := r.DeleteBox(ctx, "box-delete-pvc", true); err != nil {
+		t.Fatalf("DeleteBox(deleteVolumes=true) failed: %v", err)
+	}
+
+	mock.mu.RLock()
+	var rootPVCDeleted, wsPVCDeleted bool
+	for _, p := range mock.deletedPVCs {
+		if p == "box-delete-pvc-rootfs-pvc" {
+			rootPVCDeleted = true
+		}
+		if p == "box-delete-pvc-workspace-pvc" {
+			wsPVCDeleted = true
+		}
+	}
+	mock.mu.RUnlock()
+
+	if !rootPVCDeleted || !wsPVCDeleted {
+		t.Fatalf("expected both PVCs deleted when deleteVolumes=true, got deletedPVCs: %v", mock.deletedPVCs)
+	}
+}
+
+func TestKubeconfigParsing(t *testing.T) {
+	dummyCA := base64.StdEncoding.EncodeToString([]byte("-----BEGIN CERTIFICATE-----\nCA-DATA\n-----END CERTIFICATE-----"))
+	dummyCert := base64.StdEncoding.EncodeToString([]byte("-----BEGIN CERTIFICATE-----\nCLIENT-CERT\n-----END CERTIFICATE-----"))
+	dummyKey := base64.StdEncoding.EncodeToString([]byte("-----BEGIN RSA PRIVATE KEY-----\nCLIENT-KEY\n-----END RSA PRIVATE KEY-----"))
+
+	kubeconfigYAML := fmt.Sprintf(`apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority-data: %s
+    insecure-skip-tls-verify: true
+    server: "https://192.168.1.207:6443"
+  name: test-cluster
+contexts:
+- context:
+    cluster: test-cluster
+    namespace: test-workloads
+    user: test-user
+  name: test-context
+current-context: test-context
+kind: Config
+preferences: {}
+users:
+- name: test-user
+  user:
+    client-certificate-data: %s
+    client-key-data: %s
+    token: "test-secret-token"
+`, dummyCA, dummyCert, dummyKey)
+
+	info, err := controller.ParseKubeconfig([]byte(kubeconfigYAML))
+	if err != nil {
+		t.Fatalf("ParseKubeconfig failed: %v", err)
+	}
+
+	if info.Server != "https://192.168.1.207:6443" {
+		t.Fatalf("expected server https://192.168.1.207:6443, got %s", info.Server)
+	}
+	if info.Namespace != "test-workloads" {
+		t.Fatalf("expected namespace test-workloads, got %s", info.Namespace)
+	}
+	if info.Token != "test-secret-token" {
+		t.Fatalf("expected token test-secret-token, got %s", info.Token)
+	}
+	if !info.InsecureSkipTLSVerify {
+		t.Fatal("expected InsecureSkipTLSVerify to be true")
+	}
+	if !strings.Contains(string(info.CACertificateData), "CA-DATA") {
+		t.Fatalf("unexpected CACertificateData: %s", string(info.CACertificateData))
+	}
+	if !strings.Contains(string(info.ClientCertificateData), "CLIENT-CERT") {
+		t.Fatalf("unexpected ClientCertificateData: %s", string(info.ClientCertificateData))
+	}
+	if !strings.Contains(string(info.ClientKeyData), "CLIENT-KEY") {
+		t.Fatalf("unexpected ClientKeyData: %s", string(info.ClientKeyData))
+	}
+
+	// Verify NewRESTKubeClientWithConfig creates client
+	cfg := controller.RESTKubeClientConfig{
+		APIServerURL:   info.Server,
+		Namespace:      info.Namespace,
+		BearerToken:    info.Token,
+		InsecureTLS:    info.InsecureSkipTLSVerify,
+		WaitForRunning: true,
+		PollInterval:   100 * time.Millisecond,
+		PollTimeout:    5 * time.Second,
+	}
+	client, err := controller.NewRESTKubeClientWithConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewRESTKubeClientWithConfig failed: %v", err)
+	}
+	if !client.WaitForRunning() {
+		t.Fatal("expected WaitForRunning to be true")
+	}
+}
+
+func TestWaitForRunning_Polling(t *testing.T) {
+	var pollCount int
+	var mu sync.Mutex
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"name": "poll-pod"},
+				"status":   map[string]any{"phase": "Pending"},
+			})
+			return
+		}
+
+		if r.Method == http.MethodGet {
+			pollCount++
+			if pollCount < 3 {
+				// Still Pending or ContainerCreating without IP
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"metadata": map[string]any{"name": "poll-pod"},
+					"status": map[string]any{
+						"phase": "Pending",
+						"podIP": "",
+					},
+				})
+				return
+			}
+
+			// Pod is Running and has an IP!
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"name": "poll-pod"},
+				"status": map[string]any{
+					"phase": "Running",
+					"podIP": "10.244.5.99",
+				},
+			})
+			return
+		}
+
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(
+		ts.URL,
+		"cubepod-workloads",
+		"poll-token",
+		ts.Client(),
+		controller.WithWaitForRunning(true),
+		controller.WithPollInterval(20*time.Millisecond),
+		controller.WithPollTimeout(2*time.Second),
+	)
+
+	pod := controller.PodManifest{
+		Name:             "poll-pod",
+		RuntimeClassName: "kata-qemu",
+		Containers: []controller.ContainerManifest{
+			{Name: "sandbox", Image: "ubuntu:24.04"},
+		},
+	}
+
+	ip, err := client.EnsurePod(context.Background(), pod)
+	if err != nil {
+		t.Fatalf("EnsurePod with WaitForRunning failed: %v", err)
+	}
+
+	if ip != "10.244.5.99" {
+		t.Fatalf("expected podIP 10.244.5.99, got %s", ip)
+	}
+
+	mu.Lock()
+	count := pollCount
+	mu.Unlock()
+
+	if count < 3 {
+		t.Fatalf("expected at least 3 polls before reaching Running phase, got %d", count)
 	}
 }
