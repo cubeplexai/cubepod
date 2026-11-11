@@ -14,10 +14,12 @@ CubePod is an open-source, cloud-native **Persistent Writable RootFS MicroVM Exe
 | [`crates/podd/`](crates/podd/src/main.rs) | In-guest execution, background process (`cursor` logs), and `tar.gz` file sync daemon | Rust |
 | [`api/v1alpha1/`](api/v1alpha1/types.go) | Kubernetes CRD schemas (`PodBox`, `PodTemplate`, `PodWarmPool`) | Go |
 | [`api/openapi/`](api/openapi/cubepod-v1.yaml) | Canonical E2B-compatible superset OpenAPI 3.1 contract | OpenAPI 3.1 |
-| [`cmd/cubepod-controller/`](cmd/cubepod-controller/main.go) & [`pkg/controller/`](pkg/controller/) | Kubernetes Operator managing dual `volumeMode: Block` PVCs, WarmPools, CoW Fork, and Egress | Go |
+| [`cmd/cubepod-controller/`](cmd/cubepod-controller/main.go) & [`pkg/controller/`](pkg/controller/) | Kubernetes Operator managing dual `volumeMode: Block`/`Filesystem` PVCs, WarmPools, CoW Fork, and Egress | Go |
 | [`cmd/cubepod-gateway/`](cmd/cubepod-gateway/main.go) & [`pkg/gateway/`](pkg/gateway/) | Stateless Control Plane Gateway, E2B router, Auto-Resume, and Panel HTTP/WS/WebRTC Proxy | Go |
-| [`sdks/python/`](sdks/python/) | Async-first Python SDK (`cubepod`) | Python 3.11+ (`httpx`) |
-| [`deploy/`](deploy/) | Production Helm chart (`deploy/helm/cubepod`) and local `docker-compose` | Helm / Docker |
+| [`cmd/cubepod-egress/`](cmd/cubepod-egress/main.go) & [`pkg/egress/`](pkg/egress/) | Zero-Trust mTLS `cbxref_` secret vault and egress forward proxy sidecar | Go |
+| [`cmd/cubepod/`](cmd/cubepod/main.go) & [`pkg/client/`](pkg/client/) | Official Go Client SDK and `cubepod` CLI | Go |
+| [`sdks/python/`](sdks/python/) | Sync & Async Python SDK (`cubepod`) | Python 3.11+ (`httpx`) |
+| [`deploy/`](deploy/) | Production Helm chart (`deploy/helm/cubepod`), K8s manifests (`deploy/k8s`), and local `docker-compose` | Helm / K8s / Docker |
 
 ---
 
@@ -51,7 +53,39 @@ All non-trivial features, architectural changes, CRD/API modifications, storage/
 
 ---
 
-## 4. Build, Verification & Code Quality Rules
+## 4. Controller & Parallel `herdr` Worker Orchestration Workflow
+
+When operating as the **Controller Agent**, follow this strict multi-agent delegation workflow:
+
+1. **Strict Role Separation (Controller vs. `herdr` Workers)**:
+   - **Controller Agent Responsibilities**: Authoring CEPs (`docs/enhancements/NNNN-*/`), decomposing milestones into parallelizable tasks with non-overlapping file ownership, creating isolated Git worktrees, dispatching `herdr` workers (`agy --model gemini-3.8-flash-medium --mode auto --dangerously-skip-permissions`), reviewing PRs (`gh pr diff` / `gh pr comment`), merging PRs (`gh pr merge --squash`), and cutting releases.
+   - **Delegate All Execution & K8s Verification Details to Workers**: Never perform low-level coding, container image builds, or interactive Kubernetes cluster (`kubectl`) debugging directly inside the Controller session. Always assign a `herdr` worker session to execute implementation details, build/push test images, deploy manifests to the Kubernetes test cluster, and run `test/k8s-e2e`.
+
+2. **Mandatory `/new` Context Reset When Reusing Worker Sessions (Token Efficiency)**:
+   - Whenever reusing an existing `herdr` worker pane for a new task or CEP that is unrelated to its previous conversation turn, **you MUST first reset its session with `/new`** before sending the new prompt. Failing to run `/new` carries over the entire prior conversation context and wastes massive amounts of tokens:
+     ```bash
+     # 1. Reset worker conversation history before a new unrelated task
+     herdr agent send <worker-name> "/new" --submit
+     sleep 2
+
+     # 2. Dispatch the new self-contained task prompt
+     herdr agent prompt <worker-name> "<task-prompt>"
+     ```
+
+3. **Isolated Git Worktrees & Non-Overlapping File Ownership**:
+   - Always create a dedicated Git worktree per parallel worker (`/tmp/cubepod-wt-cep<N>` on branch `feat/cep-<NNNN>-<slug>`) so concurrent workers never contend on `.git/index.lock` or overwrite each other's working tree:
+     ```bash
+     git worktree add -b feat/cep-0011-example /tmp/cubepod-wt-cep11 main
+     ```
+   - Partition file paths across concurrent workers so each worker owns distinct packages/directories.
+
+4. **Pull Request Review & Merge Gate**:
+   - Each worker must format, lint, test, commit, push its branch, and open a GitHub Pull Request (`gh pr create`) from its worktree.
+   - The Controller Agent inspects `gh pr diff <id>`, verifies or delegates fixups if needed, leaves a structured review comment (`gh pr comment <id>`), merges into `main` (`gh pr merge <id> --squash`), and prunes completed worktrees (`git worktree remove --force ... && git worktree prune`).
+
+---
+
+## 5. Build, Verification & Code Quality Rules
 
 Always verify both Rust and Go toolchains before claiming a task is complete:
 
@@ -62,11 +96,14 @@ make fmt
 # Run Rust clippy and Go vet
 make vet
 
-# Build all binaries (bin/podd-init, bin/podd, bin/cubepod-controller, bin/cubepod-gateway)
+# Build all binaries (bin/podd-init, bin/podd, bin/cubepod-controller, bin/cubepod-gateway, bin/cubepod-egress, bin/cubepod)
 make build
 
 # Run all Rust and Go unit/integration tests
 make test
+
+# Run multi-process E2E suite
+make test-e2e
 ```
 
 - **Conventional Commits**: Use `type(scope): imperative summary` (e.g., `feat(podd-init): ...`, `docs(cep): ...`).
