@@ -77,6 +77,7 @@ type Server struct {
 	panelSecret      []byte
 	vault            *egress.Vault
 	ca               *egress.CA
+	livePodRouting   bool
 }
 
 // NewServer constructs a new Gateway Server.
@@ -92,6 +93,20 @@ func NewServer(reconciler *controller.Reconciler) *Server {
 		vault:            v,
 		ca:               ca,
 	}
+}
+
+// SetLivePodRouting enables or disables automatic routing to the live Kubernetes PodIP.
+func (s *Server) SetLivePodRouting(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.livePodRouting = enabled
+}
+
+// LivePodRouting returns whether live pod routing is enabled.
+func (s *Server) LivePodRouting() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.livePodRouting
 }
 
 // SetWorkspaceBaseDir overrides the base directory for local sandbox workspaces.
@@ -145,10 +160,20 @@ func (s *Server) Handler() http.Handler {
 	// Data-Plane Execution & File routes
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/commands/run", s.handleRunCommand)
 	mux.HandleFunc("GET /sandboxes/{sandboxID}/commands/{cmdID}/logs", s.handleGetCommandLogs)
+	mux.HandleFunc("GET /sandboxes/{sandboxID}/commands/{cmdID}/status", s.handleGetCommandStatus)
+	mux.HandleFunc("GET /sandboxes/{sandboxID}/commands/{cmdID}/stream", s.handleStreamCommandLogs)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/commands/{cmdID}/kill", s.handleKillCommand)
 	mux.HandleFunc("PUT /sandboxes/{sandboxID}/files", s.handlePutFile)
 	mux.HandleFunc("GET /sandboxes/{sandboxID}/files", s.handleGetFile)
+	mux.HandleFunc("DELETE /sandboxes/{sandboxID}/files", s.handleDeleteFile)
+	mux.HandleFunc("GET /sandboxes/{sandboxID}/files/list", s.handleListFiles)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/files/archive-sync", s.handleArchiveSync)
+
+	// WarmPool & Template routes
+	mux.HandleFunc("POST /warmpools", s.handleCreateWarmPool)
+	mux.HandleFunc("GET /warmpools", s.handleListWarmPools)
+	mux.HandleFunc("GET /templates", s.handleListTemplates)
+	mux.HandleFunc("GET /openapi.yaml", s.handleGetOpenAPI)
 
 	// Panel Token Mint & Reverse Proxy routes
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/endpoints/{port}", s.handleMintEndpointToken)
@@ -293,6 +318,11 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		LastActivityAt:   &now,
 		TimeoutSeconds:   timeoutSecs,
 		WorkspaceDir:     workspaceDir,
+	}
+
+	if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
+		rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
+		_ = pollPoddHealth(r.Context(), rec.PoddURL, 15*time.Second)
 	}
 
 	s.mu.Lock()
@@ -592,6 +622,15 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 		}
 		rec.State = string(status.Phase)
 		rec.AutoResumeCount++
+		if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
+			rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
+			_ = pollPoddHealth(ctx, rec.PoddURL, 15*time.Second)
+		}
+	} else if s.livePodRouting && rec.PoddURL == "" {
+		if boxStatus, ok := s.reconciler.GetBox(rec.SandboxID); ok && boxStatus.PodIP != "" && boxStatus.PodIP != "10.244.0.42" {
+			rec.PoddURL = fmt.Sprintf("http://%s:%d", boxStatus.PodIP, rec.EnvdPort)
+			_ = pollPoddHealth(ctx, rec.PoddURL, 15*time.Second)
+		}
 	}
 	return nil
 }
@@ -1201,4 +1240,503 @@ func (s *Server) handleArchiveSync(w http.ResponseWriter, r *http.Request) {
 		"status":    "ok",
 		"extracted": extractedCount,
 	})
+}
+
+func pollPoddHealth(ctx context.Context, poddURL string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 1 * time.Second}
+	healthURL := strings.TrimSuffix(poddURL, "/") + "/health"
+	for {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("health check timed out for %s", poddURL)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+		if err == nil {
+			resp, err := client.Do(req)
+			if err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					return nil
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("sandboxID")
+	s.mu.RLock()
+	rec, ok := s.sandboxes[id]
+	s.mu.RUnlock()
+	if !ok {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+
+	if err := s.ensureRunning(r.Context(), rec); err != nil {
+		http.Error(w, "failed to resume sandbox: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.mu.RLock()
+	poddURL := rec.PoddURL
+	s.mu.RUnlock()
+
+	// Forward to live podd daemon if registered
+	if poddURL != "" {
+		target := strings.TrimSuffix(poddURL, "/") + "/v1/files"
+		s.forwardToPodd(w, r, target)
+		return
+	}
+
+	// Local fallback
+	targetPath := r.URL.Query().Get("path")
+	if targetPath == "" {
+		http.Error(w, "path parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	fullPath, err := s.resolveFilePath(rec, targetPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		http.Error(w, "file not found", http.StatusNotFound)
+		return
+	}
+
+	if err := os.RemoveAll(fullPath); err != nil {
+		http.Error(w, "failed to delete file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "ok",
+		"deleted": targetPath,
+	})
+}
+
+type fileEntryInfo struct {
+	Name  string `json:"name"`
+	Path  string `json:"path"`
+	IsDir bool   `json:"is_dir"`
+	Size  int64  `json:"size"`
+	Mode  string `json:"mode"`
+}
+
+func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("sandboxID")
+	s.mu.RLock()
+	rec, ok := s.sandboxes[id]
+	s.mu.RUnlock()
+	if !ok {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+
+	if err := s.ensureRunning(r.Context(), rec); err != nil {
+		http.Error(w, "failed to resume sandbox: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.mu.RLock()
+	poddURL := rec.PoddURL
+	s.mu.RUnlock()
+
+	// Forward to live podd daemon if registered
+	if poddURL != "" {
+		target := strings.TrimSuffix(poddURL, "/") + "/v1/files/list"
+		s.forwardToPodd(w, r, target)
+		return
+	}
+
+	// Local fallback
+	targetPath := r.URL.Query().Get("path")
+	if targetPath == "" {
+		targetPath = "/workspace"
+	}
+
+	fullPath, err := s.resolveFilePath(rec, targetPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	fi, err := os.Stat(fullPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			http.Error(w, "directory not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if !fi.IsDir() {
+		http.Error(w, "path is not a directory", http.StatusBadRequest)
+		return
+	}
+
+	entries, err := os.ReadDir(fullPath)
+	if err != nil {
+		http.Error(w, "failed to read directory: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	result := make([]fileEntryInfo, 0, len(entries))
+	for _, entry := range entries {
+		info, _ := entry.Info()
+		var size int64
+		var mode string
+		if info != nil {
+			size = info.Size()
+			mode = info.Mode().String()
+		}
+		entryPath := path.Join(targetPath, entry.Name())
+		result = append(result, fileEntryInfo{
+			Name:  entry.Name(),
+			Path:  entryPath,
+			IsDir: entry.IsDir(),
+			Size:  size,
+			Mode:  mode,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"path":    targetPath,
+		"entries": result,
+	})
+}
+
+func (s *Server) handleGetCommandStatus(w http.ResponseWriter, r *http.Request) {
+	sandboxID := r.PathValue("sandboxID")
+	cmdID := r.PathValue("cmdID")
+
+	s.mu.RLock()
+	rec, ok := s.sandboxes[sandboxID]
+	s.mu.RUnlock()
+	if !ok {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+
+	if err := s.ensureRunning(r.Context(), rec); err != nil {
+		http.Error(w, "failed to resume sandbox: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.mu.RLock()
+	poddURL := rec.PoddURL
+	s.mu.RUnlock()
+
+	// Forward to live podd daemon if registered
+	if poddURL != "" {
+		target := fmt.Sprintf("%s/v1/commands/%s/status", strings.TrimSuffix(poddURL, "/"), cmdID)
+		s.forwardToPodd(w, r, target)
+		return
+	}
+
+	// Local fallback
+	s.mu.RLock()
+	entry, ok := s.commands[cmdID]
+	s.mu.RUnlock()
+	if !ok {
+		http.Error(w, "command not found", http.StatusNotFound)
+		return
+	}
+
+	entry.mu.RLock()
+	running := entry.running
+	exitCode := entry.exitCode
+	cursor := entry.buf.Len()
+	pid := entry.pid
+	entry.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":        cmdID,
+		"cmdID":     cmdID,
+		"pid":       pid,
+		"running":   running,
+		"exit_code": exitCode,
+		"exitCode":  exitCode,
+		"cursor":    cursor,
+	})
+}
+
+func (s *Server) handleStreamCommandLogs(w http.ResponseWriter, r *http.Request) {
+	sandboxID := r.PathValue("sandboxID")
+	cmdID := r.PathValue("cmdID")
+
+	s.mu.RLock()
+	rec, ok := s.sandboxes[sandboxID]
+	s.mu.RUnlock()
+	if !ok {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+
+	if err := s.ensureRunning(r.Context(), rec); err != nil {
+		http.Error(w, "failed to resume sandbox: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	s.mu.RLock()
+	poddURL := rec.PoddURL
+	s.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	cursor := 0
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		default:
+		}
+
+		var content string
+		var nextCursor int
+		var running bool
+		var exitCode int
+
+		if poddURL != "" {
+			reqURL := fmt.Sprintf("%s/v1/commands/%s/logs?cursor=%d", strings.TrimSuffix(poddURL, "/"), cmdID, cursor)
+			req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, reqURL, nil)
+			if err != nil {
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			var logResp struct {
+				ID       string `json:"id"`
+				Content  string `json:"content"`
+				Cursor   int    `json:"cursor"`
+				Running  bool   `json:"running"`
+				ExitCode *int   `json:"exit_code"`
+			}
+			_ = json.NewDecoder(resp.Body).Decode(&logResp)
+			_ = resp.Body.Close()
+
+			content = logResp.Content
+			nextCursor = logResp.Cursor
+			running = logResp.Running
+			if logResp.ExitCode != nil {
+				exitCode = *logResp.ExitCode
+			}
+		} else {
+			s.mu.RLock()
+			entry, ok := s.commands[cmdID]
+			s.mu.RUnlock()
+			if !ok {
+				return
+			}
+
+			entry.mu.RLock()
+			all := entry.buf.Bytes()
+			running = entry.running
+			exitCode = entry.exitCode
+			nextCursor = len(all)
+			if cursor < len(all) {
+				content = string(all[cursor:])
+			}
+			entry.mu.RUnlock()
+		}
+
+		cursor = nextCursor
+
+		frameData, _ := json.Marshal(map[string]interface{}{
+			"id":        cmdID,
+			"cmdID":     cmdID,
+			"content":   content,
+			"cursor":    cursor,
+			"running":   running,
+			"exit_code": exitCode,
+			"exitCode":  exitCode,
+		})
+
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", frameData)
+		flusher.Flush()
+
+		if !running {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+type createWarmPoolReq struct {
+	Name        string `json:"name"`
+	PoolName    string `json:"poolName"`
+	TemplateRef string `json:"templateRef"`
+	TemplateID  string `json:"templateID"`
+	Replicas    int32  `json:"replicas"`
+}
+
+func (s *Server) handleCreateWarmPool(w http.ResponseWriter, r *http.Request) {
+	var req createWarmPoolReq
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	name := req.Name
+	if name == "" {
+		name = req.PoolName
+	}
+	if name == "" {
+		name = "default-pool"
+	}
+	tpl := req.TemplateRef
+	if tpl == "" {
+		tpl = req.TemplateID
+	}
+	if tpl == "" {
+		tpl = "cubeplex-ubuntu24-desktop"
+	}
+	replicas := req.Replicas
+	if replicas <= 0 {
+		replicas = 2
+	}
+
+	spec := v1alpha1.PodWarmPoolSpec{
+		TemplateRef: tpl,
+		Replicas:    replicas,
+	}
+
+	status, err := s.reconciler.ReconcileWarmPool(r.Context(), name, spec)
+	if err != nil {
+		http.Error(w, "failed to reconcile warm pool: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"name":              name,
+		"poolName":          name,
+		"templateRef":       tpl,
+		"replicas":          replicas,
+		"readyReplicas":     status.ReadyReplicas,
+		"availableReplicas": status.AvailableReplicas,
+	})
+}
+
+func (s *Server) handleListWarmPools(w http.ResponseWriter, _ *http.Request) {
+	specs := s.reconciler.GetWarmPoolSpecs()
+	readyCount := s.reconciler.WarmPoolReadyCount()
+
+	type poolInfo struct {
+		Name              string `json:"name"`
+		PoolName          string `json:"poolName"`
+		TemplateRef       string `json:"templateRef"`
+		Replicas          int32  `json:"replicas"`
+		ReadyReplicas     int32  `json:"readyReplicas"`
+		AvailableReplicas int32  `json:"availableReplicas"`
+	}
+
+	pools := make([]poolInfo, 0, len(specs))
+	for name, spec := range specs {
+		st, _ := s.reconciler.GetWarmPoolStatus(name)
+		var ready, avail int32
+		if st != nil {
+			ready = st.ReadyReplicas
+			avail = st.AvailableReplicas
+		}
+		pools = append(pools, poolInfo{
+			Name:              name,
+			PoolName:          name,
+			TemplateRef:       spec.TemplateRef,
+			Replicas:          spec.Replicas,
+			ReadyReplicas:     ready,
+			AvailableReplicas: avail,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"warmPools":          pools,
+		"warmPoolReadyCount": readyCount,
+		"totalReady":         readyCount,
+	})
+}
+
+func (s *Server) handleListTemplates(w http.ResponseWriter, _ *http.Request) {
+	type templateInfo struct {
+		ID          string `json:"id"`
+		Name        string `json:"name"`
+		Image       string `json:"image"`
+		Description string `json:"description"`
+	}
+
+	templates := []templateInfo{
+		{
+			ID:          "cubeplex-ubuntu24-desktop",
+			Name:        "CubePlex Ubuntu 24.04 Desktop",
+			Image:       "cubeplex-ubuntu24-desktop:latest",
+			Description: "Full desktop environment with XFCE, browser, WebRTC panel, and dev tools",
+		},
+		{
+			ID:          "ubuntu:24.04",
+			Name:        "Ubuntu 24.04 Standard",
+			Image:       "ubuntu:24.04",
+			Description: "Standard headless Linux agent sandbox",
+		},
+		{
+			ID:          "debian:12",
+			Name:        "Debian 12 Bookworm",
+			Image:       "debian:12",
+			Description: "Minimal Debian 12 sandbox",
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"templates": templates,
+	})
+}
+
+func (s *Server) handleGetOpenAPI(w http.ResponseWriter, _ *http.Request) {
+	candidates := []string{
+		"api/openapi/cubepod-v1.yaml",
+		"../../api/openapi/cubepod-v1.yaml",
+		"/tmp/cubepod-wt-cep12/api/openapi/cubepod-v1.yaml",
+	}
+	var data []byte
+	var err error
+	for _, cand := range candidates {
+		data, err = os.ReadFile(cand)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		http.Error(w, "openapi specification not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }

@@ -76,6 +76,11 @@ func (s *Server) GetRegisteredPort(sandboxID string, port int) string {
 	return ""
 }
 
+// handleCreateEndpoint is an alias for handleMintEndpointToken.
+func (s *Server) handleCreateEndpoint(w http.ResponseWriter, r *http.Request) {
+	s.handleMintEndpointToken(w, r)
+}
+
 // handleMintEndpointToken mints an HMAC-SHA256 signed panel token for (sandboxID, port).
 // POST /sandboxes/{sandboxID}/endpoints/{port}
 func (s *Server) handleMintEndpointToken(w http.ResponseWriter, r *http.Request) {
@@ -88,7 +93,7 @@ func (s *Server) handleMintEndpointToken(w http.ResponseWriter, r *http.Request)
 	}
 
 	s.mu.RLock()
-	_, ok := s.sandboxes[sandboxID]
+	rec, ok := s.sandboxes[sandboxID]
 	s.mu.RUnlock()
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
@@ -102,6 +107,13 @@ func (s *Server) handleMintEndpointToken(w http.ResponseWriter, r *http.Request)
 	targetURL := req.TargetURL
 	if targetURL == "" {
 		targetURL = req.UpstreamURL
+	}
+	if targetURL == "" && rec != nil && rec.PoddURL != "" {
+		if boxStatus, ok := s.reconciler.GetBox(sandboxID); ok && boxStatus.PodIP != "" {
+			targetURL = fmt.Sprintf("http://%s:%d", boxStatus.PodIP, port)
+		} else if u, err := url.Parse(rec.PoddURL); err == nil && u.Hostname() != "" {
+			targetURL = fmt.Sprintf("http://%s:%d", u.Hostname(), port)
+		}
 	}
 	if targetURL != "" {
 		s.RegisterPort(sandboxID, port, targetURL)

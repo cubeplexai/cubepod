@@ -735,3 +735,366 @@ func TestGatewayEgressExchangeEndpoint(t *testing.T) {
 		t.Fatalf("expected 403 Forbidden for unallowed host, got %d", badHostResp.StatusCode)
 	}
 }
+
+func TestFileDeleteAndList(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Create Sandbox
+	createBody := []byte(`{"templateID":"cubeplex-ubuntu24-desktop"}`)
+	resp, err := http.Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader(createBody))
+	if err != nil {
+		t.Fatalf("create sandbox failed: %v", err)
+	}
+	defer resp.Body.Close()
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(resp.Body).Decode(&rec)
+
+	// 2. PUT two files
+	putReq1, _ := http.NewRequest(http.MethodPut, ts.URL+"/sandboxes/"+rec.SandboxID+"/files?path=file1.txt", strings.NewReader("hello file 1"))
+	putResp1, err := http.DefaultClient.Do(putReq1)
+	if err != nil || putResp1.StatusCode != http.StatusOK {
+		t.Fatalf("put file 1 failed: status=%d err=%v", putResp1.StatusCode, err)
+	}
+	putResp1.Body.Close()
+
+	putReq2, _ := http.NewRequest(http.MethodPut, ts.URL+"/sandboxes/"+rec.SandboxID+"/files?path=subdir/file2.txt", strings.NewReader("hello file 2 in sub"))
+	putResp2, err := http.DefaultClient.Do(putReq2)
+	if err != nil || putResp2.StatusCode != http.StatusOK {
+		t.Fatalf("put file 2 failed: status=%d err=%v", putResp2.StatusCode, err)
+	}
+	putResp2.Body.Close()
+
+	// 3. GET files/list on /workspace
+	listResp, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/files/list?path=/workspace")
+	if err != nil || listResp.StatusCode != http.StatusOK {
+		t.Fatalf("list files failed: status=%d err=%v", listResp.StatusCode, err)
+	}
+	defer listResp.Body.Close()
+
+	var listData struct {
+		Path    string `json:"path"`
+		Entries []struct {
+			Name  string `json:"name"`
+			Path  string `json:"path"`
+			IsDir bool   `json:"is_dir"`
+			Size  int64  `json:"size"`
+			Mode  string `json:"mode"`
+		} `json:"entries"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&listData); err != nil {
+		t.Fatalf("decode list response failed: %v", err)
+	}
+	if len(listData.Entries) < 2 {
+		t.Fatalf("expected at least 2 entries, got %d", len(listData.Entries))
+	}
+
+	foundFile1 := false
+	foundSubdir := false
+	for _, entry := range listData.Entries {
+		if entry.Name == "file1.txt" {
+			foundFile1 = true
+			if entry.IsDir || entry.Size != int64(len("hello file 1")) {
+				t.Errorf("unexpected file1 info: %+v", entry)
+			}
+		}
+		if entry.Name == "subdir" {
+			foundSubdir = true
+			if !entry.IsDir {
+				t.Errorf("expected subdir to be a directory: %+v", entry)
+			}
+		}
+	}
+	if !foundFile1 || !foundSubdir {
+		t.Fatalf("expected file1.txt and subdir in list, got %+v", listData.Entries)
+	}
+
+	// 4. DELETE /sandboxes/{id}/files?path=file1.txt
+	delReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+rec.SandboxID+"/files?path=file1.txt", nil)
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil || delResp.StatusCode != http.StatusOK {
+		t.Fatalf("delete file failed: status=%d err=%v", delResp.StatusCode, err)
+	}
+	defer delResp.Body.Close()
+	var delData map[string]interface{}
+	_ = json.NewDecoder(delResp.Body).Decode(&delData)
+	if delData["deleted"] != "file1.txt" {
+		t.Fatalf("expected deleted file1.txt, got %+v", delData)
+	}
+
+	// 5. GET deleted file -> 404
+	getResp, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/files?path=file1.txt")
+	if err != nil || getResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for deleted file, got %d", getResp.StatusCode)
+	}
+	getResp.Body.Close()
+
+	// 6. DELETE non-existent file -> 404
+	delNotFoundReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+rec.SandboxID+"/files?path=file1.txt", nil)
+	delNotFoundResp, err := http.DefaultClient.Do(delNotFoundReq)
+	if err != nil || delNotFoundResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 on deleting non-existent file, got %d", delNotFoundResp.StatusCode)
+	}
+	delNotFoundResp.Body.Close()
+
+	// 7. GET list on non-existent directory -> 404
+	badListResp, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/files/list?path=/workspace/nonexistent")
+	if err != nil || badListResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for non-existent dir, got %d", badListResp.StatusCode)
+	}
+	badListResp.Body.Close()
+}
+
+func TestCommandStatusAndSSEStream(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Create sandbox
+	createResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("create sandbox failed: %v", err)
+	}
+	defer createResp.Body.Close()
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(createResp.Body).Decode(&rec)
+
+	// 2. Start background command
+	cmdReq := `{"command":"echo step1 && sleep 0.05 && echo step2","background":true}`
+	runResp, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/commands/run", "application/json", strings.NewReader(cmdReq))
+	if err != nil || runResp.StatusCode != http.StatusOK {
+		t.Fatalf("run command failed: status=%d err=%v", runResp.StatusCode, err)
+	}
+	defer runResp.Body.Close()
+
+	var runData struct {
+		CmdID   string `json:"cmdID"`
+		Running bool   `json:"running"`
+		PID     int    `json:"pid"`
+	}
+	_ = json.NewDecoder(runResp.Body).Decode(&runData)
+	if runData.CmdID == "" {
+		t.Fatalf("expected cmdID from run command, got %+v", runData)
+	}
+
+	// 3. GET /commands/{id}/status
+	statusResp, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/commands/" + runData.CmdID + "/status")
+	if err != nil || statusResp.StatusCode != http.StatusOK {
+		t.Fatalf("get status failed: status=%d err=%v", statusResp.StatusCode, err)
+	}
+	defer statusResp.Body.Close()
+
+	var stData struct {
+		ID       string `json:"id"`
+		CmdID    string `json:"cmdID"`
+		PID      int    `json:"pid"`
+		Running  bool   `json:"running"`
+		ExitCode int    `json:"exit_code"`
+		Cursor   int    `json:"cursor"`
+	}
+	_ = json.NewDecoder(statusResp.Body).Decode(&stData)
+	if stData.CmdID != runData.CmdID || stData.PID <= 0 {
+		t.Fatalf("unexpected status data: %+v", stData)
+	}
+
+	// 4. GET /commands/{id}/stream (SSE)
+	streamResp, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/commands/" + runData.CmdID + "/stream")
+	if err != nil || streamResp.StatusCode != http.StatusOK {
+		t.Fatalf("stream logs failed: status=%d err=%v", streamResp.StatusCode, err)
+	}
+	defer streamResp.Body.Close()
+
+	contentType := streamResp.Header.Get("Content-Type")
+	if !strings.HasPrefix(contentType, "text/event-stream") {
+		t.Fatalf("expected text/event-stream content-type, got %s", contentType)
+	}
+
+	var frames []string
+	buf := make([]byte, 4096)
+	var finalRunning bool
+	timeout := time.After(5 * time.Second)
+
+loop:
+	for {
+		select {
+		case <-timeout:
+			t.Fatalf("stream timed out without completing")
+		default:
+		}
+
+		n, err := streamResp.Body.Read(buf)
+		if n > 0 {
+			chunk := string(buf[:n])
+			lines := strings.Split(chunk, "\n")
+			for _, line := range lines {
+				if strings.HasPrefix(line, "data: ") {
+					jsonPart := strings.TrimPrefix(line, "data: ")
+					frames = append(frames, jsonPart)
+					var frameMap map[string]interface{}
+					if err := json.Unmarshal([]byte(jsonPart), &frameMap); err == nil {
+						if running, ok := frameMap["running"].(bool); ok && !running {
+							finalRunning = false
+							break loop
+						}
+					}
+				}
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read stream error: %v", err)
+		}
+	}
+
+	if len(frames) == 0 {
+		t.Fatalf("expected at least 1 SSE frame")
+	}
+	if finalRunning {
+		t.Errorf("expected final command state to not be running")
+	}
+
+	// 5. GET non-existent command status -> 404
+	nfStatus, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/commands/nonexistent/status")
+	if err != nil || nfStatus.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for non-existent command status, got %d", nfStatus.StatusCode)
+	}
+	nfStatus.Body.Close()
+}
+
+func TestWarmPoolRoutes(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. POST /warmpools
+	poolReq := `{"name":"pool-cep12","templateRef":"cubeplex-ubuntu24-desktop","replicas":2}`
+	postResp, err := http.Post(ts.URL+"/warmpools", "application/json", strings.NewReader(poolReq))
+	if err != nil || postResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create warm pool failed: status=%d err=%v", postResp.StatusCode, err)
+	}
+	defer postResp.Body.Close()
+
+	var createdPool struct {
+		Name          string `json:"name"`
+		TemplateRef   string `json:"templateRef"`
+		Replicas      int32  `json:"replicas"`
+		ReadyReplicas int32  `json:"readyReplicas"`
+	}
+	_ = json.NewDecoder(postResp.Body).Decode(&createdPool)
+	if createdPool.Name != "pool-cep12" || createdPool.ReadyReplicas != 2 {
+		t.Fatalf("unexpected created pool: %+v", createdPool)
+	}
+
+	// 2. GET /warmpools
+	getResp, err := http.Get(ts.URL + "/warmpools")
+	if err != nil || getResp.StatusCode != http.StatusOK {
+		t.Fatalf("list warm pools failed: status=%d err=%v", getResp.StatusCode, err)
+	}
+	defer getResp.Body.Close()
+
+	var listData struct {
+		WarmPools []struct {
+			Name          string `json:"name"`
+			TemplateRef   string `json:"templateRef"`
+			Replicas      int32  `json:"replicas"`
+			ReadyReplicas int32  `json:"readyReplicas"`
+		} `json:"warmPools"`
+		WarmPoolReadyCount int `json:"warmPoolReadyCount"`
+	}
+	_ = json.NewDecoder(getResp.Body).Decode(&listData)
+	if len(listData.WarmPools) == 0 || listData.WarmPoolReadyCount < 2 {
+		t.Fatalf("unexpected warm pools list: %+v", listData)
+	}
+	found := false
+	for _, p := range listData.WarmPools {
+		if p.Name == "pool-cep12" && p.ReadyReplicas == 2 {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("pool-cep12 not found in list: %+v", listData.WarmPools)
+	}
+}
+
+func TestTemplateRoutesAndOpenAPI(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. GET /templates
+	tplResp, err := http.Get(ts.URL + "/templates")
+	if err != nil || tplResp.StatusCode != http.StatusOK {
+		t.Fatalf("get templates failed: status=%d err=%v", tplResp.StatusCode, err)
+	}
+	defer tplResp.Body.Close()
+
+	var tplData struct {
+		Templates []struct {
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Image       string `json:"image"`
+			Description string `json:"description"`
+		} `json:"templates"`
+	}
+	_ = json.NewDecoder(tplResp.Body).Decode(&tplData)
+	if len(tplData.Templates) == 0 {
+		t.Fatalf("expected non-empty templates list")
+	}
+
+	// 2. GET /openapi.yaml
+	apiResp, err := http.Get(ts.URL + "/openapi.yaml")
+	if err != nil || apiResp.StatusCode != http.StatusOK {
+		t.Fatalf("get openapi.yaml failed: status=%d err=%v", apiResp.StatusCode, err)
+	}
+	defer apiResp.Body.Close()
+	data, _ := io.ReadAll(apiResp.Body)
+	if !strings.Contains(string(data), "openapi: 3.1.0") || !strings.Contains(string(data), "/warmpools") {
+		t.Fatalf("expected openapi spec containing openapi: 3.1.0 and /warmpools")
+	}
+}
+
+func TestLivePodRoutingAndEndpointDefault(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	srv.SetLivePodRouting(true)
+	if !srv.LivePodRouting() {
+		t.Fatalf("expected livePodRouting to be true")
+	}
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Create a sandbox
+	createResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("create sandbox failed: %v", err)
+	}
+	defer createResp.Body.Close()
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(createResp.Body).Decode(&rec)
+
+	// Set a custom podd URL
+	mockPoddURL := "http://10.244.5.10:49983"
+	srv.SetPoddURL(rec.SandboxID, mockPoddURL)
+
+	// Mint endpoint with no targetURL override: should default targetURL to host of podd
+	mintReq := `{"expiresInSeconds":3600}`
+	mintResp, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/endpoints/8080", "application/json", strings.NewReader(mintReq))
+	if err != nil || mintResp.StatusCode != http.StatusOK {
+		t.Fatalf("mint endpoint failed: status=%d err=%v", mintResp.StatusCode, err)
+	}
+	defer mintResp.Body.Close()
+
+	registered := srv.GetRegisteredPort(rec.SandboxID, 8080)
+	if !strings.Contains(registered, ":8080") {
+		t.Fatalf("expected registered target URL for port 8080, got %q", registered)
+	}
+}
