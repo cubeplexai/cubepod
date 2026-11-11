@@ -81,6 +81,11 @@ type coreV1LocalObjectReference struct {
 	Name string `json:"name"`
 }
 
+// coreV1SecurityContext holds container-level security attributes.
+type coreV1SecurityContext struct {
+	Privileged *bool `json:"privileged,omitempty"`
+}
+
 // coreV1Container represents a single container that is expected to be run on the host.
 type coreV1Container struct {
 	Name            string                      `json:"name"`
@@ -92,6 +97,7 @@ type coreV1Container struct {
 	VolumeDevices   []coreV1VolumeDevice        `json:"volumeDevices,omitempty"`
 	Resources       *coreV1ResourceRequirements `json:"resources,omitempty"`
 	Env             []coreV1EnvVar              `json:"env,omitempty"`
+	SecurityContext *coreV1SecurityContext      `json:"securityContext,omitempty"`
 }
 
 // coreV1PodSpec is a description of a pod.
@@ -193,6 +199,12 @@ func toCoreV1Container(c ContainerManifest) coreV1Container {
 			Name:  ev.Name,
 			Value: ev.Value,
 		})
+	}
+	if c.Privileged {
+		priv := true
+		res.SecurityContext = &coreV1SecurityContext{
+			Privileged: &priv,
+		}
 	}
 	return res
 }
