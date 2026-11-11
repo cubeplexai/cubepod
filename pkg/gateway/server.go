@@ -23,6 +23,7 @@ import (
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
+	"github.com/cubeplexai/cubepod/pkg/egress"
 )
 
 // SandboxRecord represents a managed sandbox exposed over the E2B-compatible API.
@@ -31,6 +32,7 @@ type SandboxRecord struct {
 	TemplateID       string            `json:"templateID"`
 	State            string            `json:"state"`
 	EnvdPort         int               `json:"envdPort"`
+	PoddURL          string            `json:"poddURL,omitempty"`
 	RootfsGeneration int64             `json:"rootfsGeneration"`
 	VolumeKey        string            `json:"volumeKey,omitempty"`
 	Metadata         map[string]string `json:"metadata,omitempty"`
@@ -73,16 +75,22 @@ type Server struct {
 	endpoints        map[string]map[int]string
 	workspaceBaseDir string
 	panelSecret      []byte
+	vault            *egress.Vault
+	ca               *egress.CA
 }
 
 // NewServer constructs a new Gateway Server.
 func NewServer(reconciler *controller.Reconciler) *Server {
+	v := egress.NewVault()
+	ca, _ := egress.NewCA()
 	return &Server{
 		reconciler:       reconciler,
 		sandboxes:        make(map[string]*SandboxRecord),
 		commands:         make(map[string]*commandEntry),
 		endpoints:        make(map[string]map[int]string),
 		workspaceBaseDir: filepath.Join(os.TempDir(), "cubepod-sandboxes"),
+		vault:            v,
+		ca:               ca,
 	}
 }
 
@@ -91,6 +99,30 @@ func (s *Server) SetWorkspaceBaseDir(dir string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.workspaceBaseDir = dir
+}
+
+// SetPoddURL registers the live podd daemon upstream URL for a sandbox.
+func (s *Server) SetPoddURL(sandboxID, poddURL string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if rec, ok := s.sandboxes[sandboxID]; ok {
+		rec.PoddURL = poddURL
+	}
+}
+
+// RegisterPoddURL is an alias for SetPoddURL.
+func (s *Server) RegisterPoddURL(sandboxID, poddURL string) {
+	s.SetPoddURL(sandboxID, poddURL)
+}
+
+// Vault returns the internal Vault instance.
+func (s *Server) Vault() *egress.Vault {
+	return s.vault
+}
+
+// CA returns the internal CA instance.
+func (s *Server) CA() *egress.CA {
+	return s.ca
 }
 
 // Handler returns the HTTP router for the CubePod Gateway.
@@ -123,6 +155,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/panel/{token}/{rest...}", s.handlePanelProxy)
 	mux.HandleFunc("/panel/{token}", s.handlePanelProxy)
 
+	// Zero-Trust Egress Exchange route
+	mux.HandleFunc("POST /internal/v1/egress/exchange", s.handleEgressExchange)
+
 	return mux
 }
 
@@ -144,12 +179,59 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+func (s *Server) handleEgressExchange(w http.ResponseWriter, r *http.Request) {
+	h := egress.VaultExchangeHandler(s.vault, s.ca)
+	h(w, r)
+}
+
+func (s *Server) forwardToPodd(w http.ResponseWriter, r *http.Request, targetURL string) {
+	if r.URL.RawQuery != "" {
+		if strings.Contains(targetURL, "?") {
+			targetURL += "&" + r.URL.RawQuery
+		} else {
+			targetURL += "?" + r.URL.RawQuery
+		}
+	}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, targetURL, r.Body)
+	if err != nil {
+		http.Error(w, "failed to create forward request: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for k, vv := range r.Header {
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "podd forwarding failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
 type createSandboxReq struct {
 	TemplateID string            `json:"templateID"`
 	Timeout    int               `json:"timeout,omitempty"`
 	Metadata   map[string]string `json:"metadata,omitempty"`
 	Extension  struct {
-		VolumeKey string `json:"volumeKey,omitempty"`
+		VolumeKey      string                      `json:"volumeKey,omitempty"`
+		NetworkPolicy  *v1alpha1.NetworkPolicySpec `json:"networkPolicy,omitempty"`
+		SecretBindings []struct {
+			EnvName        string   `json:"envName"`
+			RawSecret      string   `json:"rawSecret"`
+			AllowedHosts   []string `json:"allowedHosts"`
+			AllowedHeaders []string `json:"allowedHeaders"`
+		} `json:"secretBindings,omitempty"`
 	} `json:"extension,omitempty"`
 }
 
@@ -180,6 +262,13 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	if err := os.MkdirAll(workspaceDir, 0755); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// Register any secret bindings with Vault
+	for _, sb := range req.Extension.SecretBindings {
+		if sb.RawSecret != "" {
+			_, _ = s.vault.BindSecret(id, sb.EnvName, sb.RawSecret, sb.AllowedHosts, sb.AllowedHeaders)
+		}
 	}
 
 	now := time.Now().UTC()
@@ -249,6 +338,23 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
+	poddURL := rec.PoddURL
+	s.mu.Unlock()
+
+	// Call POST <PoddURL>/v1/lifecycle/prepare-stop before pausing if podd is running
+	if poddURL != "" {
+		stopURL := strings.TrimSuffix(poddURL, "/") + "/v1/lifecycle/prepare-stop"
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, stopURL, nil)
+		if err == nil {
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Do(req)
+			if err == nil {
+				_ = resp.Body.Close()
+			}
+		}
+	}
+
+	s.mu.Lock()
 	status, err := s.reconciler.Reconcile(r.Context(), id, v1alpha1.PodBoxSpec{
 		TemplateRef:      rec.TemplateID,
 		DesiredState:     v1alpha1.DesiredStatePaused,
@@ -449,6 +555,9 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	delete(s.endpoints, id)
 	s.mu.Unlock()
 
+	// Revoke secrets associated with this sandbox
+	s.vault.RevokeSandbox(id)
+
 	if ok && rec.WorkspaceDir != "" {
 		_ = os.RemoveAll(filepath.Dir(rec.WorkspaceDir))
 	}
@@ -531,6 +640,18 @@ func (s *Server) handleRunCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.mu.RLock()
+	poddURL := rec.PoddURL
+	s.mu.RUnlock()
+
+	// Forward to live podd daemon if registered
+	if poddURL != "" {
+		target := strings.TrimSuffix(poddURL, "/") + "/v1/commands/run"
+		s.forwardToPodd(w, r, target)
+		return
+	}
+
+	// Local fallback execution
 	var req runCommandReq
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -679,6 +800,18 @@ func (s *Server) handleGetCommandLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.RLock()
+	poddURL := rec.PoddURL
+	s.mu.RUnlock()
+
+	// Forward to live podd daemon if registered
+	if poddURL != "" {
+		target := fmt.Sprintf("%s/v1/commands/%s/logs", strings.TrimSuffix(poddURL, "/"), cmdID)
+		s.forwardToPodd(w, r, target)
+		return
+	}
+
+	// Local fallback
+	s.mu.RLock()
 	entry, ok := s.commands[cmdID]
 	s.mu.RUnlock()
 	if !ok {
@@ -738,6 +871,18 @@ func (s *Server) handleKillCommand(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.RLock()
+	poddURL := rec.PoddURL
+	s.mu.RUnlock()
+
+	// Forward to live podd daemon if registered
+	if poddURL != "" {
+		target := fmt.Sprintf("%s/v1/commands/%s/kill", strings.TrimSuffix(poddURL, "/"), cmdID)
+		s.forwardToPodd(w, r, target)
+		return
+	}
+
+	// Local fallback
+	s.mu.RLock()
 	entry, ok := s.commands[cmdID]
 	s.mu.RUnlock()
 	if !ok {
@@ -778,6 +923,18 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.mu.RLock()
+	poddURL := rec.PoddURL
+	s.mu.RUnlock()
+
+	// Forward to live podd daemon if registered
+	if poddURL != "" {
+		target := strings.TrimSuffix(poddURL, "/") + "/v1/files"
+		s.forwardToPodd(w, r, target)
+		return
+	}
+
+	// Local fallback
 	targetPath := r.URL.Query().Get("path")
 	var bodyBytes []byte
 	if r.Body != nil {
@@ -842,6 +999,18 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.mu.RLock()
+	poddURL := rec.PoddURL
+	s.mu.RUnlock()
+
+	// Forward to live podd daemon if registered
+	if poddURL != "" {
+		target := strings.TrimSuffix(poddURL, "/") + "/v1/files"
+		s.forwardToPodd(w, r, target)
+		return
+	}
+
+	// Local fallback
 	targetPath := r.URL.Query().Get("path")
 	if targetPath == "" {
 		http.Error(w, "path parameter is required", http.StatusBadRequest)
@@ -894,6 +1063,18 @@ func (s *Server) handleArchiveSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.mu.RLock()
+	poddURL := rec.PoddURL
+	s.mu.RUnlock()
+
+	// Forward to live podd daemon if registered
+	if poddURL != "" {
+		target := strings.TrimSuffix(poddURL, "/") + "/v1/files/archive-sync"
+		s.forwardToPodd(w, r, target)
+		return
+	}
+
+	// Local fallback
 	if r.Body == nil {
 		http.Error(w, "empty request body", http.StatusBadRequest)
 		return
