@@ -5,6 +5,7 @@ import "time"
 
 const (
 	GroupName    = "pod.cubeplex.ai"
+	CRDGroup     = "cubepod.io"
 	GroupVersion = "v1alpha1"
 )
 
@@ -174,4 +175,30 @@ type PodBoxStatus struct {
 	PausedAt          *time.Time  `json:"pausedAt,omitempty"`
 	Reason            string      `json:"reason,omitempty"`
 	Message           string      `json:"message,omitempty"`
+}
+
+// ObjectMeta represents Kubernetes metadata for a Custom Resource.
+type ObjectMeta struct {
+	Name            string            `json:"name"`
+	Namespace       string            `json:"namespace,omitempty"`
+	ResourceVersion string            `json:"resourceVersion,omitempty"`
+	Labels          map[string]string `json:"labels,omitempty"`
+	Annotations     map[string]string `json:"annotations,omitempty"`
+}
+
+// PodBox is the Custom Resource representing an isolated agent execution sandbox.
+type PodBox struct {
+	APIVersion string       `json:"apiVersion,omitempty"`
+	Kind       string       `json:"kind,omitempty"`
+	Metadata   ObjectMeta   `json:"metadata"`
+	Spec       PodBoxSpec   `json:"spec"`
+	Status     PodBoxStatus `json:"status,omitempty"`
+}
+
+// PodBoxList is a list of PodBox Custom Resources.
+type PodBoxList struct {
+	APIVersion string     `json:"apiVersion,omitempty"`
+	Kind       string     `json:"kind,omitempty"`
+	Metadata   ObjectMeta `json:"metadata,omitempty"`
+	Items      []PodBox   `json:"items"`
 }

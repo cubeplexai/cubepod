@@ -1,0 +1,189 @@
+package controller
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+
+	"github.com/cubeplexai/cubepod/api/v1alpha1"
+)
+
+// UpsertPodBox creates or updates a PodBox Custom Resource in the Kubernetes APIServer.
+// It issues a POST to /apis/cubepod.io/v1alpha1/namespaces/{ns}/podboxes.
+// If the APIServer returns 409 Conflict (AlreadyExists), it retrieves the existing object's
+// metadata.resourceVersion, then issues a PUT to /apis/cubepod.io/v1alpha1/namespaces/{ns}/podboxes/{name}
+// and a PUT to .../status.
+// If the APIServer returns 404 NotFound because the CRD is not installed, it gracefully logs and returns nil.
+func (c *RESTKubeClient) UpsertPodBox(ctx context.Context, box v1alpha1.PodBox) error {
+	ns := c.resolveNamespace(box.Metadata.Namespace)
+	box.Metadata.Namespace = ns
+	name := box.Metadata.Name
+	if name == "" {
+		return fmt.Errorf("PodBox metadata.name is required")
+	}
+	if box.APIVersion == "" {
+		box.APIVersion = "cubepod.io/v1alpha1"
+	}
+	if box.Kind == "" {
+		box.Kind = "PodBox"
+	}
+
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podboxes", c.baseURL, ns)
+	payload, err := json.Marshal(box)
+	if err != nil {
+		return fmt.Errorf("failed to marshal PodBox JSON: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("UpsertPodBox POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		slog.Debug("CRD cubepod.io/v1alpha1 not installed on APIServer; skipping PodBox persistence",
+			"namespace", ns, "name", name)
+		return nil
+	}
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+
+	if resp.StatusCode == http.StatusConflict {
+		// 409 Conflict: GET existing metadata.resourceVersion, then PUT object and PUT .../status
+		existing, err := c.GetPodBox(ctx, ns, name)
+		if err != nil {
+			return fmt.Errorf("failed to get existing PodBox on conflict: %w", err)
+		}
+
+		box.Metadata.ResourceVersion = existing.Metadata.ResourceVersion
+
+		putURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podboxes/%s", c.baseURL, ns, name)
+		putPayload, err := json.Marshal(box)
+		if err != nil {
+			return fmt.Errorf("failed to marshal PodBox JSON for update: %w", err)
+		}
+
+		putResp, err := c.doRequest(ctx, http.MethodPut, putURL, bytes.NewReader(putPayload))
+		if err != nil {
+			return fmt.Errorf("UpsertPodBox PUT failed: %w", err)
+		}
+		defer putResp.Body.Close()
+
+		if putResp.StatusCode != http.StatusOK && putResp.StatusCode != http.StatusCreated {
+			putBody, _ := io.ReadAll(putResp.Body)
+			return fmt.Errorf("UpsertPodBox PUT failed: status %d (%s)", putResp.StatusCode, string(putBody))
+		}
+
+		// Read updated resourceVersion from PUT response if present
+		var updatedBox v1alpha1.PodBox
+		if err := json.NewDecoder(putResp.Body).Decode(&updatedBox); err == nil && updatedBox.Metadata.ResourceVersion != "" {
+			box.Metadata.ResourceVersion = updatedBox.Metadata.ResourceVersion
+		}
+
+		// PUT to .../status
+		statusURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podboxes/%s/status", c.baseURL, ns, name)
+		statusPayload, err := json.Marshal(box)
+		if err != nil {
+			return fmt.Errorf("failed to marshal PodBox JSON for status update: %w", err)
+		}
+
+		statusResp, err := c.doRequest(ctx, http.MethodPut, statusURL, bytes.NewReader(statusPayload))
+		if err != nil {
+			return fmt.Errorf("UpsertPodBox PUT status failed: %w", err)
+		}
+		defer statusResp.Body.Close()
+
+		if statusResp.StatusCode != http.StatusOK && statusResp.StatusCode != http.StatusCreated && statusResp.StatusCode != http.StatusNotFound {
+			statusBody, _ := io.ReadAll(statusResp.Body)
+			return fmt.Errorf("UpsertPodBox PUT status failed: status %d (%s)", statusResp.StatusCode, string(statusBody))
+		}
+
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("UpsertPodBox failed: status %d (%s)", resp.StatusCode, string(body))
+}
+
+// GetPodBox retrieves a PodBox Custom Resource by namespace and name.
+func (c *RESTKubeClient) GetPodBox(ctx context.Context, namespace, name string) (*v1alpha1.PodBox, error) {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podboxes/%s", c.baseURL, ns, name)
+
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GetPodBox request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("podbox %s/%s not found", ns, name)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GetPodBox failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	var box v1alpha1.PodBox
+	if err := json.NewDecoder(resp.Body).Decode(&box); err != nil {
+		return nil, fmt.Errorf("failed to decode PodBox: %w", err)
+	}
+	return &box, nil
+}
+
+// ListPodBoxes lists all PodBox Custom Resources in the given namespace.
+func (c *RESTKubeClient) ListPodBoxes(ctx context.Context, namespace string) ([]v1alpha1.PodBox, error) {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podboxes", c.baseURL, ns)
+
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ListPodBoxes request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return []v1alpha1.PodBox{}, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("ListPodBoxes failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	var list v1alpha1.PodBoxList
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("failed to decode PodBoxList: %w", err)
+	}
+	if list.Items == nil {
+		return []v1alpha1.PodBox{}, nil
+	}
+	return list.Items, nil
+}
+
+// DeletePodBox deletes a PodBox Custom Resource by namespace and name, ignoring 404 NotFound.
+func (c *RESTKubeClient) DeletePodBox(ctx context.Context, namespace, name string) error {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podboxes/%s", c.baseURL, ns, name)
+
+	resp, err := c.doRequest(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("DeletePodBox request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted ||
+		resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("DeletePodBox failed: status %d (%s)", resp.StatusCode, string(body))
+}
