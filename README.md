@@ -17,7 +17,8 @@ CubePod is an open-source, cloud-native execution environment designed for long-
 - [`docs/architecture.md`](docs/architecture.md) — Architecture design, technical rationale, and integration roadmap with CubePlex.
 - [`api/v1alpha1/`](api/v1alpha1/types.go) — Kubernetes CRD schemas (`PodBox`, `PodTemplate`, `PodWarmPool`).
 - [`api/openapi/`](api/openapi/cubepod-v1.yaml) — Canonical E2B-compatible superset OpenAPI 3.1 specification.
-- [`cmd/podd/`](cmd/podd/main.go) & [`pkg/podd/`](pkg/podd/) — In-guest PID 1 OverlayFS mounter (`podd-init`) and command/file execution daemon (`podd`).
+- [`cmd/podd-init/`](cmd/podd-init/main.go) & [`pkg/poddinit/`](pkg/poddinit/) — In-guest PID 1 OverlayFS `pivot_root` mounter (`podd-init`).
+- [`cmd/podd/`](cmd/podd/main.go) & [`pkg/podd/`](pkg/podd/) — In-guest command, process, and file execution daemon (`podd`).
 - [`cmd/cubepod-controller/`](cmd/cubepod-controller/main.go) & [`pkg/controller/`](pkg/controller/) — Kubernetes Operator reconciling dual Block PVCs, WarmPools, and Kata Pods.
 - [`cmd/cubepod-gateway/`](cmd/cubepod-gateway/main.go) & [`pkg/gateway/`](pkg/gateway/) — Unified Control Plane Gateway and Panel Reverse Proxy.
 - [`sdks/python/`](sdks/python/) — Async-first `cubepod` Python SDK.

@@ -21,21 +21,13 @@ func main() {
 	)
 	flag.Parse()
 
-	slog.Info("starting podd (CubePod in-guest init & execution daemon)",
+	slog.Info("starting podd (CubePod in-guest execution & file daemon)",
 		"version", version.Version,
 		"pid", os.Getpid(),
 		"addr", *addr,
 		"workdir", *workdir,
 	)
 
-	// Step 1: If running inside a Kata MicroVM with attached raw block devices,
-	// ensure ext4 filesystems and prepare the persistent OverlayFS upperdir & workspace.
-	if err := podd.PreparePersistentRoot(podd.DefaultPivotConfig()); err != nil {
-		slog.Error("failed to prepare persistent block root", "err", err)
-		os.Exit(1)
-	}
-
-	// Step 2: Start the command, file, and lifecycle HTTP server.
 	srv := podd.NewServer(*addr, *workdir)
 	httpSrv := &http.Server{
 		Addr:    *addr,
