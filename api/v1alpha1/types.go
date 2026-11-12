@@ -119,7 +119,7 @@ type LifecyclePolicy struct {
 	LeaseExpiresAt     *time.Time `json:"leaseExpiresAt,omitempty"`
 }
 
-// SecretBinding maps an environment variable placeholder (cbxref_...) to allowed egress hosts/headers.
+// SecretBinding maps an environment variable placeholder (cpodref_...) to allowed egress hosts/headers.
 type SecretBinding struct {
 	EnvName        string   `json:"envName"`
 	Placeholder    string   `json:"placeholder"`

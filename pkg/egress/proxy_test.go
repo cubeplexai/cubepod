@@ -102,7 +102,7 @@ func TestEgressProxyZeroTrustExchange(t *testing.T) {
 		Timeout: 5 * time.Second,
 	}
 
-	// 5. Test successful request with cbxref_ placeholder
+	// 5. Test successful request with cpodref_ placeholder
 	req, err := http.NewRequest(http.MethodGet, upstream.URL+"/v1/chat/completions", nil)
 	if err != nil {
 		t.Fatalf("NewRequest failed: %v", err)

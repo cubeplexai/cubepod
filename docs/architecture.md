@@ -60,7 +60,7 @@ flowchart TB
 
     subgraph ControlPlane["2. 控制与网关平面 (Control & Gateway Plane - Stateless HA)"]
         GW["cubepod-gateway (Go)<br/>• Canonical API (E2B 兼容协议 + CubePod 企业级扩展)<br/>• Panel & Port Proxy (URL-Token 鉴权, HTTP/WS/WebRTC)<br/>• 流量触发自动唤醒 (Auto-Resume) & 活跃租约 (Lease) 续期"]
-        Vault["Egress Exchange & Policy Endpoint<br/>• 单沙箱 mTLS 客户端证书认证 (Cert CN = PodID)<br/>• cbxref_ 占位符实时置换 (可直连 CubePlex :8443)<br/>• 域名白名单与海外 Upstream Proxy 配置下发"]
+        Vault["Egress Exchange & Policy Endpoint<br/>• 单沙箱 mTLS 客户端证书认证 (Cert CN = PodID)<br/>• cpodref_ 占位符实时置换 (可直连 CubePlex :8443)<br/>• 域名白名单与海外 Upstream Proxy 配置下发"]
         Op["cubepod-controller (Go K8s Operator)<br/>• CRDs: PodBox, PodTemplate, PodWarmPool<br/>• 双 Block PVC 独立编排 / CoW Snapshot Fork<br/>• 预挂盘 WarmPool 极速过户 / 原生注入 Egress Sidecar"]
     end
 
@@ -76,7 +76,7 @@ flowchart TB
 
             subgraph SidecarContainer["Egress Sidecar Container (NET_ADMIN)"]
                 NFT["DNS Proxy + nftables 防火墙<br/>(默认拒绝/白名单放行 + 透明流量劫持)"]
-                MITM["Transparent MITM Proxy<br/>• 严格校验上游 TLS SNI<br/>• mTLS 调 Vault 置换 cbxref_ 密钥<br/>• 可选转发至海外 Upstream Proxy"]
+                MITM["Transparent MITM Proxy<br/>• 严格校验上游 TLS SNI<br/>• mTLS 调 Vault 置换 cpodref_ 密钥<br/>• 可选转发至海外 Upstream Proxy"]
             end
         end
     end
@@ -199,7 +199,7 @@ flowchart TB
 | **2. 命令与进程执行 (`podd`)** | • 前台流式执行（实时推送 `stdout`/`stderr` chunk，进程退出立即关闭流，0 延迟）<br/>• 后台命令启动 (`background=true`)、进程列表、发送信号中断 (`kill` 整个进程组) | • **无状态游标日志拉取**：`GET /commands/{pid}/logs?cursor={byte_offset}`，输出持久化在沙箱 `/run/podd/procs/`，支持 CubePlex 任意后端 Worker 跨进程断线重连与增量读取。 | 彻底告别 OpenSandbox 1s 流延迟补丁，原生支撑 CubePlex 的受管后台任务 (`CommandCoordinator`)。 |
 | **3. 文件与批量同步 (`podd`)** | • `GET/PUT /files`（支持传入 `user="cubeplex"` / `uid=1000` 直接以非 root 身份读写）<br/>• 目录树列表 (`list` / `search`) 与文件变更监听 (`watch`) | • **极速归档增量同步**：`POST /files/archive-sync`，单次请求上传 `tar.gz` 流并在内存中以指定 `uid:gid` 解压至目标路径（如 `/workspace/.skills`），同时根据传入的 `remove_paths` 原子清理已卸载目录。 | 彻底消灭上传文件后的二次 `chown` shell 调用；将 CubePlex 的 Skills 同步从 N 次 HTTP 压缩为 1 次 `<50ms` 调用。 |
 | **4. 交互面板与端口代理** | • `get_host(port)`：返回 `<port>-<id>.<domain>` 子域名访问路由 | • **路径签名反向代理**：`GET/WS /sandboxes/{id}/proxy/{port}/{path}` 及 `/panel/{jwt_token}/{path}`，原生支持 HTTP、WebSocket、WebRTC 全双工转发。<br/>• **按需桌面激活**：`POST /sandboxes/{id}/desktop/start`（幂等拉起 Xorg + Chromium CDP `:9222` + Neko `:8080` + ttyd `:7681`）。 | 彻底解决 OpenSandbox Issue #949 端口模式冲突，完美支撑浏览器人机接管（过验证码/登录）与网页终端。 |
-| **5. 零信任网络与密钥金库** | （原生 E2B 无此能力） | • **声明式网络策略**：`network_policy`（默认拒绝/允许、域名通配符白名单、海外 `upstream_proxy`）。<br/>• **占位符密钥绑定**：`secret_bindings`（将 `cbxref_...` 写入 `/run/cubepod/env.sh`，出网时由 Sidecar 校验 TLS SNI 并通过 mTLS 换取真实密钥）。 | 将 CubePlex 的 `egress-bundle` 内化为平台原生能力，消灭外挂 MutatingWebhook 维护成本。 |
+| **5. 零信任网络与密钥金库** | （原生 E2B 无此能力） | • **声明式网络策略**：`network_policy`（默认拒绝/允许、域名通配符白名单、海外 `upstream_proxy`）。<br/>• **占位符密钥绑定**：`secret_bindings`（将 `cpodref_...` 写入 `/run/cubepod/env.sh`，出网时由 Sidecar 校验 TLS SNI 并通过 mTLS 换取真实密钥）。 | 将 CubePlex 的 `egress-bundle` 内化为平台原生能力，消灭外挂 MutatingWebhook 维护成本。 |
 
 ---
 

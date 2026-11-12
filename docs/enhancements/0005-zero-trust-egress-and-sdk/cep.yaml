@@ -1,4 +1,4 @@
-title: "CEP-0005: Zero-Trust Egress Secret Injection (`cbxref_` mTLS Exchange) & Python SDK `v0.1.0`"
+title: "CEP-0005: Zero-Trust Egress Secret Injection (`cpodref_` mTLS Exchange) & Python SDK `v0.1.0`"
 cep-number: "0005"
 authors:
   - "@xfgong"

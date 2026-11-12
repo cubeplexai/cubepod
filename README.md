@@ -32,7 +32,7 @@ CubePod solves these challenges with **Dual-Volume CSI Raw Block persistence**, 
 | **MicroVM Cold Start** | Standard VM boot latency (several seconds) | **Pre-Attached WarmPool (`PodWarmPool`)**: blank pre-formatted ext4 MicroVMs claimed in **< 50ms** |
 | **Sandbox Forking** | Not supported / full volume copy | **< 1s Copy-on-Write Fork**: instantaneous sub-agent cloning via CSI block snapshots |
 | **Isolation Boundary** | Shared-kernel containers or cloud black-box | **Hardware-Isolated Kata MicroVM** (dedicated Guest Linux Kernel per sandbox) |
-| **Secret & Egress Security** | Plaintext API keys injected into environment variables | **Zero-Trust Egress Vault**: transparent `cbxref_` placeholder substitution via per-pod mTLS |
+| **Secret & Egress Security** | Plaintext API keys injected into environment variables | **Zero-Trust Egress Vault**: transparent `cpodref_` placeholder substitution via per-pod mTLS |
 | **Interactive GUI & Browser** | Port mapping with port collision risks | **Signed Panel Reverse Proxy**: path/token-authenticated HTTP, WebSocket, & WebRTC (Chromium/Neko/ttyd) |
 | **API & Ecosystem** | Proprietary API & SaaS vendor lock-in | **100% Wire-Compatible E2B Superset**: drop-in support for official E2B SDKs + MCP |
 | **Deployment Model** | Proprietary cloud only | **100% Open Source**: Self-host on Kubernetes (Kata + CSI) or single-node Docker Compose |
@@ -111,8 +111,8 @@ To achieve sub-50ms cold starts without violating Kubernetes Pod volume immutabi
 
 ### 5. Built-in Zero-Trust Egress & Secret Vault
 - Sensitive external credentials (e.g., GitHub tokens, payment keys) **never enter the sandbox filesystem, environment variables, or process memory**.
-- The sandbox receives only opaque `cbxref_` references.
-- All outbound traffic is intercepted by an in-guest Egress Sidecar via `nftables`. The sidecar inspects TLS SNI, enforces domain allowlists, and dynamically exchanges `cbxref_` tokens with the egress vault over dedicated per-sandbox mTLS.
+- The sandbox receives only opaque `cpodref_` references.
+- All outbound traffic is intercepted by an in-guest Egress Sidecar via `nftables`. The sidecar inspects TLS SNI, enforces domain allowlists, and dynamically exchanges `cpodref_` tokens with the egress vault over dedicated per-sandbox mTLS.
 
 ---
 
@@ -231,7 +231,7 @@ Beyond the standard E2B interface, CubePod exposes high-throughput enterprise ex
 | [`crates/podd/`](crates/podd/src/main.rs) | In-guest execution, background process (`cursor` logs), and `tar.gz` file sync daemon | Rust (`tokio`, `axum`) |
 | [`cmd/cubepod-controller/`](cmd/cubepod-controller/main.go) & [`pkg/controller/`](pkg/controller/) | Kubernetes Operator reconciling dual Block PVCs, WarmPools, and Kata Pods | Go (`kubebuilder`, `client-go`) |
 | [`cmd/cubepod-gateway/`](cmd/cubepod-gateway/main.go) & [`pkg/gateway/`](pkg/gateway/) | Control Plane Gateway, E2B router, Auto-Resume, and Panel HTTP/WS/WebRTC Proxy | Go |
-| [`cmd/cubepod-egress/`](cmd/cubepod-egress/main.go) & [`pkg/egress/`](pkg/egress/) | Zero-Trust mTLS `cbxref_` secret vault and egress forward proxy sidecar | Go |
+| [`cmd/cubepod-egress/`](cmd/cubepod-egress/main.go) & [`pkg/egress/`](pkg/egress/) | Zero-Trust mTLS `cpodref_` secret vault and egress forward proxy sidecar | Go |
 | [`cmd/cubepod/`](cmd/cubepod/main.go) & [`pkg/client/`](pkg/client/) | Official Go Client SDK and `cubepod` CLI | Go |
 | [`sdks/python/`](sdks/python/) | Sync & Async Python SDK (`cubepod`) | Python 3.11+ (`httpx`) |
 | [`deploy/`](deploy/) | Helm chart (`deploy/helm/cubepod`), K8s manifests, and local Docker Compose | Helm / K8s / Docker |

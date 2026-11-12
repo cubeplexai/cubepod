@@ -14,7 +14,7 @@
 
 ## Summary
 
-This CEP delivers an automated End-to-End (E2E) integration test suite (`test/e2e/e2e_test.go`) and Python SDK E2E verification (`sdks/python/tests/test_e2e_live.py`) that boots the real compiled Rust binaries (`bin/podd-init` and `bin/podd`), the real Go `cubepod-controller` + `cubepod-gateway` stack, and verifies the full lifecycle, persistent sparse `ext4` volume formatting/healing, background cursor logs, `archive-sync`, `/panel/{token}/` reverse proxy, and zero-trust `cbxref_` mTLS egress secret exchange in one cohesive system test.
+This CEP delivers an automated End-to-End (E2E) integration test suite (`test/e2e/e2e_test.go`) and Python SDK E2E verification (`sdks/python/tests/test_e2e_live.py`) that boots the real compiled Rust binaries (`bin/podd-init` and `bin/podd`), the real Go `cubepod-controller` + `cubepod-gateway` stack, and verifies the full lifecycle, persistent sparse `ext4` volume formatting/healing, background cursor logs, `archive-sync`, `/panel/{token}/` reverse proxy, and zero-trust `cpodref_` mTLS egress secret exchange in one cohesive system test.
 
 ---
 

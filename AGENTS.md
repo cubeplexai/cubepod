@@ -16,7 +16,7 @@ CubePod is an open-source, cloud-native **Persistent Writable RootFS MicroVM Exe
 | [`api/openapi/`](api/openapi/cubepod-v1.yaml) | Canonical E2B-compatible superset OpenAPI 3.1 contract | OpenAPI 3.1 |
 | [`cmd/cubepod-controller/`](cmd/cubepod-controller/main.go) & [`pkg/controller/`](pkg/controller/) | Kubernetes Operator managing dual `volumeMode: Block`/`Filesystem` PVCs, WarmPools, CoW Fork, and Egress | Go |
 | [`cmd/cubepod-gateway/`](cmd/cubepod-gateway/main.go) & [`pkg/gateway/`](pkg/gateway/) | Stateless Control Plane Gateway, E2B router, Auto-Resume, and Panel HTTP/WS/WebRTC Proxy | Go |
-| [`cmd/cubepod-egress/`](cmd/cubepod-egress/main.go) & [`pkg/egress/`](pkg/egress/) | Zero-Trust mTLS `cbxref_` secret vault and egress forward proxy sidecar | Go |
+| [`cmd/cubepod-egress/`](cmd/cubepod-egress/main.go) & [`pkg/egress/`](pkg/egress/) | Zero-Trust mTLS `cpodref_` secret vault and egress forward proxy sidecar | Go |
 | [`cmd/cubepod/`](cmd/cubepod/main.go) & [`pkg/client/`](pkg/client/) | Official Go Client SDK and `cubepod` CLI | Go |
 | [`sdks/python/`](sdks/python/) | Sync & Async Python SDK (`cubepod`) | Python 3.11+ (`httpx`) |
 | [`deploy/`](deploy/) | Production Helm chart (`deploy/helm/cubepod`), K8s manifests (`deploy/k8s`), and local `docker-compose` | Helm / K8s / Docker |
@@ -48,7 +48,7 @@ New product features, architectural changes, CRD/API modifications, and security
    - `podd-init` (`crates/podd-init`) must remain a tiny, single-threaded Rust binary prior to `pivot_root(2)` and `execvp(3)` to avoid multi-threaded runtime issues with Linux mount namespaces and root pivoting.
    - **Never bake `podd-init` or `podd` into user sandbox images.** They must be packaged in the dedicated `cubepod-podd` injector image (`images/podd/Dockerfile`) and injected at Pod startup via an `initContainer` shared `emptyDir` volume mounted at `/opt/cubepod/bin` (or read-only host bind-mount in local Docker mode). `podd-init` bind-mounts `/opt/cubepod` across `pivot_root` so any stock OCI image works out-of-the-box without polluting the user's persistent RootFS `upperdir`.
 3. **Zero-Trust Egress Secret Safety**:
-   - Real external API secrets must **never** enter the sandbox environment, filesystem, or process memory. Only `cbxref_` placeholders may be injected into the sandbox, swapped at the egress boundary over per-sandbox mTLS.
+   - Real external API secrets must **never** enter the sandbox environment, filesystem, or process memory. Only `cpodref_` placeholders may be injected into the sandbox, swapped at the egress boundary over per-sandbox mTLS.
 4. **UID/GID Privilege Separation**:
    - Infrastructure hooks (`podd-init`, browser supervisord bootstrap) run as `root`, while agent commands and uploaded files default to the unprivileged sandbox user (`cubeplex`, `1000:1000`) without requiring follow-up shell `chown` hacks.
 
@@ -64,7 +64,7 @@ When operating as the **Controller Agent**, follow this strict multi-agent deleg
 | :--- | :--- | :--- | :--- |
 | `w5:p1` | **`cubepod-lead`** | **Controller / Lead Architect**: CEP authoring, task decomposition, worktree orchestration, PR review (`gh pr diff`/`comment`), merge, and release publishing | `docs/enhancements/`, `AGENTS.md`, `README.md` |
 | `w5:p2` | **`cubepod-runtime`** | **In-Guest Runtime & Local Driver**: Rust `podd-init` (PID 1 `OverlayFS`/`ext4`), Rust `podd` execution/archive daemon, and local/Docker runtime driver | `crates/podd-init/`, `crates/podd/`, `pkg/runtime/` |
-| `w5:p3` | **`cubepod-gateway`** | **Control Plane Gateway, Panel Proxy & Zero-Trust Egress**: E2B-compatible HTTP/SSE router, `/panel/{token}/` proxy, `cbxref_` mTLS Egress, and OpenAPI 3.1 contract | `pkg/gateway/`, `pkg/egress/`, `cmd/cubepod-gateway/`, `cmd/cubepod-egress/`, `api/openapi/` |
+| `w5:p3` | **`cubepod-gateway`** | **Control Plane Gateway, Panel Proxy & Zero-Trust Egress**: E2B-compatible HTTP/SSE router, `/panel/{token}/` proxy, `cpodref_` mTLS Egress, and OpenAPI 3.1 contract | `pkg/gateway/`, `pkg/egress/`, `cmd/cubepod-gateway/`, `cmd/cubepod-egress/`, `api/openapi/` |
 | `w5:p4` | **`cubepod-sdk`** | **Client SDKs & CLI**: Sync/Async Python SDK, Go Client SDK, and `cubepod` CLI | `sdks/python/`, `pkg/client/`, `cmd/cubepod/` |
 | `w5:p5` | **`cubepod-operator`** | **Kubernetes Operator, Packaging & CI/CD**: `PodBox`/`PodWarmPool` reconciler, `RESTKubeClient`, Helm chart, CRDs, Dockerfiles, and GitHub Actions | `pkg/controller/`, `cmd/cubepod-controller/`, `api/v1alpha1/`, `deploy/helm/`, `images/`, `.github/workflows/` |
 | `w5:p6` | **`cubepod-k8s-qa`** | **Kubernetes Cluster Deployment & E2E Verification**: Live `kubectl` cluster deployment, image builds/pushes, multi-process E2E, and live K8s E2E suites | `deploy/k8s/`, `test/e2e/`, `test/k8s-e2e/`, `Makefile` |

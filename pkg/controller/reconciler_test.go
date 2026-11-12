@@ -247,7 +247,7 @@ func TestBuildKataPod_EgressSidecar(t *testing.T) {
 			SecretBindings: []v1alpha1.SecretBinding{
 				{
 					EnvName:     "GITHUB_TOKEN",
-					Placeholder: "cbxref_ABC1234567890",
+					Placeholder: "cpodref_ABC1234567890",
 				},
 			},
 		},
@@ -311,7 +311,7 @@ func TestBuildKataPod_EgressSidecar(t *testing.T) {
 	mainC := pod.Containers[0]
 	var foundSecretBinding bool
 	for _, env := range mainC.Env {
-		if env.Name == "GITHUB_TOKEN" && env.Value == "cbxref_ABC1234567890" {
+		if env.Name == "GITHUB_TOKEN" && env.Value == "cpodref_ABC1234567890" {
 			foundSecretBinding = true
 		}
 	}

@@ -48,7 +48,7 @@
 - [x] API schemas, HTTP header translations (`X-API-Key`, `Authorization: Bearer`), and error envelopes specified
 - [x] Code Interpreter execution pipeline (`e2b-code-interpreter`, Jupyter kernel output MIME types) specified
 - [x] Dual-runtime behavior (Kubernetes Kata + CSI Raw Block AND Local Docker Loopback) is defined
-- [x] Security boundary (MicroVM isolation, non-root `1000:1000` execution, zero-trust `cbxref_` mTLS vault) reviewed
+- [x] Security boundary (MicroVM isolation, non-root `1000:1000` execution, zero-trust `cpodref_` mTLS vault) reviewed
 - [x] Test plan includes unit tests, official E2B SDK integration tests, and live Kubernetes E2E suites
 - [x] Production Readiness Review (PRR) section is complete
 
@@ -58,7 +58,7 @@
 
 This proposal establishes the formal specification for **E2B Drop-in Protocol Compatibility and SDK Interoperability** in CubePod. By conforming to the official E2B REST, Server-Sent Events (SSE), and data-plane wire specifications, `cubepod-gateway` enables any AI agent framework (including LangChain, LlamaIndex, AutoGen, CrewAI, OpenHands, and Smolagents) and developers using official E2B client SDKs (`e2b` Python, `@e2b/code-interpreter` TypeScript/JavaScript) to target CubePod without changing a single line of application code—simply by configuring the environment variable `E2B_DOMAIN` (or `E2B_API_URL`).
 
-Simultaneously, CubePod provides an **enterprise superset** over vanilla E2B: persistent dual-volume storage (`rootfs` + `workspace`), sub-second Copy-on-Write (CoW) sandbox forking, zero-trust egress secret substitution (`cbxref_`), atomic streaming skill synchronization (`archive-sync`), signed URL panel proxies for browser live-view and terminal, and automatic transparent waking (Auto-Resume) on paused sandboxes.
+Simultaneously, CubePod provides an **enterprise superset** over vanilla E2B: persistent dual-volume storage (`rootfs` + `workspace`), sub-second Copy-on-Write (CoW) sandbox forking, zero-trust egress secret substitution (`cpodref_`), atomic streaming skill synchronization (`archive-sync`), signed URL panel proxies for browser live-view and terminal, and automatic transparent waking (Auto-Resume) on paused sandboxes.
 
 ---
 
@@ -119,7 +119,7 @@ However, existing hosted E2B infrastructure and proprietary implementations pres
       |  | - Port/Subdomain router ({port}-{id})   |  |
       |  +-----------------------------------------+  |
       |  +-----------------------------------------+  |
-      |  | Zero-Trust Egress Vault (cbxref_)       |  |
+      |  | Zero-Trust Egress Vault (cpodref_)       |  |
       |  +-----------------------------------------+  |
       +-----------------------------------------------+
              /                               \
@@ -156,7 +156,7 @@ As a data science agent using `sandbox.run_code("plt.plot(x, y); plt.show()")`, 
 | :--- | :--- | :--- | :--- |
 | Upstream E2B SDK schema evolution breaks gateway deserialization | High | Low | Implement flexible JSON parsers that accept both camelCase (`exitCode`, `templateID`) and snake_case (`exit_code`, `template_id`), ignoring unknown fields. |
 | In-guest code execution memory exhaustion (`OOM`) crashes `podd` | Med | Med | Run user processes in dedicated Linux cgroups with kernel resource limits enforced by the MicroVM VMM or containerd slice. |
-| Malicious code extracts platform API keys | Critical | Low | Zero-Trust Egress: Sandbox never holds real API tokens; only opaque `cbxref_` placeholders are injected, which are exchanged strictly at the Egress proxy sidecar over mTLS. |
+| Malicious code extracts platform API keys | Critical | Low | Zero-Trust Egress: Sandbox never holds real API tokens; only opaque `cpodref_` placeholders are injected, which are exchanged strictly at the Egress proxy sidecar over mTLS. |
 
 ---
 
@@ -202,7 +202,7 @@ To guarantee strict drop-in compatibility without runtime deserialization errors
 | `autoPause` | `auto_pause` | `bool` | `true` or `false`. | `true` | Optional | If `true`, idle expiration triggers `Pause` (scale-to-zero, retain PVCs) rather than destruction. |
 | `autoResume` | `auto_resume` | `bool` or `object` | `true`, `false`, or resume config. | `true` | Optional | If `true`, inbound traffic to the gateway automatically resumes the paused sandbox. |
 | `extension.volumeKey` | - | `string` | Regex `^[a-zA-Z0-9_-]+$` (e.g., `"ws-usr123-projA"`). | `""` | Optional (CubePod Superset) | Binds sandbox to a deterministic persistent block PVC (`workspace-pvc`). Preserved across rootfs resets. |
-| `extension.secretBindings` | - | `[]SecretBinding` | List of `{envName, rawSecret, allowedHosts}`. | `[]` | Optional (CubePod Superset) | Injects opaque `cbxref_` placeholders; real keys remain inside the egress sidecar mTLS vault. |
+| `extension.secretBindings` | - | `[]SecretBinding` | List of `{envName, rawSecret, allowedHosts}`. | `[]` | Optional (CubePod Superset) | Injects opaque `cpodref_` placeholders; real keys remain inside the egress sidecar mTLS vault. |
 
 ##### Response Parameter Specification (Strict Upstream SDK Deserialization Contract)
 The upstream Python SDK method `Sandbox.from_dict` requires the following top-level keys. **Omission of any mandatory field causes immediate `KeyError` in `e2b.Sandbox.create()`**:
@@ -371,7 +371,7 @@ flowchart TD
    - `Authorization: Bearer cpod_...`
 2. **Zero-Trust Egress Integration**:
    - If an E2B request includes secret environment variables (`envVars: {"OPENAI_API_KEY": "sk-real-key"}`), the gateway replaces the real key with an opaque reference:
-     `cbxref_openai_a1b2c3d4`
+     `cpodref_openai_a1b2c3d4`
    - The real key is stored exclusively in `cubepod-egress` vault memory.
    - When the agent makes an outbound HTTPS request to `api.openai.com`, the in-guest egress sidecar intercepts the TLS connection, presents client certificates, and performs secure SNI-validated header replacement over mTLS.
    - **Result**: The agent (and any prompt injection exploit) can never view or exfiltrate the actual API secret.

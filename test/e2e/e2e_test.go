@@ -563,7 +563,7 @@ func TestE2E_PythonSDKLiveHTTP(t *testing.T) {
 
 // TestE2E_LivePoddBackendAndZeroTrustEgress wires gateway.Server to a real bin/podd process
 // managed by runtime.PoddProcessBackend (via SetPoddURL), verifying live tar.gz archive-sync
-// and DELETE /v1/files on disk, as well as mTLS Zero-Trust Egress cbxref_ secret swapping.
+// and DELETE /v1/files on disk, as well as mTLS Zero-Trust Egress cpodref_ secret swapping.
 func TestE2E_LivePoddBackendAndZeroTrustEgress(t *testing.T) {
 	repoRoot := findRepoRoot(t)
 	_, binPodd := ensureBinaries(t, repoRoot)
@@ -650,7 +650,7 @@ func TestE2E_LivePoddBackendAndZeroTrustEgress(t *testing.T) {
 		t.Fatalf("extracted content mismatch: %q", string(extractedBytes))
 	}
 
-	// 4. Test Zero-Trust Egress Proxy swapping cbxref_ secret over mTLS against Gateway
+	// 4. Test Zero-Trust Egress Proxy swapping cpodref_ secret over mTLS against Gateway
 	upstreamSeenAuth := ""
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamSeenAuth = r.Header.Get("Authorization")

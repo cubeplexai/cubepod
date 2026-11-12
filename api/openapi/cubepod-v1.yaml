@@ -7,7 +7,7 @@ info:
     - 100% wire-compatible with E2B Control Plane (`/sandboxes`) and Data Plane (`podd` on `:49983`).
     - Extends E2B with dual-block-volume persistence (`rootfs` + `workspace`), 1s CoW `fork`,
       stateless background command `cursor` logs, Server-Sent Events (SSE) command streaming,
-      atomic `archive-sync` for Skills, zero-trust `cbxref_` egress secret bindings,
+      atomic `archive-sync` for Skills, zero-trust `cpodref_` egress secret bindings,
       signed HTTP/WS/WebRTC panel proxying, and pre-warmed Kata MicroVM pools (`/warmpools`).
 
 paths:
@@ -764,7 +764,7 @@ paths:
 
   /internal/v1/egress/exchange:
     post:
-      summary: Swap zero-trust cbxref_ reference tokens for real external API credentials
+      summary: Swap zero-trust cpodref_ reference tokens for real external API credentials
       operationId: egressExchange
       requestBody:
         required: true

@@ -17,7 +17,7 @@
 This CEP completes the end-to-end data plane and zero-trust egress plane across `pkg/gateway`, `pkg/egress`, and a new `cmd/cubepod-egress` binary:
 1. `pkg/gateway` adds upstream `podd` HTTP forwarding (`RegisterPoddURL(sandboxID, poddURL)`): whenever a sandbox has a live `podd` URL registered, `POST /commands/run`, `GET /commands/{id}/logs`, `POST /commands/{id}/kill`, `PUT /files`, `GET /files`, and `POST /files/archive-sync` are proxied directly to the sandbox's `podd` daemon (`:49983`).
 2. `pkg/gateway` and `pkg/egress` expose the mTLS secret exchange HTTP handler (`POST /internal/v1/egress/exchange`) and secret binding registration during `POST /sandboxes`.
-3. `pkg/egress/proxy.go` and `cmd/cubepod-egress/main.go` implement the Zero-Trust Egress Proxy sidecar that intercepts outbound requests from the sandbox, enforces `AllowedHosts`/`DeniedHosts` policy, scans headers for `cbxref_<32-char-base32>` tokens, exchanges them over mTLS against the Gateway Vault, and injects the real API key on the wire to the upstream destination.
+3. `pkg/egress/proxy.go` and `cmd/cubepod-egress/main.go` implement the Zero-Trust Egress Proxy sidecar that intercepts outbound requests from the sandbox, enforces `AllowedHosts`/`DeniedHosts` policy, scans headers for `cpodref_<32-char-base32>` tokens, exchanges them over mTLS against the Gateway Vault, and injects the real API key on the wire to the upstream destination.
 
 ---
 
@@ -35,7 +35,7 @@ In `v0.1.0`, `pkg/egress` provided the cryptographic CA, policy matcher, and `Va
   - Implement `VaultExchangeHandler(vault *Vault, ca *CA) http.HandlerFunc` for `POST /internal/v1/egress/exchange` that extracts `sandboxID` from the mTLS peer certificate `CommonName` (or `X-CubePod-Sandbox-ID` when running over local loopback trust in tests), validates `(sandboxID, placeholder, sniHost, headerName)` via `vault.Exchange(...)`, and returns `{"secret": "<real-value>"}` or `403 Forbidden`.
   - Implement `EgressProxy` (`pkg/egress/proxy.go`) and `cmd/cubepod-egress/main.go`:
     - Checks destination host against `AllowedHosts` and `DeniedHosts` (`403 Forbidden` if blocked).
-    - Scans outbound HTTP request headers for `cbxref_` tokens (e.g. `Authorization: Bearer cbxref_...` or `X-Api-Key: cbxref_...`), calls the Exchange endpoint over mTLS (`ca.ClientTLSConfig`), replaces the `cbxref_` substring with the real secret in flight, and forwards the request to the upstream target without ever logging or persisting the secret.
+    - Scans outbound HTTP request headers for `cpodref_` tokens (e.g. `Authorization: Bearer cpodref_...` or `X-Api-Key: cpodref_...`), calls the Exchange endpoint over mTLS (`ca.ClientTLSConfig`), replaces the `cpodref_` substring with the real secret in flight, and forwards the request to the upstream target without ever logging or persisting the secret.
 
 ### Non-Goals
 
@@ -61,7 +61,7 @@ In `v0.1.0`, `pkg/egress` provided the cryptographic CA, policy matcher, and `Va
   ```json
   {
     "sandboxID": "cpod-123",
-    "placeholder": "cbxref_ABCDEFGHIJKLMNOPQRSTUVWXYZ234567",
+    "placeholder": "cpodref_ABCDEFGHIJKLMNOPQRSTUVWXYZ234567",
     "sniHost": "api.openai.com",
     "headerName": "Authorization"
   }
@@ -81,7 +81,7 @@ In `v0.1.0`, `pkg/egress` provided the cryptographic CA, policy matcher, and `Va
     - Start a mock upstream LLM server (`httptest.NewServer`) that asserts `Authorization: Bearer sk-real-secret-999`.
     - Start a real mTLS Vault Exchange server using `CA` and `Vault` (`httptest.NewUnstartedServer` with `ca.ServerTLSConfig()`).
     - Start `EgressProxy` configured with the sandbox's mTLS client cert (`ca.MintSandboxCert("sbx-1")`).
-    - Send an HTTP request through `EgressProxy` carrying `Authorization: Bearer cbxref_<token>`.
+    - Send an HTTP request through `EgressProxy` carrying `Authorization: Bearer cpodref_<token>`.
     - Verify the upstream server receives `Authorization: Bearer sk-real-secret-999`, while a request to an unauthorized host (`evil.com`) or wrong header (`X-Leak`) is rejected with `403 Forbidden`!
   - `pkg/gateway/server_test.go`:
     - Verify `Server` with a mock/live `podd` HTTP server (`SetPoddURL`) forwards `/commands/run`, `/logs`, `/kill`, `/files`, `/files/archive-sync`, and `/v1/lifecycle/prepare-stop` on `/pause`.

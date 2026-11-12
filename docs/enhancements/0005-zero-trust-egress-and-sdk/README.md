@@ -1,4 +1,4 @@
-# CEP-0005: Zero-Trust Egress Secret Injection (`cbxref_` mTLS Exchange) & Python SDK `v0.1.0`
+# CEP-0005: Zero-Trust Egress Secret Injection (`cpodref_` mTLS Exchange) & Python SDK `v0.1.0`
 
 | Field | Value |
 | :--- | :--- |
@@ -47,19 +47,19 @@
 
 ## Summary
 
-CEP-0005 implements CubePod's built-in Zero-Trust Egress & Secret Vault (`pkg/egress`) and completes the full-featured `cubepod` Python SDK (`sdks/python/cubepod`). `pkg/egress` provides an in-memory ECDSA P-256 CA and per-sandbox mTLS client certificate minter (`CN = <sandboxID>`), host wildcard allow/deny evaluation, and the `cbxref_<32-char-base32>` secret placeholder vault and exchange evaluator (enforcing sandbox identity, SNI host binding, and allowed HTTP header names). `sdks/python/cubepod` provides the complete async-first client (`AsyncCubePod`) covering lifecycle, foreground/background commands with `cursor` logs, file read/write, `tar.gz` skill `archive_sync`, panel endpoint generation, `reset_rootfs`, `fork`, and Egress secret bindings.
+CEP-0005 implements CubePod's built-in Zero-Trust Egress & Secret Vault (`pkg/egress`) and completes the full-featured `cubepod` Python SDK (`sdks/python/cubepod`). `pkg/egress` provides an in-memory ECDSA P-256 CA and per-sandbox mTLS client certificate minter (`CN = <sandboxID>`), host wildcard allow/deny evaluation, and the `cpodref_<32-char-base32>` secret placeholder vault and exchange evaluator (enforcing sandbox identity, SNI host binding, and allowed HTTP header names). `sdks/python/cubepod` provides the complete async-first client (`AsyncCubePod`) covering lifecycle, foreground/background commands with `cursor` logs, file read/write, `tar.gz` skill `archive_sync`, panel endpoint generation, `reset_rootfs`, `fork`, and Egress secret bindings.
 
 ---
 
 ## Motivation
 
-Real external API credentials (such as `GITHUB_TOKEN`, `OPENAI_API_KEY`, or internal service tokens) must never enter the untrusted sandbox environment. By minting opaque `cbxref_` placeholders and swapping them at the egress boundary only when the sandbox's mTLS identity and destination TLS SNI host match the secret's binding policy, CubePod eliminates secret exfiltration while remaining 100% compatible with CubePlex's `:8443` mTLS exchange architecture.
+Real external API credentials (such as `GITHUB_TOKEN`, `OPENAI_API_KEY`, or internal service tokens) must never enter the untrusted sandbox environment. By minting opaque `cpodref_` placeholders and swapping them at the egress boundary only when the sandbox's mTLS identity and destination TLS SNI host match the secret's binding policy, CubePod eliminates secret exfiltration while remaining 100% compatible with CubePlex's `:8443` mTLS exchange architecture.
 
 ### Goals
 
 - Implement `pkg/egress`:
   1. **Per-Sandbox mTLS Certificate Minter (`cert.go`)**: Generates a root CA and mints short-lived per-sandbox client certificates (`Subject.CommonName = sandboxID`), plus verifies client certificates to extract `sandboxID`.
-  2. **Placeholder Generator & Secret Exchange (`vault.go`)**: Mints `cbxref_<32-char-base32>` placeholders bound to `(sandboxID, envName, secretValue, allowedHosts, allowedHeaders)`, and evaluates `Exchange(sandboxID, placeholder, sniHost, headerName) (secretValue, error)` with fail-closed validation.
+  2. **Placeholder Generator & Secret Exchange (`vault.go`)**: Mints `cpodref_<32-char-base32>` placeholders bound to `(sandboxID, envName, secretValue, allowedHosts, allowedHeaders)`, and evaluates `Exchange(sandboxID, placeholder, sniHost, headerName) (secretValue, error)` with fail-closed validation.
   3. **Host Policy Matcher (`policy.go`)**: Evaluates `NetworkPolicySpec` (`DefaultAction: Allow|Deny`, exact and `*.domain.com` wildcard matching).
 - Complete `sdks/python/cubepod`:
   1. Full support for `create` (with `volume_key`, `network_policy`, `secret_bindings`), `connect`, `pause`, `reset_rootfs`, `fork`, `renew_timeout`, `acquire_lease`, `execute`, `start_command`, `poll_command`, `kill_command`, `write_file`, `read_file`, `archive_sync` (packing a dict of files into `tar.gz` in memory and uploading in one call), and `get_panel_endpoint`.
@@ -76,7 +76,7 @@ Real external API credentials (such as `GITHUB_TOKEN`, `OPENAI_API_KEY`, or inte
 ### User Stories
 
 #### Story 1: Fail-Closed Secret Exchange Bound to Sandbox Identity and TLS SNI
-As a CubePlex security administrator, if agent code inside `cpod-1` reads `GITHUB_TOKEN=cbxref_ABC...` and tries to send it to `evil.com` (or if `cpod-2` steals the placeholder and sends it to `api.github.com`), `pkg/egress` rejects the swap (`ErrHostNotAllowed` or `ErrSandboxMismatch`) and never reveals the secret.
+As a CubePlex security administrator, if agent code inside `cpod-1` reads `GITHUB_TOKEN=cpodref_ABC...` and tries to send it to `evil.com` (or if `cpod-2` steals the placeholder and sends it to `api.github.com`), `pkg/egress` rejects the swap (`ErrHostNotAllowed` or `ErrSandboxMismatch`) and never reveals the secret.
 
 #### Story 2: Single-Call `archive_sync` in Python SDK for CubePlex Skills
 As CubePlex's `LazySandbox`, calling `await client.archive_sync(sandbox_id, files={"/workspace/.skills/demo/SKILL.md": b"..."}, dest="/workspace")` packs an in-memory `tar.gz` and syncs all skill files in a single HTTP request.
@@ -105,7 +105,7 @@ In `pkg/egress`:
 
 ```mermaid
 flowchart LR
-    Agent["Agent Process<br/>Authorization: Bearer cbxref_..."] --> Sidecar["Egress MITM Sidecar"]
+    Agent["Agent Process<br/>Authorization: Bearer cpodref_..."] --> Sidecar["Egress MITM Sidecar"]
     Sidecar -- "mTLS (CN=cpod-1) + SNI=api.github.com" --> Vault["pkg/egress.Vault.Exchange"]
     Vault -- "Verify CN == cpod-1 & SNI in AllowedHosts" --> Secret["Return Real Secret"]
 ```
@@ -118,7 +118,7 @@ flowchart LR
 
 - **Go Unit Tests (`go test -v -race ./pkg/egress/...`)**:
   - Mint per-sandbox ECDSA mTLS cert, verify it against the CA, and assert `sandboxID` is extracted from `CN`.
-  - Verify `BindSecret` generates a valid `cbxref_` token and `Exchange` succeeds only when `sandboxID`, `sniHost` (including `*.github.com` wildcard), and `headerName` (case-insensitive) match.
+  - Verify `BindSecret` generates a valid `cpodref_` token and `Exchange` succeeds only when `sandboxID`, `sniHost` (including `*.github.com` wildcard), and `headerName` (case-insensitive) match.
   - Verify `Exchange` fails closed on wrong `sandboxID`, wrong `sniHost`, disallowed `headerName`, or revoked sandbox secrets.
 - **Python SDK Tests (`pytest` / `unittest` in `sdks/python/tests/`)**:
   - Test `AsyncCubePod` lifecycle, `execute`, background command cursor polling, `archive_sync` `tar.gz` creation, `reset_rootfs`, `fork`, and `get_panel_endpoint`.

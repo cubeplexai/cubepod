@@ -157,12 +157,12 @@ func TestVaultSecretExchange(t *testing.T) {
 		t.Fatalf("BindSecret failed: %v", err)
 	}
 
-	// Assert placeholder structure: cbxref_<32-chars>
-	if !strings.HasPrefix(placeholder, "cbxref_") {
-		t.Fatalf("expected placeholder prefix cbxref_, got %s", placeholder)
+	// Assert placeholder structure: cpodref_<32-chars>
+	if !strings.HasPrefix(placeholder, "cpodref_") {
+		t.Fatalf("expected placeholder prefix cpodref_, got %s", placeholder)
 	}
-	if len(placeholder) != 7+32 {
-		t.Fatalf("expected placeholder length %d (cbxref_ + 32 chars), got %d: %s", 7+32, len(placeholder), placeholder)
+	if len(placeholder) != 8+32 {
+		t.Fatalf("expected placeholder length %d (cpodref_ + 32 chars), got %d: %s", 8+32, len(placeholder), placeholder)
 	}
 
 	// 1. Successful exchange with exact header case
@@ -221,7 +221,7 @@ func TestVaultSecretExchange(t *testing.T) {
 	}
 
 	// 7. Fail closed on unknown placeholder
-	_, err = v.Exchange(sandboxID, "cbxref_unknown0000000000000000000000000", "api.github.com", "Authorization")
+	_, err = v.Exchange(sandboxID, "cpodref_unknown0000000000000000000000000", "api.github.com", "Authorization")
 	if !errors.Is(err, egress.ErrUnknownPlaceholder) {
 		t.Fatalf("expected ErrUnknownPlaceholder, got: %v", err)
 	}

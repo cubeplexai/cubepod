@@ -42,7 +42,10 @@ func NewVault() *Vault {
 	}
 }
 
-// BindSecret mints a unique cbxref_<32-char-base32> placeholder bound to the given sandbox,
+// DefaultPlaceholderPrefix is the prefix for opaque sandbox secret references.
+const DefaultPlaceholderPrefix = "cpodref_"
+
+// BindSecret mints a unique cpodref_<32-char-base32> placeholder bound to the given sandbox,
 // environment variable name, raw secret, allowed SNI hosts, and allowed HTTP headers.
 func (v *Vault) BindSecret(sandboxID, envName, rawSecret string, allowedHosts, allowedHeaders []string) (string, error) {
 	if sandboxID == "" {
@@ -58,7 +61,7 @@ func (v *Vault) BindSecret(sandboxID, envName, rawSecret string, allowedHosts, a
 		return "", fmt.Errorf("failed to generate random bytes for placeholder: %w", err)
 	}
 
-	placeholder := "cbxref_" + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf)
+	placeholder := DefaultPlaceholderPrefix + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf)
 
 	hostsCopy := make([]string, len(allowedHosts))
 	copy(hostsCopy, allowedHosts)

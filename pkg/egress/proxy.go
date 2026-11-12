@@ -225,7 +225,7 @@ func (p *EgressProxy) exchangeSecret(ctx context.Context, placeholder, host, hea
 }
 
 // ServeHTTP handles outbound requests, enforcing AllowedHosts/DeniedHosts,
-// scanning headers for cbxref_ tokens, exchanging them over mTLS, and forwarding upstream.
+// scanning headers for cpodref_ tokens, exchanging them over mTLS, and forwarding upstream.
 func (p *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Determine destination host
 	rawHost := r.URL.Host
@@ -258,20 +258,20 @@ func (p *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Scan headers for cbxref_ placeholders and exchange them
+	// 3. Scan headers for cpodref_ placeholders and exchange them
 	newHeaders := make(http.Header)
 	for key, values := range r.Header {
 		for _, val := range values {
 			replacedVal := val
 			for {
-				idx := strings.Index(replacedVal, "cbxref_")
+				idx := strings.Index(replacedVal, DefaultPlaceholderPrefix)
 				if idx == -1 {
 					break
 				}
-				if idx+39 > len(replacedVal) {
+				if idx+40 > len(replacedVal) {
 					break
 				}
-				placeholder := replacedVal[idx : idx+39]
+				placeholder := replacedVal[idx : idx+40]
 				// Exchange placeholder for real secret
 				realSecret, err := p.exchangeSecret(r.Context(), placeholder, targetHost, key)
 				if err != nil {
