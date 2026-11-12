@@ -704,3 +704,200 @@ func TestE2E_LivePoddBackendAndZeroTrustEgress(t *testing.T) {
 		t.Fatalf("expected upstream to receive swapped real secret %q, got %q", realSecret, upstreamSeenAuth)
 	}
 }
+
+// TestE2E_E2BProtocolDropIn validates fullstack drop-in compatibility with the E2B Sandbox Protocol
+// conforming to CEP-0018:
+// - Issues E2B-compatible POST /sandboxes with templateID: "base"
+// - Verifies clientID, envdVersion, cpuCount, memoryMB, diskSizeMB (mandatory E2B SDK fields)
+// - Issues POST /sandboxes/{id}/refreshes with {"duration": 600}
+// - Issues command execution, writes/reads file in /workspace
+// - Verifies Pause and transparent Auto-Resume on subsequent request
+// - Deletes sandbox
+func TestE2E_E2BProtocolDropIn(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	client := ts.Client()
+
+	// 1. Issues E2B-compatible POST /sandboxes with templateID: "base"
+	createPayload := []byte(`{
+		"templateID": "base",
+		"timeout": 300,
+		"metadata": {"test": "e2e-e2b-drop-in", "user": "agent-007"},
+		"envVars": {"PYTHONUNBUFFERED": "1"}
+	}`)
+	resp, err := client.Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader(createPayload))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("failed to create E2B sandbox: status=%d err=%v", resp.StatusCode, err)
+	}
+	defer resp.Body.Close()
+
+	var createMap map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&createMap); err != nil {
+		t.Fatalf("failed to decode E2B create response: %v", err)
+	}
+
+	sbID, _ := createMap["sandboxID"].(string)
+	if sbID == "" {
+		t.Fatalf("expected non-empty sandboxID in create response: %+v", createMap)
+	}
+
+	// 2. Verifies clientID, envdVersion, cpuCount, memoryMB, diskSizeMB
+	clientID, _ := createMap["clientID"].(string)
+	if clientID == "" {
+		t.Fatalf("expected non-empty clientID in create response, got %v", createMap["clientID"])
+	}
+	envdVersion, _ := createMap["envdVersion"].(string)
+	if envdVersion == "" {
+		t.Fatalf("expected non-empty envdVersion in create response, got %v", createMap["envdVersion"])
+	}
+	cpuCount, _ := createMap["cpuCount"].(float64)
+	if cpuCount <= 0 {
+		t.Fatalf("expected cpuCount > 0 in create response, got %v", createMap["cpuCount"])
+	}
+	memoryMB, _ := createMap["memoryMB"].(float64)
+	if memoryMB <= 0 {
+		t.Fatalf("expected memoryMB > 0 in create response, got %v", createMap["memoryMB"])
+	}
+	diskSizeMB, _ := createMap["diskSizeMB"].(float64)
+	if diskSizeMB <= 0 {
+		t.Fatalf("expected diskSizeMB > 0 in create response, got %v", createMap["diskSizeMB"])
+	}
+
+	// Verify GET /sandboxes/{id} also returns matching E2B detail fields
+	getResp, err := client.Get(ts.URL + "/sandboxes/" + sbID)
+	if err != nil || getResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /sandboxes/{id} failed: status=%d err=%v", getResp.StatusCode, err)
+	}
+	var detailMap map[string]interface{}
+	_ = json.NewDecoder(getResp.Body).Decode(&detailMap)
+	getResp.Body.Close()
+
+	if detailMap["clientID"] != clientID || detailMap["envdVersion"] != envdVersion {
+		t.Fatalf("detail response mismatch: %+v", detailMap)
+	}
+	if detailMap["cpuCount"].(float64) != cpuCount || detailMap["memoryMB"].(float64) != memoryMB || detailMap["diskSizeMB"].(float64) != diskSizeMB {
+		t.Fatalf("resource metrics mismatch in detail response: %+v", detailMap)
+	}
+
+	// 3. Issues POST /sandboxes/{id}/refreshes with {"duration": 600}
+	refreshPayload := []byte(`{"duration": 600}`)
+	refreshResp, err := client.Post(ts.URL+"/sandboxes/"+sbID+"/refreshes", "application/json", bytes.NewReader(refreshPayload))
+	if err != nil || (refreshResp.StatusCode != http.StatusNoContent && refreshResp.StatusCode != http.StatusOK) {
+		t.Fatalf("refresh failed: status=%d err=%v", refreshResp.StatusCode, err)
+	}
+	refreshResp.Body.Close()
+
+	// 4. Issues command execution, writes/reads file in /workspace
+	cmdPayload := []byte(`{"command": "echo 'e2b drop-in execution ok'", "workdir": "/workspace"}`)
+	cmdResp, err := client.Post(ts.URL+"/sandboxes/"+sbID+"/commands/run", "application/json", bytes.NewReader(cmdPayload))
+	if err != nil || cmdResp.StatusCode != http.StatusOK {
+		t.Fatalf("command execution failed: status=%d err=%v", cmdResp.StatusCode, err)
+	}
+	var cmdResult map[string]interface{}
+	_ = json.NewDecoder(cmdResp.Body).Decode(&cmdResult)
+	cmdResp.Body.Close()
+
+	outStr := fmt.Sprintf("%v", cmdResult["stdout"])
+	if !strings.Contains(outStr, "e2b drop-in execution ok") {
+		t.Fatalf("unexpected command output: %+v", cmdResult)
+	}
+
+	// Write file in /workspace
+	testFileData := []byte("e2b protocol workspace file content")
+	fileReq, err := http.NewRequest(http.MethodPut, ts.URL+"/sandboxes/"+sbID+"/files?path=/workspace/test_e2b.txt", bytes.NewReader(testFileData))
+	if err != nil {
+		t.Fatalf("failed to create put file request: %v", err)
+	}
+	putResp, err := client.Do(fileReq)
+	if err != nil || putResp.StatusCode != http.StatusOK {
+		t.Fatalf("write file failed: status=%d err=%v", putResp.StatusCode, err)
+	}
+	putResp.Body.Close()
+
+	// Read file from /workspace
+	readResp, err := client.Get(ts.URL + "/sandboxes/" + sbID + "/files?path=/workspace/test_e2b.txt")
+	if err != nil || readResp.StatusCode != http.StatusOK {
+		t.Fatalf("read file failed: status=%d err=%v", readResp.StatusCode, err)
+	}
+	gotContent, err := io.ReadAll(readResp.Body)
+	readResp.Body.Close()
+	if err != nil || !bytes.Equal(gotContent, testFileData) {
+		t.Fatalf("read file content mismatch: expected %q, got %q (err=%v)", string(testFileData), string(gotContent), err)
+	}
+
+	// 5. Verifies Pause and transparent Auto-Resume on subsequent request
+	pauseResp, err := client.Post(ts.URL+"/sandboxes/"+sbID+"/pause", "application/json", nil)
+	if err != nil || pauseResp.StatusCode != http.StatusOK {
+		t.Fatalf("pause sandbox failed: status=%d err=%v", pauseResp.StatusCode, err)
+	}
+	var pauseRec gateway.SandboxRecord
+	_ = json.NewDecoder(pauseResp.Body).Decode(&pauseRec)
+	pauseResp.Body.Close()
+
+	if strings.ToLower(pauseRec.State) != "paused" {
+		t.Fatalf("expected sandbox state Paused, got %s", pauseRec.State)
+	}
+
+	// Subsequent command execution triggers transparent Auto-Resume
+	resumeCmdPayload := []byte(`{"command": "echo 'transparent-auto-resume-verified'"}`)
+	arResp, err := client.Post(ts.URL+"/sandboxes/"+sbID+"/commands/run", "application/json", bytes.NewReader(resumeCmdPayload))
+	if err != nil || arResp.StatusCode != http.StatusOK {
+		t.Fatalf("auto-resume command execution failed: status=%d err=%v", arResp.StatusCode, err)
+	}
+	var arResult map[string]interface{}
+	_ = json.NewDecoder(arResp.Body).Decode(&arResult)
+	arResp.Body.Close()
+
+	arOutStr := fmt.Sprintf("%v", arResult["stdout"])
+	if !strings.Contains(arOutStr, "transparent-auto-resume-verified") {
+		t.Fatalf("unexpected auto-resume command output: %+v", arResult)
+	}
+
+	// Verify sandbox is now Running and AutoResumeCount >= 1
+	chkResp, err := client.Get(ts.URL + "/sandboxes/" + sbID)
+	if err != nil || chkResp.StatusCode != http.StatusOK {
+		t.Fatalf("get sandbox after auto-resume failed: status=%d err=%v", chkResp.StatusCode, err)
+	}
+	var chkRec gateway.SandboxRecord
+	_ = json.NewDecoder(chkResp.Body).Decode(&chkRec)
+	chkResp.Body.Close()
+
+	if strings.ToLower(chkRec.State) != "running" || chkRec.AutoResumeCount < 1 {
+		t.Fatalf("expected state Running and AutoResumeCount >= 1, got state=%s count=%d", chkRec.State, chkRec.AutoResumeCount)
+	}
+
+	// Also verify file content in /workspace is preserved across Pause/Auto-Resume
+	readPreservedResp, err := client.Get(ts.URL + "/sandboxes/" + sbID + "/files?path=/workspace/test_e2b.txt")
+	if err != nil || readPreservedResp.StatusCode != http.StatusOK {
+		t.Fatalf("read preserved file failed: status=%d err=%v", readPreservedResp.StatusCode, err)
+	}
+	preservedContent, _ := io.ReadAll(readPreservedResp.Body)
+	readPreservedResp.Body.Close()
+	if !bytes.Equal(preservedContent, testFileData) {
+		t.Fatalf("preserved file content mismatch after auto-resume: %q vs %q", string(testFileData), string(preservedContent))
+	}
+
+	// 6. Deletes sandbox
+	delReq, err := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+sbID, nil)
+	if err != nil {
+		t.Fatalf("failed to create delete request: %v", err)
+	}
+	delResp, err := client.Do(delReq)
+	if err != nil || (delResp.StatusCode != http.StatusNoContent && delResp.StatusCode != http.StatusOK) {
+		t.Fatalf("delete sandbox failed: status=%d err=%v", delResp.StatusCode, err)
+	}
+	delResp.Body.Close()
+
+	// Verify sandbox is deleted (GET returns 404)
+	notFoundResp, err := client.Get(ts.URL + "/sandboxes/" + sbID)
+	if err != nil {
+		t.Fatalf("get deleted sandbox request failed: %v", err)
+	}
+	defer notFoundResp.Body.Close()
+	if notFoundResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found for deleted sandbox, got %d", notFoundResp.StatusCode)
+	}
+}
