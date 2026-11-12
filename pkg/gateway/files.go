@@ -44,12 +44,23 @@ func (s *Server) resolveFilePath(rec *SandboxRecord, userPath string) (string, e
 	return cleanFull, nil
 }
 
-func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
+func (s *Server) resolveSandboxFromRequest(r *http.Request) (*SandboxRecord, error) {
 	id := r.PathValue("sandboxID")
-	s.mu.RLock()
-	rec, ok := s.sandboxes[id]
-	s.mu.RUnlock()
-	if !ok {
+	if id != "" {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		rec, ok := s.sandboxes[id]
+		if !ok {
+			return nil, fmt.Errorf("sandbox not found")
+		}
+		return rec, nil
+	}
+	return s.resolveConnectRPCSandbox(r)
+}
+
+func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
+	rec, err := s.resolveSandboxFromRequest(r)
+	if err != nil {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
@@ -113,6 +124,17 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	if r.URL.Path == "/files" {
+		_ = json.NewEncoder(w).Encode([]map[string]interface{}{
+			{
+				"name":     filepath.Base(targetPath),
+				"type":     "file",
+				"path":     targetPath,
+				"metadata": map[string]string{},
+			},
+		})
+		return
+	}
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"status": "ok",
 		"path":   targetPath,
@@ -121,11 +143,8 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("sandboxID")
-	s.mu.RLock()
-	rec, ok := s.sandboxes[id]
-	s.mu.RUnlock()
-	if !ok {
+	rec, err := s.resolveSandboxFromRequest(r)
+	if err != nil {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
@@ -185,11 +204,8 @@ func (s *Server) handleGetFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteFile(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("sandboxID")
-	s.mu.RLock()
-	rec, ok := s.sandboxes[id]
-	s.mu.RUnlock()
-	if !ok {
+	rec, err := s.resolveSandboxFromRequest(r)
+	if err != nil {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
@@ -249,11 +265,8 @@ type fileEntryInfo struct {
 }
 
 func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("sandboxID")
-	s.mu.RLock()
-	rec, ok := s.sandboxes[id]
-	s.mu.RUnlock()
-	if !ok {
+	rec, err := s.resolveSandboxFromRequest(r)
+	if err != nil {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}

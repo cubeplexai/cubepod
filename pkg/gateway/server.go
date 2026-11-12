@@ -186,6 +186,39 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /sandboxes/{sandboxID}/files/list", s.handleListFiles)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/files/archive-sync", s.handleArchiveSync)
 
+	// Direct REST file routes (E2B header/query sandbox resolution)
+	mux.HandleFunc("GET /files", s.handleGetFile)
+	mux.HandleFunc("POST /files", s.handlePutFile)
+	mux.HandleFunc("PUT /files", s.handlePutFile)
+	mux.HandleFunc("DELETE /files", s.handleDeleteFile)
+	mux.HandleFunc("GET /files/list", s.handleListFiles)
+
+	// Connect-RPC process and filesystem data-plane routes (CEP-0018)
+	mux.HandleFunc("POST /process.Process/Start", s.handleConnectRPCProcessStart)
+	mux.HandleFunc("POST /process.Process/SendSignal", s.handleConnectRPCProcessSendSignal)
+	mux.HandleFunc("POST /process.Process/Connect", s.handleConnectRPCProcessConnect)
+	mux.HandleFunc("POST /process.Process/List", s.handleConnectRPCProcessList)
+	mux.HandleFunc("POST /filesystem.Filesystem/Read", s.handleConnectRPCFilesystemRead)
+	mux.HandleFunc("POST /filesystem.Filesystem/Write", s.handleConnectRPCFilesystemWrite)
+	mux.HandleFunc("POST /filesystem.Filesystem/List", s.handleConnectRPCFilesystemList)
+	mux.HandleFunc("POST /filesystem.Filesystem/ListDir", s.handleConnectRPCFilesystemList)
+	mux.HandleFunc("POST /filesystem.Filesystem/Stat", s.handleConnectRPCFilesystemStat)
+	mux.HandleFunc("POST /filesystem.Filesystem/Remove", s.handleConnectRPCFilesystemRemove)
+	mux.HandleFunc("POST /filesystem.Filesystem/MakeDir", s.handleConnectRPCFilesystemMakeDir)
+
+	// Path-prefixed Connect-RPC routes for sandboxes
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/Start", s.handleConnectRPCProcessStart)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/SendSignal", s.handleConnectRPCProcessSendSignal)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/Connect", s.handleConnectRPCProcessConnect)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/List", s.handleConnectRPCProcessList)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/Read", s.handleConnectRPCFilesystemRead)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/Write", s.handleConnectRPCFilesystemWrite)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/List", s.handleConnectRPCFilesystemList)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/ListDir", s.handleConnectRPCFilesystemList)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/Stat", s.handleConnectRPCFilesystemStat)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/Remove", s.handleConnectRPCFilesystemRemove)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/MakeDir", s.handleConnectRPCFilesystemMakeDir)
+
 	// WarmPool & Template routes
 	mux.HandleFunc("POST /warmpools", s.handleCreateWarmPool)
 	mux.HandleFunc("GET /warmpools", s.handleListWarmPools)
@@ -483,6 +516,12 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sa
 	// Fallback to local code runner if port 49999 is targeted without a live upstream daemon
 	if targetURLStr == "" && port == 49999 && (r.URL.Path == "/execute" || r.URL.Path == "/sandboxes/"+sandboxID+"/code/execute") {
 		s.executeCodeLocally(w, r, rec)
+		return
+	}
+
+	// Fallback to local Connect-RPC handlers if port 49983 or Connect-RPC path is targeted without a live upstream daemon
+	if targetURLStr == "" && (port == 49983 || strings.HasPrefix(r.URL.Path, "/process.Process/") || strings.HasPrefix(r.URL.Path, "/filesystem.Filesystem/")) {
+		s.handleConnectRPCDispatch(w, r, rec)
 		return
 	}
 
