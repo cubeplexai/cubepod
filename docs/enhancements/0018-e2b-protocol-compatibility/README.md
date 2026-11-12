@@ -186,170 +186,150 @@ The table below delineates the canonical E2B API endpoints, their corresponding 
 
 ---
 
-### 2. Control Plane Wire Compatibility
+### 2. Control Plane Wire Compatibility & Parameter Specification Matrix
+
+To guarantee strict drop-in compatibility without runtime deserialization errors in upstream client SDKs (such as Python `e2b` 2.x and TypeScript `@e2b/code-interpreter`), every parameter is formally defined with its data type, valid range, default value, and underlying execution semantics.
 
 #### 2.1 Sandbox Creation (`POST /sandboxes`)
 
-##### E2B Client Request Schema
-```json
-{
-  "templateID": "base",
-  "timeout": 300,
-  "metadata": {
-    "user_id": "usr_12345",
-    "project": "agent-eval"
-  },
-  "envVars": {
-    "CUSTOM_ENV": "production"
-  },
-  "extension": {
-    "volumeKey": "ws-usr12345-code",
-    "secretBindings": [
-      {
-        "envName": "OPENAI_API_KEY",
-        "rawSecret": "sk-proj-supersecretkey",
-        "allowedHosts": ["api.openai.com"]
-      }
-    ]
+##### Request Parameter Specification
+| Parameter Key | Alias Key | Go Type | Value Range / Constraints | Default | Mandatory | MicroVM / Kernel & Platform Effect |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `templateID` | `template_id` | `string` | Regex `^[a-zA-Z0-9_-]+$`. Supported: `"base"`, `"code-interpreter"`, `"python"`, or custom K8s `PodTemplate` name. | `"cubeplex-ubuntu24-desktop"` | Optional | Selects the rootfs base image and compute resource quotas. |
+| `timeout` | `timeoutSeconds` | `int` | `1 <= timeout <= 86400` (1 second to 24 hours). | `300` | Optional | Sets the idle TTL. Monitored by the background Idle Reaper to transition the sandbox to `Paused`. |
+| `metadata` | - | `map[string]string` | Key/value strings <= 256 bytes each; max 64 entries. | `{}` | Optional | Attached to the sandbox record and Kubernetes `PodBox` labels/annotations for audit and tracking. |
+| `envVars` | `env_vars` | `map[string]string` | Valid POSIX environment variable names (`[A-Za-z_][A-Za-z0-9_]*`). | `{}` | Optional | Injected into the sandbox runtime environment (`/run/cubepod/env.sh` or process runner). |
+| `autoPause` | `auto_pause` | `bool` | `true` or `false`. | `true` | Optional | If `true`, idle expiration triggers `Pause` (scale-to-zero, retain PVCs) rather than destruction. |
+| `autoResume` | `auto_resume` | `bool` or `object` | `true`, `false`, or resume config. | `true` | Optional | If `true`, inbound traffic to the gateway automatically resumes the paused sandbox. |
+| `extension.volumeKey` | - | `string` | Regex `^[a-zA-Z0-9_-]+$` (e.g., `"ws-usr123-projA"`). | `""` | Optional (CubePod Superset) | Binds sandbox to a deterministic persistent block PVC (`workspace-pvc`). Preserved across rootfs resets. |
+| `extension.secretBindings` | - | `[]SecretBinding` | List of `{envName, rawSecret, allowedHosts}`. | `[]` | Optional (CubePod Superset) | Injects opaque `cbxref_` placeholders; real keys remain inside the egress sidecar mTLS vault. |
+
+##### Response Parameter Specification (Strict Upstream SDK Deserialization Contract)
+The upstream Python SDK method `Sandbox.from_dict` requires the following top-level keys. **Omission of any mandatory field causes immediate `KeyError` in `e2b.Sandbox.create()`**:
+
+| Response Key | Go Type | Value Example | Mandatory in E2B SDK? | Description & Constraints |
+| :--- | :--- | :--- | :--- | :--- |
+| `sandboxID` | `string` | `"cpod-1731331200000"` | **Mandatory** | Unique identifier used for subsequent routing, data-plane operations, and subdomain proxies. |
+| `templateID` | `string` | `"cubeplex-ubuntu24-desktop"` | **Mandatory** | The instantiated template identifier. |
+| `clientID` | `string` | `"cpod-client-01"` | **Mandatory** | Upstream client identification tag. |
+| `envdVersion` | `string` | `"1.1.0"` | **Mandatory** | Version string parsed by `packaging.version.Version(envd_version)`. Required for RPC capability negotiation. |
+| `state` | `string` | `"running"` or `"paused"` | Optional in Create, Mandatory in Detail | Current sandbox lifecycle state. Note: E2B SDK enum `SandboxState` strictly enforces lowercase `"running"` or `"paused"`. |
+| `startedAt` | `time.Time` | `"2026-11-11T12:00:00Z"` | Mandatory in Detail | RFC3339 / ISO8601 UTC timestamp of creation. |
+| `endAt` | `time.Time` | `"2026-11-11T12:05:00Z"` | Mandatory in Detail | RFC3339 / ISO8601 UTC timestamp of scheduled idle expiration (`startedAt + timeout`). |
+| `cpuCount` | `int` | `2` | Mandatory in Detail | Number of allocated virtual CPU cores. |
+| `memoryMB` | `int` | `2048` | Mandatory in Detail | Allocated memory limit in megabytes. |
+| `diskSizeMB` | `int` | `10240` | Mandatory in Detail | Persistent disk volume quota in megabytes. |
+| `envdPort` | `int` | `49983` | CubePod Superset | Internal port for guest data-plane daemon communication. |
+| `volumeKey` | `string` | `"ws-usr123-projA"` | CubePod Superset | Persistent workspace PVC identifier. |
+
+#### 2.2 Heartbeat & Lease Refresh (`POST /sandboxes/{id}/refreshes`)
+
+Upstream E2B SDKs issue keepalive pings via `POST /sandboxes/{id}/refreshes`.
+- **Request Body**:
+  ```json
+  {
+    "duration": 300
   }
-}
-```
+  ```
+- **Parameter Specification**:
+  - `duration`: `int`, range `1 <= duration <= 86400`. Extends `TimeoutSeconds` and updates `EndAt = time.Now() + duration`.
+- **Response**: HTTP `204 No Content` or HTTP `200 OK`. Resets the controller/gateway idle reaper deadline.
 
-##### Wire Normalization & Behavior
-1. **Template Mapping**: If `templateID` matches standard E2B aliases (`"base"`, `"code-interpreter"`, `"python"`), `cubepod-gateway` maps it to the configured default Kubernetes `PodTemplate` (e.g., `cubeplex-ubuntu24-desktop`).
-2. **Persistence Key**: When `extension.volumeKey` is provided, the gateway binds the sandbox to a deterministic persistent block PVC (`workspace-pvc`). Recreating or connecting with the same `volumeKey` restores all previous workspace files.
-3. **Response Schema**:
-```json
-{
-  "sandboxID": "cpod-1731331200000",
-  "templateID": "base",
-  "clientID": "cpod-client-01",
-  "state": "Running",
-  "envdPort": 49983,
-  "createdAt": "2026-11-11T12:00:00Z",
-  "timeout": 300,
-  "metadata": {
-    "user_id": "usr_12345",
-    "project": "agent-eval"
-  }
-}
-```
+#### 2.3 Sandbox Query & Listing (`GET /sandboxes/{id}` & `GET /sandboxes`)
 
-#### 2.2 Heartbeat & Timeout Refresh (`POST /sandboxes/{id}/refreshes`)
-
-E2B SDKs issue periodic keepalive pings to prevent idle termination:
-```json
-{
-  "duration": 300
-}
-```
-`cubepod-gateway` interprets `duration` as the new TTL in seconds, updates `rec.TimeoutSeconds`, refreshes `rec.LastActivityAt`, and extends any active Kubernetes lease. Response returns `204 No Content` or `200 OK` with `{ "refreshed": true }`.
+- **`GET /sandboxes/{id}`**: Returns the full `SandboxDetail` schema with all 10 mandatory fields above (`templateID`, `sandboxID`, `clientID`, `startedAt`, `endAt`, `envdVersion`, `cpuCount`, `memoryMB`, `diskSizeMB`, `state`).
+- **`GET /sandboxes`**: Accepts optional query parameter `?state=running` or `?templateID=...` and returns an array of `ListedSandbox` matching the exact schema above.
 
 ---
 
-### 3. Data Plane Command & Process Execution
+### 3. Data Plane Wire Protocols (Connect-RPC & REST)
 
-#### 3.1 Command Request Wire Schema (`POST /sandboxes/{id}/commands` & `/commands/run`)
+Upstream E2B uses dual data-plane pathways: **Connect-RPC over HTTP JSON** on port `49983` for direct daemon interaction, and REST/SSE endpoints proxied through the Gateway.
 
-Clients can invoke commands synchronously (waiting for completion) or in the background:
-```json
-{
-  "cmd": "python3 -c 'print(\"hello agent\")'",
-  "workdir": "/workspace",
-  "envs": {
-    "PYTHONUNBUFFERED": "1"
-  },
-  "background": false,
-  "timeout": 60
-}
-```
+#### 3.1 Connect-RPC over HTTP JSON Protocol (Port `:49983`)
+`cubepod-gateway` and `podd` support the standard Connect-RPC JSON framing (`Content-Type: application/json` or `application/connect+json`):
 
-#### 3.2 Synchronous Response Wire Schema
-```json
-{
-  "stdout": "hello agent\n",
-  "stderr": "",
-  "exitCode": 0,
-  "error": null
-}
-```
-*(Both `exitCode` and `exit_code` are populated in the JSON payload to satisfy heterogeneous SDK versions.)*
+1. **`POST /process.Process/Start`**:
+   - **Request**:
+     ```json
+     {
+       "process": {
+         "cmd": "ls -la /workspace",
+         "envs": {"TERM": "xterm-256color"},
+         "cwd": "/workspace"
+       }
+     }
+     ```
+   - **Streaming Response**: NDJSON stream of event objects:
+     - `{"event": {"start": {"pid": 1204}}}`
+     - `{"event": {"data": {"stdout": "total 4\ndrwxr-xr-x 2 ...\n"}}}`
+     - `{"event": {"end": {"exitCode": 0}}}`
 
-#### 3.3 Server-Sent Events (SSE) Streaming (`GET /sandboxes/{id}/commands/{cmdId}/stream`)
+2. **`POST /filesystem.Filesystem/Read`**:
+   - **Request**: `{"path": "/workspace/data.json"}`
+   - **Response**: `{"content": "<raw-or-base64-bytes>"}`
 
-For real-time log output, the gateway establishes an SSE stream with `Content-Type: text/event-stream; charset=utf-8`:
-```text
-event: message
-data: {"type":"stdout","content":"Downloading model weights...\n","cursor":32,"running":true}
+3. **`POST /filesystem.Filesystem/Write`**:
+   - **Request**: `{"path": "/workspace/script.py", "data": "print(123)", "user": "cubeplex"}`
+   - **Response**: `{"success": true}`
 
-event: message
-data: {"type":"stdout","content":"Download complete.\n","cursor":51,"running":false,"exitCode":0}
-```
+#### 3.2 Gateway REST & SSE Endpoints
+
+For standard HTTP client tooling, `cubepod-gateway` exposes the direct REST API:
+
+- **`POST /sandboxes/{id}/commands` & `/commands/run`**:
+  - Request: `{"cmd": "...", "workdir": "/workspace", "envs": {...}, "background": false, "timeout": 60}`
+  - Response (Sync): `{"stdout": "...", "stderr": "...", "exitCode": 0, "exit_code": 0, "error": null}`
+  - Response (Background): `{"cmd_id": "proc-1234", "pid": 1204, "running": true}`
+- **`GET /sandboxes/{id}/commands/{cmdId}/stream`**:
+  - Format: Server-Sent Events (`Content-Type: text/event-stream; charset=utf-8`)
+  - Chunks: `data: {"type":"stdout","content":"...","cursor":1024,"running":true}\n\n`
+- **`POST /sandboxes/{id}/commands/{cmdId}/kill`**:
+  - Sends `SIGTERM` / `SIGKILL` to target process group (`PGID`). Response: `{"success": true}`.
 
 ---
 
 ### 4. Data Plane Filesystem Protocol
 
-#### 4.1 Path Resolution & Privilege Invariants
-- Paths beginning with `/workspace/` or relative paths resolve within the sandbox's dedicated `/workspace` volume.
-- User files are written with `UID:GID 1000:1000` (`cubeplex`), ensuring that user commands running without root privileges can modify and delete them without permission denied errors.
+#### 4.1 Path Resolution & Security Constraints
+- All paths are sanitized against directory traversal attacks (`path.Clean`, rejecting `..` escapes beyond `/workspace`).
+- Files created by default are assigned UID/GID `1000:1000` (`cubeplex`), avoiding unprivileged permission errors when agent tools write or delete files.
 
 #### 4.2 File Listing (`GET /sandboxes/{id}/files/list?path=/workspace`)
-```json
-{
-  "entries": [
-    {
-      "name": "main.py",
-      "path": "/workspace/main.py",
-      "isDir": false,
-      "size": 1024,
-      "mode": 420
-    },
-    {
-      "name": "data",
-      "path": "/workspace/data",
-      "isDir": true,
-      "size": 4096,
-      "mode": 493
-    }
-  ]
-}
-```
+- Returns array of `{name, path, isDir, is_dir, size, mode}`.
 
 #### 4.3 Atomic Archive Sync Extension (`POST /sandboxes/{id}/files/archive-sync`)
-To eliminate the overhead of uploading large directory structures (such as agent tool packages or git checkouts) file-by-file, CubePod extends E2B with an atomic tarball endpoint. The client uploads a `application/x-tar` or `application/gzip` stream with query parameters:
-`POST /sandboxes/{id}/files/archive-sync?dest=/workspace/.skills&uid=1000&gid=1000`
-The in-guest `podd` unpacks the archive directly into target directory in memory and optionally purges paths listed in header `X-CubePod-Remove-Paths`.
+- Streamed in-memory `tar.gz` extraction into destination directory with atomic deletion list (`remove_paths`), compressing multi-file uploads from hundreds of HTTP roundtrips into a single `< 50ms` transaction.
 
 ---
 
-### 5. Code Interpreter Interoperability (`e2b-code-interpreter`)
+### 5. Code Interpreter Interoperability (`e2b-code-interpreter` on Port `:49999`)
 
-The Python library `e2b-code-interpreter` uses an execution protocol returning rich data representations (charts, tables, LaTeX).
+The upstream library `e2b-code-interpreter` connects to Jupyter on dedicated guest port `49999` (configured in `e2b_code_interpreter.constants.JUPYTER_PORT = 49999`) or via the gateway reverse proxy, streaming newline-delimited JSON (NDJSON) over `POST /execute`.
 
-#### 5.1 Request Schema (`POST /sandboxes/{id}/code/execute`)
+#### 5.1 Request Schema (`POST /execute` or `POST /sandboxes/{id}/code/execute`)
 ```json
 {
   "code": "import matplotlib.pyplot as plt\nplt.figure()\nplt.plot([1,2,3],[4,5,6])\nplt.title('Test Chart')\nplt.show()",
-  "language": "python"
+  "context_id": null,
+  "language": "python",
+  "env_vars": {"PYTHONUNBUFFERED": "1"}
 }
 ```
 
-#### 5.2 Execution Envelope Response Schema
-```json
-{
-  "stdout": "",
-  "stderr": "",
-  "results": [
-    {
-      "png": "iVBORw0KGgoAAAANSUhEUgAA...",
-      "text": "<Figure size 640x480 with 1 Axes>"
-    }
-  ],
-  "error": null,
-  "executionCount": 1
-}
-```
+#### 5.2 Streaming NDJSON Output Protocol
+The server streams chunks where each line is an independent JSON object deserialized by `e2b_code_interpreter.models._parse_output`:
+
+1. **Standard Output Stream**:
+   `{"type": "stdout", "text": "Model initialized...\n", "timestamp": 1731331200100}`
+2. **Standard Error Stream**:
+   `{"type": "stderr", "text": "Warning: depreciated API\n", "timestamp": 1731331200105}`
+3. **Rich Graphical & Formatted Results**:
+   `{"type": "result", "text": "<Figure size 640x480 with 1 Axes>", "png": "iVBORw0KGgoAAAANSUhEUgAA...", "html": null, "json": null}`
+4. **Structured Exception & Traceback**:
+   `{"type": "error", "name": "ZeroDivisionError", "value": "division by zero", "traceback": "Traceback (most recent call last):\n  File \"<stdin>\", line 1..."}`
+5. **Execution Counter**:
+   `{"type": "number_of_executions", "execution_count": 1}`
 
 #### 5.3 Execution Engine Implementation
 1. **In-Guest Jupyter Kernel Driver**: `podd` maintains a lightweight long-lived Python kernel process communicating over zero-copy IPC/stdio or an embedded Jupyter protocol adapter.
@@ -410,9 +390,18 @@ flowchart TD
 
 ---
 
-### 9. Test Plan
+### 9. Test Plan & Automated Conformance Harness
 
-#### 9.1 Unit Tests
+#### 9.1 Executable Contract Conformance Suite (`pkg/gateway/e2b_conformance_test.go`)
+An automated Go test suite that runs in CI against every commit:
+- **`TestE2BWireConformance_LifecycleAndSchemas`**:
+  - Sends upstream E2B Python `POST /sandboxes` payload with `templateID: "base"`, `timeout: 300`, `metadata`, and `envVars`.
+  - Asserts that all 4 mandatory fields required by `e2b.Sandbox.from_dict` (`templateID`, `sandboxID`, `clientID`, `envdVersion`) are present and non-empty.
+  - Calls `POST /sandboxes/{id}/refreshes` with `{"duration": 600}` and asserts HTTP `204 No Content` / `200 OK`.
+  - Calls `GET /sandboxes/{id}` and deserializes into upstream `SandboxDetail` model, validating mandatory fields (`cpuCount`, `memoryMB`, `diskSizeMB`, `startedAt`, `endAt`, `envdVersion`).
+  - Calls `GET /sandboxes` and verifies array of `ListedSandbox` schemas.
+
+#### 9.2 Unit Tests
 - `pkg/gateway/sandboxes_test.go`:
   - Deserialization of standard E2B `CreateSandboxRequest` with and without CubePod extensions.
   - Heartbeat renewal via `POST /sandboxes/{id}/refreshes`.
