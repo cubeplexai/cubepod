@@ -1,0 +1,33 @@
+title: "E2B-Compatible Template Catalog and OCI Image Builds"
+cep-number: "0019"
+authors:
+  - "@cubepod-maintainers"
+owning-area: "gateway"
+participating-areas:
+  - "controller"
+  - "runtime"
+  - "sdk"
+status: "provisional"
+creation-date: "2026-11-12"
+last-updated: "2026-11-12"
+reviewers: []
+approvers: []
+stage: "alpha"
+latest-milestone: "v0.4.0"
+milestone:
+  alpha: "v0.4.0"
+  beta: "v0.5.0"
+  stable: "v1.0.0"
+feature-gates:
+  - name: "E2BTemplateAPI"
+    components:
+      - "cubepod-gateway"
+      - "cubepod-controller"
+      - "podd"
+disable-supported: true
+metrics:
+  - "cubepod_templates"
+  - "cubepod_template_builds_total"
+  - "cubepod_template_build_duration_seconds"
+replaces: []
+superseded-by: []
