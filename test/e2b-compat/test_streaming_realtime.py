@@ -39,8 +39,10 @@ def test_stdout_streaming_realtime_intervals(gateway_url: str | None = None) -> 
         chunks: list[str] = []
 
         def on_stdout(msg: Any) -> None:
-            timestamps.append(time.time())
             text = msg.line if hasattr(msg, "line") else str(msg)
+            if not text.strip():
+                return
+            timestamps.append(time.time())
             chunks.append(text)
 
         with Sandbox.create() as sandbox:

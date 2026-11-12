@@ -536,12 +536,10 @@ class LiveGatewayHandler(http.server.BaseHTTPRequestHandler):
         def stream_stdout() -> None:
             nonlocal stdout_lines
             assert proc.stdout is not None
-            while True:
-                # Use read1 for unbuffered chunk capture without blocking for large buffers
-                chunk = proc.stdout.read1(65536) if hasattr(proc.stdout, "read1") else proc.stdout.read(1024)
-                if not chunk:
+            for line in iter(proc.stdout.readline, b""):
+                if not line:
                     break
-                text = chunk.decode("utf-8", errors="replace")
+                text = line.decode("utf-8", errors="replace")
                 stdout_lines.append(text)
                 payload = json.dumps({
                     "type": "stdout",
