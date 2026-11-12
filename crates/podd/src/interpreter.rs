@@ -17,7 +17,7 @@ use crate::DaemonConfig;
 /// Intercepts stdout/stderr, captures AST expression evaluation, rich display reprs (_repr_png_, _repr_html_),
 /// captures matplotlib active figures, formats tracebacks, and emits NDJSON protocol messages.
 pub const PYTHON_RUNNER_SCRIPT: &str = r#"
-import sys, os, ast, json, time, traceback
+import sys, os, ast, json, time, traceback, builtins
 
 real_stdout = sys.__stdout__
 
@@ -39,14 +39,25 @@ class StreamEmitter:
             for p in parts[:-1]:
                 send_msg({"type": self.stream_type, "text": p + "\n", "timestamp": int(time.time() * 1000)})
             self.buf = parts[-1]
+            real_stdout.flush()
         return len(s)
     def flush(self):
         if self.buf:
             send_msg({"type": self.stream_type, "text": self.buf, "timestamp": int(time.time() * 1000)})
             self.buf = ""
+        real_stdout.flush()
 
 sys.stdout = StreamEmitter("stdout")
 sys.stderr = StreamEmitter("stderr")
+
+_orig_print = builtins.print
+def _flush_print(*args, **kwargs):
+    if "flush" not in kwargs:
+        kwargs["flush"] = True
+    _orig_print(*args, **kwargs)
+    sys.stdout.flush()
+
+builtins.print = _flush_print
 
 def _no_input(prompt=None):
     raise EOFError("interactive input() is not supported in code interpreter execution")
@@ -56,6 +67,7 @@ user_globals = {
     "__doc__": None,
     "__builtins__": __builtins__,
     "input": _no_input,
+    "print": _flush_print,
 }
 
 def emit_result(val):

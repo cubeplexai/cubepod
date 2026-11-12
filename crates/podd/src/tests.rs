@@ -851,3 +851,353 @@ fn test_code_execute_missing_code() {
         "missing_code_field"
     );
 }
+
+fn parse_connect_frames(raw: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut frames = Vec::new();
+    let mut idx = 0;
+    while idx + 5 <= raw.len() {
+        let flag = raw[idx];
+        let len =
+            u32::from_be_bytes([raw[idx + 1], raw[idx + 2], raw[idx + 3], raw[idx + 4]]) as usize;
+        let start = idx + 5;
+        let end = start + len;
+        if end > raw.len() {
+            break;
+        }
+        frames.push((flag, raw[start..end].to_vec()));
+        idx = end;
+    }
+    frames
+}
+
+fn base64_decode(input: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
+        .collect();
+    for chunk in clean.chunks(4) {
+        let mut val = 0u32;
+        for (i, &b) in chunk.iter().enumerate() {
+            let v = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => 0,
+            };
+            val |= (v as u32) << (18 - i * 6);
+        }
+        if chunk.len() >= 2 {
+            out.push((val >> 16) as u8);
+        }
+        if chunk.len() >= 3 {
+            out.push((val >> 8) as u8);
+        }
+        if chunk.len() >= 4 {
+            out.push(val as u8);
+        }
+    }
+    out
+}
+
+#[test]
+fn test_base64_encode_and_frames() {
+    use crate::commands::{base64_encode, make_connect_frame, unpack_connect_payload};
+
+    assert_eq!(base64_encode(b""), "");
+    assert_eq!(base64_encode(b"f"), "Zg==");
+    assert_eq!(base64_encode(b"fo"), "Zm8=");
+    assert_eq!(base64_encode(b"foo"), "Zm9v");
+    assert_eq!(base64_encode(b"hello\n"), "aGVsbG8K");
+
+    let payload = b"{\"process\":{\"cmd\":\"echo hi\"}}";
+    let frame = make_connect_frame(payload, false);
+    assert_eq!(frame[0], 0);
+    let len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+    assert_eq!(len, payload.len());
+    assert_eq!(&frame[5..], payload);
+
+    let unpacked = unpack_connect_payload(&frame).unwrap();
+    assert_eq!(unpacked, payload);
+
+    let raw_unpacked = unpack_connect_payload(payload).unwrap();
+    assert_eq!(raw_unpacked, payload);
+}
+
+#[test]
+fn test_connectrpc_start_raw_json() {
+    let (addr, _) = start_test_server("/tmp");
+    let req_body = r#"{"process":{"cmd":"echo 'connect-rpc raw json works'"}}"#;
+    let (status, headers, body) = post_raw(
+        &addr,
+        "/process.Process/Start",
+        "application/connect+json",
+        req_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-type").map(|s| s.as_str()),
+        Some("application/connect+json")
+    );
+
+    let frames = parse_connect_frames(&body);
+    assert!(
+        frames.len() >= 3,
+        "expected at least start, data, end frames, got {}",
+        frames.len()
+    );
+
+    // Frame 0: Start Event
+    assert_eq!(frames[0].0, 0);
+    let start_json: JsonValue =
+        JsonValue::parse(std::str::from_utf8(&frames[0].1).unwrap()).unwrap();
+    let pid = start_json
+        .get("event")
+        .unwrap()
+        .get("start")
+        .unwrap()
+        .get("pid")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+    assert!(pid > 0);
+
+    // Frame 1: Data Event with stdout
+    assert_eq!(frames[1].0, 0);
+    let data_json: JsonValue =
+        JsonValue::parse(std::str::from_utf8(&frames[1].1).unwrap()).unwrap();
+    let b64_stdout = data_json
+        .get("event")
+        .unwrap()
+        .get("data")
+        .unwrap()
+        .get("stdout")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    let stdout_bytes = base64_decode(b64_stdout);
+    let stdout_str = String::from_utf8_lossy(&stdout_bytes);
+    assert_eq!(stdout_str, "connect-rpc raw json works\n");
+
+    // Frame 2: End Event with exitCode 0
+    let end_frame = &frames[frames.len() - 2];
+    assert_eq!(end_frame.0, 0);
+    let end_json: JsonValue = JsonValue::parse(std::str::from_utf8(&end_frame.1).unwrap()).unwrap();
+    let exit_code = end_json
+        .get("event")
+        .unwrap()
+        .get("end")
+        .unwrap()
+        .get("exitCode")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+    assert_eq!(exit_code, 0);
+
+    // Final Frame: EOS flag = 2
+    let eos_frame = frames.last().unwrap();
+    assert_eq!(eos_frame.0, 2);
+}
+
+#[test]
+fn test_connectrpc_start_framed_envelope_and_args() {
+    use crate::commands::make_connect_frame;
+
+    let (addr, _) = start_test_server("/tmp");
+    let payload =
+        r#"{"process":{"cmd":"/bin/bash","args":["-l","-c","echo 'framed envelope args'"]}}"#;
+    let framed_body = make_connect_frame(payload.as_bytes(), false);
+
+    let (status, headers, body) = post_raw(
+        &addr,
+        "/process.Process/Start",
+        "application/connect+json",
+        &framed_body,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("content-type").map(|s| s.as_str()),
+        Some("application/connect+json")
+    );
+
+    let frames = parse_connect_frames(&body);
+    assert!(frames.len() >= 3);
+
+    let data_json: JsonValue =
+        JsonValue::parse(std::str::from_utf8(&frames[1].1).unwrap()).unwrap();
+    let b64_stdout = data_json
+        .get("event")
+        .unwrap()
+        .get("data")
+        .unwrap()
+        .get("stdout")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    let stdout_bytes = base64_decode(b64_stdout);
+    assert_eq!(
+        String::from_utf8_lossy(&stdout_bytes),
+        "framed envelope args\n"
+    );
+}
+
+#[test]
+fn test_connectrpc_start_stderr_separation() {
+    let (addr, _) = start_test_server("/tmp");
+    let req_body = r#"{"process":{"cmd":"echo 'out line' && echo 'err line' >&2"}}"#;
+    let (status, _, body) = post_raw(
+        &addr,
+        "/process.Process/Start",
+        "application/connect+json",
+        req_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+
+    let frames = parse_connect_frames(&body);
+    let mut saw_stdout = false;
+    let mut saw_stderr = false;
+
+    for (flag, payload) in &frames {
+        if *flag == 0 {
+            if let Ok(j) = JsonValue::parse(std::str::from_utf8(payload).unwrap()) {
+                if let Some(data) = j.get("event").and_then(|e| e.get("data")) {
+                    if let Some(out) = data.get("stdout").and_then(|s| s.as_str()) {
+                        let text = String::from_utf8_lossy(&base64_decode(out)).to_string();
+                        if text.contains("out line") {
+                            saw_stdout = true;
+                        }
+                    }
+                    if let Some(err) = data.get("stderr").and_then(|s| s.as_str()) {
+                        let text = String::from_utf8_lossy(&base64_decode(err)).to_string();
+                        if text.contains("err line") {
+                            saw_stderr = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(saw_stdout, "expected stdout 'out line'");
+    assert!(saw_stderr, "expected stderr 'err line'");
+}
+
+#[test]
+fn test_connectrpc_send_signal_kill() {
+    let (addr, registry) = start_test_server("/tmp");
+
+    // Spawn long-running sleep command in a thread via Connect-RPC Start
+    let addr_clone = addr.clone();
+    let start_thread = std::thread::spawn(move || {
+        let req_body = r#"{"process":{"cmd":"sleep 30"}}"#;
+        post_raw(
+            &addr_clone,
+            "/process.Process/Start",
+            "application/connect+json",
+            req_body.as_bytes(),
+        )
+    });
+
+    // Give it a moment to spawn and retrieve PID from registry
+    let mut target_pid = 0;
+    for _ in 0..50 {
+        std::thread::sleep(Duration::from_millis(50));
+        let active = registry.entries.lock().unwrap();
+        if let Some(entry) = active.values().next() {
+            let proc = entry.lock().unwrap();
+            if proc.running && proc.pid > 0 {
+                target_pid = proc.pid;
+                break;
+            }
+        }
+    }
+    assert!(target_pid > 0, "target process should be running");
+
+    // Send SIGKILL via /process.Process/SendSignal
+    let kill_body = format!(
+        r#"{{"process":{{"pid":{}}},"signal":"SIGNAL_SIGKILL"}}"#,
+        target_pid
+    );
+    let (status, _, body) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(std::str::from_utf8(&body).unwrap(), "{}");
+
+    // The start stream should now terminate
+    let (start_status, _, start_body) = start_thread.join().unwrap();
+    assert_eq!(start_status, 200);
+    let frames = parse_connect_frames(&start_body);
+    let end_frame = &frames[frames.len() - 2];
+    let end_json: JsonValue = JsonValue::parse(std::str::from_utf8(&end_frame.1).unwrap()).unwrap();
+    let exit_code = end_json
+        .get("event")
+        .unwrap()
+        .get("end")
+        .unwrap()
+        .get("exitCode")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    // Killed by SIGKILL (signal 9 -> 128 + 9 = 137 or -1)
+    assert!(
+        exit_code == 137 || exit_code == -1,
+        "expected killed exitCode 137 or -1, got {exit_code}"
+    );
+}
+
+#[test]
+fn test_connectrpc_send_signal_framed_and_not_found() {
+    use crate::commands::make_connect_frame;
+
+    let (addr, _) = start_test_server("/tmp");
+
+    // Unknown PID returns 404
+    let not_found_req = r#"{"process":{"pid":9999999},"signal":"SIGNAL_SIGKILL"}"#;
+    let (status, _, body) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        not_found_req.as_bytes(),
+    );
+    assert_eq!(status, 404);
+    assert!(std::str::from_utf8(&body).unwrap().contains("not_found"));
+
+    // Framed payload also accepted
+    let framed = make_connect_frame(not_found_req.as_bytes(), false);
+    let (status2, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/connect+json",
+        &framed,
+    );
+    assert_eq!(status2, 404);
+}
+
+#[test]
+fn test_interpreter_zero_latency_flushing() {
+    let (addr, _) = start_test_server("/tmp");
+    let req_body = r#"{"code":"print('line one')\nprint('line two')"}"#;
+    let (status, _, body) = post_raw(&addr, "/execute", "application/json", req_body.as_bytes());
+    assert_eq!(status, 200);
+
+    let body_str = String::from_utf8(body).unwrap();
+    let lines: Vec<&str> = body_str.lines().filter(|l| !l.is_empty()).collect();
+    assert!(
+        lines.len() >= 3,
+        "expected at least 2 stdout lines and 1 counter line"
+    );
+
+    let line1 = JsonValue::parse(lines[0]).unwrap();
+    assert_eq!(line1.get("type").unwrap().as_str().unwrap(), "stdout");
+    assert_eq!(line1.get("text").unwrap().as_str().unwrap(), "line one\n");
+
+    let line2 = JsonValue::parse(lines[1]).unwrap();
+    assert_eq!(line2.get("type").unwrap().as_str().unwrap(), "stdout");
+    assert_eq!(line2.get("text").unwrap().as_str().unwrap(), "line two\n");
+}

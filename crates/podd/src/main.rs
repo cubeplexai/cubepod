@@ -22,9 +22,10 @@ use std::env;
 use std::net::{TcpListener, TcpStream};
 
 pub use commands::{
-    handle_command_kill, handle_command_logs, handle_command_run, handle_command_status,
-    kill_all_managed, ManagedProcess, ProcessEntry, ProcessOutputBuffer, ProcessRegistry,
-    ProcessTable,
+    base64_encode, handle_command_kill, handle_command_logs, handle_command_run,
+    handle_command_status, handle_connectrpc_process_start, handle_connectrpc_send_signal,
+    kill_all_managed, make_connect_frame, unpack_connect_payload, ManagedProcess, ProcessEntry,
+    ProcessOutputBuffer, ProcessRegistry, ProcessTable,
 };
 pub use files::{
     apply_permissions_and_ownership, chown_if_root, decompress_if_gzip, handle_archive_sync,
@@ -87,6 +88,12 @@ pub fn route_request(
         }
         ("POST", "/v1/commands/run") => {
             handle_command_run(&mut stream, &req, config, registry);
+        }
+        ("POST", "/process.Process/Start") => {
+            handle_connectrpc_process_start(&mut stream, &req, config, registry);
+        }
+        ("POST", "/process.Process/SendSignal") => {
+            handle_connectrpc_send_signal(&mut stream, &req, registry);
         }
         ("PUT", "/v1/files") => {
             handle_file_put(&mut stream, &req, &query_params);

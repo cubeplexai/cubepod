@@ -17,6 +17,79 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
 }
 
+pub fn read_chunked_body(stream: &mut TcpStream, initial: &[u8]) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut buf = initial.to_vec();
+    let mut tmp = [0u8; 1024];
+
+    loop {
+        // Read until we find line delimiter for chunk size
+        let line_end = loop {
+            if let Some(pos) = find_subsequence(&buf, b"\r\n") {
+                break (pos, pos + 2);
+            } else if let Some(pos) = find_subsequence(&buf, b"\n") {
+                break (pos, pos + 1);
+            }
+            let n = stream
+                .read(&mut tmp)
+                .map_err(|e| format!("chunk size read error: {e}"))?;
+            if n == 0 {
+                return Err("unexpected EOF reading chunk size".to_string());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        };
+
+        let chunk_header = String::from_utf8_lossy(&buf[..line_end.0]);
+        let hex_str = chunk_header.split(';').next().unwrap_or("").trim();
+        let chunk_size = usize::from_str_radix(hex_str, 16)
+            .map_err(|e| format!("invalid chunk size '{hex_str}': {e}"))?;
+
+        buf.drain(..line_end.1);
+
+        if chunk_size == 0 {
+            // End of chunks. Consume trailing CRLF if present.
+            if buf.starts_with(b"\r\n") {
+                buf.drain(..2);
+            } else if buf.starts_with(b"\n") {
+                buf.drain(..1);
+            }
+            break;
+        }
+
+        // Read chunk data of length chunk_size
+        while buf.len() < chunk_size {
+            let n = stream
+                .read(&mut tmp)
+                .map_err(|e| format!("chunk data read error: {e}"))?;
+            if n == 0 {
+                return Err("unexpected EOF reading chunk data".to_string());
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+
+        body.extend_from_slice(&buf[..chunk_size]);
+        buf.drain(..chunk_size);
+
+        // Consume trailing CRLF after chunk data
+        while buf.is_empty() {
+            let n = stream
+                .read(&mut tmp)
+                .map_err(|e| format!("chunk crlf read error: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        if buf.starts_with(b"\r\n") {
+            buf.drain(..2);
+        } else if buf.starts_with(b"\n") {
+            buf.drain(..1);
+        }
+    }
+
+    Ok(body)
+}
+
 pub fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let mut header_buf = Vec::new();
     let mut buf = [0u8; 1024];
@@ -75,22 +148,32 @@ pub fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> 
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    let mut body = Vec::with_capacity(content_length);
-    let initial_body = &header_buf[header_end.1..];
-    let to_take = initial_body.len().min(content_length);
-    body.extend_from_slice(&initial_body[..to_take]);
+    let is_chunked = headers
+        .get("transfer-encoding")
+        .map(|v| v.to_ascii_lowercase().contains("chunked"))
+        .unwrap_or(false);
 
-    while body.len() < content_length {
-        let needed = content_length - body.len();
-        let chunk_size = needed.min(buf.len());
-        let n = stream
-            .read(&mut buf[..chunk_size])
-            .map_err(|e| format!("body read error: {e}"))?;
-        if n == 0 {
-            break;
+    let initial_body = &header_buf[header_end.1..];
+    let body = if is_chunked {
+        read_chunked_body(stream, initial_body)?
+    } else {
+        let mut body = Vec::with_capacity(content_length);
+        let to_take = initial_body.len().min(content_length);
+        body.extend_from_slice(&initial_body[..to_take]);
+
+        while body.len() < content_length {
+            let needed = content_length - body.len();
+            let chunk_size = needed.min(buf.len());
+            let n = stream
+                .read(&mut buf[..chunk_size])
+                .map_err(|e| format!("body read error: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&buf[..n]);
         }
-        body.extend_from_slice(&buf[..n]);
-    }
+        body
+    };
 
     Ok(HttpRequest {
         method,
