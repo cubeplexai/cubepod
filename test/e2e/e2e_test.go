@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -900,4 +903,406 @@ func TestE2E_E2BProtocolDropIn(t *testing.T) {
 	if notFoundResp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404 Not Found for deleted sandbox, got %d", notFoundResp.StatusCode)
 	}
+}
+
+// TestE2E_E2BProductionHardening validates production hardening, stress resilience,
+// high-throughput file transfer, and idle reaper lease protection conforming to CEP-0018:
+//  1. High-throughput file transfer: uploads and downloads a 5MB binary file via E2B files API,
+//     verifying SHA-256 integrity and in-guest filesystem byte accuracy.
+//  2. Long-running command lease protection: verifies that a command executing across an idle timeout
+//     is NOT mistakenly paused by the ControllerManager Idle Reaper while an active execution lease is held,
+//     and is reaped only after lease expiration.
+//  3. Stress test: spawns multiple concurrent sandboxes executing parallel commands and file I/O
+//     without resource leaks or race conditions.
+func TestE2E_E2BProductionHardening(t *testing.T) {
+	t.Run("HighThroughputFileTransfer", func(t *testing.T) {
+		reconciler := controller.NewReconciler()
+		srv := gateway.NewServer(reconciler)
+		ts := httptest.NewServer(srv.Handler())
+		defer ts.Close()
+		client := ts.Client()
+
+		// 1. Create sandbox
+		createPayload := []byte(`{"templateID": "base", "timeout": 600}`)
+		resp, err := client.Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader(createPayload))
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("failed to create sandbox: status=%v err=%v", resp.StatusCode, err)
+		}
+		var sbRec gateway.SandboxRecord
+		_ = json.NewDecoder(resp.Body).Decode(&sbRec)
+		resp.Body.Close()
+		sbID := sbRec.SandboxID
+
+		// 2. Generate 5MB pseudo-random binary payload
+		const fileSize = 5 * 1024 * 1024 // 5 MB
+		payload := make([]byte, fileSize)
+		for i := range payload {
+			payload[i] = byte((i*37 + 13) % 256)
+		}
+		hasher := sha256.New()
+		hasher.Write(payload)
+		expectedChecksum := hex.EncodeToString(hasher.Sum(nil))
+
+		// 3. Upload 5MB binary file via E2B files API (PUT /sandboxes/{id}/files?path=...)
+		uploadStart := time.Now()
+		putReq, err := http.NewRequest(http.MethodPut, ts.URL+"/sandboxes/"+sbID+"/files?path=/workspace/data_5mb.bin", bytes.NewReader(payload))
+		if err != nil {
+			t.Fatalf("failed to create upload request: %v", err)
+		}
+		putReq.Header.Set("Content-Type", "application/octet-stream")
+		putResp, err := client.Do(putReq)
+		if err != nil || putResp.StatusCode != http.StatusOK {
+			t.Fatalf("upload 5MB file failed: status=%v err=%v", putResp.StatusCode, err)
+		}
+		putResp.Body.Close()
+		uploadDuration := time.Since(uploadStart)
+		t.Logf("Uploaded 5MB in %v (%.2f MB/s)", uploadDuration, float64(fileSize)/(1024*1024)/uploadDuration.Seconds())
+
+		// 4. Download 5MB binary file via E2B files API (GET /sandboxes/{id}/files?path=...)
+		downloadStart := time.Now()
+		getResp, err := client.Get(ts.URL + "/sandboxes/" + sbID + "/files?path=/workspace/data_5mb.bin")
+		if err != nil || getResp.StatusCode != http.StatusOK {
+			t.Fatalf("download 5MB file failed: status=%v err=%v", getResp.StatusCode, err)
+		}
+		downloadedBytes, err := io.ReadAll(getResp.Body)
+		getResp.Body.Close()
+		if err != nil {
+			t.Fatalf("failed to read downloaded body: %v", err)
+		}
+		downloadDuration := time.Since(downloadStart)
+		t.Logf("Downloaded 5MB in %v (%.2f MB/s)", downloadDuration, float64(fileSize)/(1024*1024)/downloadDuration.Seconds())
+
+		// 5. Verify byte count and SHA-256 integrity
+		if len(downloadedBytes) != fileSize {
+			t.Fatalf("download size mismatch: expected %d bytes, got %d bytes", fileSize, len(downloadedBytes))
+		}
+		dlHasher := sha256.New()
+		dlHasher.Write(downloadedBytes)
+		actualChecksum := hex.EncodeToString(dlHasher.Sum(nil))
+		if actualChecksum != expectedChecksum {
+			t.Fatalf("SHA-256 checksum mismatch: expected %s, got %s", expectedChecksum, actualChecksum)
+		}
+
+		// 6. In-guest verification: execute wc -c in the sandbox to verify exact file size on disk
+		checkCmd := []byte(`{"command": "wc -c data_5mb.bin"}`)
+		cmdResp, err := client.Post(ts.URL+"/sandboxes/"+sbID+"/commands/run", "application/json", bytes.NewReader(checkCmd))
+		if err != nil || cmdResp.StatusCode != http.StatusOK {
+			t.Fatalf("in-guest file check command failed: status=%v err=%v", cmdResp.StatusCode, err)
+		}
+		var cmdRes map[string]interface{}
+		_ = json.NewDecoder(cmdResp.Body).Decode(&cmdRes)
+		cmdResp.Body.Close()
+		stdoutStr := fmt.Sprintf("%v", cmdRes["stdout"])
+		if !strings.Contains(stdoutStr, fmt.Sprintf("%d", fileSize)) {
+			t.Fatalf("in-guest file size check failed, expected %d in stdout, got: %s", fileSize, stdoutStr)
+		}
+
+		// Cleanup
+		delReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+sbID, nil)
+		_, _ = client.Do(delReq)
+	})
+
+	t.Run("LongRunningCommandLeaseProtection", func(t *testing.T) {
+		reconciler := controller.NewReconciler()
+		srv := gateway.NewServer(reconciler)
+		ts := httptest.NewServer(srv.Handler())
+		defer ts.Close()
+		client := ts.Client()
+
+		// 1. Create sandbox
+		createPayload := []byte(`{"templateID": "base", "timeout": 300}`)
+		resp, err := client.Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader(createPayload))
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("failed to create sandbox: status=%v err=%v", resp.StatusCode, err)
+		}
+		var sbRec gateway.SandboxRecord
+		_ = json.NewDecoder(resp.Body).Decode(&sbRec)
+		resp.Body.Close()
+		sbID := sbRec.SandboxID
+
+		// 2. Configure a short IdleTimeout (1s) on the reconciler
+		spec := v1alpha1.PodBoxSpec{
+			TemplateRef:      "cubeplex-ubuntu24-desktop",
+			DesiredState:     v1alpha1.DesiredStateRunning,
+			RootfsGeneration: 1,
+			Lifecycle: v1alpha1.LifecyclePolicy{
+				IdleTimeoutSeconds: 1,
+			},
+		}
+		if _, err := reconciler.Reconcile(context.Background(), sbID, spec); err != nil {
+			t.Fatalf("failed to configure lifecycle on reconciler: %v", err)
+		}
+
+		// 3. Start ControllerManager with a fast ticker (50ms) to aggressively reap idle sandboxes
+		mgrCtx, cancelMgr := context.WithCancel(context.Background())
+		defer cancelMgr()
+		mgr := controller.NewControllerManager(reconciler, "127.0.0.1:0", 50*time.Millisecond)
+		go func() {
+			_ = mgr.Start(mgrCtx)
+		}()
+
+		// 4. Launch a long-running background command that takes 1.2s (longer than the 1s IdleTimeout)
+		bgPayload := []byte(`{"command": "sleep 1.2 && echo 'lease-work-done' > job.out", "background": true}`)
+		bgResp, err := client.Post(ts.URL+"/sandboxes/"+sbID+"/commands/run", "application/json", bytes.NewReader(bgPayload))
+		if err != nil || bgResp.StatusCode != http.StatusOK {
+			t.Fatalf("failed to run background command: status=%v err=%v", bgResp.StatusCode, err)
+		}
+		var bgRes map[string]interface{}
+		_ = json.NewDecoder(bgResp.Body).Decode(&bgRes)
+		bgResp.Body.Close()
+		cmdID := fmt.Sprintf("%v", bgRes["cmdID"])
+		if cmdID == "" || cmdID == "<nil>" {
+			cmdID = fmt.Sprintf("%v", bgRes["id"])
+		}
+
+		// 5. Acquire active execution lease for 10s via Gateway API and update Reconciler
+		leaseSecs := 10
+		leasePayload := []byte(fmt.Sprintf(`{"leaseSeconds": %d}`, leaseSecs))
+		leaseResp, err := client.Post(ts.URL+"/sandboxes/"+sbID+"/lease", "application/json", bytes.NewReader(leasePayload))
+		if err != nil || leaseResp.StatusCode != http.StatusOK {
+			t.Fatalf("lease request failed: status=%v err=%v", leaseResp.StatusCode, err)
+		}
+		leaseResp.Body.Close()
+
+		leaseExpiry := time.Now().UTC().Add(time.Duration(leaseSecs) * time.Second)
+		if err := reconciler.AcquireLease(sbID, leaseExpiry); err != nil {
+			t.Fatalf("reconciler AcquireLease failed: %v", err)
+		}
+
+		// 6. Explicitly set LastActivityAt to 2 seconds in the past so LastActivityAt + IdleTimeout <= now.
+		// Without an active lease, the Idle Reaper would immediately pause the sandbox!
+		past := time.Now().UTC().Add(-2 * time.Second)
+		_ = reconciler.TouchActivity(sbID, past)
+
+		// Wait 600ms while ControllerManager runs reap cycles
+		time.Sleep(600 * time.Millisecond)
+
+		// Verify sandbox is STILL Running thanks to active lease protection!
+		boxStatus, ok := reconciler.GetBox(sbID)
+		if !ok || boxStatus.Phase != v1alpha1.PodBoxPhaseRunning {
+			t.Fatalf("sandbox was mistakenly paused by Idle Reaper during active lease! Phase: %s, Reason: %s", boxStatus.Phase, boxStatus.Reason)
+		}
+
+		// Wait for the background command to finish (1.2s total)
+		time.Sleep(800 * time.Millisecond)
+
+		// Verify the long-running job finished and produced output
+		verifyResp, err := client.Get(ts.URL + "/sandboxes/" + sbID + "/files?path=/workspace/job.out")
+		if err != nil || verifyResp.StatusCode != http.StatusOK {
+			t.Fatalf("failed to read background job output: status=%v err=%v", verifyResp.StatusCode, err)
+		}
+		jobOut, _ := io.ReadAll(verifyResp.Body)
+		verifyResp.Body.Close()
+		if !strings.Contains(string(jobOut), "lease-work-done") {
+			t.Fatalf("unexpected job output: %s", string(jobOut))
+		}
+
+		// 7. Now expire the lease and touch past activity
+		expired := time.Now().UTC().Add(-5 * time.Second)
+		_ = reconciler.AcquireLease(sbID, expired)
+		_ = reconciler.TouchActivity(sbID, past)
+
+		// Wait for ControllerManager reaper to execute a reap cycle
+		time.Sleep(200 * time.Millisecond)
+
+		// Verify sandbox is now IdlePaused because the lease expired
+		boxStatus, ok = reconciler.GetBox(sbID)
+		if !ok || boxStatus.Phase != v1alpha1.PodBoxPhasePaused {
+			t.Fatalf("expected sandbox to be Paused after lease expiration, got Phase=%s Reason=%s", boxStatus.Phase, boxStatus.Reason)
+		}
+		if boxStatus.Reason != "IdlePaused" {
+			t.Fatalf("expected reason IdlePaused, got %s", boxStatus.Reason)
+		}
+
+		// 8. Resume sandbox via E2B connect endpoint and verify transition back to Running
+		connectResp, err := client.Post(ts.URL+"/sandboxes/"+sbID+"/connect", "application/json", nil)
+		if err != nil || connectResp.StatusCode != http.StatusOK {
+			t.Fatalf("connect sandbox failed: status=%v err=%v", connectResp.StatusCode, err)
+		}
+		connectResp.Body.Close()
+
+		boxStatus, ok = reconciler.GetBox(sbID)
+		if !ok || boxStatus.Phase != v1alpha1.PodBoxPhaseRunning {
+			t.Fatalf("expected sandbox to be Running after connect, got %s", boxStatus.Phase)
+		}
+
+		// Subsequent command execution runs cleanly
+		resumeCmd := []byte(`{"command": "echo 'resumed-after-reaper'"}`)
+		arResp, err := client.Post(ts.URL+"/sandboxes/"+sbID+"/commands/run", "application/json", bytes.NewReader(resumeCmd))
+		if err != nil || arResp.StatusCode != http.StatusOK {
+			t.Fatalf("command after resume failed: status=%v err=%v", arResp.StatusCode, err)
+		}
+		var arRes map[string]interface{}
+		_ = json.NewDecoder(arResp.Body).Decode(&arRes)
+		arResp.Body.Close()
+		if !strings.Contains(fmt.Sprintf("%v", arRes["stdout"]), "resumed-after-reaper") {
+			t.Fatalf("unexpected stdout after resume: %+v", arRes)
+		}
+
+		// Cleanup
+		delReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+sbID, nil)
+		_, _ = client.Do(delReq)
+	})
+
+	t.Run("ConcurrentSandboxesStressTest", func(t *testing.T) {
+		reconciler := controller.NewReconciler()
+		srv := gateway.NewServer(reconciler)
+		ts := httptest.NewServer(srv.Handler())
+		defer ts.Close()
+
+		const numSandboxes = 6
+		const commandsPerSandbox = 5
+
+		var (
+			wg      sync.WaitGroup
+			errChan = make(chan error, numSandboxes*commandsPerSandbox+numSandboxes)
+			sbIDs   = make([]string, numSandboxes)
+			client  = ts.Client()
+		)
+
+		// 1. Concurrently spawn multiple sandboxes
+		for i := 0; i < numSandboxes; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				createBody := []byte(fmt.Sprintf(`{"templateID": "base", "metadata": {"worker": "%d"}}`, idx))
+				resp, err := client.Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader(createBody))
+				if err != nil {
+					errChan <- fmt.Errorf("worker %d: create failed: %w", idx, err)
+					return
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusCreated {
+					errChan <- fmt.Errorf("worker %d: create returned status %d", idx, resp.StatusCode)
+					return
+				}
+				var rec gateway.SandboxRecord
+				if err := json.NewDecoder(resp.Body).Decode(&rec); err != nil {
+					errChan <- fmt.Errorf("worker %d: decode failed: %w", idx, err)
+					return
+				}
+				sbIDs[idx] = rec.SandboxID
+			}(i)
+		}
+		wg.Wait()
+
+		// Verify no sandbox creation errors
+		close(errChan)
+		for err := range errChan {
+			t.Fatalf("sandbox creation error: %v", err)
+		}
+
+		// 2. Concurrently execute commands across all sandboxes
+		var cmdWg sync.WaitGroup
+		cmdErrChan := make(chan error, numSandboxes*commandsPerSandbox)
+
+		for i := 0; i < numSandboxes; i++ {
+			sbID := sbIDs[i]
+			for j := 0; j < commandsPerSandbox; j++ {
+				cmdWg.Add(1)
+				go func(sb string, cmdIdx int) {
+					defer cmdWg.Done()
+					// Run a command that computes values and tests environment variables
+					magicVal := cmdIdx*100 + 42
+					cmdPayload := []byte(fmt.Sprintf(`{
+						"command": "echo result=$(( %d + 8 ))",
+						"envs": {"WORKER_CMD": "%d"}
+					}`, magicVal, cmdIdx))
+
+					resp, err := client.Post(ts.URL+"/sandboxes/"+sb+"/commands/run", "application/json", bytes.NewReader(cmdPayload))
+					if err != nil {
+						cmdErrChan <- fmt.Errorf("sandbox %s cmd %d failed: %w", sb, cmdIdx, err)
+						return
+					}
+					defer resp.Body.Close()
+					if resp.StatusCode != http.StatusOK {
+						cmdErrChan <- fmt.Errorf("sandbox %s cmd %d returned status %d", sb, cmdIdx, resp.StatusCode)
+						return
+					}
+					var res map[string]interface{}
+					if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+						cmdErrChan <- fmt.Errorf("sandbox %s cmd %d decode failed: %w", sb, cmdIdx, err)
+						return
+					}
+					expected := fmt.Sprintf("result=%d", magicVal+8)
+					stdout := fmt.Sprintf("%v", res["stdout"])
+					if !strings.Contains(stdout, expected) {
+						cmdErrChan <- fmt.Errorf("sandbox %s cmd %d expected %q, got %q", sb, cmdIdx, expected, stdout)
+						return
+					}
+
+					// Also write and read back a file concurrently
+					fData := []byte(fmt.Sprintf("worker-data-%s-%d", sb, cmdIdx))
+					putReq, err := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/sandboxes/%s/files?path=/workspace/w_%d.txt", ts.URL, sb, cmdIdx), bytes.NewReader(fData))
+					if err != nil {
+						cmdErrChan <- fmt.Errorf("sandbox %s file req %d failed: %w", sb, cmdIdx, err)
+						return
+					}
+					putResp, err := client.Do(putReq)
+					if err != nil || putResp.StatusCode != http.StatusOK {
+						cmdErrChan <- fmt.Errorf("sandbox %s file put %d failed: %v", sb, cmdIdx, err)
+						return
+					}
+					putResp.Body.Close()
+
+					getResp, err := client.Get(fmt.Sprintf("%s/sandboxes/%s/files?path=/workspace/w_%d.txt", ts.URL, sb, cmdIdx))
+					if err != nil || getResp.StatusCode != http.StatusOK {
+						cmdErrChan <- fmt.Errorf("sandbox %s file get %d failed: %v", sb, cmdIdx, err)
+						return
+					}
+					gotBytes, _ := io.ReadAll(getResp.Body)
+					getResp.Body.Close()
+					if !bytes.Equal(gotBytes, fData) {
+						cmdErrChan <- fmt.Errorf("sandbox %s file content %d mismatch: got %q, expected %q", sb, cmdIdx, string(gotBytes), string(fData))
+						return
+					}
+				}(sbID, j)
+			}
+		}
+		cmdWg.Wait()
+		close(cmdErrChan)
+
+		for err := range cmdErrChan {
+			t.Fatalf("concurrent command execution error: %v", err)
+		}
+
+		// 3. Concurrently delete all sandboxes and verify no leaks
+		var delWg sync.WaitGroup
+		delErrChan := make(chan error, numSandboxes)
+		for _, sbID := range sbIDs {
+			delWg.Add(1)
+			go func(sb string) {
+				defer delWg.Done()
+				delReq, err := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+sb, nil)
+				if err != nil {
+					delErrChan <- fmt.Errorf("sandbox %s delete req failed: %w", sb, err)
+					return
+				}
+				delResp, err := client.Do(delReq)
+				if err != nil || (delResp.StatusCode != http.StatusNoContent && delResp.StatusCode != http.StatusOK) {
+					delErrChan <- fmt.Errorf("sandbox %s delete failed: status=%v err=%w", sb, delResp.StatusCode, err)
+					return
+				}
+				delResp.Body.Close()
+
+				// Verify 404
+				getResp, err := client.Get(ts.URL + "/sandboxes/" + sb)
+				if err != nil {
+					delErrChan <- fmt.Errorf("sandbox %s get after delete failed: %w", sb, err)
+					return
+				}
+				getResp.Body.Close()
+				if getResp.StatusCode != http.StatusNotFound {
+					delErrChan <- fmt.Errorf("sandbox %s expected 404 after delete, got %d", sb, getResp.StatusCode)
+					return
+				}
+			}(sbID)
+		}
+		delWg.Wait()
+		close(delErrChan)
+
+		for err := range delErrChan {
+			t.Fatalf("sandbox deletion error: %v", err)
+		}
+	})
 }
