@@ -14,10 +14,15 @@ import (
 )
 
 type createSandboxReq struct {
-	TemplateID string            `json:"templateID"`
-	Timeout    int               `json:"timeout,omitempty"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
-	Extension  struct {
+	TemplateID  string            `json:"templateID"`
+	Template_ID string            `json:"template_id,omitempty"`
+	Timeout     int               `json:"timeout,omitempty"`
+	Metadata    map[string]string `json:"metadata,omitempty"`
+	EnvVars     map[string]string `json:"envVars,omitempty"`
+	Env_Vars    map[string]string `json:"env_vars,omitempty"`
+	AutoPause   *bool             `json:"autoPause,omitempty"`
+	AutoResume  any               `json:"autoResume,omitempty"`
+	Extension   struct {
 		VolumeKey      string                      `json:"volumeKey,omitempty"`
 		NetworkPolicy  *v1alpha1.NetworkPolicySpec `json:"networkPolicy,omitempty"`
 		SecretBindings []struct {
@@ -71,7 +76,10 @@ func pollPoddHealth(ctx context.Context, poddURL string, timeout time.Duration) 
 func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	var req createSandboxReq
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	if req.TemplateID == "" {
+	if req.TemplateID == "" && req.Template_ID != "" {
+		req.TemplateID = req.Template_ID
+	}
+	if req.TemplateID == "" || req.TemplateID == "base" || req.TemplateID == "code-interpreter" || req.TemplateID == "code-interpreter-v1" || req.TemplateID == "python" {
 		req.TemplateID = "cubeplex-ubuntu24-desktop"
 	}
 	timeoutSecs := req.Timeout
@@ -105,9 +113,17 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
+	endAt := now.Add(time.Duration(timeoutSecs) * time.Second)
 	rec := &SandboxRecord{
 		SandboxID:        id,
 		TemplateID:       req.TemplateID,
+		ClientID:         "cpod-client-01",
+		EnvdVersion:      "1.1.0",
+		StartedAt:        now,
+		EndAt:            endAt,
+		CPUCount:         2,
+		MemoryMB:         2048,
+		DiskSizeMB:       10240,
 		State:            string(status.Phase),
 		EnvdPort:         49983,
 		RootfsGeneration: status.ObservedRootfsGen,
@@ -256,6 +272,37 @@ func (s *Server) handleTimeoutSandbox(w http.ResponseWriter, r *http.Request) {
 	s.handleSetTimeout(w, r)
 }
 
+type refreshReq struct {
+	Duration int `json:"duration"`
+}
+
+func (s *Server) handleRefreshSandbox(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("sandboxID")
+	var req refreshReq
+	if r.Body != nil {
+		_ = json.NewDecoder(r.Body).Decode(&req)
+	}
+	secs := req.Duration
+	if secs <= 0 {
+		secs = 300
+	}
+
+	s.mu.Lock()
+	rec, ok := s.sandboxes[id]
+	if !ok {
+		s.mu.Unlock()
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+	rec.TimeoutSeconds = secs
+	now := time.Now().UTC()
+	rec.LastActivityAt = &now
+	rec.EndAt = now.Add(time.Duration(secs) * time.Second)
+	s.mu.Unlock()
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) handleSetTimeout(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sandboxID")
 	var req timeoutReq
@@ -379,9 +426,17 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	_ = os.MkdirAll(workspaceDir, 0755)
 
 	now := time.Now().UTC()
+	endAt := now.Add(time.Duration(parent.TimeoutSeconds) * time.Second)
 	child := &SandboxRecord{
 		SandboxID:        childID,
 		TemplateID:       parent.TemplateID,
+		ClientID:         "cpod-client-01",
+		EnvdVersion:      "1.1.0",
+		StartedAt:        now,
+		EndAt:            endAt,
+		CPUCount:         2,
+		MemoryMB:         2048,
+		DiskSizeMB:       10240,
 		State:            string(status.Phase),
 		EnvdPort:         49983,
 		RootfsGeneration: status.ObservedRootfsGen,

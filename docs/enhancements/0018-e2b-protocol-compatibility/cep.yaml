@@ -1,0 +1,29 @@
+title: "E2B Drop-in Protocol Compatibility and SDK Interoperability Specification"
+cep-number: 18
+authors:
+  - "@cubepod-maintainers"
+owning-area: "gateway"
+participating-areas:
+  - "runtime"
+  - "sdk"
+status: "implementable"
+creation-date: "2026-11-11"
+last-updated: "2026-11-11"
+target-version: "v0.3.1"
+stage: "alpha"
+latest-milestone: "v0.3.1"
+milestone:
+  alpha: "v0.3.1"
+  beta: "v0.4.0"
+  stable: "v1.0.0"
+feature-gates:
+  - name: "E2BProtocolCompatibility"
+    components:
+      - "cubepod-gateway"
+      - "podd"
+disable-supported: false
+metrics:
+  - "cubepod_e2b_requests_total"
+  - "cubepod_e2b_request_duration_seconds"
+replaces: []
+superseded-by: []

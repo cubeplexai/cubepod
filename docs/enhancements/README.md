@@ -29,3 +29,5 @@ This directory contains all **CubePod Enhancement Proposals (CEPs)**—the offic
 | **[CEP-0015](0015-k8s-cluster-live-e2e/README.md)** | Real Kubernetes Cluster (`kubectl`) Deployment and Live End-to-End Verification Suite | `implemented` | `v0.3.0` | `deploy/k8s/` & `test/k8s-e2e/` |
 | **[CEP-0016](0016-k8s-block-csi-and-overlayfs-live-e2e/README.md)** | OpenEBS LVM-LocalPV Block CSI Provisioning and Live In-Guest OverlayFS Pivot Verification | `implementable` | `v0.3.1` | `pkg/controller/` & `deploy/k8s/` & `test/k8s-e2e/` |
 | **[CEP-0017](0017-longhorn-v2-block-verification/README.md)** | Longhorn V2 SPDK Block CSI Deployment and Live `volumeMode: Block` Verification | `implementable` | `v0.3.1` | `deploy/k8s/longhorn-v2/` & `test/k8s-e2e/` |
+| **[CEP-0018](0018-e2b-protocol-compatibility/README.md)** | E2B Drop-in Protocol Compatibility and SDK Interoperability Specification | `implementable` | `v0.3.1` | [`pkg/gateway/`](../../pkg/gateway/) & [`crates/podd/`](../../crates/podd/) & [`api/openapi/cubepod-v1.yaml`](../../api/openapi/cubepod-v1.yaml) |
+

@@ -24,6 +24,13 @@ type SandboxRecord struct {
 	SandboxID        string            `json:"sandboxID"`
 	TemplateID       string            `json:"templateID"`
 	State            string            `json:"state"`
+	ClientID         string            `json:"clientID"`
+	EnvdVersion      string            `json:"envdVersion"`
+	StartedAt        time.Time         `json:"startedAt"`
+	EndAt            time.Time         `json:"endAt"`
+	CPUCount         int               `json:"cpuCount"`
+	MemoryMB         int               `json:"memoryMB"`
+	DiskSizeMB       int               `json:"diskSizeMB"`
 	EnvdPort         int               `json:"envdPort"`
 	PoddURL          string            `json:"poddURL,omitempty"`
 	RootfsGeneration int64             `json:"rootfsGeneration"`
@@ -148,6 +155,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/pause", s.handlePauseSandbox)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/connect", s.handleConnectSandbox)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/timeout", s.handleTimeoutSandbox)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/refreshes", s.handleRefreshSandbox)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/lease", s.handleLeaseSandbox)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/reset-rootfs", s.handleResetRootfs)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/fork", s.handleForkSandbox)
