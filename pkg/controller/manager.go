@@ -83,6 +83,11 @@ func (m *ControllerManager) handleMetrics(w http.ResponseWriter, r *http.Request
 
 // ReconcileOnce executes one pass of ReapIdle and WarmPool replenishment.
 func (m *ControllerManager) ReconcileOnce(ctx context.Context) {
+	// Sync state from Kubernetes (PodBoxes and PodWarmPools)
+	if _, err := m.reconciler.SyncFromKube(ctx); err != nil {
+		slog.Debug("sync from kube failed", "err", err)
+	}
+
 	now := time.Now().UTC()
 	paused, terminated := m.reconciler.ReapIdle(ctx, now)
 	if len(paused) > 0 || len(terminated) > 0 {

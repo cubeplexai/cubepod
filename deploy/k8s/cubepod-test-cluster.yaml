@@ -202,7 +202,7 @@ spec:
             - "-addr=:8081"
             - "-volume-mode=Block"
             - "-storage-class=longhorn-v2-block-thin"
-            - "-runtime-class=none"
+            - "-runtime-class=kata-clh"
             - "-podd-image=hub.sensedeal.vip/library/cubepod-podd:v0.3.1-k8s"
             - "-sandbox-image=hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917"
           ports:
@@ -263,7 +263,7 @@ spec:
             - "-namespace=cubepod-workloads"
             - "-volume-mode=Block"
             - "-storage-class=longhorn-v2-block-thin"
-            - "-runtime-class=none"
+            - "-runtime-class=kata-clh"
             - "-podd-image=hub.sensedeal.vip/library/cubepod-podd:v0.3.1-k8s"
             - "-sandbox-image=hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917"
             - "-live-pod-routing=true"

@@ -187,3 +187,147 @@ func (c *RESTKubeClient) DeletePodBox(ctx context.Context, namespace, name strin
 	body, _ := io.ReadAll(resp.Body)
 	return fmt.Errorf("DeletePodBox failed: status %d (%s)", resp.StatusCode, string(body))
 }
+
+// UpsertPodWarmPool creates or updates a PodWarmPool Custom Resource in the Kubernetes APIServer.
+func (c *RESTKubeClient) UpsertPodWarmPool(ctx context.Context, pool v1alpha1.PodWarmPool) error {
+	ns := c.resolveNamespace(pool.Metadata.Namespace)
+	pool.Metadata.Namespace = ns
+	name := pool.Metadata.Name
+	if name == "" {
+		return fmt.Errorf("PodWarmPool metadata.name is required")
+	}
+	if pool.APIVersion == "" {
+		pool.APIVersion = "cubepod.io/v1alpha1"
+	}
+	if pool.Kind == "" {
+		pool.Kind = "PodWarmPool"
+	}
+
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podwarmpools", c.baseURL, ns)
+	payload, err := json.Marshal(pool)
+	if err != nil {
+		return fmt.Errorf("failed to marshal PodWarmPool JSON: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("UpsertPodWarmPool POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		slog.Debug("CRD podwarmpools.cubepod.io not installed on APIServer; skipping PodWarmPool persistence",
+			"namespace", ns, "name", name)
+		return nil
+	}
+
+	if resp.StatusCode == http.StatusConflict {
+		existing, err := c.GetPodWarmPool(ctx, ns, name)
+		if err != nil {
+			return fmt.Errorf("UpsertPodWarmPool conflict resolution failed to GET existing object: %w", err)
+		}
+		pool.Metadata.ResourceVersion = existing.Metadata.ResourceVersion
+
+		putURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podwarmpools/%s", c.baseURL, ns, name)
+		putPayload, err := json.Marshal(pool)
+		if err != nil {
+			return fmt.Errorf("failed to marshal PodWarmPool for PUT: %w", err)
+		}
+		putResp, err := c.doRequest(ctx, http.MethodPut, putURL, bytes.NewReader(putPayload))
+		if err != nil {
+			return fmt.Errorf("UpsertPodWarmPool PUT failed: %w", err)
+		}
+		defer putResp.Body.Close()
+
+		if putResp.StatusCode >= 400 {
+			body, _ := io.ReadAll(putResp.Body)
+			return fmt.Errorf("UpsertPodWarmPool PUT failed: status %d (%s)", putResp.StatusCode, string(body))
+		}
+
+		statusURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podwarmpools/%s/status", c.baseURL, ns, name)
+		statusResp, err := c.doRequest(ctx, http.MethodPut, statusURL, bytes.NewReader(putPayload))
+		if err == nil {
+			_ = statusResp.Body.Close()
+		}
+		return nil
+	}
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("UpsertPodWarmPool POST failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// GetPodWarmPool retrieves a single PodWarmPool Custom Resource by namespace and name.
+func (c *RESTKubeClient) GetPodWarmPool(ctx context.Context, namespace, name string) (*v1alpha1.PodWarmPool, error) {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podwarmpools/%s", c.baseURL, ns, name)
+
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GetPodWarmPool GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("PodWarmPool %s/%s not found (404)", ns, name)
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GetPodWarmPool failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	var pool v1alpha1.PodWarmPool
+	if err := json.NewDecoder(resp.Body).Decode(&pool); err != nil {
+		return nil, fmt.Errorf("failed to decode PodWarmPool: %w", err)
+	}
+	return &pool, nil
+}
+
+// ListPodWarmPools retrieves all PodWarmPool Custom Resources in the given namespace.
+func (c *RESTKubeClient) ListPodWarmPools(ctx context.Context, namespace string) ([]v1alpha1.PodWarmPool, error) {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podwarmpools", c.baseURL, ns)
+
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ListPodWarmPools GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return []v1alpha1.PodWarmPool{}, nil
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("ListPodWarmPools failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	var list v1alpha1.PodWarmPoolList
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("failed to decode PodWarmPoolList: %w", err)
+	}
+	return list.Items, nil
+}
+
+// DeletePodWarmPool removes a PodWarmPool Custom Resource by namespace and name.
+func (c *RESTKubeClient) DeletePodWarmPool(ctx context.Context, namespace, name string) error {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podwarmpools/%s", c.baseURL, ns, name)
+
+	resp, err := c.doRequest(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("DeletePodWarmPool DELETE failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted ||
+		resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("DeletePodWarmPool failed: status %d (%s)", resp.StatusCode, string(body))
+}

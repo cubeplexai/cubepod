@@ -202,3 +202,20 @@ type PodBoxList struct {
 	Metadata   ObjectMeta `json:"metadata,omitempty"`
 	Items      []PodBox   `json:"items"`
 }
+
+// PodWarmPool is the Custom Resource representing a standby pool of warm MicroVM sandboxes.
+type PodWarmPool struct {
+	APIVersion string            `json:"apiVersion,omitempty"`
+	Kind       string            `json:"kind,omitempty"`
+	Metadata   ObjectMeta        `json:"metadata"`
+	Spec       PodWarmPoolSpec   `json:"spec"`
+	Status     PodWarmPoolStatus `json:"status,omitempty"`
+}
+
+// PodWarmPoolList is a list of PodWarmPool Custom Resources.
+type PodWarmPoolList struct {
+	APIVersion string        `json:"apiVersion,omitempty"`
+	Kind       string        `json:"kind,omitempty"`
+	Metadata   ObjectMeta    `json:"metadata,omitempty"`
+	Items      []PodWarmPool `json:"items"`
+}

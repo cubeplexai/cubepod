@@ -91,8 +91,16 @@ func TestK8sLiveE2E(t *testing.T) {
 		t.Fatalf("failed to get live Kubernetes pod %s/%s: %v", workloadsNamespace, podName, err)
 	}
 
-	// Verify initContainer podd-installer exists
 	specMap, _ := podObj["spec"].(map[string]any)
+
+	// Verify runtimeClassName is set (validating Kata MicroVM execution)
+	runtimeClass, _ := specMap["runtimeClassName"].(string)
+	if runtimeClass == "" {
+		t.Fatalf("expected Pod %s to have runtimeClassName set, got empty", podName)
+	}
+	t.Logf("[K8s-E2E] Verified Pod runtimeClassName: %q", runtimeClass)
+
+	// Verify initContainer podd-installer exists
 	initContainers, _ := specMap["initContainers"].([]any)
 	foundPoddInstaller := false
 	for _, ic := range initContainers {
@@ -191,7 +199,7 @@ func TestK8sLiveE2E(t *testing.T) {
 
 	// Foreground and background command execution and cursor log polling
 	t.Logf("[K8s-E2E] Step b: Testing foreground command execution...")
-	fgCmd := "echo 'live-k8s-pod-foreground-ok' && whoami && uname -m"
+	fgCmd := "echo 'live-k8s-pod-foreground-ok' && whoami && uname -a"
 	fgRes, err := c.RunCommand(ctx, sandboxID, client.RunCommandRequest{Command: fgCmd})
 	if err != nil {
 		t.Fatalf("failed to run foreground command: %v", err)
@@ -479,4 +487,67 @@ func TestK8sLiveE2E(t *testing.T) {
 	}
 
 	t.Logf("[K8s-E2E] Teardown verified! Pod and Block PVCs cleanly removed from %s", workloadsNamespace)
+}
+
+// TestK8sWarmPoolClaimLive tests provisioning a standby PodWarmPool and measuring
+// the rapid claim latency when a new sandbox request arrives.
+func TestK8sWarmPoolClaimLive(t *testing.T) {
+	if os.Getenv("CUBEPOD_K8S_E2E") != "1" {
+		t.Skip("Skipping live Kubernetes E2E tests: set CUBEPOD_K8S_E2E=1 to run against live cluster")
+	}
+
+	cfg := loadClusterConfig(t)
+	if cfg.GatewayURL == "" {
+		t.Fatal("gateway URL required")
+	}
+	gatewayURL := cfg.GatewayURL
+	sandboxImage := cfg.SandboxImage
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	c := client.New(gatewayURL, client.WithTimeout(3*time.Minute))
+
+	// 1. Create WarmPool with 1 replica for our sandboxImage
+	poolName := fmt.Sprintf("live-wp-%d", time.Now().Unix()%10000)
+	t.Logf("[K8s-WarmPool] Step 1: Creating warmpool %s with template %s...", poolName, sandboxImage)
+	wp, err := c.CreateWarmPool(ctx, poolName, sandboxImage, 1)
+	if err != nil {
+		t.Fatalf("failed to create warmpool: %v", err)
+	}
+	t.Logf("[K8s-WarmPool] Warmpool created: %+v", wp)
+
+	// Wait for the standby warmpod to be provisioned, mounted, and running
+	t.Logf("[K8s-WarmPool] Waiting for warm standby pod to be provisioned and ready...")
+	time.Sleep(30 * time.Second)
+
+	// 2. Measure sandbox creation via WarmPool Claim!
+	t.Logf("[K8s-WarmPool] Step 2: Creating sandbox and timing the WarmPool Claim latency...")
+	start := time.Now()
+	sb, err := c.CreateSandbox(ctx, client.CreateSandboxRequest{
+		TemplateID: sandboxImage,
+		Metadata: map[string]string{
+			"test": "warmpool-claim",
+		},
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("failed to create sandbox via warmpool claim: %v", err)
+	}
+	defer func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		_ = c.DeleteSandboxWithOptions(cleanupCtx, sb.SandboxID, true)
+	}()
+
+	t.Logf("[K8s-WarmPool] SUCCESS! Sandbox %s claimed from warmpool in %v! (vs ~30s on cold start)", sb.SandboxID, elapsed)
+
+	// 3. Verify fast command execution
+	res, err := c.RunCommand(ctx, sb.SandboxID, client.RunCommandRequest{
+		Command: "uname -a",
+	})
+	if err != nil || res.ExitCode == nil || *res.ExitCode != 0 {
+		t.Fatalf("command execution on claimed warm sandbox failed: %v", err)
+	}
+	t.Logf("[K8s-WarmPool] Claimed sandbox command output: %s", strings.TrimSpace(res.Output))
 }

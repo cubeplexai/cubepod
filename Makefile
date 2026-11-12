@@ -63,7 +63,7 @@ test-e2b-compat: build-gateway
 	@bash test/e2b-compat/run_tests.sh
 
 # Optional deploy/k8s/env.local overrides discovery. See deploy/k8s/env.example.
-K8S_ENV := set -a; if [ -f deploy/k8s/env.local ]; then . deploy/k8s/env.local; fi; set +a;
+K8S_ENV := set -a; if [ -f deploy/k8s/env.local ]; then . deploy/k8s/env.local; fi; set +a
 
 test-k8s-e2e:
 	$(K8S_ENV); CUBEPOD_K8S_E2E=1 $(GO) test -v -timeout 15m ./test/k8s-e2e/ -run 'TestK8sLiveE2E|TestLoadClusterConfigLive'
