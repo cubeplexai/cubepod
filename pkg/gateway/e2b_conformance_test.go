@@ -150,4 +150,34 @@ func TestE2BWireConformance_LifecycleAndSchemas(t *testing.T) {
 			t.Fatalf("missing required E2B ListedSandbox field %q in list response", f)
 		}
 	}
+
+	// 5. Verify GET /sandboxes/{id}/endpoints/49999 for get_host compatibility
+	epResp, err := client.Get(srv.URL + "/sandboxes/" + sandboxID + "/endpoints/49999")
+	if err != nil || epResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /sandboxes/{id}/endpoints/49999 failed: %v (status=%d)", err, epResp.StatusCode)
+	}
+	defer epResp.Body.Close()
+	var epMap map[string]any
+	if err := json.NewDecoder(epResp.Body).Decode(&epMap); err != nil {
+		t.Fatalf("failed to decode endpoint response: %v", err)
+	}
+	if epMap["host"] == "" || epMap["url"] == "" {
+		t.Fatalf("expected host and url in endpoint response: %+v", epMap)
+	}
+
+	// 6. Verify POST /sandboxes/{id}/code/execute returns valid NDJSON stream conforming to e2b-code-interpreter
+	codePayload := []byte(`{"code": "print('e2b conformance test')"}`)
+	codeResp, err := client.Post(srv.URL+"/sandboxes/"+sandboxID+"/code/execute", "application/json", bytes.NewReader(codePayload))
+	if err != nil || codeResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /sandboxes/{id}/code/execute failed: %v (status=%d)", err, codeResp.StatusCode)
+	}
+	defer codeResp.Body.Close()
+	var codeOut bytes.Buffer
+	_, _ = codeOut.ReadFrom(codeResp.Body)
+	if !bytes.Contains(codeOut.Bytes(), []byte("e2b conformance test")) {
+		t.Fatalf("expected stdout from code interpreter execution, got: %s", codeOut.String())
+	}
+	if !bytes.Contains(codeOut.Bytes(), []byte("number_of_executions")) {
+		t.Fatalf("expected number_of_executions in NDJSON stream, got: %s", codeOut.String())
+	}
 }
