@@ -25,25 +25,31 @@ type KubeClient interface {
 	GetPodBox(ctx context.Context, namespace, name string) (*v1alpha1.PodBox, error)
 	ListPodBoxes(ctx context.Context, namespace string) ([]v1alpha1.PodBox, error)
 	DeletePodBox(ctx context.Context, namespace, name string) error
+	UpsertPodWarmPool(ctx context.Context, pool v1alpha1.PodWarmPool) error
+	GetPodWarmPool(ctx context.Context, namespace, name string) (*v1alpha1.PodWarmPool, error)
+	ListPodWarmPools(ctx context.Context, namespace string) ([]v1alpha1.PodWarmPool, error)
+	DeletePodWarmPool(ctx context.Context, namespace, name string) error
 }
 
 // MemoryKubeClient is an in-memory, thread-safe implementation of KubeClient
 // for unit testing and offline development.
 type MemoryKubeClient struct {
-	mu    sync.RWMutex
-	PVCs  map[string]BlockPVCManifest
-	Pods  map[string]PodManifest
-	IPs   map[string]string
-	Boxes map[string]v1alpha1.PodBox
+	mu        sync.RWMutex
+	PVCs      map[string]BlockPVCManifest
+	Pods      map[string]PodManifest
+	IPs       map[string]string
+	Boxes     map[string]v1alpha1.PodBox
+	WarmPools map[string]v1alpha1.PodWarmPool
 }
 
 // NewMemoryKubeClient creates a new in-memory KubeClient.
 func NewMemoryKubeClient() *MemoryKubeClient {
 	return &MemoryKubeClient{
-		PVCs:  make(map[string]BlockPVCManifest),
-		Pods:  make(map[string]PodManifest),
-		IPs:   make(map[string]string),
-		Boxes: make(map[string]v1alpha1.PodBox),
+		PVCs:      make(map[string]BlockPVCManifest),
+		Pods:      make(map[string]PodManifest),
+		IPs:       make(map[string]string),
+		Boxes:     make(map[string]v1alpha1.PodBox),
+		WarmPools: make(map[string]v1alpha1.PodWarmPool),
 	}
 }
 
@@ -120,6 +126,61 @@ func (m *MemoryKubeClient) DeletePodBox(_ context.Context, namespace, name strin
 		namespace = "default"
 	}
 	delete(m.Boxes, boxKey(namespace, name))
+	return nil
+}
+
+// UpsertPodWarmPool stores or updates a PodWarmPool in memory.
+func (m *MemoryKubeClient) UpsertPodWarmPool(_ context.Context, pool v1alpha1.PodWarmPool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ns := pool.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	m.WarmPools[boxKey(ns, pool.Metadata.Name)] = pool
+	return nil
+}
+
+// GetPodWarmPool retrieves a PodWarmPool from memory by namespace and name.
+func (m *MemoryKubeClient) GetPodWarmPool(_ context.Context, namespace, name string) (*v1alpha1.PodWarmPool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	pool, ok := m.WarmPools[boxKey(namespace, name)]
+	if !ok {
+		return nil, fmt.Errorf("podwarmpool %s/%s not found", namespace, name)
+	}
+	cp := pool
+	return &cp, nil
+}
+
+// ListPodWarmPools returns all PodWarmPool instances matching the given namespace (or all if empty).
+func (m *MemoryKubeClient) ListPodWarmPools(_ context.Context, namespace string) ([]v1alpha1.PodWarmPool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	res := make([]v1alpha1.PodWarmPool, 0, len(m.WarmPools))
+	for _, pool := range m.WarmPools {
+		poolNs := pool.Metadata.Namespace
+		if poolNs == "" {
+			poolNs = "default"
+		}
+		if namespace == "" || poolNs == namespace {
+			res = append(res, pool)
+		}
+	}
+	return res, nil
+}
+
+// DeletePodWarmPool removes the PodWarmPool from memory.
+func (m *MemoryKubeClient) DeletePodWarmPool(_ context.Context, namespace, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	delete(m.WarmPools, boxKey(namespace, name))
 	return nil
 }
 

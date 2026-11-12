@@ -93,6 +93,12 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: 1,
 	}
+
+	// Automatic WarmPool Claim: check if there is an available warmpool for this template
+	if warmPoolName := s.reconciler.FindAvailableWarmPool(req.TemplateID); warmPoolName != "" {
+		spec.WarmPoolRef = warmPoolName
+	}
+
 	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

@@ -318,10 +318,27 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 		}
 	}
 
-	return &v1alpha1.PodWarmPoolStatus{
+	st := &v1alpha1.PodWarmPoolStatus{
 		ReadyReplicas:     finalAvail,
 		AvailableReplicas: finalAvail,
-	}, nil
+	}
+
+	// Persist the PodWarmPool CRD state to Kubernetes API
+	if r.kubeClient != nil {
+		cr := v1alpha1.PodWarmPool{
+			APIVersion: "cubepod.io/v1alpha1",
+			Kind:       "PodWarmPool",
+			Metadata: v1alpha1.ObjectMeta{
+				Name:      poolName,
+				Namespace: r.namespace,
+			},
+			Spec:   spec,
+			Status: *st,
+		}
+		_ = r.kubeClient.UpsertPodWarmPool(ctx, cr)
+	}
+
+	return st, nil
 }
 
 // ClaimWarmPod claims a standby warm pod from the given pool for a new PodBox.
@@ -615,9 +632,9 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 	return nil
 }
 
-// SyncFromKube recovers PodBox states from the Kubernetes API into memory.
-// It queries the APIServer for all PodBoxes in the reconciler's namespace,
-// populates r.boxes and r.specs in memory, and returns the count of recovered PodBoxes.
+// SyncFromKube recovers PodBox and PodWarmPool states from the Kubernetes API into memory.
+// It queries the APIServer for all PodBoxes and PodWarmPools in the reconciler's namespace,
+// populates r.boxes, r.specs, and r.warmPools in memory, and returns the count of recovered PodBoxes.
 func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -637,12 +654,49 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 		if name == "" {
 			continue
 		}
-		st := box.Status
-		r.boxes[name] = &st
-		r.specs[name] = box.Spec
+		// If box already exists in memory with a newer or modified state, don't clobber
+		if _, exists := r.boxes[name]; !exists {
+			st := box.Status
+			r.boxes[name] = &st
+			r.specs[name] = box.Spec
+		}
 		recovered++
 	}
+
+	// Also sync PodWarmPools from Kubernetes
+	if pools, err := r.kubeClient.ListPodWarmPools(ctx, r.namespace); err == nil {
+		for _, p := range pools {
+			pName := p.Metadata.Name
+			if pName == "" {
+				continue
+			}
+			if _, exists := r.warmPools[pName]; !exists {
+				r.warmPools[pName] = &warmPoolState{
+					spec:    p.Spec,
+					entries: make([]*WarmPodEntry, 0),
+				}
+			}
+		}
+	}
+
 	return recovered, nil
+}
+
+// FindAvailableWarmPool looks for a warm pool that matches the template and has available warm replicas.
+func (r *Reconciler) FindAvailableWarmPool(templateRef string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for name, pool := range r.warmPools {
+		if pool.spec.TemplateRef == templateRef {
+			for _, entry := range pool.entries {
+				if !entry.Claimed {
+					return name
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // Delete tears down a PodBox, removing its compute Pod and dual Block PVCs.
