@@ -529,3 +529,325 @@ fn test_file_delete_endpoint() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_code_execute_stdout_and_result_streaming() {
+    let (addr, _) = start_test_server("/tmp");
+    let req_body = r#"{"code":"print('Hello from test interpreter')\n21 * 2"}"#;
+    let (status, headers, body) =
+        post_raw(&addr, "/execute", "application/json", req_body.as_bytes());
+    assert_eq!(status, 200);
+    assert!(headers
+        .get("content-type")
+        .map(|c| c.contains("application/x-ndjson"))
+        .unwrap_or(false));
+
+    let body_str = String::from_utf8(body).unwrap();
+    let lines: Vec<&str> = body_str.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected stdout, result, and number_of_executions: {:?}",
+        lines
+    );
+
+    let l1 = JsonValue::parse(lines[0]).unwrap();
+    assert_eq!(l1.get("type").unwrap().as_str().unwrap(), "stdout");
+    assert_eq!(
+        l1.get("text").unwrap().as_str().unwrap(),
+        "Hello from test interpreter\n"
+    );
+    assert!(l1.get("timestamp").unwrap().as_u64().is_some());
+
+    let l2 = JsonValue::parse(lines[1]).unwrap();
+    assert_eq!(l2.get("type").unwrap().as_str().unwrap(), "result");
+    assert_eq!(l2.get("text").unwrap().as_str().unwrap(), "42");
+    assert_eq!(l2.get("png").unwrap(), &JsonValue::Null);
+    assert_eq!(l2.get("html").unwrap(), &JsonValue::Null);
+
+    let l3 = JsonValue::parse(lines[2]).unwrap();
+    assert_eq!(
+        l3.get("type").unwrap().as_str().unwrap(),
+        "number_of_executions"
+    );
+    assert_eq!(l3.get("execution_count").unwrap().as_u64(), Some(1));
+}
+
+#[test]
+fn test_code_execute_stderr_streaming() {
+    let (addr, _) = start_test_server("/tmp");
+    let req_body = r#"{"code":"import sys\n_ = sys.stderr.write('Warning: deprecated API\\n')\n"}"#;
+    let (status, headers, body) = post_raw(
+        &addr,
+        "/v1/code/execute",
+        "application/json",
+        req_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    assert!(headers
+        .get("content-type")
+        .map(|c| c.contains("application/x-ndjson"))
+        .unwrap_or(false));
+
+    let body_str = String::from_utf8(body).unwrap();
+    let lines: Vec<&str> = body_str.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected stderr and number_of_executions: {:?}",
+        lines
+    );
+
+    let l1 = JsonValue::parse(lines[0]).unwrap();
+    assert_eq!(l1.get("type").unwrap().as_str().unwrap(), "stderr");
+    assert_eq!(
+        l1.get("text").unwrap().as_str().unwrap(),
+        "Warning: deprecated API\n"
+    );
+    assert!(l1.get("timestamp").unwrap().as_u64().is_some());
+
+    let l2 = JsonValue::parse(lines[1]).unwrap();
+    assert_eq!(
+        l2.get("type").unwrap().as_str().unwrap(),
+        "number_of_executions"
+    );
+    assert_eq!(l2.get("execution_count").unwrap().as_u64(), Some(1));
+}
+
+#[test]
+fn test_code_execute_error_formatting() {
+    let (addr, _) = start_test_server("/tmp");
+    let req_body = r#"{"code":"1 / 0"}"#;
+    let (status, _, body) = post_raw(&addr, "/execute", "application/json", req_body.as_bytes());
+    assert_eq!(status, 200);
+
+    let body_str = String::from_utf8(body).unwrap();
+    let lines: Vec<&str> = body_str.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected error and number_of_executions: {:?}",
+        lines
+    );
+
+    let err_obj = JsonValue::parse(lines[0]).unwrap();
+    assert_eq!(err_obj.get("type").unwrap().as_str().unwrap(), "error");
+    assert_eq!(
+        err_obj.get("name").unwrap().as_str().unwrap(),
+        "ZeroDivisionError"
+    );
+    assert_eq!(
+        err_obj.get("value").unwrap().as_str().unwrap(),
+        "division by zero"
+    );
+    assert!(err_obj
+        .get("traceback")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains("ZeroDivisionError"));
+
+    let num_obj = JsonValue::parse(lines[1]).unwrap();
+    assert_eq!(
+        num_obj.get("type").unwrap().as_str().unwrap(),
+        "number_of_executions"
+    );
+    assert_eq!(num_obj.get("execution_count").unwrap().as_u64(), Some(1));
+}
+
+#[test]
+fn test_code_execute_syntax_error() {
+    let (addr, _) = start_test_server("/tmp");
+    let req_body = r#"{"code":"def bad_syntax(:"}"#;
+    let (status, _, body) = post_raw(&addr, "/execute", "application/json", req_body.as_bytes());
+    assert_eq!(status, 200);
+
+    let body_str = String::from_utf8(body).unwrap();
+    let lines: Vec<&str> = body_str.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2);
+
+    let err_obj = JsonValue::parse(lines[0]).unwrap();
+    assert_eq!(err_obj.get("type").unwrap().as_str().unwrap(), "error");
+    assert_eq!(
+        err_obj.get("name").unwrap().as_str().unwrap(),
+        "SyntaxError"
+    );
+    assert!(err_obj
+        .get("traceback")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .contains("SyntaxError"));
+
+    let num_obj = JsonValue::parse(lines[1]).unwrap();
+    assert_eq!(
+        num_obj.get("type").unwrap().as_str().unwrap(),
+        "number_of_executions"
+    );
+}
+
+#[test]
+fn test_code_contexts_crud_and_persistence() {
+    let (addr, _) = start_test_server("/workspace");
+
+    // 1. POST /contexts
+    let (status, _, body) = post_json(
+        &addr,
+        "/contexts",
+        r#"{"language":"python","cwd":"/workspace"}"#,
+    );
+    assert_eq!(status, 200);
+    let created = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    let ctx_id = created.get("id").unwrap().as_str().unwrap().to_string();
+    assert_eq!(created.get("language").unwrap().as_str().unwrap(), "python");
+    assert_eq!(created.get("cwd").unwrap().as_str().unwrap(), "/workspace");
+
+    // 2. GET /contexts
+    let (list_status, _, list_body) = get(&addr, "/contexts");
+    assert_eq!(list_status, 200);
+    let list_json = JsonValue::parse(std::str::from_utf8(&list_body).unwrap()).unwrap();
+    match list_json {
+        JsonValue::Array(arr) => {
+            assert!(arr
+                .iter()
+                .any(|item| item.get("id").and_then(|i| i.as_str()) == Some(&ctx_id)));
+        }
+        _ => panic!("expected array for GET /contexts"),
+    }
+
+    // 3. POST /execute in context: define state
+    let run1 = format!(
+        r#"{{"context_id":"{ctx_id}","code":"stored_value = 100\nprint('defined')\nstored_value + 25"}}"#
+    );
+    let (r1_status, _, r1_body) = post_raw(&addr, "/execute", "application/json", run1.as_bytes());
+    assert_eq!(r1_status, 200);
+    let r1_body_str = std::str::from_utf8(&r1_body).unwrap();
+    let r1_lines: Vec<&str> = r1_body_str.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(r1_lines.len(), 3);
+    let r1_res = JsonValue::parse(r1_lines[1]).unwrap();
+    assert_eq!(r1_res.get("text").unwrap().as_str().unwrap(), "125");
+    let r1_cnt = JsonValue::parse(r1_lines[2]).unwrap();
+    assert_eq!(r1_cnt.get("execution_count").unwrap().as_u64(), Some(1));
+
+    // 4. POST /execute in context: use state from run 1
+    let run2 = format!(r#"{{"context_id":"{ctx_id}","code":"stored_value * 2"}}"#);
+    let (r2_status, _, r2_body) = post_raw(&addr, "/execute", "application/json", run2.as_bytes());
+    assert_eq!(r2_status, 200);
+    let r2_lines: Vec<&str> = std::str::from_utf8(&r2_body)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(r2_lines.len(), 2);
+    let r2_res = JsonValue::parse(r2_lines[0]).unwrap();
+    assert_eq!(r2_res.get("text").unwrap().as_str().unwrap(), "200");
+    let r2_cnt = JsonValue::parse(r2_lines[1]).unwrap();
+    assert_eq!(r2_cnt.get("execution_count").unwrap().as_u64(), Some(2));
+
+    // 5. POST /contexts/{id}/restart: resets memory
+    let (rst_status, _, rst_body) = post_raw(
+        &addr,
+        &format!("/contexts/{ctx_id}/restart"),
+        "application/json",
+        b"{}",
+    );
+    assert_eq!(rst_status, 200);
+    let rst_json = JsonValue::parse(std::str::from_utf8(&rst_body).unwrap()).unwrap();
+    assert_eq!(rst_json.get("id").unwrap().as_str().unwrap(), ctx_id);
+
+    // 6. POST /execute in context after restart: stored_value should be undefined (NameError)
+    let run3 = format!(r#"{{"context_id":"{ctx_id}","code":"stored_value"}}"#);
+    let (r3_status, _, r3_body) = post_raw(&addr, "/execute", "application/json", run3.as_bytes());
+    assert_eq!(r3_status, 200);
+    let r3_lines: Vec<&str> = std::str::from_utf8(&r3_body)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(r3_lines.len(), 2);
+    let r3_err = JsonValue::parse(r3_lines[0]).unwrap();
+    assert_eq!(r3_err.get("name").unwrap().as_str().unwrap(), "NameError");
+
+    // 7. DELETE /contexts/{id}
+    let (del_status, _, del_body) = delete(&addr, &format!("/contexts/{ctx_id}"));
+    assert_eq!(del_status, 200);
+    let del_json = JsonValue::parse(std::str::from_utf8(&del_body).unwrap()).unwrap();
+    assert_eq!(del_json.get("id").unwrap().as_str().unwrap(), ctx_id);
+
+    // 8. Subsequent DELETE returns 404
+    let (del2_status, _, _) = delete(&addr, &format!("/contexts/{ctx_id}"));
+    assert_eq!(del2_status, 404);
+
+    // 9. Subsequent execute on deleted context returns 404
+    let (nf_status, _, _) = post_raw(&addr, "/execute", "application/json", run3.as_bytes());
+    assert_eq!(nf_status, 404);
+}
+
+#[test]
+fn test_code_execute_rich_display() {
+    let (addr, _) = start_test_server("/tmp");
+    let py_code = r#"
+class VisualItem:
+    def _repr_html_(self):
+        return "<h1>Chart</h1>"
+    def _repr_png_(self):
+        return "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+VisualItem()
+"#;
+    let req = format!(r#"{{"code":"{}"}}"#, escape_json(py_code));
+    let (status, _, body) = post_raw(&addr, "/execute", "application/json", req.as_bytes());
+    assert_eq!(status, 200);
+
+    let body_str = String::from_utf8(body).unwrap();
+    let lines: Vec<&str> = body_str.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 2);
+
+    let res_obj = JsonValue::parse(lines[0]).unwrap();
+    assert_eq!(res_obj.get("type").unwrap().as_str().unwrap(), "result");
+    assert_eq!(
+        res_obj.get("html").unwrap().as_str().unwrap(),
+        "<h1>Chart</h1>"
+    );
+    assert_eq!(
+        res_obj.get("png").unwrap().as_str().unwrap(),
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    );
+}
+
+#[test]
+fn test_code_execute_shell_bash() {
+    let (addr, _) = start_test_server("/tmp");
+    let req_body = r#"{"code":"echo 'Hello from bash shell'","language":"bash"}"#;
+    let (status, _, body) = post_raw(&addr, "/execute", "application/json", req_body.as_bytes());
+    assert_eq!(status, 200);
+
+    let body_str = String::from_utf8(body).unwrap();
+    let lines: Vec<&str> = body_str.lines().filter(|l| !l.is_empty()).collect();
+    assert!(lines.len() >= 2);
+
+    let stdout_obj = JsonValue::parse(lines[0]).unwrap();
+    assert_eq!(stdout_obj.get("type").unwrap().as_str().unwrap(), "stdout");
+    assert_eq!(
+        stdout_obj.get("text").unwrap().as_str().unwrap(),
+        "Hello from bash shell\n"
+    );
+
+    let num_obj = JsonValue::parse(lines.last().unwrap()).unwrap();
+    assert_eq!(
+        num_obj.get("type").unwrap().as_str().unwrap(),
+        "number_of_executions"
+    );
+    assert_eq!(num_obj.get("execution_count").unwrap().as_u64(), Some(1));
+}
+
+#[test]
+fn test_code_execute_missing_code() {
+    let (addr, _) = start_test_server("/tmp");
+    let (status, _, body) = post_json(&addr, "/execute", r#"{"language":"python"}"#);
+    assert_eq!(status, 400);
+    let json = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    assert_eq!(
+        json.get("error").unwrap().as_str().unwrap(),
+        "missing_code_field"
+    );
+}
