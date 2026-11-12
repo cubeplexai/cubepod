@@ -59,7 +59,7 @@ test-go:
 test-e2e: build
 	$(GO) test -v -race ./test/e2e/...
 
-test-e2b-compat:
+test-e2b-compat: build-gateway
 	@bash test/e2b-compat/run_tests.sh
 
 # Optional deploy/k8s/env.local overrides discovery. See deploy/k8s/env.example.
