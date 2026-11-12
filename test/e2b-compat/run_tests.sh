@@ -20,6 +20,9 @@ if command -v uv >/dev/null 2>&1; then
         --with "e2b-code-interpreter>=2.0.0" \
         --with "pytest>=8.0.0" \
         --with "pytest-asyncio>=0.23.0" \
+        --with "matplotlib" \
+        --with "pandas" \
+        --with "numpy" \
         python -m pytest -c "${SCRIPT_DIR}/pytest.ini" "${SCRIPT_DIR}" -v "$@"
 elif command -v pytest >/dev/null 2>&1; then
     echo "[e2b-compat] Using local pytest..."
@@ -29,6 +32,10 @@ else
     python3 "${SCRIPT_DIR}/test_official_e2b_sync.py"
     python3 "${SCRIPT_DIR}/test_official_e2b_async.py"
     python3 "${SCRIPT_DIR}/test_official_code_interpreter.py"
+    python3 "${SCRIPT_DIR}/test_streaming_realtime.py"
+    python3 "${SCRIPT_DIR}/test_timeout_and_zombie_kill.py"
+    python3 "${SCRIPT_DIR}/test_multimodal_data_science.py"
+    python3 "${SCRIPT_DIR}/test_concurrent_sandboxes_isolation.py"
 fi
 
 echo "====================================================================="

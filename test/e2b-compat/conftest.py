@@ -1,6 +1,6 @@
 """Pytest fixtures for official E2B Python SDK Compatibility Test Suite.
 Conforms to CEP-0018:
-- Provides automated ephemeral MockGatewayServer or binds to live CUBEPOD_GATEWAY_URL
+- Provides automated ephemeral LiveGateway or binds to live CUBEPOD_GATEWAY_URL
 - Configures E2B_API_URL, E2B_SANDBOX_URL, E2B_API_KEY
 - Provides sync and async sandbox lifecycle fixtures with automatic teardown
 """
@@ -17,12 +17,13 @@ _DIR = os.path.dirname(os.path.abspath(__file__))
 if _DIR not in sys.path:
     sys.path.insert(0, _DIR)
 
+from live_gateway import LiveGateway
 from mock_server import MockE2BGateway
 
 
 @pytest.fixture(scope="session")
 def gateway_url() -> Generator[str, None, None]:
-    """Provide Gateway base URL (live CUBEPOD_GATEWAY_URL or embedded MockE2BGateway)."""
+    """Provide Gateway base URL (live CUBEPOD_GATEWAY_URL or embedded LiveGateway)."""
     live_url = os.getenv("CUBEPOD_GATEWAY_URL")
     if live_url:
         os.environ["E2B_API_URL"] = live_url
@@ -31,7 +32,7 @@ def gateway_url() -> Generator[str, None, None]:
         yield live_url
         return
 
-    gateway = MockE2BGateway()
+    gateway = LiveGateway()
     url = gateway.start()
     os.environ["E2B_API_URL"] = url
     os.environ["E2B_SANDBOX_URL"] = url
@@ -41,6 +42,12 @@ def gateway_url() -> Generator[str, None, None]:
         yield url
     finally:
         gateway.stop()
+
+
+@pytest.fixture(scope="session")
+def live_gateway(gateway_url: str) -> str:
+    """Convenience alias for gateway_url fixture."""
+    return gateway_url
 
 
 @pytest.fixture
