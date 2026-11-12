@@ -34,6 +34,20 @@ impl JsonValue {
         }
     }
 
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            JsonValue::Number(n) => Some(*n as i64),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&Vec<JsonValue>> {
+        match self {
+            JsonValue::Array(arr) => Some(arr),
+            _ => None,
+        }
+    }
+
     pub fn get(&self, key: &str) -> Option<&JsonValue> {
         match self {
             JsonValue::Object(map) => map.get(key),
