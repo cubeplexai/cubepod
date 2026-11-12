@@ -6,10 +6,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +25,8 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/egress"
 )
+
+var subdomainHostRegex = regexp.MustCompile(`^([0-9]+)-([a-zA-Z0-9_-]+)\.(.*)$`)
 
 // SandboxRecord represents a managed sandbox exposed over the E2B-compatible API.
 type SandboxRecord struct {
@@ -162,7 +171,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /sandboxes/{sandboxID}", s.handleDeleteSandbox)
 
 	// Data-Plane Execution & File routes
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/commands", s.handleRunCommand)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/commands/run", s.handleRunCommand)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/code/execute", s.handleCodeExecute)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/execute", s.handleCodeExecute)
+	mux.HandleFunc("POST /execute", s.handleExecute)
 	mux.HandleFunc("GET /sandboxes/{sandboxID}/commands/{cmdID}/logs", s.handleGetCommandLogs)
 	mux.HandleFunc("GET /sandboxes/{sandboxID}/commands/{cmdID}/status", s.handleGetCommandStatus)
 	mux.HandleFunc("GET /sandboxes/{sandboxID}/commands/{cmdID}/stream", s.handleStreamCommandLogs)
@@ -179,7 +192,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /templates", s.handleListTemplates)
 	mux.HandleFunc("GET /openapi.yaml", s.handleGetOpenAPI)
 
-	// Panel Token Mint & Reverse Proxy routes
+	// Host Endpoint & Panel Reverse Proxy routes
+	mux.HandleFunc("GET /sandboxes/{sandboxID}/endpoints/{port}", s.handleGetEndpoint)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/endpoints/{port}", s.handleMintEndpointToken)
 	mux.HandleFunc("/panel/{token}/{rest...}", s.handlePanelProxy)
 	mux.HandleFunc("/panel/{token}", s.handlePanelProxy)
@@ -187,7 +201,22 @@ func (s *Server) Handler() http.Handler {
 	// Zero-Trust Egress Exchange route
 	mux.HandleFunc("POST /internal/v1/egress/exchange", s.handleEgressExchange)
 
-	return s.withMetrics(mux)
+	hostRouter := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Subdomain Host Router: inspect r.Host for regex ^([0-9]+)-([a-zA-Z0-9_-]+)\.(.*)$,
+		// extracting targetPort and sandboxID. When matched, reverse-proxy the request
+		// to the target sandbox on targetPort (e.g. 49999 for Jupyter, 49983 for envd/podd, 8080 for web).
+		matches := subdomainHostRegex.FindStringSubmatch(r.Host)
+		if len(matches) == 4 {
+			port, err := strconv.Atoi(matches[1])
+			if err == nil && port > 0 && port <= 65535 {
+				s.handleSubdomainProxy(w, r, matches[2], port)
+				return
+			}
+		}
+		mux.ServeHTTP(w, r)
+	})
+
+	return s.withMetrics(hostRouter)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -414,4 +443,327 @@ func (s *Server) handleOpenAPISpec(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
+}
+
+// handleSubdomainProxy reverse-proxies inbound requests matching ^([0-9]+)-([a-zA-Z0-9_-]+)\.(.*)$
+// to the target sandbox on targetPort (e.g. 49999 for Jupyter, 49983 for envd/podd, 8080 for web).
+func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sandboxID string, port int) {
+	s.mu.RLock()
+	rec, ok := s.sandboxes[sandboxID]
+	s.mu.RUnlock()
+	if !ok {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+
+	// Auto-resume sandbox if currently Paused
+	if err := s.ensureRunning(r.Context(), rec); err != nil {
+		slog.Error("failed to auto-resume sandbox for subdomain proxy", "sandboxID", sandboxID, "port", port, "err", err)
+		http.Error(w, "failed to auto-resume sandbox: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.mu.Lock()
+	s.recordActivity(rec)
+	s.mu.Unlock()
+
+	targetURLStr := s.GetRegisteredPort(sandboxID, port)
+	if targetURLStr == "" && rec != nil {
+		if s.livePodRouting {
+			if boxStatus, ok := s.reconciler.GetBox(sandboxID); ok && boxStatus.PodIP != "" && boxStatus.PodIP != "10.244.0.42" {
+				targetURLStr = fmt.Sprintf("http://%s:%d", boxStatus.PodIP, port)
+			}
+		} else if rec.PoddURL != "" {
+			if u, err := url.Parse(rec.PoddURL); err == nil && u.Hostname() != "" && u.Hostname() != "10.244.0.42" {
+				targetURLStr = fmt.Sprintf("http://%s:%d", u.Hostname(), port)
+			}
+		}
+	}
+
+	// Fallback to local code runner if port 49999 is targeted without a live upstream daemon
+	if targetURLStr == "" && port == 49999 && (r.URL.Path == "/execute" || r.URL.Path == "/sandboxes/"+sandboxID+"/code/execute") {
+		s.executeCodeLocally(w, r, rec)
+		return
+	}
+
+	if targetURLStr == "" {
+		http.Error(w, fmt.Sprintf("no upstream registered for sandbox %s port %d", sandboxID, port), http.StatusBadGateway)
+		return
+	}
+
+	targetURL, err := url.Parse(targetURLStr)
+	if err != nil {
+		http.Error(w, "invalid target URL: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = targetURL.Scheme
+			req.URL.Host = targetURL.Host
+			req.Host = targetURL.Host
+
+			targetPath := strings.TrimSuffix(targetURL.Path, "/")
+			reqPath := req.URL.Path
+			if !strings.HasPrefix(reqPath, "/") {
+				reqPath = "/" + reqPath
+			}
+			req.URL.Path = targetPath + reqPath
+
+			if targetURL.RawQuery == "" || req.URL.RawQuery == "" {
+				req.URL.RawQuery = targetURL.RawQuery + req.URL.RawQuery
+			} else {
+				req.URL.RawQuery = targetURL.RawQuery + "&" + req.URL.RawQuery
+			}
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			slog.Error("subdomain reverse proxy connection failed", "target", targetURLStr, "err", err)
+			http.Error(w, fmt.Sprintf("reverse proxy error: %v", err), http.StatusBadGateway)
+		},
+	}
+
+	proxy.ServeHTTP(w, r)
+}
+
+// handleGetEndpoint returns the public ingress host and URL for a sandbox port (E2B get_host compatible).
+func (s *Server) handleGetEndpoint(w http.ResponseWriter, r *http.Request) {
+	sandboxID := r.PathValue("sandboxID")
+	portStr := r.PathValue("port")
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		http.Error(w, "invalid port parameter", http.StatusBadRequest)
+		return
+	}
+
+	s.mu.RLock()
+	_, ok := s.sandboxes[sandboxID]
+	s.mu.RUnlock()
+	if !ok {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+
+	hostDomain := r.Host
+	if hostDomain == "" {
+		hostDomain = "cubepod.local"
+	}
+	subdomainHost := fmt.Sprintf("%d-%s.%s", port, sandboxID, hostDomain)
+	urlPath := fmt.Sprintf("http://%s", subdomainHost)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"host":      subdomainHost,
+		"url":       urlPath,
+		"endpoint":  subdomainHost,
+		"port":      port,
+		"sandboxID": sandboxID,
+	})
+}
+
+// handleCodeExecute routes POST /sandboxes/{sandboxID}/code/execute or /execute to in-guest port 49999 or local runner.
+func (s *Server) handleCodeExecute(w http.ResponseWriter, r *http.Request) {
+	sandboxID := r.PathValue("sandboxID")
+	if sandboxID == "" {
+		sandboxID = r.URL.Query().Get("sandboxID")
+	}
+	if sandboxID == "" {
+		sandboxID = r.URL.Query().Get("sandbox_id")
+	}
+	if sandboxID == "" {
+		sandboxID = r.Header.Get("X-Sandbox-ID")
+	}
+	if sandboxID == "" {
+		http.Error(w, "sandboxID is required", http.StatusBadRequest)
+		return
+	}
+
+	s.executeCodeForSandbox(w, r, sandboxID)
+}
+
+// handleExecute handles direct POST /execute routing with sandboxID via query param or header.
+func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
+	sandboxID := r.URL.Query().Get("sandboxID")
+	if sandboxID == "" {
+		sandboxID = r.URL.Query().Get("sandbox_id")
+	}
+	if sandboxID == "" {
+		sandboxID = r.Header.Get("X-Sandbox-ID")
+	}
+	if sandboxID == "" {
+		http.Error(w, "sandboxID is required", http.StatusBadRequest)
+		return
+	}
+
+	s.executeCodeForSandbox(w, r, sandboxID)
+}
+
+func (s *Server) executeCodeForSandbox(w http.ResponseWriter, r *http.Request, sandboxID string) {
+	s.mu.RLock()
+	rec, ok := s.sandboxes[sandboxID]
+	s.mu.RUnlock()
+	if !ok {
+		http.Error(w, "sandbox not found", http.StatusNotFound)
+		return
+	}
+
+	if err := s.ensureRunning(r.Context(), rec); err != nil {
+		http.Error(w, "failed to resume sandbox: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	s.mu.Lock()
+	s.recordActivity(rec)
+	s.mu.Unlock()
+
+	// Check if in-guest port 49999 has a target upstream registered
+	targetURLStr := s.GetRegisteredPort(sandboxID, 49999)
+	if targetURLStr == "" && rec != nil {
+		if s.livePodRouting {
+			if boxStatus, ok := s.reconciler.GetBox(sandboxID); ok && boxStatus.PodIP != "" && boxStatus.PodIP != "10.244.0.42" {
+				targetURLStr = fmt.Sprintf("http://%s:49999", boxStatus.PodIP)
+			}
+		} else if rec.PoddURL != "" {
+			if u, err := url.Parse(rec.PoddURL); err == nil && u.Hostname() != "" && u.Hostname() != "10.244.0.42" {
+				targetURLStr = fmt.Sprintf("http://%s:49999", u.Hostname())
+			}
+		}
+	}
+
+	if targetURLStr != "" {
+		s.proxyToCodeInterpreter(w, r, targetURLStr)
+		return
+	}
+
+	// Local runner fallback
+	s.executeCodeLocally(w, r, rec)
+}
+
+func (s *Server) proxyToCodeInterpreter(w http.ResponseWriter, r *http.Request, targetURLStr string) {
+	targetURL, err := url.Parse(targetURLStr)
+	if err != nil {
+		http.Error(w, "invalid target URL: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = targetURL.Scheme
+			req.URL.Host = targetURL.Host
+			req.Host = targetURL.Host
+
+			targetPath := strings.TrimSuffix(targetURL.Path, "/")
+			targetPath = strings.TrimSuffix(targetPath, "/execute")
+			req.URL.Path = targetPath + "/execute"
+			if targetURL.RawQuery == "" || req.URL.RawQuery == "" {
+				req.URL.RawQuery = targetURL.RawQuery + req.URL.RawQuery
+			} else {
+				req.URL.RawQuery = targetURL.RawQuery + "&" + req.URL.RawQuery
+			}
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			slog.Error("code interpreter reverse proxy failed", "target", targetURLStr, "err", err)
+			http.Error(w, fmt.Sprintf("code interpreter reverse proxy error: %v", err), http.StatusBadGateway)
+		},
+	}
+
+	proxy.ServeHTTP(w, r)
+}
+
+func (s *Server) executeCodeLocally(w http.ResponseWriter, r *http.Request, rec *SandboxRecord) {
+	var req struct {
+		Code      string            `json:"code"`
+		Command   string            `json:"command"`
+		ContextID any               `json:"context_id,omitempty"`
+		Language  string            `json:"language,omitempty"`
+		EnvVars   map[string]string `json:"env_vars,omitempty"`
+		Envs      map[string]string `json:"envs,omitempty"`
+	}
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err == nil && len(bodyBytes) > 0 {
+		_ = json.Unmarshal(bodyBytes, &req)
+	}
+
+	code := req.Code
+	if code == "" {
+		code = req.Command
+	}
+	if code == "" && len(bodyBytes) > 0 {
+		code = string(bodyBytes)
+	}
+	if strings.TrimSpace(code) == "" {
+		http.Error(w, "code is required", http.StatusBadRequest)
+		return
+	}
+
+	workdir := rec.WorkspaceDir
+	_ = os.MkdirAll(workdir, 0755)
+
+	envs := req.EnvVars
+	if envs == nil {
+		envs = req.Envs
+	}
+
+	cmd := exec.CommandContext(r.Context(), "python3", "-c", code)
+	cmd.Dir = workdir
+	cmd.Env = os.Environ()
+	cmd.Env = append(cmd.Env, "PYTHONUNBUFFERED=1")
+	for k, v := range envs {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+
+	runErr := cmd.Run()
+	now := time.Now().UnixMilli()
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+
+	writeJSONLine := func(val any) {
+		line, _ := json.Marshal(val)
+		_, _ = w.Write(append(line, '\n'))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	if stdoutBuf.Len() > 0 {
+		writeJSONLine(map[string]any{
+			"type":      "stdout",
+			"text":      stdoutBuf.String(),
+			"timestamp": now,
+		})
+	}
+
+	if stderrBuf.Len() > 0 {
+		writeJSONLine(map[string]any{
+			"type":      "stderr",
+			"text":      stderrBuf.String(),
+			"timestamp": now,
+		})
+	}
+
+	if runErr != nil {
+		exitCode := 1
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
+			exitCode = exitErr.ExitCode()
+		}
+		writeJSONLine(map[string]any{
+			"type":      "error",
+			"name":      "ExecutionError",
+			"value":     runErr.Error(),
+			"traceback": stderrBuf.String(),
+			"exitCode":  exitCode,
+		})
+	}
+
+	writeJSONLine(map[string]any{
+		"type":            "number_of_executions",
+		"execution_count": 1,
+	})
 }

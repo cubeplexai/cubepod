@@ -189,6 +189,34 @@ paths:
               schema:
                 $ref: "#/components/schemas/SandboxInfo"
 
+  /sandboxes/{sandboxID}/refreshes:
+    post:
+      summary: Refresh sandbox idle timeout and keepalive lease (E2B standard)
+      operationId: refreshSandbox
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                duration:
+                  type: integer
+                  description: Duration in seconds to extend the sandbox timeout
+                  example: 300
+      responses:
+        "204":
+          description: Sandbox timeout refreshed successfully
+        "200":
+          description: Sandbox timeout refreshed
+        "404":
+          description: Sandbox not found
+
   /sandboxes/{sandboxID}/lease:
     post:
       summary: Acquire or renew lease protection against automatic idle pausing
@@ -264,6 +292,30 @@ paths:
               schema:
                 $ref: "#/components/schemas/SandboxInfo"
 
+  /sandboxes/{sandboxID}/commands:
+    post:
+      summary: Execute command in sandbox (E2B standard route alias for /commands/run)
+      operationId: runCommandStandard
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunCommandRequest"
+      responses:
+        "200":
+          description: Command execution result or background process metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResponse"
+
   /sandboxes/{sandboxID}/commands/run:
     post:
       summary: Execute command in sandbox (foreground synchronous or background asynchronous)
@@ -287,6 +339,35 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CommandResponse"
+
+  /sandboxes/{sandboxID}/code/execute:
+    post:
+      summary: Execute Python code via in-guest Jupyter code interpreter on port 49999 (e2b-code-interpreter)
+      operationId: executeCode
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CodeExecuteRequest"
+      responses:
+        "200":
+          description: Streaming NDJSON execution chunks (stdout, stderr, results, errors)
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CodeExecuteResponse"
+        "404":
+          description: Sandbox not found
 
   /sandboxes/{sandboxID}/commands/{cmdID}/logs:
     get:
@@ -592,6 +673,40 @@ paths:
                     type: integer
 
   /sandboxes/{sandboxID}/endpoints/{port}:
+    get:
+      summary: Get public ingress host/URL for sandbox port (E2B get_host compatible)
+      operationId: getEndpointHost
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: port
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: Host domain or public endpoint URL
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  host:
+                    type: string
+                    example: "8080-cpod-12345.cubepod.local"
+                  url:
+                    type: string
+                    example: "http://8080-cpod-12345.cubepod.local"
+                  endpoint:
+                    type: string
+                  port:
+                    type: integer
+                  sandboxID:
+                    type: string
     post:
       summary: Mint HMAC-SHA256 signed panel proxy token for interactive web/VNC/HTTP ports
       operationId: mintEndpointToken
@@ -726,9 +841,15 @@ components:
         templateID:
           type: string
           default: "cubeplex-ubuntu24-desktop"
+        template_id:
+          type: string
+          description: E2B canonical alias for templateID
         timeout:
           type: integer
           default: 1800
+        timeoutSeconds:
+          type: integer
+          description: E2B canonical alias for timeout
         metadata:
           type: object
           additionalProperties:
@@ -737,6 +858,23 @@ components:
           type: object
           additionalProperties:
             type: string
+        env_vars:
+          type: object
+          description: E2B canonical alias for envVars
+          additionalProperties:
+            type: string
+        autoPause:
+          type: boolean
+          default: true
+        auto_pause:
+          type: boolean
+          default: true
+        autoResume:
+          type: boolean
+          default: true
+        auto_resume:
+          type: boolean
+          default: true
         extension:
           type: object
           description: CubePod enterprise extensions
@@ -787,9 +925,30 @@ components:
           type: string
         templateID:
           type: string
+        clientID:
+          type: string
+          example: "cpod-client-01"
+        envdVersion:
+          type: string
+          example: "1.1.0"
         state:
           type: string
           enum: [Running, Paused, Provisioning, Pausing, Resuming, Failed, Terminated]
+        startedAt:
+          type: string
+          format: date-time
+        endAt:
+          type: string
+          format: date-time
+        cpuCount:
+          type: integer
+          example: 2
+        memoryMB:
+          type: integer
+          example: 2048
+        diskSizeMB:
+          type: integer
+          example: 10240
         envdPort:
           type: integer
           default: 49983
@@ -812,6 +971,51 @@ components:
         leaseSeconds:
           type: integer
         autoResumeCount:
+          type: integer
+
+    CodeExecuteRequest:
+      type: object
+      required:
+        - code
+      properties:
+        code:
+          type: string
+          description: Python code snippet to execute
+          example: "import matplotlib.pyplot as plt\nprint('hello from code interpreter')"
+        context_id:
+          type: string
+          nullable: true
+        language:
+          type: string
+          default: "python"
+        env_vars:
+          type: object
+          additionalProperties:
+            type: string
+
+    CodeExecuteResponse:
+      type: object
+      description: Event chunk emitted in NDJSON stream
+      properties:
+        type:
+          type: string
+          enum: [stdout, stderr, result, error, number_of_executions]
+        text:
+          type: string
+        png:
+          type: string
+          description: Base64-encoded PNG image data
+        html:
+          type: string
+        name:
+          type: string
+        value:
+          type: string
+        traceback:
+          type: string
+        execution_count:
+          type: integer
+        timestamp:
           type: integer
 
     RunCommandRequest:

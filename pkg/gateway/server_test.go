@@ -1098,3 +1098,310 @@ func TestLivePodRoutingAndEndpointDefault(t *testing.T) {
 		t.Fatalf("expected registered target URL for port 8080, got %q", registered)
 	}
 }
+
+func TestSubdomainHostRouting(t *testing.T) {
+	// 1. Mock upstream servers simulating different targetPorts
+	mockWeb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = fmt.Fprintf(w, "web-port-8080: path=%s query=%s", r.URL.Path, r.URL.RawQuery)
+	}))
+	defer mockWeb.Close()
+
+	mockJupyter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte("{\"type\":\"stdout\",\"text\":\"jupyter-port-49999\"}\n"))
+	}))
+	defer mockJupyter.Close()
+
+	mockEnvd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"service":"envd","port":49983}`))
+	}))
+	defer mockEnvd.Close()
+
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 2. Create sandbox
+	createResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"cubeplex-ubuntu24-desktop"}`))
+	if err != nil {
+		t.Fatalf("create failed: %v", err)
+	}
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(createResp.Body).Decode(&rec)
+	createResp.Body.Close()
+
+	// 3. Register target ports
+	srv.RegisterPort(rec.SandboxID, 8080, mockWeb.URL)
+	srv.RegisterPort(rec.SandboxID, 49999, mockJupyter.URL)
+	srv.RegisterPort(rec.SandboxID, 49983, mockEnvd.URL)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	// 4. Test port 8080 subdomain routing: Host = 8080-<sandboxID>.cubepod.ai
+	reqWeb, err := http.NewRequest(http.MethodGet, ts.URL+"/app/dashboard?user=alice", nil)
+	if err != nil {
+		t.Fatalf("new request failed: %v", err)
+	}
+	reqWeb.Host = fmt.Sprintf("8080-%s.cubepod.ai", rec.SandboxID)
+	respWeb, err := client.Do(reqWeb)
+	if err != nil || respWeb.StatusCode != http.StatusOK {
+		t.Fatalf("subdomain web routing failed: status=%d err=%v", respWeb.StatusCode, err)
+	}
+	bodyWeb, _ := io.ReadAll(respWeb.Body)
+	respWeb.Body.Close()
+	if !strings.Contains(string(bodyWeb), "web-port-8080: path=/app/dashboard query=user=alice") {
+		t.Fatalf("unexpected body from web routing: %s", string(bodyWeb))
+	}
+
+	// 5. Test port 49999 subdomain routing: Host = 49999-<sandboxID>.example.com:8080
+	reqJupyter, err := http.NewRequest(http.MethodPost, ts.URL+"/execute", strings.NewReader(`{"code":"print(1)"}`))
+	if err != nil {
+		t.Fatalf("new request failed: %v", err)
+	}
+	reqJupyter.Host = fmt.Sprintf("49999-%s.example.com:8080", rec.SandboxID)
+	respJupyter, err := client.Do(reqJupyter)
+	if err != nil || respJupyter.StatusCode != http.StatusOK {
+		t.Fatalf("subdomain jupyter routing failed: status=%d err=%v", respJupyter.StatusCode, err)
+	}
+	bodyJupyter, _ := io.ReadAll(respJupyter.Body)
+	respJupyter.Body.Close()
+	if !strings.Contains(string(bodyJupyter), "jupyter-port-49999") {
+		t.Fatalf("unexpected body from jupyter routing: %s", string(bodyJupyter))
+	}
+
+	// 6. Test port 49983 subdomain routing: Host = 49983-<sandboxID>.cubepod.internal
+	reqEnvd, err := http.NewRequest(http.MethodGet, ts.URL+"/v1/health", nil)
+	if err != nil {
+		t.Fatalf("new request failed: %v", err)
+	}
+	reqEnvd.Host = fmt.Sprintf("49983-%s.cubepod.internal", rec.SandboxID)
+	respEnvd, err := client.Do(reqEnvd)
+	if err != nil || respEnvd.StatusCode != http.StatusOK {
+		t.Fatalf("subdomain envd routing failed: status=%d err=%v", respEnvd.StatusCode, err)
+	}
+	bodyEnvd, _ := io.ReadAll(respEnvd.Body)
+	respEnvd.Body.Close()
+	if !strings.Contains(string(bodyEnvd), "envd") {
+		t.Fatalf("unexpected body from envd routing: %s", string(bodyEnvd))
+	}
+
+	// 7. Test Auto-Resume via Subdomain routing
+	pauseResp, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/pause", "application/json", nil)
+	if err != nil || pauseResp.StatusCode != http.StatusOK {
+		t.Fatalf("pause failed: status=%d err=%v", pauseResp.StatusCode, err)
+	}
+	pauseResp.Body.Close()
+
+	reqResume, _ := http.NewRequest(http.MethodGet, ts.URL+"/ping", nil)
+	reqResume.Host = fmt.Sprintf("8080-%s.cubepod.ai", rec.SandboxID)
+	respResume, err := client.Do(reqResume)
+	if err != nil || respResume.StatusCode != http.StatusOK {
+		t.Fatalf("subdomain resume request failed: status=%d err=%v", respResume.StatusCode, err)
+	}
+	respResume.Body.Close()
+
+	// Verify sandbox is resumed
+	getResp, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID)
+	if err != nil || getResp.StatusCode != http.StatusOK {
+		t.Fatalf("get sandbox failed: %v", err)
+	}
+	var chkRec gateway.SandboxRecord
+	_ = json.NewDecoder(getResp.Body).Decode(&chkRec)
+	getResp.Body.Close()
+	if chkRec.State != "Running" || chkRec.AutoResumeCount < 1 {
+		t.Fatalf("expected sandbox to be auto-resumed to Running, got %s (resumes=%d)", chkRec.State, chkRec.AutoResumeCount)
+	}
+
+	// 8. Test 404 for unknown sandbox on subdomain
+	reqNotFound, _ := http.NewRequest(http.MethodGet, ts.URL+"/", nil)
+	reqNotFound.Host = "8080-nonexistent-box.cubepod.ai"
+	respNotFound, err := client.Do(reqNotFound)
+	if err != nil || respNotFound.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for nonexistent sandbox, got %d", respNotFound.StatusCode)
+	}
+	respNotFound.Body.Close()
+
+	// 9. Test 502 for unregistered port on subdomain
+	reqBadPort, _ := http.NewRequest(http.MethodGet, ts.URL+"/", nil)
+	reqBadPort.Host = fmt.Sprintf("9999-%s.cubepod.ai", rec.SandboxID)
+	respBadPort, err := client.Do(reqBadPort)
+	if err != nil || respBadPort.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 for unregistered port, got %d", respBadPort.StatusCode)
+	}
+	respBadPort.Body.Close()
+}
+
+func TestCodeExecuteProxyingAndLocalRunner(t *testing.T) {
+	// 1. Mock upstream code interpreter on port 49999
+	var receivedCode string
+	mockJupyter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/execute" {
+			http.NotFound(w, r)
+			return
+		}
+		var payload struct {
+			Code string `json:"code"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		receivedCode = payload.Code
+
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte("{\"type\":\"stdout\",\"text\":\"mock-jupyter-output\\n\"}\n"))
+		_, _ = w.Write([]byte("{\"type\":\"number_of_executions\",\"execution_count\":1}\n"))
+	}))
+	defer mockJupyter.Close()
+
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 2. Create sandbox
+	createResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("create sandbox failed: %v", err)
+	}
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(createResp.Body).Decode(&rec)
+	createResp.Body.Close()
+
+	// Register port 49999 pointing to mock Jupyter
+	srv.RegisterPort(rec.SandboxID, 49999, mockJupyter.URL)
+
+	// 3. Test POST /sandboxes/{id}/code/execute
+	codeReqBody := `{"code":"import math\nprint(math.pi)"}`
+	respCode, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/code/execute", "application/json", strings.NewReader(codeReqBody))
+	if err != nil || respCode.StatusCode != http.StatusOK {
+		t.Fatalf("code execute failed: status=%d err=%v", respCode.StatusCode, err)
+	}
+	bodyCode, _ := io.ReadAll(respCode.Body)
+	respCode.Body.Close()
+	if !strings.Contains(string(bodyCode), "mock-jupyter-output") {
+		t.Fatalf("unexpected code execute response: %s", string(bodyCode))
+	}
+	if !strings.Contains(receivedCode, "import math") {
+		t.Fatalf("expected upstream to receive python code, got: %s", receivedCode)
+	}
+
+	// 4. Test POST /sandboxes/{id}/execute
+	respExec, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/execute", "application/json", strings.NewReader(`{"code":"print(42)"}`))
+	if err != nil || respExec.StatusCode != http.StatusOK {
+		t.Fatalf("execute alias failed: status=%d err=%v", respExec.StatusCode, err)
+	}
+	bodyExec, _ := io.ReadAll(respExec.Body)
+	respExec.Body.Close()
+	if !strings.Contains(string(bodyExec), "mock-jupyter-output") {
+		t.Fatalf("unexpected execute alias response: %s", string(bodyExec))
+	}
+
+	// 5. Test direct POST /execute with query parameter ?sandboxID=...
+	respDirectQuery, err := http.Post(ts.URL+"/execute?sandboxID="+rec.SandboxID, "application/json", strings.NewReader(`{"code":"print(100)"}`))
+	if err != nil || respDirectQuery.StatusCode != http.StatusOK {
+		t.Fatalf("direct /execute with query failed: status=%d err=%v", respDirectQuery.StatusCode, err)
+	}
+	bodyDirectQuery, _ := io.ReadAll(respDirectQuery.Body)
+	respDirectQuery.Body.Close()
+	if !strings.Contains(string(bodyDirectQuery), "mock-jupyter-output") {
+		t.Fatalf("unexpected direct /execute response: %s", string(bodyDirectQuery))
+	}
+
+	// 6. Test direct POST /execute with header X-Sandbox-ID
+	reqDirectHeader, _ := http.NewRequest(http.MethodPost, ts.URL+"/execute", strings.NewReader(`{"code":"print(200)"}`))
+	reqDirectHeader.Header.Set("X-Sandbox-ID", rec.SandboxID)
+	reqDirectHeader.Header.Set("Content-Type", "application/json")
+	respDirectHeader, err := http.DefaultClient.Do(reqDirectHeader)
+	if err != nil || respDirectHeader.StatusCode != http.StatusOK {
+		t.Fatalf("direct /execute with header failed: status=%d err=%v", respDirectHeader.StatusCode, err)
+	}
+	bodyDirectHeader, _ := io.ReadAll(respDirectHeader.Body)
+	respDirectHeader.Body.Close()
+	if !strings.Contains(string(bodyDirectHeader), "mock-jupyter-output") {
+		t.Fatalf("unexpected direct /execute header response: %s", string(bodyDirectHeader))
+	}
+
+	// 7. Test Local Runner Fallback when no port 49999 is registered
+	createResp2, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("create second sandbox failed: %v", err)
+	}
+	var rec2 gateway.SandboxRecord
+	_ = json.NewDecoder(createResp2.Body).Decode(&rec2)
+	createResp2.Body.Close()
+
+	respLocal, err := http.Post(ts.URL+"/sandboxes/"+rec2.SandboxID+"/code/execute", "application/json", strings.NewReader(`{"code":"print('local-runner-success')"}`))
+	if err != nil || respLocal.StatusCode != http.StatusOK {
+		t.Fatalf("local runner code execute failed: status=%d err=%v", respLocal.StatusCode, err)
+	}
+	bodyLocal, _ := io.ReadAll(respLocal.Body)
+	respLocal.Body.Close()
+	if !strings.Contains(string(bodyLocal), "local-runner-success") {
+		t.Fatalf("expected local runner output containing 'local-runner-success', got: %s", string(bodyLocal))
+	}
+	if !strings.Contains(string(bodyLocal), `"number_of_executions"`) {
+		t.Fatalf("expected number_of_executions line, got: %s", string(bodyLocal))
+	}
+}
+
+func TestGetEndpointAndE2BRoutes(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Create sandbox
+	createResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"timeout":600}`))
+	if err != nil {
+		t.Fatalf("create sandbox failed: %v", err)
+	}
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(createResp.Body).Decode(&rec)
+	createResp.Body.Close()
+
+	// Test GET /sandboxes/{id}/endpoints/8080 (get_host compatible)
+	epResp, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/endpoints/8080")
+	if err != nil || epResp.StatusCode != http.StatusOK {
+		t.Fatalf("get endpoint failed: status=%d err=%v", epResp.StatusCode, err)
+	}
+	var epResult map[string]interface{}
+	_ = json.NewDecoder(epResp.Body).Decode(&epResult)
+	epResp.Body.Close()
+	hostStr, ok := epResult["host"].(string)
+	if !ok || !strings.HasPrefix(hostStr, "8080-"+rec.SandboxID) {
+		t.Fatalf("expected host starting with 8080-%s, got %v", rec.SandboxID, epResult["host"])
+	}
+
+	// Test POST /sandboxes/{id}/commands (E2B standard route alias for /commands/run)
+	cmdReq := `{"cmd":"echo e2b-standard-command"}`
+	cmdResp, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/commands", "application/json", strings.NewReader(cmdReq))
+	if err != nil || cmdResp.StatusCode != http.StatusOK {
+		t.Fatalf("standard commands route failed: status=%d err=%v", cmdResp.StatusCode, err)
+	}
+	var cmdResult map[string]interface{}
+	_ = json.NewDecoder(cmdResp.Body).Decode(&cmdResult)
+	cmdResp.Body.Close()
+	if !strings.Contains(cmdResult["stdout"].(string), "e2b-standard-command") {
+		t.Fatalf("unexpected stdout: %v", cmdResult["stdout"])
+	}
+
+	// Test POST /sandboxes/{id}/refreshes (E2B keepalive)
+	refResp, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/refreshes", "application/json", strings.NewReader(`{"duration":1200}`))
+	if err != nil || (refResp.StatusCode != http.StatusNoContent && refResp.StatusCode != http.StatusOK) {
+		t.Fatalf("refreshes route failed: status=%d err=%v", refResp.StatusCode, err)
+	}
+	refResp.Body.Close()
+
+	// Verify EndAt was extended
+	getResp, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID)
+	if err != nil || getResp.StatusCode != http.StatusOK {
+		t.Fatalf("get sandbox failed: %v", err)
+	}
+	var updatedRec gateway.SandboxRecord
+	_ = json.NewDecoder(getResp.Body).Decode(&updatedRec)
+	getResp.Body.Close()
+	if updatedRec.TimeoutSeconds != 1200 {
+		t.Fatalf("expected TimeoutSeconds to be updated to 1200, got %d", updatedRec.TimeoutSeconds)
+	}
+}
