@@ -23,7 +23,6 @@ feature-gates:
     components:
       - "cubepod-gateway"
       - "cubepod-controller"
-      - "podd"
 disable-supported: true
 metrics:
   - "cubepod_templates"
