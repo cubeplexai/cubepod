@@ -35,6 +35,7 @@ Commands:
   template get <id-or-alias> [--alias]        Get template by ID or alias
   template create --from-image <img> --alias <alias> [--cpu <n>] [--memory-mb <n>] [--disk-mb <n>]
                                               Register template from existing OCI image
+  template update <id> --public=true|false    Update template public visibility
   template delete <id> [--force]              Delete a template
   sandbox create [flags]                      Provision a new sandbox
   sandbox list [--template <id>]              List managed sandboxes
@@ -384,199 +385,271 @@ func handleTemplate(ctx context.Context, c *client.Client, args []string, jsonOu
 
 func runTemplate(ctx context.Context, c *client.Client, args []string, jsonOutput bool, out io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: cubepod template <list|get|create|delete> [arguments...]")
+		return fmt.Errorf("usage: cubepod template <list|get|create|update|delete> [arguments...]")
 	}
 	sub := args[0]
 	rest := args[1:]
 
 	switch sub {
 	case "list":
-		list, err := c.ListTemplates(ctx)
-		if err != nil {
-			return err
-		}
-		if jsonOutput {
-			buf, err := json.MarshalIndent(list, "", "  ")
-			if err != nil {
-				return err
-			}
-			fmt.Fprintln(out, string(buf))
-			return nil
-		}
-		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
-		fmt.Fprintln(w, "TEMPLATE ID\tALIASES\tSTATUS\tCPU\tMEMORY")
-		for _, tpl := range list {
-			id := tpl.TemplateID
-			if id == "" {
-				id = tpl.ID
-			}
-			aliases := strings.Join(tpl.Aliases, ", ")
-			if aliases == "" && len(tpl.Names) > 0 {
-				aliases = strings.Join(tpl.Names, ", ")
-			}
-			if aliases == "" && tpl.Image != "" {
-				aliases = tpl.Image
-			}
-			status := tpl.BuildStatus
-			if status == "" {
-				status = "ready"
-			}
-			memStr := "-"
-			if tpl.MemoryMB > 0 {
-				memStr = fmt.Sprintf("%d MB", tpl.MemoryMB)
-			}
-			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", id, aliases, status, tpl.CPUCount, memStr)
-		}
-		return w.Flush()
-
+		return runTemplateList(ctx, c, rest, jsonOutput, out)
 	case "get":
-		var (
-			isAlias bool
-			target  string
-		)
-		for _, a := range rest {
-			if a == "--alias" || a == "-alias" {
-				isAlias = true
-			} else if !strings.HasPrefix(a, "-") && target == "" {
-				target = a
-			}
-		}
-		if target == "" {
-			return fmt.Errorf("usage: cubepod template get <id-or-alias> [--alias]")
-		}
-
-		var (
-			tpl *client.Template
-			err error
-		)
-		if isAlias {
-			tpl, err = c.GetTemplateByAlias(ctx, target)
-		} else {
-			tpl, err = c.GetTemplate(ctx, target)
-			if err != nil && !strings.Contains(target, "/") {
-				var apiErr *client.APIError
-				is404 := (errors.As(err, &apiErr) && apiErr.StatusCode == 404) || strings.Contains(err.Error(), "404")
-				if is404 {
-					if aliasTpl, aliasErr := c.GetTemplateByAlias(ctx, target); aliasErr == nil {
-						tpl = aliasTpl
-						err = nil
-					}
-				}
-			}
-		}
-		if err != nil {
-			return err
-		}
-
-		if jsonOutput {
-			buf, err := json.MarshalIndent(tpl, "", "  ")
-			if err != nil {
-				return err
-			}
-			fmt.Fprintln(out, string(buf))
-			return nil
-		}
-		fmt.Fprintf(out, "Template ID: %s\n", tpl.TemplateID)
-		if tpl.BuildID != "" {
-			fmt.Fprintf(out, "Build ID:    %s\n", tpl.BuildID)
-		}
-		if len(tpl.Aliases) > 0 {
-			fmt.Fprintf(out, "Aliases:     %s\n", strings.Join(tpl.Aliases, ", "))
-		}
-		if len(tpl.Names) > 0 {
-			fmt.Fprintf(out, "Names:       %s\n", strings.Join(tpl.Names, ", "))
-		}
-		if tpl.BuildStatus != "" {
-			fmt.Fprintf(out, "Status:      %s\n", tpl.BuildStatus)
-		}
-		if tpl.CPUCount > 0 {
-			fmt.Fprintf(out, "CPU:         %d\n", tpl.CPUCount)
-		}
-		if tpl.MemoryMB > 0 {
-			fmt.Fprintf(out, "Memory:      %d MB\n", tpl.MemoryMB)
-		}
-		if tpl.DiskSizeMB > 0 {
-			fmt.Fprintf(out, "Disk:        %d MB\n", tpl.DiskSizeMB)
-		}
-		fmt.Fprintf(out, "Public:      %t\n", tpl.Public)
-		return nil
-
+		return runTemplateGet(ctx, c, rest, jsonOutput, out)
 	case "create":
-		fs := flag.NewFlagSet("template create", flag.ContinueOnError)
-		fromImage := fs.String("from-image", "", "Source OCI image reference")
-		alias := fs.String("alias", "", "Template alias")
-		name := fs.String("name", "", "Template name")
-		cpu := fs.Int("cpu", 0, "CPU count")
-		memoryMB := fs.Int("memory-mb", 0, "Memory in MB")
-		diskMB := fs.Int("disk-mb", 0, "Minimum free disk in MB")
-		if err := fs.Parse(rest); err != nil {
-			return err
-		}
-		if *fromImage == "" || *alias == "" {
-			return fmt.Errorf("usage: cubepod template create --from-image <image> --alias <alias> [--cpu <n>] [--memory-mb <n>] [--disk-mb <n>]")
-		}
-
-		req := client.CreateTemplateFromImageRequest{
-			FromImage:     *fromImage,
-			Alias:         *alias,
-			Name:          *name,
-			CPUCount:      *cpu,
-			MemoryMB:      *memoryMB,
-			MinFreeDiskMB: *diskMB,
-		}
-		res, err := c.CreateTemplateFromImage(ctx, req)
-		if err != nil {
-			return err
-		}
-
-		if jsonOutput {
-			buf, err := json.MarshalIndent(res, "", "  ")
-			if err != nil {
-				return err
-			}
-			fmt.Fprintln(out, string(buf))
-			return nil
-		}
-		fmt.Fprintf(out, "Created template: %s (build: %s)\n", res.TemplateID, res.BuildID)
-		if len(res.Aliases) > 0 {
-			fmt.Fprintf(out, "Aliases: %s\n", strings.Join(res.Aliases, ", "))
-		}
-		return nil
-
+		return runTemplateCreate(ctx, c, rest, jsonOutput, out)
+	case "update":
+		return runTemplateUpdate(ctx, c, rest, jsonOutput, out)
 	case "delete":
-		var (
-			force  bool
-			target string
-		)
-		for _, a := range rest {
-			if a == "--force" || a == "-force" {
-				force = true
-			} else if !strings.HasPrefix(a, "-") && target == "" {
-				target = a
-			}
-		}
-		if target == "" {
-			return fmt.Errorf("usage: cubepod template delete <id> [--force]")
-		}
-
-		if err := c.DeleteTemplate(ctx, target, force); err != nil {
-			return err
-		}
-
-		if jsonOutput {
-			buf, err := json.MarshalIndent(map[string]string{"status": "deleted", "templateID": target}, "", "  ")
-			if err != nil {
-				return err
-			}
-			fmt.Fprintln(out, string(buf))
-			return nil
-		}
-		fmt.Fprintf(out, "Deleted template: %s\n", target)
-		return nil
-
+		return runTemplateDelete(ctx, c, rest, jsonOutput, out)
 	default:
 		return fmt.Errorf("unknown template subcommand: %s", sub)
 	}
+}
+
+func normalizeBoolFlagArgs(args []string) []string {
+	var flags, pos []string
+	for i, a := range args {
+		if a == "--" {
+			pos = append(pos, args[i:]...)
+			break
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			flags = append(flags, a)
+		} else {
+			pos = append(pos, a)
+		}
+	}
+	return append(flags, pos...)
+}
+
+func runTemplateList(ctx context.Context, c *client.Client, rest []string, jsonOutput bool, out io.Writer) error {
+	fs := flag.NewFlagSet("template list", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: cubepod template list")
+	}
+
+	list, err := c.ListTemplates(ctx)
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		buf, err := json.MarshalIndent(list, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(out, string(buf))
+		return nil
+	}
+	w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
+	fmt.Fprintln(w, "TEMPLATE ID\tALIASES\tSTATUS\tCPU\tMEMORY")
+	for _, tpl := range list {
+		id := tpl.TemplateID
+		if id == "" {
+			id = tpl.ID
+		}
+		aliases := strings.Join(tpl.Aliases, ", ")
+		if aliases == "" && len(tpl.Names) > 0 {
+			aliases = strings.Join(tpl.Names, ", ")
+		}
+		if aliases == "" && tpl.Image != "" {
+			aliases = tpl.Image
+		}
+		status := tpl.BuildStatus
+		if status == "" {
+			status = "ready"
+		}
+		memStr := "-"
+		if tpl.MemoryMB > 0 {
+			memStr = fmt.Sprintf("%d MB", tpl.MemoryMB)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", id, aliases, status, tpl.CPUCount, memStr)
+	}
+	return w.Flush()
+}
+
+func runTemplateGet(ctx context.Context, c *client.Client, rest []string, jsonOutput bool, out io.Writer) error {
+	fs := flag.NewFlagSet("template get", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	isAlias := fs.Bool("alias", false, "Lookup template by alias")
+	if err := fs.Parse(normalizeBoolFlagArgs(rest)); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: cubepod template get <id-or-alias> [--alias]")
+	}
+	target := fs.Arg(0)
+
+	var (
+		tpl *client.Template
+		err error
+	)
+	if *isAlias {
+		tpl, err = c.GetTemplateByAlias(ctx, target)
+	} else {
+		tpl, err = c.GetTemplate(ctx, target)
+		if err != nil {
+			var apiErr *client.APIError
+			is404 := errors.As(err, &apiErr) && apiErr.StatusCode == 404
+			if is404 || strings.ContainsAny(target, ":/") {
+				if aliasTpl, aliasErr := c.GetTemplateByAlias(ctx, target); aliasErr == nil {
+					tpl = aliasTpl
+					err = nil
+				} else if is404 {
+					err = aliasErr
+				}
+			}
+		}
+	}
+	if err != nil {
+		return err
+	}
+
+	if jsonOutput {
+		buf, err := json.MarshalIndent(tpl, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(out, string(buf))
+		return nil
+	}
+	fmt.Fprintf(out, "Template ID: %s\n", tpl.TemplateID)
+	if tpl.BuildID != "" {
+		fmt.Fprintf(out, "Build ID:    %s\n", tpl.BuildID)
+	}
+	if len(tpl.Aliases) > 0 {
+		fmt.Fprintf(out, "Aliases:     %s\n", strings.Join(tpl.Aliases, ", "))
+	}
+	if len(tpl.Names) > 0 {
+		fmt.Fprintf(out, "Names:       %s\n", strings.Join(tpl.Names, ", "))
+	}
+	if tpl.BuildStatus != "" {
+		fmt.Fprintf(out, "Status:      %s\n", tpl.BuildStatus)
+	}
+	if tpl.CPUCount > 0 {
+		fmt.Fprintf(out, "CPU:         %d\n", tpl.CPUCount)
+	}
+	if tpl.MemoryMB > 0 {
+		fmt.Fprintf(out, "Memory:      %d MB\n", tpl.MemoryMB)
+	}
+	if tpl.DiskSizeMB > 0 {
+		fmt.Fprintf(out, "Disk:        %d MB\n", tpl.DiskSizeMB)
+	}
+	fmt.Fprintf(out, "Public:      %t\n", tpl.Public)
+	return nil
+}
+
+func runTemplateCreate(ctx context.Context, c *client.Client, rest []string, jsonOutput bool, out io.Writer) error {
+	fs := flag.NewFlagSet("template create", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	fromImage := fs.String("from-image", "", "Source OCI image reference")
+	alias := fs.String("alias", "", "Template alias")
+	name := fs.String("name", "", "Template name")
+	cpu := fs.Int("cpu", 0, "CPU count")
+	memoryMB := fs.Int("memory-mb", 0, "Memory in MB")
+	diskMB := fs.Int("disk-mb", 0, "Minimum free disk in MB")
+	if err := fs.Parse(rest); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *fromImage == "" || *alias == "" {
+		return fmt.Errorf("usage: cubepod template create --from-image <image> --alias <alias> [--cpu <n>] [--memory-mb <n>] [--disk-mb <n>]")
+	}
+
+	req := client.CreateTemplateFromImageRequest{
+		FromImage:     *fromImage,
+		Alias:         *alias,
+		Name:          *name,
+		CPUCount:      *cpu,
+		MemoryMB:      *memoryMB,
+		MinFreeDiskMB: *diskMB,
+	}
+	res, err := c.CreateTemplateFromImage(ctx, req)
+	if err != nil {
+		return err
+	}
+
+	if jsonOutput {
+		buf, err := json.MarshalIndent(res, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(out, string(buf))
+		return nil
+	}
+	fmt.Fprintf(out, "Created template: %s (build: %s)\n", res.TemplateID, res.BuildID)
+	if len(res.Aliases) > 0 {
+		fmt.Fprintf(out, "Aliases: %s\n", strings.Join(res.Aliases, ", "))
+	}
+	return nil
+}
+
+func runTemplateUpdate(ctx context.Context, c *client.Client, rest []string, jsonOutput bool, out io.Writer) error {
+	fs := flag.NewFlagSet("template update", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	public := fs.Bool("public", false, "Set template public visibility (true|false)")
+	if err := fs.Parse(normalizeBoolFlagArgs(rest)); err != nil {
+		return err
+	}
+	publicSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "public" {
+			publicSet = true
+		}
+	})
+	if fs.NArg() != 1 || !publicSet {
+		return fmt.Errorf("usage: cubepod template update <id> --public=true|false")
+	}
+	target := fs.Arg(0)
+
+	if err := c.UpdateTemplateVisibility(ctx, target, *public); err != nil {
+		return err
+	}
+
+	if jsonOutput {
+		buf, err := json.MarshalIndent(map[string]interface{}{
+			"status":     "updated",
+			"templateID": target,
+			"public":     *public,
+		}, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(out, string(buf))
+		return nil
+	}
+	fmt.Fprintf(out, "Updated template %s (public: %t)\n", target, *public)
+	return nil
+}
+
+func runTemplateDelete(ctx context.Context, c *client.Client, rest []string, jsonOutput bool, out io.Writer) error {
+	fs := flag.NewFlagSet("template delete", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	force := fs.Bool("force", false, "Force deletion even if referenced")
+	if err := fs.Parse(normalizeBoolFlagArgs(rest)); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: cubepod template delete <id> [--force]")
+	}
+	target := fs.Arg(0)
+
+	if err := c.DeleteTemplate(ctx, target, *force); err != nil {
+		return err
+	}
+
+	if jsonOutput {
+		buf, err := json.MarshalIndent(map[string]string{"status": "deleted", "templateID": target}, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(out, string(buf))
+		return nil
+	}
+	fmt.Fprintf(out, "Deleted template: %s\n", target)
+	return nil
 }
 
 func handleWarmpool(ctx context.Context, c *client.Client, args []string, jsonOutput bool) {

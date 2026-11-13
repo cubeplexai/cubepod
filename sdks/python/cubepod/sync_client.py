@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -330,16 +331,21 @@ class CubePod:
         path: str,
         content: str | bytes,
         *,
-        uid: int = 1000,
-        gid: int = 1000,
+        uid: int | None = None,
+        gid: int | None = None,
         mode: str = "0644",
     ) -> dict[str, Any]:
-        """Write a file directly inside the sandbox with specified UID/GID and mode."""
+        """Write a file directly inside the sandbox with optional UID/GID and mode."""
         data = content.encode("utf-8") if isinstance(content, str) else content
+        params: dict[str, str] = {"path": path, "mode": mode}
+        if uid is not None:
+            params["uid"] = str(uid)
+        if gid is not None:
+            params["gid"] = str(gid)
         resp = self._request(
             "PUT",
             f"/sandboxes/{sandbox_id}/files",
-            params={"path": path, "uid": str(uid), "gid": str(gid), "mode": mode},
+            params=params,
             content=data,
             headers={"Content-Type": "application/octet-stream"},
         )
@@ -396,16 +402,25 @@ class CubePod:
         files: dict[str, str | bytes],
         *,
         dest: str = "/workspace",
-        uid: int = 1000,
-        gid: int = 1000,
+        uid: int | None = None,
+        gid: int | None = None,
     ) -> dict[str, Any]:
         """Pack files into an in-memory tar.gz archive and extract inside the sandbox in a single HTTP request."""
-        tar_bytes = _build_tar_gz_bytes(files, uid=uid, gid=gid)
+        tar_bytes = _build_tar_gz_bytes(
+            files,
+            uid=uid if uid is not None else 1000,
+            gid=gid if gid is not None else 1000,
+        )
+        params: dict[str, str] = {"dest": dest}
+        if uid is not None:
+            params["uid"] = str(uid)
+        if gid is not None:
+            params["gid"] = str(gid)
 
         resp = self._request(
             "POST",
             f"/sandboxes/{sandbox_id}/files/archive-sync",
-            params={"dest": dest},
+            params=params,
             content=tar_bytes,
             headers={"Content-Type": "application/gzip"},
         )
@@ -440,13 +455,38 @@ class CubePod:
 
     def get_template(self, template_id: str) -> dict[str, Any]:
         """Fetch status and metadata for a specific template."""
-        resp = self._request("GET", f"/templates/{template_id}")
+        resp = self._request("GET", f"/templates/{quote(template_id, safe='')}")
         resp.raise_for_status()
         return resp.json()
 
     def get_template_by_alias(self, alias: str) -> dict[str, Any]:
         """Fetch template metadata by alias name or tag."""
-        resp = self._request("GET", f"/templates/aliases/{alias}")
+        resp = self._request("GET", f"/templates/aliases/{quote(alias, safe='')}")
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_template_build_status(
+        self,
+        template_id: str,
+        build_id: str,
+        *,
+        logs_offset: int | None = None,
+        limit: int | None = None,
+        level: str | None = None,
+    ) -> dict[str, Any]:
+        """Fetch build status and incremental logs for a template build."""
+        params: dict[str, Any] = {}
+        if logs_offset is not None:
+            params["logsOffset"] = logs_offset
+        if limit is not None:
+            params["limit"] = limit
+        if level is not None:
+            params["level"] = level
+        resp = self._request(
+            "GET",
+            f"/templates/{quote(template_id, safe='')}/builds/{quote(build_id, safe='')}/status",
+            params=params or None,
+        )
         resp.raise_for_status()
         return resp.json()
 
@@ -458,59 +498,48 @@ class CubePod:
         cpu_count: int | None = None,
         memory_mb: int | None = None,
         min_free_disk_mb: int | None = None,
+        tags: list[str] | None = None,
+        from_image_registry: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        wait: bool = True,
+        poll_interval: float = 0.5,
+        timeout: float = 300.0,
     ) -> dict[str, Any]:
-        """Register a template from an existing OCI image without invoking BuildKit.
-
-        Calls POST /v3/templates with only the fields provided by the caller,
-        followed by POST /v2/templates/{templateID}/builds/{buildID} with fromImage
-        and an empty steps array. Returns a dict containing templateID, buildID, aliases, names.
-        """
-        payload: dict[str, Any] = {}
-        if name is not None:
-            payload["name"] = name
-        if alias is not None:
-            payload["alias"] = alias
-        if cpu_count is not None:
-            payload["cpuCount"] = cpu_count
-        if memory_mb is not None:
-            payload["memoryMB"] = memory_mb
-        if min_free_disk_mb is not None:
-            payload["minFreeDiskMb"] = min_free_disk_mb
-
-        resp = self._request("POST", "/v3/templates", json=payload)
-        resp.raise_for_status()
-        created = resp.json()
-
-        template_id = created.get("templateID")
-        build_id = created.get("buildID")
-
+        """Register a template from an existing OCI image without invoking BuildKit."""
         build_payload: dict[str, Any] = {
             "fromImage": from_image,
             "steps": [],
         }
-        build_resp = self._request(
-            "POST",
-            f"/v2/templates/{template_id}/builds/{build_id}",
-            json=build_payload,
-        )
-        build_resp.raise_for_status()
+        if from_image_registry is not None:
+            build_payload["fromImageRegistry"] = from_image_registry
 
-        return {
-            "templateID": template_id,
-            "buildID": build_id,
-            "aliases": created.get("aliases", []),
-            "names": created.get("names", []),
-        }
+        return self._create_and_start_template_build(
+            name=name,
+            alias=alias,
+            tags=tags,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+            min_free_disk_mb=min_free_disk_mb,
+            idempotency_key=idempotency_key,
+            build_payload=build_payload,
+            wait=wait,
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
 
     def delete_template(self, template_id: str, force: bool = False) -> None:
         """Delete a template by templateID. If force is True, appends ?force=true."""
         params = {"force": "true"} if force else None
-        resp = self._request("DELETE", f"/templates/{template_id}", params=params)
+        resp = self._request("DELETE", f"/templates/{quote(template_id, safe='')}", params=params)
         resp.raise_for_status()
 
-    def set_template_public(self, template_id: str) -> dict[str, Any] | None:
-        """Mark a template as public via PATCH /templates/{templateID} with {"public":true}."""
-        resp = self._request("PATCH", f"/templates/{template_id}", json={"public": True})
+    def set_template_public(self, template_id: str, public: bool = True) -> dict[str, Any] | None:
+        """Update template visibility via PATCH /templates/{templateID}."""
+        resp = self._request(
+            "PATCH",
+            f"/templates/{quote(template_id, safe='')}",
+            json={"public": public},
+        )
         resp.raise_for_status()
         if resp.content:
             return resp.json()
@@ -529,32 +558,16 @@ class CubePod:
         start_cmd: str | None = None,
         ready_cmd: str | None = None,
         force: bool = False,
+        tags: list[str] | None = None,
+        from_image_registry: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        wait: bool = True,
+        poll_interval: float = 0.5,
+        timeout: float = 300.0,
     ) -> dict[str, Any]:
-        """Thin helper for Beta template builds: registers via POST /v3/templates
-        and triggers build via POST /v2/templates/{templateID}/builds/{buildID}.
-
-        Note: uploading context files (tar archives) via PUT /templates/{templateID}/files/{hash}
-        is the caller's responsibility.
+        """Thin helper for Beta template builds: registers via POST /v3/templates,
+        triggers build via POST /v2/templates/{templateID}/builds/{buildID}, and polls status when wait=True.
         """
-        payload: dict[str, Any] = {}
-        if name is not None:
-            payload["name"] = name
-        if alias is not None:
-            payload["alias"] = alias
-        if cpu_count is not None:
-            payload["cpuCount"] = cpu_count
-        if memory_mb is not None:
-            payload["memoryMB"] = memory_mb
-        if min_free_disk_mb is not None:
-            payload["minFreeDiskMb"] = min_free_disk_mb
-
-        resp = self._request("POST", "/v3/templates", json=payload)
-        resp.raise_for_status()
-        created = resp.json()
-
-        template_id = created.get("templateID")
-        build_id = created.get("buildID")
-
         build_payload: dict[str, Any] = {
             "steps": steps if steps is not None else [],
         }
@@ -562,6 +575,8 @@ class CubePod:
             build_payload["fromImage"] = from_image
         if from_template is not None:
             build_payload["fromTemplate"] = from_template
+        if from_image_registry is not None:
+            build_payload["fromImageRegistry"] = from_image_registry
         if start_cmd is not None:
             build_payload["startCmd"] = start_cmd
         if ready_cmd is not None:
@@ -569,19 +584,101 @@ class CubePod:
         if force:
             build_payload["force"] = True
 
+        return self._create_and_start_template_build(
+            name=name,
+            alias=alias,
+            tags=tags,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+            min_free_disk_mb=min_free_disk_mb,
+            idempotency_key=idempotency_key,
+            build_payload=build_payload,
+            wait=wait,
+            poll_interval=poll_interval,
+            timeout=timeout,
+        )
+
+    def _create_and_start_template_build(
+        self,
+        *,
+        name: str | None,
+        alias: str | None,
+        tags: list[str] | None,
+        cpu_count: int | None,
+        memory_mb: int | None,
+        min_free_disk_mb: int | None,
+        idempotency_key: str | None,
+        build_payload: dict[str, Any],
+        wait: bool,
+        poll_interval: float,
+        timeout: float,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if alias is not None:
+            payload["alias"] = alias
+        if tags is not None:
+            payload["tags"] = tags
+        if cpu_count is not None:
+            payload["cpuCount"] = cpu_count
+        if memory_mb is not None:
+            payload["memoryMB"] = memory_mb
+        if min_free_disk_mb is not None:
+            payload["minFreeDiskMb"] = min_free_disk_mb
+
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
+        resp = self._request("POST", "/v3/templates", json=payload, headers=headers)
+        resp.raise_for_status()
+        created = resp.json()
+
+        template_id = str(created.get("templateID", ""))
+        build_id = str(created.get("buildID", ""))
+
         build_resp = self._request(
             "POST",
-            f"/v2/templates/{template_id}/builds/{build_id}",
+            f"/v2/templates/{quote(template_id, safe='')}/builds/{quote(build_id, safe='')}",
             json=build_payload,
         )
         build_resp.raise_for_status()
+
+        if wait:
+            self._wait_for_template_build(
+                template_id,
+                build_id,
+                poll_interval=poll_interval,
+                timeout=timeout,
+            )
 
         return {
             "templateID": template_id,
             "buildID": build_id,
             "aliases": created.get("aliases", []),
             "names": created.get("names", []),
+            "tags": created.get("tags", []),
         }
+
+    def _wait_for_template_build(
+        self,
+        template_id: str,
+        build_id: str,
+        *,
+        poll_interval: float = 0.5,
+        timeout: float = 300.0,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            status_data = self.get_template_build_status(template_id, build_id)
+            status = status_data.get("status", "")
+            if status == "ready":
+                return status_data
+            if status == "error":
+                raise RuntimeError(_format_build_error(build_id, status_data.get("reason")))
+            if status not in ("waiting", "building", "uploaded", ""):
+                raise RuntimeError(f"Unexpected build status {status!r} for build {build_id}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for template build {build_id}")
+            time.sleep(poll_interval)
 
     def close(self) -> None:
         """Close the underlying HTTP client session."""
@@ -596,6 +693,19 @@ class CubePod:
             envd_port=data.get("envdPort", 49983),
             rootfs_generation=data.get("rootfsGeneration", 1),
         )
+
+
+def _format_build_error(build_id: str, reason: Any) -> str:
+    if isinstance(reason, dict):
+        msg = reason.get("message") or str(reason)
+        step = reason.get("step")
+        if step:
+            msg = f"{msg} (step: {step})"
+    elif reason:
+        msg = str(reason)
+    else:
+        msg = "unknown build error"
+    return f"Template build {build_id} failed: {msg}"
 
 
 # Alias SyncCubePod to CubePod for naming symmetry with AsyncCubePod

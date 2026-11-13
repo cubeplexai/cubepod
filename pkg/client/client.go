@@ -49,6 +49,9 @@ type RunCommandRequest struct {
 	Envs       map[string]string `json:"envs,omitempty"`
 	UID        int               `json:"uid,omitempty"`
 	GID        int               `json:"gid,omitempty"`
+	UIDPtr     *int              `json:"-"`
+	GIDPtr     *int              `json:"-"`
+	RunAsRoot  bool              `json:"-"`
 }
 
 // CommandResult represents the final or initial execution output of a command.
@@ -105,36 +108,109 @@ type WarmPool struct {
 	AvailableReplicas int32  `json:"availableReplicas,omitempty"`
 }
 
+// RegistryAuth provides pull credentials for a base image during template builds.
+type RegistryAuth struct {
+	Type     string `json:"type,omitempty"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
+// BuildLogEntry represents a single structured template build log entry.
+type BuildLogEntry struct {
+	Timestamp string `json:"timestamp"`
+	Level     string `json:"level"`
+	Message   string `json:"message"`
+}
+
+// BuildStatusReason describes why a template build failed.
+type BuildStatusReason struct {
+	Message    string          `json:"message"`
+	Step       string          `json:"step,omitempty"`
+	LogEntries []BuildLogEntry `json:"logEntries,omitempty"`
+}
+
+// UnmarshalJSON decodes either the canonical BuildStatusReason object or a plain string fallback.
+func (r *BuildStatusReason) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		return nil
+	}
+	if trimmed[0] == '"' {
+		var msg string
+		if err := json.Unmarshal(trimmed, &msg); err != nil {
+			return err
+		}
+		r.Message = msg
+		return nil
+	}
+	type rawReason BuildStatusReason
+	var raw rawReason
+	if err := json.Unmarshal(trimmed, &raw); err != nil {
+		return err
+	}
+	*r = BuildStatusReason(raw)
+	return nil
+}
+
+// TemplateBuildStatus represents the response returned by GET /templates/{templateID}/builds/{buildID}/status.
+type TemplateBuildStatus struct {
+	TemplateID string             `json:"templateID"`
+	BuildID    string             `json:"buildID"`
+	Status     string             `json:"status"`
+	Reason     *BuildStatusReason `json:"reason,omitempty"`
+	Logs       []string           `json:"logs,omitempty"`
+	LogEntries []BuildLogEntry    `json:"logEntries,omitempty"`
+}
+
+// TemplateBuildRecord summarizes a build entry on a TemplateWithBuilds response.
+type TemplateBuildRecord struct {
+	BuildID    string             `json:"buildID"`
+	TemplateID string             `json:"templateID,omitempty"`
+	Status     string             `json:"status"`
+	CreatedAt  string             `json:"createdAt"`
+	UpdatedAt  string             `json:"updatedAt"`
+	CPUCount   int                `json:"cpuCount"`
+	MemoryMB   int                `json:"memoryMB"`
+	Reason     *BuildStatusReason `json:"reason,omitempty"`
+}
+
 // Template represents an E2B-compatible template catalog entry.
 type Template struct {
-	TemplateID  string   `json:"templateID,omitempty"`
-	ID          string   `json:"id,omitempty"` // legacy compatibility
-	BuildID     string   `json:"buildID,omitempty"`
-	CPUCount    int      `json:"cpuCount,omitempty"`
-	MemoryMB    int      `json:"memoryMB,omitempty"`
-	DiskSizeMB  int      `json:"diskSizeMB,omitempty"`
-	Public      bool     `json:"public,omitempty"`
-	Aliases     []string `json:"aliases,omitempty"`
-	Names       []string `json:"names,omitempty"`
-	BuildStatus string   `json:"buildStatus,omitempty"`
-	EnvdVersion string   `json:"envdVersion,omitempty"`
-	SpawnCount  int      `json:"spawnCount,omitempty"`
-	BuildCount  int      `json:"buildCount,omitempty"`
-	CreatedAt   string   `json:"createdAt,omitempty"`
-	UpdatedAt   string   `json:"updatedAt,omitempty"`
-	Image       string   `json:"image,omitempty"`       // legacy compatibility
-	Name        string   `json:"name,omitempty"`        // legacy compatibility
-	Description string   `json:"description,omitempty"` // legacy compatibility
+	TemplateID    string                `json:"templateID,omitempty"`
+	ID            string                `json:"id,omitempty"` // legacy compatibility
+	BuildID       string                `json:"buildID,omitempty"`
+	CPUCount      int                   `json:"cpuCount,omitempty"`
+	MemoryMB      int                   `json:"memoryMB,omitempty"`
+	DiskSizeMB    int                   `json:"diskSizeMB,omitempty"`
+	Public        bool                  `json:"public,omitempty"`
+	Aliases       []string              `json:"aliases,omitempty"`
+	Names         []string              `json:"names,omitempty"`
+	BuildStatus   string                `json:"buildStatus,omitempty"`
+	EnvdVersion   string                `json:"envdVersion,omitempty"`
+	SpawnCount    int                   `json:"spawnCount,omitempty"`
+	BuildCount    int                   `json:"buildCount,omitempty"`
+	CreatedAt     string                `json:"createdAt,omitempty"`
+	UpdatedAt     string                `json:"updatedAt,omitempty"`
+	LastSpawnedAt *string               `json:"lastSpawnedAt,omitempty"`
+	Builds        []TemplateBuildRecord `json:"builds,omitempty"`
+	Image         string                `json:"image,omitempty"`       // legacy compatibility
+	Name          string                `json:"name,omitempty"`        // legacy compatibility
+	Description   string                `json:"description,omitempty"` // legacy compatibility
 }
 
 // CreateTemplateFromImageRequest parameters for registering a template from an existing OCI image.
 type CreateTemplateFromImageRequest struct {
-	Name          string `json:"name,omitempty"`
-	Alias         string `json:"alias,omitempty"`
-	FromImage     string `json:"fromImage"`
-	CPUCount      int    `json:"cpuCount,omitempty"`
-	MemoryMB      int    `json:"memoryMB,omitempty"`
-	MinFreeDiskMB int    `json:"minFreeDiskMb,omitempty"`
+	Name              string        `json:"name,omitempty"`
+	Alias             string        `json:"alias,omitempty"`
+	Tags              []string      `json:"tags,omitempty"`
+	FromImage         string        `json:"fromImage"`
+	FromImageRegistry *RegistryAuth `json:"fromImageRegistry,omitempty"`
+	CPUCount          int           `json:"cpuCount,omitempty"`
+	MemoryMB          int           `json:"memoryMB,omitempty"`
+	MinFreeDiskMB     int           `json:"minFreeDiskMb,omitempty"`
+	IdempotencyKey    string        `json:"-"`
+	NoWait            bool          `json:"-"`
+	PollInterval      time.Duration `json:"-"`
 }
 
 // TemplateCreateResult represents the response returned by template registration/build calls.
@@ -143,6 +219,7 @@ type TemplateCreateResult struct {
 	BuildID    string   `json:"buildID"`
 	Aliases    []string `json:"aliases"`
 	Names      []string `json:"names"`
+	Tags       []string `json:"tags,omitempty"`
 	Public     bool     `json:"public,omitempty"`
 }
 
@@ -156,17 +233,22 @@ type BuildStep struct {
 
 // BuildTemplateRequest parameters for building a template via rootless BuildKit.
 type BuildTemplateRequest struct {
-	Name          string      `json:"name,omitempty"`
-	Alias         string      `json:"alias,omitempty"`
-	CPUCount      int         `json:"cpuCount,omitempty"`
-	MemoryMB      int         `json:"memoryMB,omitempty"`
-	MinFreeDiskMB int         `json:"minFreeDiskMb,omitempty"`
-	FromImage     string      `json:"fromImage,omitempty"`
-	FromTemplate  string      `json:"fromTemplate,omitempty"`
-	Steps         []BuildStep `json:"steps"`
-	StartCmd      string      `json:"startCmd,omitempty"`
-	ReadyCmd      string      `json:"readyCmd,omitempty"`
-	Force         bool        `json:"force,omitempty"`
+	Name              string        `json:"name,omitempty"`
+	Alias             string        `json:"alias,omitempty"`
+	Tags              []string      `json:"tags,omitempty"`
+	CPUCount          int           `json:"cpuCount,omitempty"`
+	MemoryMB          int           `json:"memoryMB,omitempty"`
+	MinFreeDiskMB     int           `json:"minFreeDiskMb,omitempty"`
+	FromImage         string        `json:"fromImage,omitempty"`
+	FromTemplate      string        `json:"fromTemplate,omitempty"`
+	FromImageRegistry *RegistryAuth `json:"fromImageRegistry,omitempty"`
+	Steps             []BuildStep   `json:"steps"`
+	StartCmd          string        `json:"startCmd,omitempty"`
+	ReadyCmd          string        `json:"readyCmd,omitempty"`
+	Force             bool          `json:"force,omitempty"`
+	IdempotencyKey    string        `json:"-"`
+	NoWait            bool          `json:"-"`
+	PollInterval      time.Duration `json:"-"`
 }
 
 // Option configures a Client instance.
@@ -485,11 +567,47 @@ func (c *Client) AcquireLease(ctx context.Context, sandboxID string, leaseSecond
 
 // RunCommand executes a command inside the sandbox.
 func (c *Client) RunCommand(ctx context.Context, sandboxID string, req RunCommandRequest) (*CommandResult, error) {
-	if req.UID == 0 && req.GID == 0 {
-		req.UID = 1000
-		req.GID = 1000
+	var (
+		body []byte
+		err  error
+	)
+	if !req.RunAsRoot && req.UIDPtr == nil && req.GIDPtr == nil {
+		body, err = json.Marshal(req)
+	} else {
+		type runCommandWire struct {
+			Command    string            `json:"command"`
+			Background bool              `json:"background,omitempty"`
+			Workdir    string            `json:"workdir,omitempty"`
+			Envs       map[string]string `json:"envs,omitempty"`
+			UID        *int              `json:"uid,omitempty"`
+			GID        *int              `json:"gid,omitempty"`
+		}
+		wire := runCommandWire{
+			Command:    req.Command,
+			Background: req.Background,
+			Workdir:    req.Workdir,
+			Envs:       req.Envs,
+		}
+		if req.UIDPtr != nil {
+			wire.UID = req.UIDPtr
+		} else if req.RunAsRoot {
+			zero := 0
+			wire.UID = &zero
+		} else if req.UID != 0 {
+			u := req.UID
+			wire.UID = &u
+		}
+		if req.GIDPtr != nil {
+			wire.GID = req.GIDPtr
+		} else if req.RunAsRoot {
+			zero := 0
+			wire.GID = &zero
+		} else if req.GID != 0 {
+			g := req.GID
+			wire.GID = &g
+		}
+		body, err = json.Marshal(wire)
 	}
-	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
@@ -566,10 +684,21 @@ func (c *Client) KillCommand(ctx context.Context, sandboxID, commandID string) e
 
 // WriteFile writes a file at the target path inside the sandbox.
 func (c *Client) WriteFile(ctx context.Context, sandboxID, path string, content []byte, mode string) error {
+	return c.WriteFileWithOwner(ctx, sandboxID, path, content, mode, nil, nil)
+}
+
+// WriteFileWithOwner writes a file at the target path inside the sandbox with optional uid/gid ownership.
+func (c *Client) WriteFileWithOwner(ctx context.Context, sandboxID, path string, content []byte, mode string, uid, gid *int) error {
 	if mode == "" {
 		mode = "0644"
 	}
 	u := fmt.Sprintf("/sandboxes/%s/files?path=%s&mode=%s", sandboxID, url.QueryEscape(path), url.QueryEscape(mode))
+	if uid != nil {
+		u += fmt.Sprintf("&uid=%d", *uid)
+	}
+	if gid != nil {
+		u += fmt.Sprintf("&gid=%d", *gid)
+	}
 	req, err := c.newRequest(ctx, http.MethodPut, u, bytes.NewReader(content))
 	if err != nil {
 		return err
@@ -640,6 +769,11 @@ func (c *Client) ListFiles(ctx context.Context, sandboxID, path string) ([]FileE
 
 // ArchiveSync packs in-memory files into a tar.gz archive and extracts inside the sandbox.
 func (c *Client) ArchiveSync(ctx context.Context, sandboxID, dest string, files map[string][]byte) error {
+	return c.ArchiveSyncWithOwner(ctx, sandboxID, dest, files, nil, nil)
+}
+
+// ArchiveSyncWithOwner packs in-memory files into a tar.gz archive and extracts inside the sandbox with optional uid/gid ownership.
+func (c *Client) ArchiveSyncWithOwner(ctx context.Context, sandboxID, dest string, files map[string][]byte, uid, gid *int) error {
 	if dest == "" {
 		dest = "/workspace"
 	}
@@ -670,6 +804,12 @@ func (c *Client) ArchiveSync(ctx context.Context, sandboxID, dest string, files 
 	}
 
 	u := fmt.Sprintf("/sandboxes/%s/files/archive-sync?dest=%s", sandboxID, url.QueryEscape(dest))
+	if uid != nil {
+		u += fmt.Sprintf("&uid=%d", *uid)
+	}
+	if gid != nil {
+		u += fmt.Sprintf("&gid=%d", *gid)
+	}
 	req, err := c.newRequest(ctx, http.MethodPost, u, &buf)
 	if err != nil {
 		return err
@@ -878,72 +1018,18 @@ func (c *Client) GetTemplateByAlias(ctx context.Context, alias string) (*Templat
 }
 
 // CreateTemplateFromImage provisions a template from an existing OCI image without triggering BuildKit.
-// It sends only the caller-provided fields to POST /v3/templates, then starts the build on POST /v2/templates/{templateID}/builds/{buildID}.
+// It sends only the caller-provided fields to POST /v3/templates, starts the build on
+// POST /v2/templates/{templateID}/builds/{buildID}, and polls status until ready unless NoWait is set.
 func (c *Client) CreateTemplateFromImage(ctx context.Context, req CreateTemplateFromImageRequest) (*TemplateCreateResult, error) {
-	v3Payload := make(map[string]interface{})
-	if req.Name != "" {
-		v3Payload["name"] = req.Name
-	}
-	if req.Alias != "" {
-		v3Payload["alias"] = req.Alias
-	}
-	if req.CPUCount != 0 {
-		v3Payload["cpuCount"] = req.CPUCount
-	}
-	if req.MemoryMB != 0 {
-		v3Payload["memoryMB"] = req.MemoryMB
-	}
-	if req.MinFreeDiskMB != 0 {
-		v3Payload["minFreeDiskMb"] = req.MinFreeDiskMB
-	}
-
-	bufV3, err := json.Marshal(v3Payload)
-	if err != nil {
-		return nil, err
-	}
-	reqV3, err := c.newRequest(ctx, http.MethodPost, "/v3/templates", bytes.NewReader(bufV3))
-	if err != nil {
-		return nil, err
-	}
-	reqV3.Header.Set("Content-Type", "application/json")
-	respV3, err := c.do(reqV3)
-	if err != nil {
-		return nil, err
-	}
-	defer respV3.Body.Close()
-
-	var res TemplateCreateResult
-	if err := json.NewDecoder(respV3.Body).Decode(&res); err != nil {
-		return nil, err
-	}
-
+	v3Payload := buildTemplateV3Payload(req.Name, req.Alias, req.Tags, req.CPUCount, req.MemoryMB, req.MinFreeDiskMB)
 	buildPayload := map[string]interface{}{
 		"fromImage": req.FromImage,
-		"steps":     []interface{}{},
+		"steps":     []BuildStep{},
 	}
-	bufBuild, err := json.Marshal(buildPayload)
-	if err != nil {
-		return nil, err
+	if req.FromImageRegistry != nil {
+		buildPayload["fromImageRegistry"] = req.FromImageRegistry
 	}
-	path := fmt.Sprintf("/v2/templates/%s/builds/%s", url.PathEscape(res.TemplateID), url.PathEscape(res.BuildID))
-	reqBuild, err := c.newRequest(ctx, http.MethodPost, path, bytes.NewReader(bufBuild))
-	if err != nil {
-		return nil, err
-	}
-	reqBuild.Header.Set("Content-Type", "application/json")
-	respBuild, err := c.do(reqBuild)
-	if err != nil {
-		return nil, err
-	}
-	defer respBuild.Body.Close()
-
-	if res.Aliases == nil {
-		res.Aliases = []string{}
-	}
-	if res.Names == nil {
-		res.Names = []string{}
-	}
-	return &res, nil
+	return c.createAndStartTemplateBuild(ctx, v3Payload, req.IdempotencyKey, buildPayload, req.NoWait, req.PollInterval)
 }
 
 // DeleteTemplate deletes a template by templateID. If force is true, ?force=true is appended.
@@ -964,9 +1050,9 @@ func (c *Client) DeleteTemplate(ctx context.Context, templateID string, force bo
 	return nil
 }
 
-// SetTemplatePublic marks a template as public via PATCH /templates/{templateID} with {"public":true}.
-func (c *Client) SetTemplatePublic(ctx context.Context, templateID string) error {
-	body, _ := json.Marshal(map[string]bool{"public": true})
+// UpdateTemplateVisibility updates a template's public visibility via PATCH /templates/{templateID}.
+func (c *Client) UpdateTemplateVisibility(ctx context.Context, templateID string, public bool) error {
+	body, _ := json.Marshal(map[string]bool{"public": public})
 	req, err := c.newRequest(ctx, http.MethodPatch, fmt.Sprintf("/templates/%s", url.PathEscape(templateID)), bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -980,46 +1066,36 @@ func (c *Client) SetTemplatePublic(ctx context.Context, templateID string) error
 	return nil
 }
 
-// BuildTemplate is a thin helper for Beta template builds: registers via POST /v3/templates
-// and triggers the build via POST /v2/templates/{templateID}/builds/{buildID}.
+// SetTemplatePublic marks a template as public via PATCH /templates/{templateID} with {"public":true}.
+func (c *Client) SetTemplatePublic(ctx context.Context, templateID string) error {
+	return c.UpdateTemplateVisibility(ctx, templateID, true)
+}
+
+// GetTemplateBuildStatus fetches the current build status and logs for a template build.
+func (c *Client) GetTemplateBuildStatus(ctx context.Context, templateID, buildID string) (*TemplateBuildStatus, error) {
+	path := fmt.Sprintf("/templates/%s/builds/%s/status", url.PathEscape(templateID), url.PathEscape(buildID))
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var status TemplateBuildStatus
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return nil, err
+	}
+	return &status, nil
+}
+
+// BuildTemplate is a thin helper for Beta template builds: registers via POST /v3/templates,
+// triggers the build via POST /v2/templates/{templateID}/builds/{buildID}, and polls status until ready unless NoWait is set.
 // Note: uploading context files (tar archives) via PUT /templates/{templateID}/files/{hash} is the caller's responsibility.
 func (c *Client) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (*TemplateCreateResult, error) {
-	v3Payload := make(map[string]interface{})
-	if req.Name != "" {
-		v3Payload["name"] = req.Name
-	}
-	if req.Alias != "" {
-		v3Payload["alias"] = req.Alias
-	}
-	if req.CPUCount != 0 {
-		v3Payload["cpuCount"] = req.CPUCount
-	}
-	if req.MemoryMB != 0 {
-		v3Payload["memoryMB"] = req.MemoryMB
-	}
-	if req.MinFreeDiskMB != 0 {
-		v3Payload["minFreeDiskMb"] = req.MinFreeDiskMB
-	}
-
-	bufV3, err := json.Marshal(v3Payload)
-	if err != nil {
-		return nil, err
-	}
-	reqV3, err := c.newRequest(ctx, http.MethodPost, "/v3/templates", bytes.NewReader(bufV3))
-	if err != nil {
-		return nil, err
-	}
-	reqV3.Header.Set("Content-Type", "application/json")
-	respV3, err := c.do(reqV3)
-	if err != nil {
-		return nil, err
-	}
-	defer respV3.Body.Close()
-
-	var res TemplateCreateResult
-	if err := json.NewDecoder(respV3.Body).Decode(&res); err != nil {
-		return nil, err
-	}
+	v3Payload := buildTemplateV3Payload(req.Name, req.Alias, req.Tags, req.CPUCount, req.MemoryMB, req.MinFreeDiskMB)
 
 	steps := req.Steps
 	if steps == nil {
@@ -1034,6 +1110,9 @@ func (c *Client) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (*
 	if req.FromTemplate != "" {
 		buildPayload["fromTemplate"] = req.FromTemplate
 	}
+	if req.FromImageRegistry != nil {
+		buildPayload["fromImageRegistry"] = req.FromImageRegistry
+	}
 	if req.StartCmd != "" {
 		buildPayload["startCmd"] = req.StartCmd
 	}
@@ -1042,6 +1121,63 @@ func (c *Client) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (*
 	}
 	if req.Force {
 		buildPayload["force"] = true
+	}
+
+	return c.createAndStartTemplateBuild(ctx, v3Payload, req.IdempotencyKey, buildPayload, req.NoWait, req.PollInterval)
+}
+
+func buildTemplateV3Payload(name, alias string, tags []string, cpuCount, memoryMB, minFreeDiskMB int) map[string]interface{} {
+	payload := make(map[string]interface{})
+	if name != "" {
+		payload["name"] = name
+	}
+	if alias != "" {
+		payload["alias"] = alias
+	}
+	if len(tags) > 0 {
+		payload["tags"] = tags
+	}
+	if cpuCount != 0 {
+		payload["cpuCount"] = cpuCount
+	}
+	if memoryMB != 0 {
+		payload["memoryMB"] = memoryMB
+	}
+	if minFreeDiskMB != 0 {
+		payload["minFreeDiskMb"] = minFreeDiskMB
+	}
+	return payload
+}
+
+func (c *Client) createAndStartTemplateBuild(
+	ctx context.Context,
+	v3Payload map[string]interface{},
+	idempotencyKey string,
+	buildPayload map[string]interface{},
+	noWait bool,
+	pollInterval time.Duration,
+) (*TemplateCreateResult, error) {
+	bufV3, err := json.Marshal(v3Payload)
+	if err != nil {
+		return nil, err
+	}
+	reqV3, err := c.newRequest(ctx, http.MethodPost, "/v3/templates", bytes.NewReader(bufV3))
+	if err != nil {
+		return nil, err
+	}
+	reqV3.Header.Set("Content-Type", "application/json")
+	if idempotencyKey != "" {
+		reqV3.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	respV3, err := c.do(reqV3)
+	if err != nil {
+		return nil, err
+	}
+	defer respV3.Body.Close()
+
+	var res TemplateCreateResult
+	if err := json.NewDecoder(respV3.Body).Decode(&res); err != nil {
+		return nil, err
 	}
 
 	bufBuild, err := json.Marshal(buildPayload)
@@ -1066,7 +1202,47 @@ func (c *Client) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (*
 	if res.Names == nil {
 		res.Names = []string{}
 	}
-	return &res, nil
+	if res.Tags == nil {
+		res.Tags = []string{}
+	}
+
+	if noWait {
+		return &res, nil
+	}
+
+	if pollInterval <= 0 {
+		pollInterval = 500 * time.Millisecond
+	}
+
+	for {
+		status, err := c.GetTemplateBuildStatus(ctx, res.TemplateID, res.BuildID)
+		if err != nil {
+			return nil, err
+		}
+		switch status.Status {
+		case "ready":
+			return &res, nil
+		case "error":
+			msg := "template build failed"
+			if status.Reason != nil && status.Reason.Message != "" {
+				msg = status.Reason.Message
+				if status.Reason.Step != "" {
+					msg = fmt.Sprintf("%s (step: %s)", msg, status.Reason.Step)
+				}
+			}
+			return nil, fmt.Errorf("template build %s failed: %s", res.BuildID, msg)
+		case "waiting", "building", "uploaded", "":
+			// Poll again until ready or error.
+		default:
+			return nil, fmt.Errorf("unexpected build status %q for build %s", status.Status, res.BuildID)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 // FormatTime formats a time pointer or returns empty string.
