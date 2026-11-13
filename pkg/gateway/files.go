@@ -47,9 +47,7 @@ func (s *Server) resolveFilePath(rec *SandboxRecord, userPath string) (string, e
 func (s *Server) resolveSandboxFromRequest(r *http.Request) (*SandboxRecord, error) {
 	id := r.PathValue("sandboxID")
 	if id != "" {
-		s.mu.RLock()
-		defer s.mu.RUnlock()
-		rec, ok := s.sandboxes[id]
+		rec, ok := s.resolveSandbox(r.Context(), id)
 		if !ok {
 			return nil, fmt.Errorf("sandbox not found")
 		}
@@ -348,9 +346,7 @@ func (s *Server) handleListFiles(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleArchiveSync(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sandboxID")
-	s.mu.RLock()
-	rec, ok := s.sandboxes[id]
-	s.mu.RUnlock()
+	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return

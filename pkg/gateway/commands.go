@@ -24,9 +24,7 @@ type runCommandReq struct {
 
 func (s *Server) handleRunCommand(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sandboxID")
-	s.mu.RLock()
-	rec, ok := s.sandboxes[id]
-	s.mu.RUnlock()
+	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
@@ -183,9 +181,7 @@ func (s *Server) handleGetCommandLogs(w http.ResponseWriter, r *http.Request) {
 	sandboxID := r.PathValue("sandboxID")
 	cmdID := r.PathValue("cmdID")
 
-	s.mu.RLock()
-	rec, ok := s.sandboxes[sandboxID]
-	s.mu.RUnlock()
+	rec, ok := s.resolveSandbox(r.Context(), sandboxID)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
@@ -254,9 +250,7 @@ func (s *Server) handleGetCommandStatus(w http.ResponseWriter, r *http.Request) 
 	sandboxID := r.PathValue("sandboxID")
 	cmdID := r.PathValue("cmdID")
 
-	s.mu.RLock()
-	rec, ok := s.sandboxes[sandboxID]
-	s.mu.RUnlock()
+	rec, ok := s.resolveSandbox(r.Context(), sandboxID)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
@@ -310,9 +304,7 @@ func (s *Server) handleStreamCommandLogs(w http.ResponseWriter, r *http.Request)
 	sandboxID := r.PathValue("sandboxID")
 	cmdID := r.PathValue("cmdID")
 
-	s.mu.RLock()
-	rec, ok := s.sandboxes[sandboxID]
-	s.mu.RUnlock()
+	rec, ok := s.resolveSandbox(r.Context(), sandboxID)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
@@ -425,9 +417,7 @@ func (s *Server) handleKillCommand(w http.ResponseWriter, r *http.Request) {
 	sandboxID := r.PathValue("sandboxID")
 	cmdID := r.PathValue("cmdID")
 
-	s.mu.RLock()
-	rec, ok := s.sandboxes[sandboxID]
-	s.mu.RUnlock()
+	rec, ok := s.resolveSandbox(r.Context(), sandboxID)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return

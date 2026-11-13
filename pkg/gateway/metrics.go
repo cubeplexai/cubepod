@@ -16,10 +16,13 @@ import (
 
 // Metrics encapsulates Prometheus counters for CubePod Gateway observability.
 type Metrics struct {
-	HTTPRequestsTotal     atomic.Uint64
-	SandboxesCreatedTotal atomic.Uint64
-	AutoresumeTotal       atomic.Uint64
-	CommandsExecutedTotal atomic.Uint64
+	HTTPRequestsTotal             atomic.Uint64
+	SandboxesCreatedTotal         atomic.Uint64
+	AutoresumeTotal               atomic.Uint64
+	CommandsExecutedTotal         atomic.Uint64
+	DesktopActivationsOK          atomic.Uint64
+	DesktopActivationsUnsupported atomic.Uint64
+	DesktopActivationsError       atomic.Uint64
 }
 
 // Metrics returns the server's metrics counters.
@@ -186,6 +189,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			"cubepod_gateway_sandboxes_active_running": runningCount,
 			"cubepod_gateway_sandboxes_active_paused":  pausedCount,
 			"cubepod_gateway_warmpools_total":          warmpoolsTotal,
+			"cubepod_desktop_activations_total": map[string]uint64{
+				"ok":          m.DesktopActivationsOK.Load(),
+				"unsupported": m.DesktopActivationsUnsupported.Load(),
+				"error":       m.DesktopActivationsError.Load(),
+			},
 		}
 		if e2bEnabled {
 			payload["cubepod_templates"] = templateStatusCounts
@@ -215,6 +223,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_commands_executed_total Total commands executed in sandboxes\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_commands_executed_total counter\n")
 	fmt.Fprintf(&buf, "cubepod_gateway_commands_executed_total %d\n", m.CommandsExecutedTotal.Load())
+
+	fmt.Fprintf(&buf, "# HELP cubepod_desktop_activations_total Total desktop stack activations by result\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_desktop_activations_total counter\n")
+	fmt.Fprintf(&buf, "cubepod_desktop_activations_total{result=\"ok\"} %d\n", m.DesktopActivationsOK.Load())
+	fmt.Fprintf(&buf, "cubepod_desktop_activations_total{result=\"unsupported\"} %d\n", m.DesktopActivationsUnsupported.Load())
+	fmt.Fprintf(&buf, "cubepod_desktop_activations_total{result=\"error\"} %d\n", m.DesktopActivationsError.Load())
 
 	// Gauges
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_sandboxes_active Current number of active sandboxes by state\n")

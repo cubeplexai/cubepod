@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +40,168 @@ type createSandboxReq struct {
 			AllowedHeaders []string `json:"allowedHeaders"`
 		} `json:"secretBindings,omitempty"`
 	} `json:"extension,omitempty"`
+}
+
+func formatPoddURL(podIP string, envdPort int) string {
+	if podIP == "" || podIP == "10.244.0.42" {
+		return ""
+	}
+	if envdPort <= 0 {
+		envdPort = 49983
+	}
+	if _, _, err := net.SplitHostPort(podIP); err == nil {
+		return "http://" + podIP
+	}
+	return fmt.Sprintf("http://%s:%d", podIP, envdPort)
+}
+
+func (s *Server) lookupPodBox(ctx context.Context, sandboxID string) (*v1alpha1.PodBox, bool, error) {
+	if s.reconciler == nil || s.reconciler.KubeClient() == nil {
+		return nil, false, nil
+	}
+	kc := s.reconciler.KubeClient()
+	if box, err := kc.GetPodBox(ctx, "", sandboxID); err == nil && box != nil {
+		return box, true, nil
+	}
+	boxes, err := kc.ListPodBoxes(ctx, "")
+	if err != nil {
+		return nil, false, err
+	}
+	for i := range boxes {
+		if boxes[i].Metadata.Name == sandboxID {
+			b := boxes[i]
+			return &b, true, nil
+		}
+	}
+	return nil, false, nil
+}
+
+// resolveSandbox returns a cached SandboxRecord or reconstructs it from Kubernetes PodBox state
+// on cache miss (CEP-0022 stateless multi-replica HA). When livePodRouting is active and the
+// PodBox has been deleted in Kubernetes, stale cached entries are evicted.
+func (s *Server) resolveSandbox(ctx context.Context, sandboxID string) (*SandboxRecord, bool) {
+	if sandboxID == "" {
+		return nil, false
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.mu.RLock()
+	rec, ok := s.sandboxes[sandboxID]
+	liveRouting := s.livePodRouting
+	s.mu.RUnlock()
+
+	if ok {
+		if liveRouting && s.reconciler != nil && s.reconciler.KubeClient() != nil {
+			box, found, err := s.lookupPodBox(ctx, sandboxID)
+			if err == nil && !found {
+				s.mu.Lock()
+				delete(s.sandboxes, sandboxID)
+				delete(s.endpoints, sandboxID)
+				s.mu.Unlock()
+				return nil, false
+			}
+			if err == nil && found {
+				s.mu.Lock()
+				rec.State = string(box.Status.Phase)
+				rec.Reason = box.Status.Reason
+				if box.Status.ObservedRootfsGen > 0 {
+					rec.RootfsGeneration = box.Status.ObservedRootfsGen
+				}
+				if box.Status.Phase == v1alpha1.PodBoxPhasePaused && box.Status.PodIP == "" {
+					rec.PoddURL = ""
+				} else if poddURL := formatPoddURL(box.Status.PodIP, rec.EnvdPort); poddURL != "" {
+					rec.PoddURL = poddURL
+				}
+				s.mu.Unlock()
+			}
+		}
+		return rec, true
+	}
+
+	if s.reconciler == nil || s.reconciler.KubeClient() == nil {
+		return nil, false
+	}
+
+	box, found, err := s.lookupPodBox(ctx, sandboxID)
+	if err != nil || !found {
+		return nil, false
+	}
+
+	_, _ = s.reconciler.SyncFromKube(ctx)
+
+	templateID := box.Spec.TemplateRef
+	timeoutSecs := 1800
+	var volumeKey string
+	var metadata map[string]string
+	if box.Metadata.Annotations != nil {
+		if templateID == "" {
+			templateID = box.Metadata.Annotations["cubepod.io/template-id"]
+		}
+		if rawTimeout := box.Metadata.Annotations["cubepod.io/timeout-seconds"]; rawTimeout != "" {
+			if parsed, convErr := strconv.Atoi(rawTimeout); convErr == nil && parsed > 0 {
+				timeoutSecs = parsed
+			}
+		}
+		volumeKey = box.Metadata.Annotations["cubepod.io/volume-key"]
+		for k, v := range box.Metadata.Annotations {
+			if strings.HasPrefix(k, "cubepod.io/metadata-") {
+				if metadata == nil {
+					metadata = make(map[string]string)
+				}
+				metadata[strings.TrimPrefix(k, "cubepod.io/metadata-")] = v
+			}
+		}
+	}
+	if templateID == "" {
+		templateID = "base"
+	}
+
+	now := time.Now().UTC()
+	createdAt := now
+	if box.Status.LastActivityAt != nil && !box.Status.LastActivityAt.IsZero() {
+		createdAt = *box.Status.LastActivityAt
+	}
+	rootfsGen := box.Status.ObservedRootfsGen
+	if rootfsGen == 0 {
+		rootfsGen = box.Spec.RootfsGeneration
+	}
+	if rootfsGen == 0 {
+		rootfsGen = 1
+	}
+
+	reconstructed := &SandboxRecord{
+		SandboxID:        sandboxID,
+		TemplateID:       templateID,
+		ClientID:         "cpod-client-01",
+		EnvdVersion:      "1.1.0",
+		StartedAt:        createdAt,
+		EndAt:            createdAt.Add(time.Duration(timeoutSecs) * time.Second),
+		CPUCount:         2,
+		MemoryMB:         2048,
+		DiskSizeMB:       10240,
+		State:            string(box.Status.Phase),
+		Reason:           box.Status.Reason,
+		EnvdPort:         49983,
+		PoddURL:          formatPoddURL(box.Status.PodIP, 49983),
+		RootfsGeneration: rootfsGen,
+		VolumeKey:        volumeKey,
+		Metadata:         metadata,
+		CreatedAt:        createdAt,
+		LastActivityAt:   &now,
+		TimeoutSeconds:   timeoutSecs,
+		WorkspaceDir:     filepath.Join(s.workspaceBaseDir, sandboxID, "workspace"),
+	}
+
+	s.mu.Lock()
+	if existing, exists := s.sandboxes[sandboxID]; exists {
+		s.mu.Unlock()
+		return existing, true
+	}
+	s.sandboxes[sandboxID] = reconstructed
+	s.mu.Unlock()
+	return reconstructed, true
 }
 
 func (s *Server) recordActivity(rec *SandboxRecord) {
@@ -276,6 +439,16 @@ func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
 	stateFilter := r.URL.Query().Get("state")
 	templateFilter := r.URL.Query().Get("templateID")
 
+	if s.LivePodRouting() && s.reconciler != nil && s.reconciler.KubeClient() != nil {
+		if boxes, err := s.reconciler.KubeClient().ListPodBoxes(r.Context(), ""); err == nil {
+			for i := range boxes {
+				if boxes[i].Metadata.Name != "" {
+					_, _ = s.resolveSandbox(r.Context(), boxes[i].Metadata.Name)
+				}
+			}
+		}
+	}
+
 	s.mu.RLock()
 	list := make([]*SandboxRecord, 0, len(s.sandboxes))
 	for _, rec := range s.sandboxes {
@@ -295,9 +468,7 @@ func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sandboxID")
-	s.mu.RLock()
-	rec, ok := s.sandboxes[id]
-	s.mu.RUnlock()
+	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
@@ -308,13 +479,12 @@ func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sandboxID")
-	s.mu.Lock()
-	rec, ok := s.sandboxes[id]
+	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		s.mu.Unlock()
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
+	s.mu.Lock()
 	poddURL := rec.PoddURL
 	s.mu.Unlock()
 
@@ -352,13 +522,12 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sandboxID")
-	s.mu.Lock()
-	rec, ok := s.sandboxes[id]
+	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		s.mu.Unlock()
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
+	s.mu.Lock()
 	wasPaused := rec.State == "Paused" || rec.State == string(v1alpha1.PodBoxPhasePaused)
 	// Auto-resume from Paused if needed (E2B connect semantics).
 	status, err := s.reconciler.Reconcile(r.Context(), id, v1alpha1.PodBoxSpec{
@@ -410,13 +579,13 @@ func (s *Server) handleRefreshSandbox(w http.ResponseWriter, r *http.Request) {
 		secs = 300
 	}
 
-	s.mu.Lock()
-	rec, ok := s.sandboxes[id]
+	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		s.mu.Unlock()
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
+
+	s.mu.Lock()
 	rec.TimeoutSeconds = secs
 	now := time.Now().UTC()
 	rec.LastActivityAt = &now
@@ -440,13 +609,13 @@ func (s *Server) handleSetTimeout(w http.ResponseWriter, r *http.Request) {
 		secs = 1800
 	}
 
-	s.mu.Lock()
-	rec, ok := s.sandboxes[id]
+	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		s.mu.Unlock()
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
+
+	s.mu.Lock()
 	rec.TimeoutSeconds = secs
 	s.recordActivity(rec)
 	s.mu.Unlock()
@@ -474,13 +643,13 @@ func (s *Server) handleAcquireLease(w http.ResponseWriter, r *http.Request) {
 		secs = 300
 	}
 
-	s.mu.Lock()
-	rec, ok := s.sandboxes[id]
+	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		s.mu.Unlock()
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
+
+	s.mu.Lock()
 	rec.LeaseSeconds = secs
 	exp := time.Now().UTC().Add(time.Duration(secs) * time.Second)
 	rec.LeaseExpiresAt = &exp
@@ -493,13 +662,12 @@ func (s *Server) handleAcquireLease(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sandboxID")
-	s.mu.Lock()
-	rec, ok := s.sandboxes[id]
+	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		s.mu.Unlock()
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
+	s.mu.Lock()
 	rec.RootfsGeneration++
 	status, err := s.reconciler.Reconcile(r.Context(), id, v1alpha1.PodBoxSpec{
 		TemplateRef:      rec.TemplateID,
@@ -524,9 +692,7 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	parentID := r.PathValue("sandboxID")
-	s.mu.RLock()
-	parent, ok := s.sandboxes[parentID]
-	s.mu.RUnlock()
+	parent, ok := s.resolveSandbox(r.Context(), parentID)
 	if !ok {
 		http.Error(w, "parent sandbox not found", http.StatusNotFound)
 		return
