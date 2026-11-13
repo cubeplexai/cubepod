@@ -1,4 +1,4 @@
-# `@cubeplex/cubepod`
+# cubepod — CubePod TypeScript / Node.js SDK
 
 Official TypeScript / JavaScript SDK for **CubePod** — persistent, E2B-compatible MicroVM agent sandboxes with dual-volume RootFS + `/workspace` isolation, 1-second Copy-on-Write forks, streaming Code Interpreter, zero-trust egress, and template builds.
 
@@ -10,13 +10,13 @@ Official TypeScript / JavaScript SDK for **CubePod** — persistent, E2B-compati
 ## Installation
 
 ```bash
-npm install @cubeplex/cubepod
+npm install cubepod
 ```
 
 ## Quick Start
 
 ```ts
-import { CubePodClient, Sandbox } from '@cubeplex/cubepod';
+import { CubePodClient, Sandbox } from 'cubepod';
 
 const sandbox = await Sandbox.create({
   baseUrl: 'http://localhost:8080',
@@ -36,7 +36,7 @@ await sandbox.kill();
 ## Sandbox Lifecycle, CoW Fork & RootFS Reset
 
 ```ts
-import { Sandbox } from '@cubeplex/cubepod';
+import { Sandbox } from 'cubepod';
 
 const sandbox = await Sandbox.create('ubuntu:24.04', {
   baseUrl: 'http://localhost:8080',
@@ -181,7 +181,7 @@ const pools = await client.listWarmPools();
 ## Error Handling
 
 ```ts
-import { CubePodAPIError, CubePodError } from '@cubeplex/cubepod';
+import { CubePodAPIError, CubePodError } from 'cubepod';
 
 try {
   await client.getTemplate('non-existent');
