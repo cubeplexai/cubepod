@@ -6,7 +6,7 @@ owning-area: "gateway"
 participating-areas:
   - "runtime"
   - "sdk"
-status: "implementable"
+status: "implemented"
 creation-date: "2026-11-11"
 last-updated: "2026-11-11"
 target-version: "v0.3.1"

@@ -1,0 +1,30 @@
+title: "Crash-Consistent Multi-Generation CoW Fork and Stateless Multi-Replica Gateway HA"
+cep-number: "0022"
+authors:
+  - "@cubepod-maintainers"
+owning-area: "controller"
+participating-areas:
+  - "gateway"
+  - "storage"
+  - "runtime"
+status: "implementable"
+creation-date: "2026-11-13"
+last-updated: "2026-11-13"
+reviewers: []
+approvers: []
+stage: "alpha"
+latest-milestone: "v0.5.0"
+milestone:
+  alpha: "v0.5.0"
+  beta: "v0.6.0"
+  stable: "v1.0.0"
+feature-gates:
+  - name: "StatelessGatewayHA"
+    components:
+      - "cubepod-gateway"
+      - "cubepod-controller"
+disable-supported: true
+metrics:
+  - "cubepod_sandbox_forks_total"
+  - "cubepod_sandbox_fork_duration_seconds"
+  - "cubepod_gateway_crd_resyncs_total"

@@ -1,0 +1,29 @@
+title: "Transparent Zero-Trust Egress Interception, Selective HTTPS MITM, and Per-Pod mTLS Secret Lifecycle"
+cep-number: "0020"
+authors:
+  - "@cubepod-maintainers"
+owning-area: "egress"
+participating-areas:
+  - "controller"
+  - "gateway"
+status: "implementable"
+creation-date: "2026-11-13"
+last-updated: "2026-11-13"
+reviewers: []
+approvers: []
+stage: "alpha"
+latest-milestone: "v0.5.0"
+milestone:
+  alpha: "v0.5.0"
+  beta: "v0.6.0"
+  stable: "v1.0.0"
+feature-gates:
+  - name: "TransparentEgress"
+    components:
+      - "cubepod-egress"
+      - "cubepod-controller"
+disable-supported: true
+metrics:
+  - "cubepod_egress_requests_total"
+  - "cubepod_egress_secret_exchanges_total"
+  - "cubepod_egress_blocked_hosts_total"
