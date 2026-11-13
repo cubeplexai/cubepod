@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -683,5 +684,206 @@ func TestConcurrentWarmPoolAndClaims(t *testing.T) {
 	}
 	if st.AvailableReplicas != 5 {
 		t.Fatalf("expected 5 remaining available replicas, got %d", st.AvailableReplicas)
+	}
+}
+
+func TestReconciler_SyncFromKube_WarmPoolDeletionCleanup(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// 1. Create warmpool with 2 replicas
+	poolSpec := v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    2,
+	}
+	_, err := r.ReconcileWarmPool(ctx, "delete-pool", poolSpec)
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	// 2. Claim 1 replica
+	claimed, err := r.ClaimWarmPod(ctx, "delete-pool", "claimer-box")
+	if err != nil {
+		t.Fatalf("ClaimWarmPod failed: %v", err)
+	}
+
+	// Identify unclaimed entry
+	specs := r.GetWarmPoolSpecs()
+	if _, ok := specs["delete-pool"]; !ok {
+		t.Fatal("expected delete-pool in specs")
+	}
+
+	var unclaimedPodName, unclaimedRootfsPVC, unclaimedWorkspacePVC string
+	for _, pod := range memKube.ListPods() {
+		if strings.HasPrefix(pod.Name, "delete-pool-warm-") && pod.Name != claimed.PodName {
+			unclaimedPodName = pod.Name
+			break
+		}
+	}
+	if unclaimedPodName == "" {
+		t.Fatal("expected to find unclaimed pod in kubeClient")
+	}
+	// PodName is <entryID>-kata-pod, PVCs are <entryID>-rootfs-pvc and <entryID>-workspace-pvc
+	entryID := strings.TrimSuffix(unclaimedPodName, "-kata-pod")
+	unclaimedRootfsPVC = entryID + "-rootfs-pvc"
+	unclaimedWorkspacePVC = entryID + "-workspace-pvc"
+
+	// 3. Delete the PodWarmPool CR from Kubernetes (e.g. via kubectl delete podwarmpool)
+	if err := memKube.DeletePodWarmPool(ctx, "cubepod-workloads", "delete-pool"); err != nil {
+		t.Fatalf("DeletePodWarmPool failed: %v", err)
+	}
+
+	// 4. SyncFromKube should detect that delete-pool is gone, delete unclaimed Pod & PVCs, and remove from r.warmPools
+	_, err = r.SyncFromKube(ctx)
+	if err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+
+	// Verify delete-pool is deleted from r.warmPools
+	if _, exists := r.GetWarmPoolSpecs()["delete-pool"]; exists {
+		t.Fatal("expected delete-pool to be removed from reconciler warmPools")
+	}
+
+	// Verify unclaimed pod and PVCs were deleted from Kubernetes
+	if _, exists := memKube.GetPod("cubepod-workloads", unclaimedPodName); exists {
+		t.Fatalf("expected unclaimed pod %s to be deleted from K8s", unclaimedPodName)
+	}
+	if _, exists := memKube.GetPVC("cubepod-workloads", unclaimedRootfsPVC); exists {
+		t.Fatalf("expected unclaimed rootfs PVC %s to be deleted from K8s", unclaimedRootfsPVC)
+	}
+	if _, exists := memKube.GetPVC("cubepod-workloads", unclaimedWorkspacePVC); exists {
+		t.Fatalf("expected unclaimed workspace PVC %s to be deleted from K8s", unclaimedWorkspacePVC)
+	}
+
+	// Verify claimed pod and PVCs were NOT deleted
+	if _, exists := memKube.GetPod("cubepod-workloads", claimed.PodName); !exists {
+		t.Fatalf("expected claimed pod %s to be preserved in K8s", claimed.PodName)
+	}
+	if _, exists := memKube.GetPVC("cubepod-workloads", claimed.RootfsPVCName); !exists {
+		t.Fatalf("expected claimed rootfs PVC %s to be preserved in K8s", claimed.RootfsPVCName)
+	}
+	if _, exists := memKube.GetPVC("cubepod-workloads", claimed.WorkspacePVCName); !exists {
+		t.Fatalf("expected claimed workspace PVC %s to be preserved in K8s", claimed.WorkspacePVCName)
+	}
+}
+
+func TestReconciler_ReconcileWarmPool_Status404_DoesNotRecreate(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// Create pool in memory reconciler, but do NOT put it in memKube so UpdatePodWarmPoolStatus returns 404
+	poolSpec := v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	}
+
+	st, err := r.ReconcileWarmPool(ctx, "deleted-pool", poolSpec)
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+	if st.AvailableReplicas != 1 {
+		t.Fatalf("expected 1 available replica, got %d", st.AvailableReplicas)
+	}
+
+	// Ensure memKube did NOT have UpsertPodWarmPool called (it was not recreated)
+	if _, err := memKube.GetPodWarmPool(ctx, "cubepod-workloads", "deleted-pool"); err == nil {
+		t.Fatal("expected deleted-pool NOT to be recreated in KubeClient on status 404")
+	}
+}
+
+func TestReconciler_ClaimWarmPod_PatchesLabels(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	_, err := r.ReconcileWarmPool(ctx, "label-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	// Before claim, check standby pod labels
+	pods := memKube.ListPods()
+	if len(pods) != 1 {
+		t.Fatalf("expected 1 pod in kubeClient, got %d", len(pods))
+	}
+	if pods[0].Labels["cubepod.io/claimed"] != "false" {
+		t.Fatalf("expected claimed=false before claim, got %s", pods[0].Labels["cubepod.io/claimed"])
+	}
+
+	// Claim the pod
+	entry, err := r.ClaimWarmPod(ctx, "label-pool", "claimer-box-123")
+	if err != nil {
+		t.Fatalf("ClaimWarmPod failed: %v", err)
+	}
+
+	// Entry labels updated
+	if entry.PodManifest.Labels["cubepod.io/claimed"] != "true" {
+		t.Fatalf("expected entry label claimed=true, got %s", entry.PodManifest.Labels["cubepod.io/claimed"])
+	}
+	if entry.PodManifest.Labels["cubepod.io/claimed-by"] != "claimer-box-123" {
+		t.Fatalf("expected entry label claimed-by=claimer-box-123, got %s", entry.PodManifest.Labels["cubepod.io/claimed-by"])
+	}
+
+	// KubeClient pod labels patched
+	patchedPod, ok := memKube.GetPod("cubepod-workloads", entry.PodName)
+	if !ok {
+		t.Fatalf("expected pod %s in kubeClient", entry.PodName)
+	}
+	if patchedPod.Labels["cubepod.io/claimed"] != "true" {
+		t.Fatalf("expected patched pod label claimed=true, got %s", patchedPod.Labels["cubepod.io/claimed"])
+	}
+	if patchedPod.Labels["cubepod.io/claimed-by"] != "claimer-box-123" {
+		t.Fatalf("expected patched pod label claimed-by=claimer-box-123, got %s", patchedPod.Labels["cubepod.io/claimed-by"])
+	}
+}
+
+func TestBuildKataPod_ClaimLabels(t *testing.T) {
+	tpl := v1alpha1.PodTemplateSpec{
+		RuntimeClassName: "none",
+	}
+
+	// 1. Standby pod in pool: boxName starts with pool-warm-
+	standbySpec := v1alpha1.PodBoxSpec{
+		WarmPoolRef: "my-pool",
+		TemplateRef: "my-tpl",
+	}
+	standbyStatus := v1alpha1.PodBoxStatus{}
+	standbyPod := controller.BuildKataPod("my-pool-warm-1", tpl, standbySpec, standbyStatus, "Filesystem")
+	if standbyPod.Labels["cubepod.io/claimed"] != "false" {
+		t.Fatalf("expected standby pod claimed=false, got %s", standbyPod.Labels["cubepod.io/claimed"])
+	}
+	if _, ok := standbyPod.Labels["cubepod.io/claimed-by"]; ok {
+		t.Fatalf("standby pod should not have claimed-by label, got %s", standbyPod.Labels["cubepod.io/claimed-by"])
+	}
+
+	// 2. Claimed pod: boxName is the sandbox name
+	claimSpec := v1alpha1.PodBoxSpec{
+		WarmPoolRef: "my-pool",
+		TemplateRef: "my-tpl",
+	}
+	claimStatus := v1alpha1.PodBoxStatus{
+		Reason:  "WarmPoolClaimed",
+		PodName: "my-pool-warm-1-kata-pod",
+	}
+	claimedPod := controller.BuildKataPod("sandbox-claimer", tpl, claimSpec, claimStatus, "Filesystem")
+	if claimedPod.Labels["cubepod.io/claimed"] != "true" {
+		t.Fatalf("expected claimed pod claimed=true, got %s", claimedPod.Labels["cubepod.io/claimed"])
+	}
+	if claimedPod.Labels["cubepod.io/claimed-by"] != "sandbox-claimer" {
+		t.Fatalf("expected claimed pod claimed-by=sandbox-claimer, got %s", claimedPod.Labels["cubepod.io/claimed-by"])
 	}
 }

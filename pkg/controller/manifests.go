@@ -325,7 +325,12 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 	if spec.WarmPoolRef != "" {
 		labels["cubepod.io/warmpool"] = spec.WarmPoolRef
 		labels["cubepod.io/template"] = spec.TemplateRef
-		labels["cubepod.io/claimed"] = "false"
+		if !strings.HasPrefix(boxName, spec.WarmPoolRef+"-warm-") || status.Reason == "WarmPoolClaimed" {
+			labels["cubepod.io/claimed"] = "true"
+			labels["cubepod.io/claimed-by"] = boxName
+		} else {
+			labels["cubepod.io/claimed"] = "false"
+		}
 	}
 
 	return PodManifest{

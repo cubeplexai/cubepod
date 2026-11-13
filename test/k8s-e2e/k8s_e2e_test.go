@@ -521,9 +521,14 @@ func TestK8sWarmPoolClaimLive(t *testing.T) {
 	t.Logf("[K8s-WarmPool] Waiting for warm standby pod to be provisioned and ready (polling up to 60s)...")
 	pollDeadline := time.Now().Add(60 * time.Second)
 	ready := false
+	var lastListErr error
 	for time.Now().Before(pollDeadline) {
 		pools, err := c.ListWarmPools(ctx)
-		if err == nil {
+		if err != nil {
+			lastListErr = err
+			t.Logf("[K8s-WarmPool] polling ListWarmPools err: %v", err)
+		} else {
+			lastListErr = nil
 			for _, p := range pools {
 				if p.Name == poolName && p.AvailableReplicas >= 1 {
 					ready = true
@@ -537,6 +542,9 @@ func TestK8sWarmPoolClaimLive(t *testing.T) {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if !ready {
+		if lastListErr != nil {
+			t.Fatalf("warmpool %s did not become ready within 60s; last ListWarmPools error: %v", poolName, lastListErr)
+		}
 		t.Fatalf("warmpool %s did not become ready (availableReplicas >= 1) within 60s", poolName)
 	}
 
@@ -561,6 +569,9 @@ func TestK8sWarmPoolClaimLive(t *testing.T) {
 
 	if elapsed >= 5*time.Second {
 		t.Fatalf("expected warm pool claim latency < 5s, got %v", elapsed)
+	}
+	if sb.Reason != "WarmPoolClaimed" {
+		t.Fatalf("expected sandbox to be claimed from warm pool (reason WarmPoolClaimed), got %q", sb.Reason)
 	}
 
 	t.Logf("[K8s-WarmPool] SUCCESS! Sandbox %s claimed from warmpool in %v! (vs ~30s on cold start)", sb.SandboxID, elapsed)

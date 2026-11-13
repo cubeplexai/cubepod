@@ -421,3 +421,37 @@ func TestClient_ErrorHandling(t *testing.T) {
 		t.Fatalf("expected error containing 404, got %v", err)
 	}
 }
+
+func TestClient_ListWarmPools_WrappedResponse(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /warmpools", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"warmPools": []map[string]interface{}{
+				{
+					"name":              "wrapped-pool",
+					"templateRef":       "cubeplex-desktop",
+					"replicas":          3,
+					"readyReplicas":     3,
+					"availableReplicas": 3,
+				},
+			},
+			"warmPoolReadyCount": 3,
+			"totalReady":         3,
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	c := client.New(server.URL)
+	pools, err := c.ListWarmPools(context.Background())
+	if err != nil {
+		t.Fatalf("ListWarmPools with wrapped response failed: %v", err)
+	}
+	if len(pools) != 1 {
+		t.Fatalf("expected 1 pool, got %d", len(pools))
+	}
+	if pools[0].Name != "wrapped-pool" || pools[0].AvailableReplicas != 3 {
+		t.Fatalf("unexpected pool data: %+v", pools[0])
+	}
+}

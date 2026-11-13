@@ -51,6 +51,7 @@ type SandboxRecord struct {
 	LeaseExpiresAt   *time.Time        `json:"leaseExpiresAt,omitempty"`
 	LastActivityAt   *time.Time        `json:"lastActivityAt,omitempty"`
 	AutoResumeCount  int               `json:"autoResumeCount"`
+	Reason           string            `json:"reason,omitempty"`
 	WorkspaceDir     string            `json:"-"`
 }
 

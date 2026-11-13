@@ -835,3 +835,60 @@ func TestWaitForRunning_Polling(t *testing.T) {
 		t.Fatalf("expected at least 3 polls before reaching Running phase, got %d", count)
 	}
 }
+
+func TestRESTKubeClient_PatchPodLabels(t *testing.T) {
+	var receivedMethod string
+	var receivedPath string
+	var receivedContentType string
+	var receivedAuth string
+	var receivedBody []byte
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedMethod = r.Method
+		receivedPath = r.URL.Path
+		receivedContentType = r.Header.Get("Content-Type")
+		receivedAuth = r.Header.Get("Authorization")
+		receivedBody, _ = io.ReadAll(r.Body)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+	labels := map[string]string{
+		"cubepod.io/claimed":    "true",
+		"cubepod.io/claimed-by": "test-box",
+	}
+
+	err := client.PatchPodLabels(context.Background(), "cubepod-workloads", "pod-xyz", labels)
+	if err != nil {
+		t.Fatalf("PatchPodLabels failed: %v", err)
+	}
+
+	if receivedMethod != http.MethodPatch {
+		t.Errorf("expected PATCH method, got %s", receivedMethod)
+	}
+	if receivedPath != "/api/v1/namespaces/cubepod-workloads/pods/pod-xyz" {
+		t.Errorf("expected path /api/v1/namespaces/cubepod-workloads/pods/pod-xyz, got %s", receivedPath)
+	}
+	if receivedContentType != "application/strategic-merge-patch+json" {
+		t.Errorf("expected Content-Type application/strategic-merge-patch+json, got %s", receivedContentType)
+	}
+	if receivedAuth != "Bearer test-token" {
+		t.Errorf("expected Authorization Bearer test-token, got %s", receivedAuth)
+	}
+
+	var parsed struct {
+		Metadata struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(receivedBody, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal request body: %v", err)
+	}
+	if parsed.Metadata.Labels["cubepod.io/claimed"] != "true" || parsed.Metadata.Labels["cubepod.io/claimed-by"] != "test-box" {
+		t.Errorf("unexpected patched labels: %+v", parsed.Metadata.Labels)
+	}
+}

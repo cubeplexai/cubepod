@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1039,13 +1038,16 @@ func TestWarmPoolClaim_GracefulFallbackToColdStart(t *testing.T) {
 	}
 	_ = postResp.Body.Close()
 
-	// 2. Claim the only replica directly from reconciler to simulate race / exhaustion
-	_, err = reconciler.ClaimWarmPod(context.Background(), "pool-fallback", "race-winner")
-	if err != nil {
-		t.Fatalf("failed to claim warm pod: %v", err)
+	// 2. Ensure FindAvailableWarmPool DOES find the available pool
+	availPool := reconciler.FindAvailableWarmPool("cubeplex-ubuntu24-desktop")
+	if availPool != "pool-fallback" {
+		t.Fatalf("expected FindAvailableWarmPool to return pool-fallback, got %q", availPool)
 	}
 
-	// 3. Now POST /sandboxes with template cubeplex-ubuntu24-desktop
+	// 3. Trigger a claim error so that Reconcile fails when spec.WarmPoolRef != ""
+	reconciler.SetFailWarmPoolClaim(true)
+
+	// 4. Now POST /sandboxes with template cubeplex-ubuntu24-desktop
 	sbReq := `{"templateID":"cubeplex-ubuntu24-desktop"}`
 	sbResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(sbReq))
 	if err != nil {
@@ -1059,6 +1061,7 @@ func TestWarmPoolClaim_GracefulFallbackToColdStart(t *testing.T) {
 
 	var sbData struct {
 		SandboxID string `json:"sandboxID"`
+		Reason    string `json:"reason"`
 	}
 	_ = json.NewDecoder(sbResp.Body).Decode(&sbData)
 	if sbData.SandboxID == "" {
