@@ -99,7 +99,7 @@ func (c *RESTKubeClient) UpsertPodBox(ctx context.Context, box v1alpha1.PodBox) 
 		}
 		defer statusResp.Body.Close()
 
-		if statusResp.StatusCode != http.StatusOK && statusResp.StatusCode != http.StatusCreated && statusResp.StatusCode != http.StatusNotFound {
+		if statusResp.StatusCode != http.StatusOK && statusResp.StatusCode != http.StatusCreated {
 			statusBody, _ := io.ReadAll(statusResp.Body)
 			return fmt.Errorf("UpsertPodBox PUT status failed: status %d (%s)", statusResp.StatusCode, string(statusBody))
 		}

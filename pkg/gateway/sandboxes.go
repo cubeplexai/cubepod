@@ -113,17 +113,23 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
 	if err != nil && spec.WarmPoolRef != "" {
 		slog.Warn("warmpool claim failed, refreshing standbys from Kubernetes via SyncFromKube and retrying", "sandboxID", id, "pool", spec.WarmPoolRef, "err", err)
-		_, _ = s.reconciler.SyncFromKube(r.Context())
-		if req.WarmPoolRef == "" {
-			spec.WarmPoolRef = s.reconciler.FindAvailableWarmPool(req.TemplateID)
-		}
-		if spec.WarmPoolRef != "" {
-			status, err = s.reconciler.Reconcile(r.Context(), id, spec)
-		}
-		if err != nil || spec.WarmPoolRef == "" {
-			slog.Warn("warmpool claim retry failed, falling back to cold start", "sandboxID", id, "pool", spec.WarmPoolRef, "err", err)
+		if _, syncErr := s.reconciler.SyncFromKube(r.Context()); syncErr != nil {
+			slog.Warn("SyncFromKube failed during claim retry", "err", syncErr)
+			// do not fall through to find on stale map; fall back to cold start immediately
 			spec.WarmPoolRef = ""
 			status, err = s.reconciler.Reconcile(r.Context(), id, spec)
+		} else {
+			if req.WarmPoolRef == "" {
+				spec.WarmPoolRef = s.reconciler.FindAvailableWarmPool(req.TemplateID)
+			}
+			if spec.WarmPoolRef != "" {
+				status, err = s.reconciler.Reconcile(r.Context(), id, spec)
+			}
+			if err != nil || spec.WarmPoolRef == "" {
+				slog.Warn("warmpool claim retry failed, falling back to cold start", "sandboxID", id, "pool", spec.WarmPoolRef, "err", err)
+				spec.WarmPoolRef = ""
+				status, err = s.reconciler.Reconcile(r.Context(), id, spec)
+			}
 		}
 	}
 	if err != nil {

@@ -917,19 +917,26 @@ func TestBuildKataPod_ClaimLabels(t *testing.T) {
 
 type failingPatchKubeClient struct {
 	*controller.MemoryKubeClient
-	failPodNames map[string]bool
+	failPodNames   map[string]bool
+	transientError bool
 }
 
 func (f *failingPatchKubeClient) PatchPodLabels(ctx context.Context, ns, name string, labels map[string]string) error {
 	if f.failPodNames[name] {
-		return fmt.Errorf("injected PatchPodLabels failure for %s", name)
+		if f.transientError {
+			return fmt.Errorf("injected transient PatchPodLabels failure for %s", name)
+		}
+		return fmt.Errorf("%w: injected CAS failure for %s", controller.ErrCASConflict, name)
 	}
 	return f.MemoryKubeClient.PatchPodLabels(ctx, ns, name, labels)
 }
 
 func (f *failingPatchKubeClient) ClaimPod(ctx context.Context, ns, name, boxName string) error {
 	if f.failPodNames[name] {
-		return fmt.Errorf("injected ClaimPod failure for %s", name)
+		if f.transientError {
+			return fmt.Errorf("injected transient ClaimPod failure for %s", name)
+		}
+		return fmt.Errorf("%w: injected CAS failure for %s", controller.ErrCASConflict, name)
 	}
 	return f.MemoryKubeClient.ClaimPod(ctx, ns, name, boxName)
 }
@@ -1179,7 +1186,8 @@ func TestReconciler_WarmPool_EnsurePodConflictClaimedNotAdopted(t *testing.T) {
 		controller.WithNamespace("cubepod-workloads"),
 	)
 
-	// Reconcile warm pool with 1 replica: EnsurePod will hit 409 (already exists and claimed)
+	// Reconcile warm pool with 1 replica: EnsurePod will hit 409 (already exists and claimed).
+	// It must skip adopting the claimed pod, and continue iterating to create a replacement standby!
 	st, err := r.ReconcileWarmPool(ctx, "conflict-pool", v1alpha1.PodWarmPoolSpec{
 		TemplateRef: "base-tpl",
 		Replicas:    1,
@@ -1188,9 +1196,14 @@ func TestReconciler_WarmPool_EnsurePodConflictClaimedNotAdopted(t *testing.T) {
 		t.Fatalf("ReconcileWarmPool failed: %v", err)
 	}
 
-	// The claimed pod must NOT be added as an available standby entry!
-	if st.AvailableReplicas != 0 {
-		t.Fatalf("expected 0 available replicas because pod was already claimed, got %d", st.AvailableReplicas)
+	// Replacement standby was created, reaching 1 available replica
+	if st.AvailableReplicas != 1 {
+		t.Fatalf("expected 1 available replica after replacement standby created, got %d", st.AvailableReplicas)
+	}
+
+	entries := r.GetWarmPoolEntries("conflict-pool")
+	if len(entries) != 1 || entries[0].PodName != "conflict-pool-warm-2-kata-pod" {
+		t.Fatalf("expected replacement entry conflict-pool-warm-2-kata-pod, got %+v", entries)
 	}
 }
 
@@ -1469,5 +1482,284 @@ func TestReconciler_ClaimWarmPod_CASFailureMarksOtherReplica(t *testing.T) {
 	st, ok := r.GetWarmPoolStatus("cas-test-pool")
 	if !ok || st.AvailableReplicas != 0 {
 		t.Fatalf("expected 0 available replicas, got %d", st.AvailableReplicas)
+	}
+}
+
+func TestReconciler_ClaimWarmPod_TransientErrorLeavesUnclaimedForRetry(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+
+	failingKube := &failingPatchKubeClient{
+		MemoryKubeClient: memKube,
+		failPodNames:     make(map[string]bool),
+		transientError:   true,
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(failingKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	_, err := r.ReconcileWarmPool(ctx, "transient-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    2,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	pods, err := memKube.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=transient-pool")
+	if err != nil || len(pods) != 2 {
+		t.Fatalf("expected 2 pods, got %d", len(pods))
+	}
+
+	// Inject transient failure on pod1 (NOT ErrCASConflict)
+	failingKube.failPodNames[pods[0].Name] = true
+
+	claimed, err := r.ClaimWarmPod(ctx, "transient-pool", "claimer-box")
+	if err != nil {
+		t.Fatalf("ClaimWarmPod failed: %v", err)
+	}
+	if claimed.PodName != pods[1].Name {
+		t.Fatalf("expected pod2 to be claimed, got: %s", claimed.PodName)
+	}
+
+	// Transient error on pod1 leaves it unclaimed in memory for future retry!
+	st, ok := r.GetWarmPoolStatus("transient-pool")
+	if !ok || st.AvailableReplicas != 1 {
+		t.Fatalf("expected 1 available replica remaining (pod1 unclaimed for retry), got %d", st.AvailableReplicas)
+	}
+}
+
+type mockCustomKubeClient struct {
+	*controller.MemoryKubeClient
+	failListPods  bool
+	emptyListPods bool
+	failUpsertBox bool
+}
+
+func (m *mockCustomKubeClient) ListPods(ctx context.Context, ns, selector string) ([]controller.PodManifest, error) {
+	if m.failListPods {
+		return nil, fmt.Errorf("injected ListPods failure")
+	}
+	if m.emptyListPods {
+		return []controller.PodManifest{}, nil
+	}
+	return m.MemoryKubeClient.ListPods(ctx, ns, selector)
+}
+
+func (m *mockCustomKubeClient) UpsertPodBox(ctx context.Context, box v1alpha1.PodBox) error {
+	if m.failUpsertBox {
+		return fmt.Errorf("injected UpsertPodBox failure")
+	}
+	return m.MemoryKubeClient.UpsertPodBox(ctx, box)
+}
+
+func TestReconciler_WarmPool_409AdoptUnclaimed(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+
+	// Pre-populate an existing pod that was created and is unclaimed
+	podName := "adopt-pool-warm-1-kata-pod"
+	existingPod := controller.PodManifest{
+		Name:      podName,
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"cubepod.io/warmpool":   "adopt-pool",
+			"cubepod.io/template":   "base-tpl",
+			"cubepod.io/claimed":    "false",
+			"cubepod.io/claimed-by": "",
+			"custom.label/key":      "custom-val",
+		},
+	}
+	if _, err := memKube.EnsurePod(ctx, existingPod); err != nil {
+		t.Fatalf("EnsurePod failed: %v", err)
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	st, err := r.ReconcileWarmPool(ctx, "adopt-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	if st.AvailableReplicas != 1 {
+		t.Fatalf("expected 1 available replica adopted, got %d", st.AvailableReplicas)
+	}
+
+	entries := r.GetWarmPoolEntries("adopt-pool")
+	if len(entries) != 1 || entries[0].PodName != podName {
+		t.Fatalf("expected adopted entry %s, got: %+v", podName, entries)
+	}
+	if entries[0].PodManifest.Labels["custom.label/key"] != "custom-val" {
+		t.Fatalf("expected copied labels, got: %+v", entries[0].PodManifest.Labels)
+	}
+}
+
+func TestReconciler_WarmPool_409ListPodsError(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	customKube := &mockCustomKubeClient{
+		MemoryKubeClient: memKube,
+		failListPods:     true,
+	}
+
+	// Pre-populate pod so EnsurePod returns 409
+	podName := "list-err-pool-warm-1-kata-pod"
+	_ = memKube.Pods
+	if _, err := memKube.EnsurePod(ctx, controller.PodManifest{
+		Name:      podName,
+		Namespace: "cubepod-workloads",
+	}); err != nil {
+		t.Fatalf("EnsurePod failed: %v", err)
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(customKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// In the creation loop, warm-1 hits 409, ListPods fails -> warning, continue without appending entry.
+	// warm-2 does not exist, so EnsurePod succeeds -> 1 available replica.
+	st, err := r.ReconcileWarmPool(ctx, "list-err-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+	if st.AvailableReplicas != 1 {
+		t.Fatalf("expected 1 available replica from warm-2, got %d", st.AvailableReplicas)
+	}
+	entries := r.GetWarmPoolEntries("list-err-pool")
+	if len(entries) != 1 || entries[0].PodName != "list-err-pool-warm-2-kata-pod" {
+		t.Fatalf("expected entry to be warm-2, got: %+v", entries)
+	}
+}
+
+func TestReconciler_WarmPool_409PodNotFoundInList(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	customKube := &mockCustomKubeClient{
+		MemoryKubeClient: memKube,
+		emptyListPods:    true,
+	}
+
+	podName := "missing-pod-pool-warm-1-kata-pod"
+	if _, err := memKube.EnsurePod(ctx, controller.PodManifest{
+		Name:      podName,
+		Namespace: "cubepod-workloads",
+	}); err != nil {
+		t.Fatalf("EnsurePod failed: %v", err)
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(customKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// warm-1 hits 409, pod not found in list -> continue without appending entry.
+	// warm-2 succeeds -> 1 available replica.
+	st, err := r.ReconcileWarmPool(ctx, "missing-pod-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+	if st.AvailableReplicas != 1 {
+		t.Fatalf("expected 1 available replica from warm-2, got %d", st.AvailableReplicas)
+	}
+}
+
+func TestReconciler_ReapIdle_RollbackOnUpsertPodBoxError(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	customKube := &mockCustomKubeClient{
+		MemoryKubeClient: memKube,
+		failUpsertBox:    false, // start normal
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(customKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	boxSpec := v1alpha1.PodBoxSpec{
+		TemplateRef:  "base-tpl",
+		DesiredState: v1alpha1.DesiredStateRunning,
+		Lifecycle: v1alpha1.LifecyclePolicy{
+			IdleTimeoutSeconds: 30,
+		},
+	}
+	_, err := r.Reconcile(ctx, "idle-fail-box", boxSpec)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	// Now make UpsertPodBox fail
+	customKube.failUpsertBox = true
+
+	now := time.Now().UTC().Add(60 * time.Second)
+	paused, _ := r.ReapIdle(ctx, now)
+
+	// Upsert failed, so paused list must be empty and in-memory box must remain Running!
+	if len(paused) != 0 {
+		t.Fatalf("expected 0 paused boxes on Upsert failure, got %v", paused)
+	}
+
+	box, ok := r.GetBox("idle-fail-box")
+	if !ok {
+		t.Fatal("box not found")
+	}
+	if box.Phase != v1alpha1.PodBoxPhaseRunning {
+		t.Fatalf("expected box to remain Running after rollback, got %s", box.Phase)
+	}
+}
+
+func TestReconciler_SyncFromKube_UnpersistedPoolCleanupAfter10s(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	failingKube := &failingUpsertKubeClient{
+		MemoryKubeClient: memKube,
+		failUpsert:       true, // fail persistence to K8s
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(failingKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	_, err := r.ReconcileWarmPool(ctx, "unpersisted-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    2,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	// 1. Fresh unpersisted pool (<10s old): SyncFromKube must NOT delete it
+	_, err = r.SyncFromKube(ctx)
+	if err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+	if _, exists := r.GetWarmPoolSpecs()["unpersisted-pool"]; !exists {
+		t.Fatal("expected unpersisted-pool to be kept within 10s window")
+	}
+
+	// 2. Pool older than 10s: SyncFromKube must delete it and clean up resources
+	r.SetPoolCreatedAt("unpersisted-pool", time.Now().Add(-15*time.Second))
+	_, err = r.SyncFromKube(ctx)
+	if err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+	if _, exists := r.GetWarmPoolSpecs()["unpersisted-pool"]; exists {
+		t.Fatal("expected unpersisted-pool to be deleted after 10s expiration")
 	}
 }

@@ -1628,3 +1628,142 @@ func TestGateway_CreateSandbox_CASFailureRefreshesFromKubeAndClaims(t *testing.T
 		t.Fatalf("expected pod2 to be claimed, got: %s", box.PodName)
 	}
 }
+
+type mockFailingSyncKubeClient struct {
+	*controller.MemoryKubeClient
+	failListPodBoxes bool
+}
+
+func (m *mockFailingSyncKubeClient) ListPodBoxes(ctx context.Context, ns string) ([]v1alpha1.PodBox, error) {
+	if m.failListPodBoxes {
+		return nil, fmt.Errorf("injected ListPodBoxes failure")
+	}
+	return m.MemoryKubeClient.ListPodBoxes(ctx, ns)
+}
+
+func TestGateway_CreateSandbox_WarmPoolClaimFail_SyncFromKubeError_FallsBackToColdStart(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	mockKube := &mockFailingSyncKubeClient{
+		MemoryKubeClient: memKube,
+	}
+
+	reconciler := controller.NewReconciler(
+		controller.WithKubeClient(mockKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// 1. Create WarmPool with 1 replica
+	poolSpec := v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "cubeplex-ubuntu24-desktop",
+		Replicas:    1,
+	}
+	st, err := reconciler.ReconcileWarmPool(ctx, "sync-err-pool", poolSpec)
+	if err != nil || st.AvailableReplicas != 1 {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	// 2. Mark standby claimed by other replica in memKube so CAS fails
+	pods, _ := memKube.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=sync-err-pool")
+	if len(pods) != 1 {
+		t.Fatalf("expected 1 pod, got %d", len(pods))
+	}
+	pod1 := pods[0]
+	pod1.Labels["cubepod.io/claimed"] = "true"
+	pod1.Labels["cubepod.io/claimed-by"] = "other-replica"
+	_ = memKube.PatchPodLabels(ctx, "cubepod-workloads", pod1.Name, pod1.Labels)
+
+	// 3. Make SyncFromKube fail on retry
+	mockKube.failListPodBoxes = true
+
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 4. POST /sandboxes
+	sbReq := `{"templateID":"cubeplex-ubuntu24-desktop"}`
+	sbResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(sbReq))
+	if err != nil {
+		t.Fatalf("POST /sandboxes failed: %v", err)
+	}
+	defer sbResp.Body.Close()
+
+	if sbResp.StatusCode != http.StatusCreated && sbResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 201/200, got: %d", sbResp.StatusCode)
+	}
+
+	var sbData struct {
+		SandboxID string `json:"sandboxID"`
+		Reason    string `json:"reason"`
+	}
+	_ = json.NewDecoder(sbResp.Body).Decode(&sbData)
+
+	box, ok := reconciler.GetBox(sbData.SandboxID)
+	if !ok {
+		t.Fatalf("sandbox not found: %s", sbData.SandboxID)
+	}
+	if box.Reason != "Provisioned" {
+		t.Fatalf("expected cold start 'Provisioned' fallback when SyncFromKube failed, got: %s", box.Reason)
+	}
+}
+
+func TestGateway_CreateWarmPool_RunsSyncFromKubeFirst(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+
+	// Pre-populate an existing pod in Kubernetes with high-water warm index 42
+	existingPod := controller.PodManifest{
+		Name:      "test-pool-warm-42-kata-pod",
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"cubepod.io/warmpool":   "test-pool",
+			"cubepod.io/claimed":    "true",
+			"cubepod.io/claimed-by": "old-box",
+		},
+	}
+	_ = memKube.UpsertPodWarmPool(ctx, v1alpha1.PodWarmPool{
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "test-pool",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: v1alpha1.PodWarmPoolSpec{
+			TemplateRef: "cubeplex-ubuntu24-desktop",
+			Replicas:    1,
+		},
+	})
+	_, _ = memKube.EnsurePod(ctx, existingPod)
+
+	reconciler := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// POST /warmpools: should run SyncFromKube first, discover index 42, and create index 43
+	reqBody := `{"name":"test-pool","templateRef":"cubeplex-ubuntu24-desktop","replicas":1}`
+	resp, err := http.Post(ts.URL+"/warmpools", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("POST /warmpools failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got: %d", resp.StatusCode)
+	}
+
+	st, ok := reconciler.GetWarmPoolStatus("test-pool")
+	if !ok || st.AvailableReplicas != 1 {
+		t.Fatalf("expected 1 available replica, got %v", st)
+	}
+
+	entries := reconciler.GetWarmPoolEntries("test-pool")
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 total entries (1 claimed from sync, 1 newly created), got %d", len(entries))
+	}
+	if entries[1].PodName != "test-pool-warm-43-kata-pod" {
+		t.Fatalf("expected warmCounter to advance past 42 to 43, got: %s", entries[1].PodName)
+	}
+}

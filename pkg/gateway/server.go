@@ -357,6 +357,10 @@ func (s *Server) handleCreateWarmPool(w http.ResponseWriter, r *http.Request) {
 		Replicas:    replicas,
 	}
 
+	if _, syncErr := s.reconciler.SyncFromKube(r.Context()); syncErr != nil {
+		slog.Warn("SyncFromKube failed before ReconcileWarmPool", "pool", name, "err", syncErr)
+	}
+
 	status, err := s.reconciler.ReconcileWarmPool(r.Context(), name, spec)
 	if err != nil {
 		http.Error(w, "failed to reconcile warm pool: "+err.Error(), http.StatusInternalServerError)
