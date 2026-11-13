@@ -414,17 +414,19 @@ fn test_archive_sync_tar_gz_and_remove_paths() {
     std::fs::write(&readme, b"# Sample Archive Sync Project\n").unwrap();
 
     let tar_gz_path = test_root.join("archive.tar.gz");
-    let tar_status = Command::new("tar")
-        .args([
-            "-czf",
-            tar_gz_path.to_str().unwrap(),
-            "-C",
-            src_dir.to_str().unwrap(),
-            "src/main.py",
-            "README.md",
-        ])
-        .status()
-        .expect("failed to execute tar command");
+    let mut tar_cmd = Command::new("tar");
+    tar_cmd.args([
+        "-czf",
+        tar_gz_path.to_str().unwrap(),
+        "-C",
+        src_dir.to_str().unwrap(),
+        "src/main.py",
+        "README.md",
+    ]);
+    let tar_status = crate::startcmd::spawn_tracked(&mut tar_cmd)
+        .expect("failed to execute tar command")
+        .wait()
+        .expect("failed to wait for tar command");
     assert!(tar_status.success());
     let tar_gz_bytes = std::fs::read(&tar_gz_path).unwrap();
 
@@ -1752,12 +1754,16 @@ fn test_resolve_default_credentials_cases() {
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg(r#"printf '%s|%s|%s' "$HOME" "$USER" "$LOGNAME""#)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let resolved = configure_command_credentials(&mut cmd, Some(current_euid), None, None).unwrap();
     let expected_home = resolved.home_dir.unwrap();
     let expected_user = resolved.username.unwrap();
-    let out = cmd.output().expect("run sh");
+    let out = crate::startcmd::spawn_tracked(&mut cmd)
+        .expect("spawn sh")
+        .wait_with_output()
+        .expect("wait sh");
     assert!(out.status.success());
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
@@ -1768,10 +1774,16 @@ fn test_resolve_default_credentials_cases() {
     override_cmd
         .arg("-c")
         .arg(r#"printf '%s' "$HOME""#)
-        .stdout(Stdio::piped());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     configure_command_credentials(&mut override_cmd, Some(current_euid), None, None).unwrap();
     override_cmd.env("HOME", "/custom/override");
-    let out2 = override_cmd.output().expect("run sh override");
+    let out2 = crate::startcmd::spawn_tracked(&mut override_cmd)
+        .expect("spawn sh override")
+        .wait_with_output()
+        .expect("wait sh override");
+    assert!(out2.status.success());
     assert_eq!(String::from_utf8_lossy(&out2.stdout), "/custom/override");
 }
 
