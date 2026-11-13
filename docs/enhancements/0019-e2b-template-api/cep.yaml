@@ -7,7 +7,7 @@ participating-areas:
   - "controller"
   - "runtime"
   - "sdk"
-status: "implementable"
+status: "implemented"
 creation-date: "2026-11-12"
 last-updated: "2026-11-13"
 reviewers:

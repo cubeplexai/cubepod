@@ -6,7 +6,7 @@ owning-area: "runtime"
 participating-areas:
   - "gateway"
   - "controller"
-status: "implementable"
+status: "implemented"
 creation-date: "2026-11-13"
 last-updated: "2026-11-13"
 reviewers: []
