@@ -1763,3 +1763,128 @@ func TestReconciler_SyncFromKube_UnpersistedPoolCleanupAfter10s(t *testing.T) {
 		t.Fatal("expected unpersisted-pool to be deleted after 10s expiration")
 	}
 }
+
+func TestReconciler_WarmCounter_RecoveryFromPausedPodBoxPVCNames(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+
+	// 1. Pre-populate a paused PodBox in Kubernetes: PodName is cleared, but Rootfs/Workspace PVCs have warm index 12
+	pausedBox := v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "sb-paused-123",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: v1alpha1.PodBoxSpec{
+			DesiredState: v1alpha1.DesiredStatePaused,
+			WarmPoolRef:  "test-pool",
+		},
+		Status: v1alpha1.PodBoxStatus{
+			Phase:            v1alpha1.PodBoxPhasePaused,
+			PodName:          "", // cleared on pause!
+			RootfsPVCName:    "test-pool-warm-12-rootfs-pvc",
+			WorkspacePVCName: "test-pool-warm-12-workspace-pvc",
+		},
+	}
+	if err := memKube.UpsertPodBox(ctx, pausedBox); err != nil {
+		t.Fatalf("failed to upsert paused PodBox: %v", err)
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// 2. SyncFromKube must recover warmCounter from RootfsPVCName and WorkspacePVCName
+	recovered, err := r.SyncFromKube(ctx)
+	if err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("expected 1 recovered box, got %d", recovered)
+	}
+	if r.WarmCounter() != 12 {
+		t.Fatalf("expected warmCounter to advance to 12 from paused PodBox PVC names, got %d", r.WarmCounter())
+	}
+
+	// 3. Scaling up must allocate index 13, avoiding collision with index 12
+	_, err = r.ReconcileWarmPool(ctx, "test-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	entries := r.GetWarmPoolEntries("test-pool")
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+	if entries[0].ID != "test-pool-warm-13" {
+		t.Fatalf("expected entryID test-pool-warm-13, got: %s", entries[0].ID)
+	}
+}
+
+func TestReconciler_WarmPool_ScaleUpAvoidsBoxPVCConflict(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// Create a warm pool with 1 replica (index 1)
+	_, err := r.ReconcileWarmPool(ctx, "test-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	// Reconcile sandbox-1 with WarmPoolRef to claim index 1
+	boxStatus, err := r.Reconcile(ctx, "sandbox-1", v1alpha1.PodBoxSpec{
+		TemplateRef:      "base-tpl",
+		WarmPoolRef:      "test-pool",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	})
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if boxStatus.RootfsPVCName != "test-pool-warm-1-rootfs-pvc" {
+		t.Fatalf("unexpected rootfs PVC: %s", boxStatus.RootfsPVCName)
+	}
+
+	// Pause sandbox-1: PodName is cleared
+	_, err = r.Pause(ctx, "sandbox-1")
+	if err != nil {
+		t.Fatalf("Pause failed: %v", err)
+	}
+
+	// Now scale up test-pool to 1 replica; it must not collide with index 1
+	_, err = r.ReconcileWarmPool(ctx, "test-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool scale-up failed: %v", err)
+	}
+
+	entries := r.GetWarmPoolEntries("test-pool")
+	var availEntry *controller.WarmPodEntry
+	for _, e := range entries {
+		if !e.Claimed {
+			availEntry = e
+			break
+		}
+	}
+	if availEntry == nil {
+		t.Fatal("expected available entry after scale-up")
+	}
+	if availEntry.ID != "test-pool-warm-2" {
+		t.Fatalf("expected entryID test-pool-warm-2, got: %s", availEntry.ID)
+	}
+}

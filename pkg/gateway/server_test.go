@@ -1632,9 +1632,13 @@ func TestGateway_CreateSandbox_CASFailureRefreshesFromKubeAndClaims(t *testing.T
 type mockFailingSyncKubeClient struct {
 	*controller.MemoryKubeClient
 	failListPodBoxes bool
+	listPodBoxesErr  error
 }
 
 func (m *mockFailingSyncKubeClient) ListPodBoxes(ctx context.Context, ns string) ([]v1alpha1.PodBox, error) {
+	if m.listPodBoxesErr != nil {
+		return nil, m.listPodBoxesErr
+	}
 	if m.failListPodBoxes {
 		return nil, fmt.Errorf("injected ListPodBoxes failure")
 	}
@@ -1765,5 +1769,72 @@ func TestGateway_CreateWarmPool_RunsSyncFromKubeFirst(t *testing.T) {
 	}
 	if entries[1].PodName != "test-pool-warm-43-kata-pod" {
 		t.Fatalf("expected warmCounter to advance past 42 to 43, got: %s", entries[1].PodName)
+	}
+}
+
+func TestGateway_CreateWarmPool_SyncFromKubeError_Returns500AndAborts(t *testing.T) {
+	memKube := controller.NewMemoryKubeClient()
+	mockKube := &mockFailingSyncKubeClient{
+		MemoryKubeClient: memKube,
+		failListPodBoxes: true,
+	}
+
+	reconciler := controller.NewReconciler(
+		controller.WithKubeClient(mockKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	reqBody := `{"name":"test-pool","templateRef":"cubeplex-ubuntu24-desktop","replicas":2}`
+	resp, err := http.Post(ts.URL+"/warmpools", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("POST /warmpools failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("expected 500 Internal Server Error when SyncFromKube fails, got: %d", resp.StatusCode)
+	}
+
+	// Verify that ReconcileWarmPool was NOT executed on cold counter
+	specs := reconciler.GetWarmPoolSpecs()
+	if _, exists := specs["test-pool"]; exists {
+		t.Fatalf("expected test-pool not to be reconciled when SyncFromKube fails")
+	}
+}
+
+func TestGateway_CreateWarmPool_SyncFromKube_ErrCRDNotInstalled_Proceeds(t *testing.T) {
+	memKube := controller.NewMemoryKubeClient()
+	mockKube := &mockFailingSyncKubeClient{
+		MemoryKubeClient: memKube,
+		listPodBoxesErr:  controller.ErrCRDNotInstalled,
+	}
+
+	reconciler := controller.NewReconciler(
+		controller.WithKubeClient(mockKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	reqBody := `{"name":"test-pool-crdless","templateRef":"cubeplex-ubuntu24-desktop","replicas":2}`
+	resp, err := http.Post(ts.URL+"/warmpools", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatalf("POST /warmpools failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created when CRD is not installed, got: %d", resp.StatusCode)
+	}
+
+	specs := reconciler.GetWarmPoolSpecs()
+	if _, exists := specs["test-pool-crdless"]; !exists {
+		t.Fatalf("expected test-pool-crdless to be reconciled when ErrCRDNotInstalled")
 	}
 }
