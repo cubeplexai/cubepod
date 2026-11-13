@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Chromium wrapper for CubePod interactive desktop sandboxes (CEP-0021).
+# Locates the Playwright-installed Chromium binary and enforces container-safe
+# software rendering and loopback-only CDP debugging flags.
+set -euo pipefail
+
+CHROME_BIN="${CUBEPOD_REAL_CHROME_BIN:-/opt/cubepod/desktop/chromium-bin}"
+if [ ! -x "$CHROME_BIN" ]; then
+  CHROME_BIN="$(find /opt/cubepod/desktop/ms-playwright -path '*/chromium-*/chrome-linux*/chrome' -type f 2>/dev/null | head -n 1 || true)"
+fi
+if [ -z "$CHROME_BIN" ] || [ ! -x "$CHROME_BIN" ]; then
+  echo "chromium-wrapper: Chromium binary not found under /opt/cubepod/desktop" >&2
+  exit 1
+fi
+
+CDP_PORT="${CUBEPOD_CDP_PORT:-9222}"
+ARGS=("$@")
+EXTRA_ARGS=()
+
+has_flag() {
+  local prefix="$1"
+  local arg
+  for arg in "${ARGS[@]}"; do
+    if [[ "$arg" == "$prefix" || "$arg" == "$prefix="* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+has_flag "--no-sandbox" || EXTRA_ARGS+=("--no-sandbox")
+has_flag "--disable-dev-shm-usage" || EXTRA_ARGS+=("--disable-dev-shm-usage")
+has_flag "--disable-gpu" || EXTRA_ARGS+=("--disable-gpu")
+has_flag "--remote-debugging-address" || EXTRA_ARGS+=("--remote-debugging-address=127.0.0.1")
+has_flag "--remote-debugging-port" || EXTRA_ARGS+=("--remote-debugging-port=${CDP_PORT}")
+
+exec "$CHROME_BIN" "${EXTRA_ARGS[@]}" "${ARGS[@]}"

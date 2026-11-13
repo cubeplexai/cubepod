@@ -1,0 +1,445 @@
+#!/usr/bin/env bash
+# CubePod Interactive Desktop & Browser Stack Lazy Supervisor (CEP-0021)
+# Installed at /opt/cubepod/desktop/cubepod-desktop-ctl inside images/desktop.
+set -euo pipefail
+
+DAEMONS=(xvfb wm chromium vnc websockify ttyd)
+
+# Configuration & test overrides
+XVFB_BIN="${CUBEPOD_XVFB_BIN:-Xvfb}"
+WM_BIN="${CUBEPOD_WM_BIN:-openbox}"
+BROWSER_BIN="${CUBEPOD_BROWSER_BIN:-/opt/cubepod/desktop/chromium-wrapper}"
+X11VNC_BIN="${CUBEPOD_X11VNC_BIN:-x11vnc}"
+WEBSOCKIFY_BIN="${CUBEPOD_WEBSOCKIFY_BIN:-websockify}"
+TTYD_BIN="${CUBEPOD_TTYD_BIN:-ttyd}"
+
+DESKTOP_PORT="${CUBEPOD_DESKTOP_PORT:-8080}"
+TERMINAL_PORT="${CUBEPOD_TERMINAL_PORT:-7681}"
+CDP_PORT="${CUBEPOD_CDP_PORT:-9222}"
+VNC_PORT="${CUBEPOD_VNC_PORT:-5900}"
+
+DISPLAY_NUM="${CUBEPOD_DISPLAY:-:99}"
+DEFAULT_RESOLUTION="${CUBEPOD_RESOLUTION:-1280x800x24}"
+DEFAULT_URL="${CUBEPOD_INITIAL_URL:-about:blank}"
+NOVNC_DIR="${CUBEPOD_NOVNC_DIR:-/usr/share/novnc}"
+PROFILE_DIR="${CUBEPOD_BROWSER_PROFILE_DIR:-/home/cubeplex/.config/chromium}"
+WORKDIR="${CUBEPOD_WORKDIR:-/workspace}"
+
+resolve_run_dir() {
+  if [ -n "${CUBEPOD_DESKTOP_RUN_DIR:-}" ]; then
+    mkdir -p "$CUBEPOD_DESKTOP_RUN_DIR"
+    printf '%s' "$CUBEPOD_DESKTOP_RUN_DIR"
+    return 0
+  fi
+  if mkdir -p /run/cubepod/desktop 2>/dev/null && [ -w /run/cubepod/desktop ]; then
+    printf '%s' "/run/cubepod/desktop"
+    return 0
+  fi
+  mkdir -p /tmp/cubepod-desktop
+  printf '%s' "/tmp/cubepod-desktop"
+}
+
+RUN_DIR="$(resolve_run_dir)"
+LOCK_FILE="${RUN_DIR}/ctl.lock"
+STATE_FILE="${RUN_DIR}/state.env"
+XDG_RUNTIME_DIR_PATH="${RUN_DIR}/xdg"
+
+DROP_PRIV=0
+TARGET_UID=""
+TARGET_GID=""
+TARGET_HOME="${HOME:-/home/cubeplex}"
+if [ "$(id -u)" -eq 0 ] && id cubeplex >/dev/null 2>&1; then
+  DROP_PRIV=1
+  TARGET_UID="$(id -u cubeplex)"
+  TARGET_GID="$(id -g cubeplex)"
+  TARGET_HOME="$(getent passwd cubeplex | cut -d: -f6)"
+  TARGET_HOME="${TARGET_HOME:-/home/cubeplex}"
+fi
+
+prepare_dirs() {
+  mkdir -p "$RUN_DIR" "$XDG_RUNTIME_DIR_PATH" "$PROFILE_DIR"
+  chmod 0700 "$XDG_RUNTIME_DIR_PATH" || true
+  if [ ! -d "$WORKDIR" ]; then
+    if mkdir -p "$WORKDIR" 2>/dev/null; then
+      :
+    else
+      WORKDIR="${TARGET_HOME:-/tmp}"
+    fi
+  fi
+  if [ "$DROP_PRIV" = "1" ]; then
+    chown "${TARGET_UID}:${TARGET_GID}" "$RUN_DIR" "$XDG_RUNTIME_DIR_PATH" "$PROFILE_DIR" 2>/dev/null || true
+    if [ -d "${TARGET_HOME}/.config" ]; then
+      chown "${TARGET_UID}:${TARGET_GID}" "${TARGET_HOME}/.config" 2>/dev/null || true
+    fi
+    if [ -e "$LOCK_FILE" ]; then
+      chown "${TARGET_UID}:${TARGET_GID}" "$LOCK_FILE" 2>/dev/null || true
+    fi
+    mkdir -p /tmp/.X11-unix 2>/dev/null || true
+    chmod 1777 /tmp/.X11-unix 2>/dev/null || true
+  fi
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+is_pid_alive() {
+  local pid="$1"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [ -r "/proc/${pid}/stat" ]; then
+    local stat_line state
+    stat_line="$(cat "/proc/${pid}/stat" 2>/dev/null || true)"
+    if [ -n "$stat_line" ]; then
+      state="${stat_line##*) }"
+      state="${state%% *}"
+      if [ "$state" = "Z" ] || [ "$state" = "X" ]; then
+        return 1
+      fi
+    fi
+  fi
+  return 0
+}
+
+get_daemon_pid() {
+  local name="$1"
+  local pidfile="${RUN_DIR}/${name}.pid"
+  [ -f "$pidfile" ] || return 1
+  local pid
+  pid="$(tr -d '[:space:]' <"$pidfile" 2>/dev/null || true)"
+  if is_pid_alive "$pid"; then
+    printf '%s' "$pid"
+    return 0
+  fi
+  rm -f "$pidfile"
+  return 1
+}
+
+save_state() {
+  local resolution="$1"
+  local display="$2"
+  {
+    printf 'SAVED_RESOLUTION=%q\n' "$resolution"
+    printf 'SAVED_DISPLAY=%q\n' "$display"
+  } >"$STATE_FILE"
+  if [ "$DROP_PRIV" = "1" ]; then
+    chown "${TARGET_UID}:${TARGET_GID}" "$STATE_FILE" 2>/dev/null || true
+  fi
+}
+
+load_state() {
+  SAVED_RESOLUTION="$DEFAULT_RESOLUTION"
+  SAVED_DISPLAY="$DISPLAY_NUM"
+  if [ -f "$STATE_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE"
+  fi
+}
+
+cleanup_stale_chromium_locks() {
+  # Only purge Singleton* files if no live Chromium process owns this profile dir.
+  if pgrep -f -- "[u]ser-data-dir=${PROFILE_DIR}" >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ "$PROFILE_DIR" = "/home/cubeplex/.config/chromium" ] && id cubeplex >/dev/null 2>&1; then
+    if pgrep -u "$(id -u cubeplex)" -x "chrome|chromium|chromium-browser" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  rm -f \
+    "${PROFILE_DIR}/SingletonLock" \
+    "${PROFILE_DIR}/SingletonCookie" \
+    "${PROFILE_DIR}/SingletonSocket"
+}
+
+spawn_daemon() {
+  local name="$1"
+  local cwd="$2"
+  shift 2
+
+  local log_file="${RUN_DIR}/${name}.log"
+  local pid_file="${RUN_DIR}/${name}.pid"
+
+  if [ "$DROP_PRIV" = "1" ]; then
+    touch "$log_file"
+    chown "${TARGET_UID}:${TARGET_GID}" "$log_file" 2>/dev/null || true
+  fi
+
+  (
+    cd "$cwd"
+    exec 9>&-
+    exec </dev/null >>"$log_file" 2>&1
+    if [ "$DROP_PRIV" = "1" ]; then
+      if command -v setpriv >/dev/null 2>&1; then
+        exec setpriv --reuid="$TARGET_UID" --regid="$TARGET_GID" --init-groups -- \
+          env HOME="$TARGET_HOME" USER=cubeplex LOGNAME=cubeplex \
+          DISPLAY="$DISPLAY_NUM" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR_PATH" "$@"
+      elif command -v runuser >/dev/null 2>&1; then
+        exec runuser -u cubeplex -- \
+          env HOME="$TARGET_HOME" USER=cubeplex LOGNAME=cubeplex \
+          DISPLAY="$DISPLAY_NUM" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR_PATH" "$@"
+      else
+        exec su -s /bin/bash cubeplex -c 'exec env "$@"' -- _ \
+          HOME="$TARGET_HOME" USER=cubeplex LOGNAME=cubeplex \
+          DISPLAY="$DISPLAY_NUM" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR_PATH" "$@"
+      fi
+    else
+      exec env DISPLAY="$DISPLAY_NUM" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR_PATH" "$@"
+    fi
+  ) &
+
+  local pid=$!
+  echo "$pid" >"$pid_file"
+  if [ "$DROP_PRIV" = "1" ]; then
+    chown "${TARGET_UID}:${TARGET_GID}" "$pid_file" 2>/dev/null || true
+  fi
+
+  # Brief verification that the process did not immediately crash on launch.
+  sleep 0.05
+  if ! is_pid_alive "$pid"; then
+    rm -f "$pid_file"
+    echo "cubepod-desktop-ctl: daemon '$name' exited prematurely (see $log_file)" >&2
+    return 1
+  fi
+}
+
+wait_xvfb_ready() {
+  local display_id="${DISPLAY_NUM#:}"
+  display_id="${display_id%%.*}"
+  local x_sock="/tmp/.X11-unix/X${display_id}"
+  if [ "$(basename "$XVFB_BIN")" != "Xvfb" ]; then
+    return 0
+  fi
+  local i=0
+  while [ "$i" -lt 40 ]; do
+    if [ -S "$x_sock" ]; then
+      return 0
+    fi
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 0
+}
+
+parse_resolution_dims() {
+  local res="$1"
+  if [[ "$res" =~ ^([0-9]+)x([0-9]+)(x([0-9]+))?$ ]]; then
+    RES_WIDTH="${BASH_REMATCH[1]}"
+    RES_HEIGHT="${BASH_REMATCH[2]}"
+    local depth="${BASH_REMATCH[4]:-24}"
+    NORMALIZED_RES="${RES_WIDTH}x${RES_HEIGHT}x${depth}"
+  else
+    echo "cubepod-desktop-ctl: invalid --resolution '$res' (expected WxHxD)" >&2
+    return 1
+  fi
+}
+
+emit_status_json() {
+  local resolution="$1"
+  local display="$2"
+
+  local alive_count=0
+  local pids_json=""
+  local name pid
+  for name in "${DAEMONS[@]}"; do
+    if pid="$(get_daemon_pid "$name")"; then
+      alive_count=$((alive_count + 1))
+      if [ -n "$pids_json" ]; then
+        pids_json+=","
+      fi
+      pids_json+="\"${name}\":${pid}"
+    fi
+  done
+
+  local state_str="stopped"
+  if [ "$alive_count" -eq "${#DAEMONS[@]}" ]; then
+    state_str="running"
+  elif [ "$alive_count" -gt 0 ]; then
+    state_str="degraded"
+  fi
+
+  printf '{"status":"%s","display":"%s","resolution":"%s","ports":{"desktop":%d,"terminal":%d,"cdp":%d},"pids":{%s}}\n' \
+    "$state_str" \
+    "$(json_escape "$display")" \
+    "$(json_escape "$resolution")" \
+    "$DESKTOP_PORT" \
+    "$TERMINAL_PORT" \
+    "$CDP_PORT" \
+    "$pids_json"
+}
+
+cmd_start() {
+  local resolution="$DEFAULT_RESOLUTION"
+  local initial_url="$DEFAULT_URL"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --resolution)
+        shift
+        [ "$#" -gt 0 ] || { echo "cubepod-desktop-ctl: --resolution requires a value" >&2; exit 2; }
+        resolution="$1"
+        ;;
+      --resolution=*)
+        resolution="${1#--resolution=}"
+        ;;
+      --url)
+        shift
+        [ "$#" -gt 0 ] || { echo "cubepod-desktop-ctl: --url requires a value" >&2; exit 2; }
+        initial_url="$1"
+        ;;
+      --url=*)
+        initial_url="${1#--url=}"
+        ;;
+      *)
+        echo "cubepod-desktop-ctl: unknown start option '$1'" >&2
+        exit 2
+        ;;
+    esac
+    shift
+  done
+
+  parse_resolution_dims "$resolution"
+  resolution="$NORMALIZED_RES"
+
+  prepare_dirs
+  save_state "$resolution" "$DISPLAY_NUM"
+
+  if ! get_daemon_pid xvfb >/dev/null; then
+    spawn_daemon xvfb "$WORKDIR" \
+      "$XVFB_BIN" "$DISPLAY_NUM" -screen 0 "$resolution" -ac +extension GLX +render -noreset
+    wait_xvfb_ready
+  fi
+
+  if ! get_daemon_pid wm >/dev/null; then
+    spawn_daemon wm "$WORKDIR" "$WM_BIN"
+  fi
+
+  if ! get_daemon_pid chromium >/dev/null; then
+    cleanup_stale_chromium_locks
+    spawn_daemon chromium "$WORKDIR" \
+      "$BROWSER_BIN" \
+      --no-sandbox \
+      --disable-dev-shm-usage \
+      --disable-gpu \
+      --remote-debugging-address=127.0.0.1 \
+      --remote-debugging-port="$CDP_PORT" \
+      --user-data-dir="$PROFILE_DIR" \
+      --no-first-run \
+      --no-default-browser-check \
+      --window-size="${RES_WIDTH},${RES_HEIGHT}" \
+      "$initial_url"
+  fi
+
+  if ! get_daemon_pid vnc >/dev/null; then
+    spawn_daemon vnc "$WORKDIR" \
+      "$X11VNC_BIN" -display "$DISPLAY_NUM" -rfbport "$VNC_PORT" -listen 127.0.0.1 -forever -shared -nopw -xkb
+  fi
+
+  if ! get_daemon_pid websockify >/dev/null; then
+    spawn_daemon websockify "$WORKDIR" \
+      "$WEBSOCKIFY_BIN" --web "$NOVNC_DIR" "0.0.0.0:${DESKTOP_PORT}" "127.0.0.1:${VNC_PORT}"
+  fi
+
+  if ! get_daemon_pid ttyd >/dev/null; then
+    spawn_daemon ttyd "$WORKDIR" \
+      "$TTYD_BIN" -W -p "$TERMINAL_PORT" /bin/bash
+  fi
+
+  emit_status_json "$resolution" "$DISPLAY_NUM"
+}
+
+cmd_status() {
+  load_state
+  emit_status_json "$SAVED_RESOLUTION" "$SAVED_DISPLAY"
+}
+
+cmd_stop() {
+  load_state
+
+  local stop_order=(ttyd websockify vnc chromium wm xvfb)
+  local pids_to_wait=()
+  local name pid
+
+  for name in "${stop_order[@]}"; do
+    if pid="$(get_daemon_pid "$name")"; then
+      kill -TERM "$pid" 2>/dev/null || true
+      pids_to_wait+=("$pid")
+    fi
+  done
+
+  local i=0
+  while [ "$i" -lt 40 ] && [ "${#pids_to_wait[@]}" -gt 0 ]; do
+    local remaining=()
+    for pid in "${pids_to_wait[@]}"; do
+      if is_pid_alive "$pid"; then
+        remaining+=("$pid")
+      fi
+    done
+    pids_to_wait=("${remaining[@]}")
+    [ "${#pids_to_wait[@]}" -eq 0 ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+
+  if [ "${#pids_to_wait[@]}" -gt 0 ]; then
+    for pid in "${pids_to_wait[@]}"; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+    sleep 0.05
+  fi
+
+  for name in "${stop_order[@]}"; do
+    rm -f "${RUN_DIR}/${name}.pid"
+  done
+
+  emit_status_json "$SAVED_RESOLUTION" "$SAVED_DISPLAY"
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: cubepod-desktop-ctl <start|status|stop> [options]
+
+Subcommands:
+  start [--resolution 1280x800x24] [--url about:blank]
+  status
+  stop
+EOF
+}
+
+main() {
+  if [ "$#" -lt 1 ]; then
+    usage
+    exit 2
+  fi
+
+  local subcmd="$1"
+  shift
+
+  case "$subcmd" in
+    start|status|stop)
+      ;;
+    -h|--help|help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+
+  mkdir -p "$RUN_DIR"
+  exec 9>"$LOCK_FILE"
+  flock -x 9
+
+  case "$subcmd" in
+    start) cmd_start "$@" ;;
+    status) cmd_status "$@" ;;
+    stop) cmd_stop "$@" ;;
+  esac
+}
+
+main "$@"
