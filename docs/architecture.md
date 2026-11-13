@@ -39,7 +39,7 @@
 | 组件 / 概念 | 命名 | 说明 |
 | :--- | :--- | :--- |
 | **项目与品牌名** | **CubePod** | 寓意“AI Agent 的安全休眠与执行太空舱”，与 `CubePlex`、`CubeLoop` 构成完整矩阵，彻底规避与第三方沙箱撞名。 |
-| **仓库与 SDK 包名** | `cubepod` | GitHub: `cubeplexai/cubepod`；Python: `pip install cubepod`；TS: `npm install @cubeplex/cubepod`。 |
+| **仓库与 SDK 包名** | `cubepod` | GitHub: `cubeplexai/cubepod`；Python: `pip install cubepod`；TS: `npm install cubepod`。 |
 | **沙箱内守护进程** | **`podd`** (`cubepod-daemon`) | 运行在沙箱内部的单二进制 Rust 守护进程（兼做容器 PID 1 `podd-init` 挂载器与命令/文件执行 Server）。 |
 | **控制面网关** | **`cubepod-gateway`** | 无状态高可用 API 网关、E2B 协议路由器、以及浏览器/终端 WebSocket/WebRTC 反向代理。 |
 | **K8s 控制器** | **`cubepod-controller`** | 管理沙箱全生命周期、双 Block PVC、预热池与 Egress 注入的 K8s Operator。 |
@@ -342,7 +342,7 @@ cubepod/
 │   └── docker-compose/         # 本地单机一键开发环境
 └── sdks/
     ├── python/                 # `cubepod` Python Async SDK
-    └── typescript/             # `@cubeplex/cubepod` TypeScript SDK
+    └── typescript/             # `cubepod` TypeScript SDK
 ```
 
 ---
