@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
+	"github.com/cubeplexai/cubepod/pkg/controller"
 )
 
 // Metrics encapsulates Prometheus counters for CubePod Gateway observability.
@@ -92,8 +93,9 @@ func (s *Server) withMetrics(next http.Handler) http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rec, r)
 
-		// Check if a sandbox was created (POST /sandboxes with 201 Created)
-		if r.Method == http.MethodPost && len(parts) == 1 && parts[0] == "sandboxes" && rec.statusCode == http.StatusCreated {
+		// Check if a sandbox was created (POST /sandboxes or POST /v2/sandboxes with 201 Created)
+		if r.Method == http.MethodPost && rec.statusCode == http.StatusCreated &&
+			((len(parts) == 1 && parts[0] == "sandboxes") || (len(parts) == 2 && parts[0] == "v2" && parts[1] == "sandboxes")) {
 			m.SandboxesCreatedTotal.Add(1)
 		}
 
@@ -144,11 +146,39 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if s.reconciler != nil {
 		warmpoolsTotal = len(s.reconciler.GetWarmPoolSpecs())
 	}
+
+	e2bEnabled := s.E2BTemplateAPIEnabled()
+	var templateStatusCounts map[string]int
+	if e2bEnabled {
+		templateStatusCounts = map[string]int{
+			v1alpha1.BuildStatusReady:    0,
+			v1alpha1.BuildStatusBuilding: 0,
+			v1alpha1.BuildStatusWaiting:  0,
+			v1alpha1.BuildStatusError:    0,
+		}
+		if s.reconciler != nil && s.reconciler.KubeClient() != nil {
+			s.syncTemplates(r.Context())
+			if list, err := s.reconciler.KubeClient().ListPodTemplates(r.Context(), ""); err == nil {
+				for _, tpl := range list {
+					crStatus := tpl.Status.BuildStatus
+					if crStatus == "" {
+						if tpl.Status.ReadyImage != "" {
+							crStatus = v1alpha1.BuildStatusReady
+						} else {
+							crStatus = v1alpha1.BuildStatusWaiting
+						}
+					}
+					wireStatus := controller.WireBuildStatus(crStatus)
+					templateStatusCounts[wireStatus]++
+				}
+			}
+		}
+	}
 	templatesTotal := len(defaultTemplates)
 
 	if strings.Contains(r.Header.Get("Accept"), "application/json") {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		payload := map[string]interface{}{
 			"cubepod_gateway_http_requests_total":      m.HTTPRequestsTotal.Load(),
 			"cubepod_gateway_sandboxes_created_total":  m.SandboxesCreatedTotal.Load(),
 			"cubepod_gateway_autoresume_total":         m.AutoresumeTotal.Load(),
@@ -156,8 +186,13 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			"cubepod_gateway_sandboxes_active_running": runningCount,
 			"cubepod_gateway_sandboxes_active_paused":  pausedCount,
 			"cubepod_gateway_warmpools_total":          warmpoolsTotal,
-			"cubepod_gateway_templates_total":          templatesTotal,
-		})
+		}
+		if e2bEnabled {
+			payload["cubepod_templates"] = templateStatusCounts
+		} else {
+			payload["cubepod_gateway_templates_total"] = templatesTotal
+		}
+		_ = json.NewEncoder(w).Encode(payload)
 		return
 	}
 
@@ -191,9 +226,22 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_warmpools_total gauge\n")
 	fmt.Fprintf(&buf, "cubepod_gateway_warmpools_total %d\n", warmpoolsTotal)
 
-	fmt.Fprintf(&buf, "# HELP cubepod_gateway_templates_total Total registered or available templates\n")
-	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_templates_total gauge\n")
-	fmt.Fprintf(&buf, "cubepod_gateway_templates_total %d\n", templatesTotal)
+	if e2bEnabled {
+		fmt.Fprintf(&buf, "# HELP cubepod_templates Current number of templates by build status\n")
+		fmt.Fprintf(&buf, "# TYPE cubepod_templates gauge\n")
+		for _, status := range []string{
+			v1alpha1.BuildStatusReady,
+			v1alpha1.BuildStatusBuilding,
+			v1alpha1.BuildStatusWaiting,
+			v1alpha1.BuildStatusError,
+		} {
+			fmt.Fprintf(&buf, "cubepod_templates{status=%q} %d\n", status, templateStatusCounts[status])
+		}
+	} else {
+		fmt.Fprintf(&buf, "# HELP cubepod_gateway_templates_total Total registered or available templates\n")
+		fmt.Fprintf(&buf, "# TYPE cubepod_gateway_templates_total gauge\n")
+		fmt.Fprintf(&buf, "cubepod_gateway_templates_total %d\n", templatesTotal)
+	}
 
 	_, _ = w.Write(buf.Bytes())
 }

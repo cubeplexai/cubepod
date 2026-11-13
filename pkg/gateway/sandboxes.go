@@ -1,10 +1,14 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,6 +16,7 @@ import (
 	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
+	"github.com/cubeplexai/cubepod/pkg/controller"
 )
 
 type createSandboxReq struct {
@@ -78,12 +83,51 @@ func pollPoddHealth(ctx context.Context, poddURL string, timeout time.Duration) 
 func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	var req createSandboxReq
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	if req.TemplateID == "" && req.Template_ID != "" {
-		req.TemplateID = req.Template_ID
+
+	var cpuCount = 2
+	var memoryMB = 2048
+	var diskSizeMB = 10240
+	var resolvedReadyCmd string
+
+	if s.E2BTemplateAPIEnabled() {
+		if s.reconciler.KubeClient() != nil {
+			_ = s.reconciler.SyncTemplatesFromKube(r.Context())
+		}
+		rawTemplateID := req.TemplateID
+		if rawTemplateID == "" && req.Template_ID != "" {
+			rawTemplateID = req.Template_ID
+		}
+		resolved, err := s.reconciler.ResolveTemplate(rawTemplateID)
+		if err != nil {
+			if errors.Is(err, controller.ErrTemplateNotReady) {
+				writeError(w, http.StatusConflict, "template is not ready")
+				return
+			}
+			if errors.Is(err, controller.ErrTemplateNotFound) {
+				writeError(w, http.StatusNotFound, "template not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		cpuCount = int(resolved.CPUCount)
+		memoryMB = int(resolved.MemoryMB)
+		diskSizeMB = int(resolved.DiskSizeMB)
+		resolvedReadyCmd = resolved.ReadyCmd
+		if rawTemplateID == "" {
+			req.TemplateID = "base"
+		} else {
+			req.TemplateID = rawTemplateID
+		}
+	} else {
+		if req.TemplateID == "" && req.Template_ID != "" {
+			req.TemplateID = req.Template_ID
+		}
+		if req.TemplateID == "" || req.TemplateID == "base" || req.TemplateID == "code-interpreter" || req.TemplateID == "code-interpreter-v1" || req.TemplateID == "python" {
+			req.TemplateID = "cubeplex-ubuntu24-desktop"
+		}
 	}
-	if req.TemplateID == "" || req.TemplateID == "base" || req.TemplateID == "code-interpreter" || req.TemplateID == "code-interpreter-v1" || req.TemplateID == "python" {
-		req.TemplateID = "cubeplex-ubuntu24-desktop"
-	}
+
 	timeoutSecs := req.Timeout
 	if timeoutSecs <= 0 {
 		timeoutSecs = 1800
@@ -133,8 +177,20 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
+		if errors.Is(err, controller.ErrTemplateNotReady) {
+			writeError(w, http.StatusConflict, "template is not ready")
+			return
+		}
+		if errors.Is(err, controller.ErrTemplateNotFound) {
+			writeError(w, http.StatusNotFound, "template not found")
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	if s.E2BTemplateAPIEnabled() {
+		s.reconciler.RecordTemplateSpawn(r.Context(), req.TemplateID)
 	}
 
 	workspaceDir := filepath.Join(s.workspaceBaseDir, id, "workspace")
@@ -159,9 +215,9 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		EnvdVersion:      "1.1.0",
 		StartedAt:        now,
 		EndAt:            endAt,
-		CPUCount:         2,
-		MemoryMB:         2048,
-		DiskSizeMB:       10240,
+		CPUCount:         cpuCount,
+		MemoryMB:         memoryMB,
+		DiskSizeMB:       diskSizeMB,
 		State:            string(status.Phase),
 		Reason:           status.Reason,
 		EnvdPort:         49983,
@@ -175,8 +231,36 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
-		rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
-		_ = waitForPoddReady(r.Context(), rec.PoddURL, 15*time.Second)
+		if _, _, splitErr := net.SplitHostPort(status.PodIP); splitErr == nil {
+			rec.PoddURL = "http://" + status.PodIP
+		} else {
+			rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
+		}
+		healthTimeout := 15 * time.Second
+		if probeTimeout := s.ProbeTimeout(); probeTimeout > 0 && probeTimeout < healthTimeout {
+			healthTimeout = probeTimeout
+		}
+		_ = waitForPoddReady(r.Context(), rec.PoddURL, healthTimeout)
+	}
+
+	if s.E2BTemplateAPIEnabled() && resolvedReadyCmd != "" && status.Reason != "WarmPoolClaimed" && rec.PoddURL != "" {
+		if err := s.waitForTemplateReadyCmd(r.Context(), rec.PoddURL, resolvedReadyCmd, s.ProbeTimeout()); err != nil {
+			rec.State = string(v1alpha1.PodBoxPhaseFailed)
+			rec.Reason = "TemplateReadyProbeTimedOut"
+			s.mu.Lock()
+			s.sandboxes[id] = rec
+			s.mu.Unlock()
+			s.markPodBoxFailed(r.Context(), id, "TemplateReadyProbeTimedOut")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code":      http.StatusServiceUnavailable,
+				"message":   "template ready command timed out",
+				"sandboxID": rec.SandboxID,
+				"logPath":   "/var/log/cubepod/start-cmd.log",
+			})
+			return
+		}
 	}
 
 	s.mu.Lock()
@@ -461,8 +545,23 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.copyResolvedImageAnnotation(r.Context(), parentID, childID)
+
 	workspaceDir := filepath.Join(s.workspaceBaseDir, childID, "workspace")
 	_ = os.MkdirAll(workspaceDir, 0755)
+
+	cpuCount := parent.CPUCount
+	if cpuCount <= 0 {
+		cpuCount = 2
+	}
+	memoryMB := parent.MemoryMB
+	if memoryMB <= 0 {
+		memoryMB = 2048
+	}
+	diskSizeMB := parent.DiskSizeMB
+	if diskSizeMB <= 0 {
+		diskSizeMB = 10240
+	}
 
 	now := time.Now().UTC()
 	endAt := now.Add(time.Duration(parent.TimeoutSeconds) * time.Second)
@@ -473,9 +572,9 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		EnvdVersion:      "1.1.0",
 		StartedAt:        now,
 		EndAt:            endAt,
-		CPUCount:         2,
-		MemoryMB:         2048,
-		DiskSizeMB:       10240,
+		CPUCount:         cpuCount,
+		MemoryMB:         memoryMB,
+		DiskSizeMB:       diskSizeMB,
 		State:            string(status.Phase),
 		Reason:           status.Reason,
 		EnvdPort:         49983,
@@ -543,4 +642,129 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 		}
 	}
 	return nil
+}
+
+func (s *Server) waitForTemplateReadyCmd(ctx context.Context, poddURL, readyCmd string, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 120 * time.Second
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	interval := 500 * time.Millisecond
+	if timeout < interval {
+		interval = 25 * time.Millisecond
+	}
+
+	payload, err := json.Marshal(map[string]string{"command": readyCmd})
+	if err != nil {
+		return err
+	}
+	runURL := strings.TrimRight(poddURL, "/") + "/v1/commands/run"
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	tryOnce := func() bool {
+		req, err := http.NewRequestWithContext(probeCtx, http.MethodPost, runURL, bytes.NewReader(payload))
+		if err != nil {
+			return false
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode != http.StatusOK {
+			return false
+		}
+		var out struct {
+			ExitCode      *int `json:"exit_code"`
+			CamelExitCode *int `json:"exitCode"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil {
+			return false
+		}
+		if out.ExitCode != nil && *out.ExitCode == 0 {
+			return true
+		}
+		if out.CamelExitCode != nil && *out.CamelExitCode == 0 {
+			return true
+		}
+		return false
+	}
+
+	if tryOnce() {
+		return nil
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-probeCtx.Done():
+			return probeCtx.Err()
+		case <-ticker.C:
+			if tryOnce() {
+				return nil
+			}
+		}
+	}
+}
+
+func (s *Server) markPodBoxFailed(ctx context.Context, boxName, reason string) {
+	if s.reconciler == nil || s.reconciler.KubeClient() == nil {
+		return
+	}
+	kc := s.reconciler.KubeClient()
+	boxes, err := kc.ListPodBoxes(ctx, "")
+	if err != nil {
+		return
+	}
+	for _, box := range boxes {
+		if box.Metadata.Name != boxName {
+			continue
+		}
+		box.Status.Phase = v1alpha1.PodBoxPhaseFailed
+		box.Status.Reason = reason
+		type podBoxStatusUpdater interface {
+			UpdatePodBoxStatus(context.Context, v1alpha1.PodBox) error
+		}
+		if u, ok := kc.(podBoxStatusUpdater); ok {
+			_ = u.UpdatePodBoxStatus(ctx, box)
+			return
+		}
+		_ = kc.UpsertPodBox(ctx, box)
+		return
+	}
+}
+
+func (s *Server) copyResolvedImageAnnotation(ctx context.Context, parentID, childID string) {
+	if s.reconciler == nil || s.reconciler.KubeClient() == nil {
+		return
+	}
+	kc := s.reconciler.KubeClient()
+	boxes, err := kc.ListPodBoxes(ctx, "")
+	if err != nil {
+		return
+	}
+	var parentResolvedImage string
+	var childBox *v1alpha1.PodBox
+	for i := range boxes {
+		if boxes[i].Metadata.Name == parentID && boxes[i].Metadata.Annotations != nil {
+			parentResolvedImage = boxes[i].Metadata.Annotations["cubepod.io/resolved-image"]
+		}
+		if boxes[i].Metadata.Name == childID {
+			b := boxes[i]
+			childBox = &b
+		}
+	}
+	if parentResolvedImage == "" || childBox == nil {
+		return
+	}
+	if childBox.Metadata.Annotations == nil {
+		childBox.Metadata.Annotations = map[string]string{}
+	}
+	childBox.Metadata.Annotations["cubepod.io/resolved-image"] = parentResolvedImage
+	_ = kc.UpsertPodBox(ctx, *childBox)
 }
