@@ -1,6 +1,6 @@
 {
   "name": "@cubeplex/cubepod",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Official TypeScript/JavaScript SDK for CubePod (E2B-compatible persistent MicroVM sandboxes)",
   "license": "Apache-2.0",
   "type": "module",
@@ -31,5 +31,17 @@
     "microvm",
     "ai-agents",
     "code-interpreter"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cubeplexai/cubepod.git",
+    "directory": "sdks/typescript"
+  },
+  "homepage": "https://github.com/cubeplexai/cubepod/tree/main/sdks/typescript",
+  "bugs": {
+    "url": "https://github.com/cubeplexai/cubepod/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }

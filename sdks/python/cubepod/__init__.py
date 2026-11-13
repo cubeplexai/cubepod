@@ -14,7 +14,10 @@ from .models import (
 )
 from .sync_client import CubePod, SyncCubePod
 
+__version__ = "0.4.0"
+
 __all__ = [
+    "__version__",
     "SandboxInfo",
     "ExecutionResult",
     "CommandInfo",
