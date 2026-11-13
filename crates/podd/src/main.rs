@@ -211,6 +211,8 @@ pub fn run_server(
 }
 
 pub fn serve(listener: TcpListener, config: DaemonConfig, registry: ProcessRegistry) {
+    ensure_subreaper();
+    ensure_sigchld_handler();
     maybe_spawn_start_cmd(&config.workdir);
     run_server(listener, config, registry, ContextRegistry::new());
 }

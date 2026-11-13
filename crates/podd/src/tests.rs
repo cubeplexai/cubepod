@@ -1205,6 +1205,14 @@ fn test_interpreter_zero_latency_flushing() {
 #[test]
 fn test_start_cmd_unset_serves_daemon_without_process_or_log() {
     // 1. CUBEPOD_START_CMD unset: serving the daemon does not create a start process and does not require the log file.
+    let log_tmp_dir =
+        std::env::temp_dir().join(format!("podd-test-unset-log-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&log_tmp_dir);
+
+    // Point CUBEPOD_START_CMD_LOG_DIR at temp directory, clear CUBEPOD_START_CMD
+    std::env::set_var("CUBEPOD_START_CMD_LOG_DIR", log_tmp_dir.to_str().unwrap());
+    std::env::remove_var("CUBEPOD_START_CMD");
+
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let registry = ProcessRegistry::new();
@@ -1220,9 +1228,12 @@ fn test_start_cmd_unset_serves_daemon_without_process_or_log() {
     assert_eq!(json.get("status").unwrap().as_str(), Some("ok"));
     assert_eq!(json.get("active_processes").unwrap().as_u64(), Some(0));
 
-    // Default start command log was not required or created
-    assert!(!std::path::Path::new("/var/log/cubepod/start-cmd.log").exists());
-    assert!(!std::path::Path::new("/var/log/cubepod/start-cmd.status").exists());
+    // Assert that temp directory does not gain a log or status file
+    assert!(!log_tmp_dir.join("start-cmd.log").exists());
+    assert!(!log_tmp_dir.join("start-cmd.status").exists());
+
+    std::env::remove_var("CUBEPOD_START_CMD_LOG_DIR");
+    let _ = std::fs::remove_dir_all(&log_tmp_dir);
 }
 
 #[test]
@@ -1316,15 +1327,15 @@ fn test_start_cmd_set_runs_once_outputs_logs_and_second_poll_no_op() {
 #[test]
 fn test_child_that_exits_is_reaped_no_zombie() {
     use crate::startcmd::{
-        ensure_subreaper, get_reaped_pids, reap_zombies, StartCmdConfig, StartCmdRunner,
+        ensure_sigchld_handler, ensure_subreaper, get_reaped_pids, StartCmdConfig, StartCmdRunner,
         StartCmdStatus, TemplateUserCredentials,
     };
     use std::fs;
-    use std::path::Path;
 
     // 3. A child that exits is reaped. Spawn a command that forks a grandchild which exits immediately,
-    // and assert no zombie remains (check /proc or that wait collected the pid).
+    // and assert no zombie remains (assert get_reaped_pids contains its pid via SIGCHLD).
     ensure_subreaper();
+    ensure_sigchld_handler();
 
     let temp_dir = std::env::temp_dir().join(format!("podd-test-reap-{}", std::process::id()));
     let _ = fs::create_dir_all(&temp_dir);
@@ -1382,22 +1393,22 @@ fn test_child_that_exits_is_reaped_no_zombie() {
     let gpid = gpid.expect("could not parse grandchild pid from start-cmd.log");
     assert_ne!(gpid, child_pid);
 
-    // Wait for grandchild to exit and be reaped
+    // Wait for grandchild to exit and be reaped by the SIGCHLD thread (without calling reap_zombies directly)
     let mut reaped = false;
-    for _ in 0..100 {
-        let newly = reap_zombies();
-        if newly.contains(&(gpid as libc::pid_t))
-            || get_reaped_pids().contains(&(gpid as libc::pid_t))
-        {
-            reaped = true;
-            break;
-        }
-        if !Path::new(&format!("/proc/{}", gpid)).exists() {
+    for _ in 0..150 {
+        if get_reaped_pids().contains(&(gpid as libc::pid_t)) {
             reaped = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+
+    assert!(
+        reaped,
+        "grandchild pid {} was not collected by the SIGCHLD reaper thread (collected: {:?})",
+        gpid,
+        get_reaped_pids()
+    );
 
     // Verify /proc/<gpid>/status if still accessible: must not be in Zombie state
     let proc_status_path = format!("/proc/{}/status", gpid);
@@ -1412,11 +1423,6 @@ fn test_child_that_exits_is_reaped_no_zombie() {
             }
         }
     }
-
-    assert!(
-        reaped || !Path::new(&format!("/proc/{}", gpid)).exists(),
-        "grandchild was not reaped"
-    );
 
     let _ = fs::remove_dir_all(&temp_dir);
 }

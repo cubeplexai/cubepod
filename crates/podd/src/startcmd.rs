@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::files::chown_if_root;
 
@@ -22,7 +23,18 @@ static SIGCHLD_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Look up the exit code of a process that may have been collected by the zombie reaper.
 pub fn lookup_reaped_exit_code(pid: u32) -> Option<i32> {
-    REAPED_STATUSES.lock().unwrap().as_ref()?.get(&pid).copied()
+    for _ in 0..10 {
+        if let Some(code) = REAPED_STATUSES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|m| m.get(&pid).copied())
+        {
+            return Some(code);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    None
 }
 
 /// Get all process IDs collected by the zombie reaper so far.
@@ -63,7 +75,8 @@ extern "C" fn sigchld_handler(_sig: libc::c_int) {
     SIGCHLD_RECEIVED.store(true, Ordering::SeqCst);
 }
 
-/// Setup SIGCHLD handler so background reaping can wake up on child exits.
+/// Setup SIGCHLD handler and spawn a dedicated background thread kept for the life
+/// of the process that calls reap_zombies whenever SIGCHLD_RECEIVED is set.
 pub fn ensure_sigchld_handler() {
     if SIGCHLD_INITIALIZED.swap(true, Ordering::SeqCst) {
         return;
@@ -74,6 +87,19 @@ pub fn ensure_sigchld_handler() {
         sa.sa_flags = libc::SA_RESTART | libc::SA_NOCLDSTOP;
         libc::sigaction(libc::SIGCHLD, &sa, std::ptr::null_mut());
     }
+
+    std::thread::Builder::new()
+        .name("podd-zombie-reaper".to_string())
+        .spawn(|| {
+            reap_zombies();
+            loop {
+                if SIGCHLD_RECEIVED.swap(false, Ordering::SeqCst) {
+                    reap_zombies();
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+        .expect("failed to spawn podd-zombie-reaper thread");
 }
 
 /// Mark current process as a child subreaper so orphaned descendants (grandchildren)
@@ -423,8 +449,13 @@ impl StartCmdRunner {
 /// Reads environment variables and spawns the start command if configured.
 pub fn maybe_spawn_start_cmd(workdir: &str) -> StartCmdStatus {
     let mut guard = GLOBAL_RUNNER.lock().unwrap();
-    if guard.is_none() {
-        *guard = Some(StartCmdRunner::from_env(workdir));
+    if let Some(runner) = guard.as_ref() {
+        return runner.poll();
     }
-    guard.as_ref().unwrap().poll()
+    let runner = StartCmdRunner::from_env(workdir);
+    let status = runner.poll();
+    if status != StartCmdStatus::NotConfigured {
+        *guard = Some(runner);
+    }
+    status
 }
