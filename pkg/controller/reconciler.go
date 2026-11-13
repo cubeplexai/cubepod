@@ -219,8 +219,9 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 	pool, exists := r.warmPools[poolName]
 	if !exists {
 		pool = &warmPoolState{
-			spec:    spec,
-			entries: make([]*WarmPodEntry, 0),
+			spec:      spec,
+			entries:   make([]*WarmPodEntry, 0),
+			persisted: false,
 		}
 		r.warmPools[poolName] = pool
 	}
@@ -338,25 +339,32 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 		AvailableReplicas: finalAvail,
 	}
 
-	// Persist the PodWarmPool CRD state to Kubernetes API via status update (avoiding spec overwrite)
+	// Persist the PodWarmPool CRD state to Kubernetes API
 	if r.kubeClient != nil {
-		err := r.kubeClient.UpdatePodWarmPoolStatus(ctx, r.namespace, poolName, *st)
-		if err != nil {
-			errStr := strings.ToLower(err.Error())
-			if strings.Contains(errStr, "not found") || strings.Contains(errStr, "404") {
-				slog.Debug("PodWarmPool not found in Kubernetes; skipping status update and recreation", "pool", poolName, "err", err)
-			} else {
-				cr := v1alpha1.PodWarmPool{
-					APIVersion: "cubepod.io/v1alpha1",
-					Kind:       "PodWarmPool",
-					Metadata: v1alpha1.ObjectMeta{
-						Name:      poolName,
-						Namespace: r.namespace,
-					},
-					Spec:   spec,
-					Status: *st,
+		if !pool.persisted {
+			cr := v1alpha1.PodWarmPool{
+				APIVersion: "cubepod.io/v1alpha1",
+				Kind:       "PodWarmPool",
+				Metadata: v1alpha1.ObjectMeta{
+					Name:      poolName,
+					Namespace: r.namespace,
+				},
+				Spec:   spec,
+				Status: *st,
+			}
+			if err := r.kubeClient.UpsertPodWarmPool(ctx, cr); err != nil {
+				slog.Warn("failed to upsert initial PodWarmPool CR", "pool", poolName, "err", err)
+			}
+			pool.persisted = true
+		} else {
+			err := r.kubeClient.UpdatePodWarmPoolStatus(ctx, r.namespace, poolName, *st)
+			if err != nil {
+				errStr := strings.ToLower(err.Error())
+				if strings.Contains(errStr, "not found") || strings.Contains(errStr, "404") {
+					slog.Debug("PodWarmPool not found in Kubernetes; skipping status update and recreation", "pool", poolName, "err", err)
+				} else {
+					slog.Warn("failed to update PodWarmPool status", "pool", poolName, "err", err)
 				}
-				_ = r.kubeClient.UpsertPodWarmPool(ctx, cr)
 			}
 		}
 	}
@@ -383,6 +391,19 @@ func (r *Reconciler) claimWarmPodLocked(ctx context.Context, poolName string, bo
 
 	for _, entry := range pool.entries {
 		if !entry.Claimed {
+			if r.kubeClient != nil {
+				if ctx == nil {
+					ctx = context.Background()
+				}
+				if err := r.kubeClient.PatchPodLabels(ctx, r.namespace, entry.PodName, map[string]string{
+					"cubepod.io/claimed":    "true",
+					"cubepod.io/claimed-by": boxName,
+				}); err != nil {
+					slog.Warn("failed to patch pod labels on claim, skipping standby pod", "pod", entry.PodName, "box", boxName, "err", err)
+					continue
+				}
+			}
+
 			entry.Claimed = true
 			entry.ClaimedBy = boxName
 			now := time.Now().UTC()
@@ -392,18 +413,6 @@ func (r *Reconciler) claimWarmPodLocked(ctx context.Context, poolName string, bo
 			}
 			entry.PodManifest.Labels["cubepod.io/claimed"] = "true"
 			entry.PodManifest.Labels["cubepod.io/claimed-by"] = boxName
-
-			if r.kubeClient != nil {
-				if ctx == nil {
-					ctx = context.Background()
-				}
-				if err := r.kubeClient.PatchPodLabels(ctx, r.namespace, entry.PodName, map[string]string{
-					"cubepod.io/claimed":    "true",
-					"cubepod.io/claimed-by": boxName,
-				}); err != nil {
-					slog.Warn("failed to patch pod labels on claim", "pod", entry.PodName, "box", boxName, "err", err)
-				}
-			}
 
 			return entry, nil
 		}
@@ -716,6 +725,20 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("failed to list PodWarmPools from Kubernetes: %w", err)
 	}
 
+	// Query pods for each warm pool
+	poolPods := make(map[string][]PodManifest, len(pools))
+	for _, p := range pools {
+		pName := p.Metadata.Name
+		if pName == "" {
+			continue
+		}
+		pods, err := r.kubeClient.ListPods(ctx, r.namespace, "cubepod.io/warmpool="+pName)
+		if err != nil {
+			return 0, fmt.Errorf("failed to list pods for warmpool %s: %w", pName, err)
+		}
+		poolPods[pName] = pods
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -745,14 +768,73 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 			continue
 		}
 		activePools[pName] = true
-		if pool, exists := r.warmPools[pName]; exists {
-			pool.spec = p.Spec
+		pool, exists := r.warmPools[pName]
+		if !exists {
+			pool = &warmPoolState{
+				spec:      p.Spec,
+				entries:   make([]*WarmPodEntry, 0),
+				persisted: true,
+			}
+			r.warmPools[pName] = pool
 		} else {
-			r.warmPools[pName] = &warmPoolState{
-				spec:    p.Spec,
-				entries: make([]*WarmPodEntry, 0),
+			pool.spec = p.Spec
+			pool.persisted = true
+		}
+
+		// Reconstruct or update pool.entries from Kubernetes pods
+		pods := poolPods[pName]
+		existingEntries := make(map[string]*WarmPodEntry, len(pool.entries))
+		for _, entry := range pool.entries {
+			existingEntries[entry.PodName] = entry
+		}
+
+		var updatedEntries []*WarmPodEntry
+		for _, pod := range pods {
+			claimed := (pod.Labels != nil && pod.Labels["cubepod.io/claimed"] == "true")
+			var claimedBy string
+			if pod.Labels != nil {
+				claimedBy = pod.Labels["cubepod.io/claimed-by"]
+			}
+
+			if entry, ok := existingEntries[pod.Name]; ok {
+				entry.Claimed = claimed
+				entry.ClaimedBy = claimedBy
+				if entry.PodManifest.Labels == nil {
+					entry.PodManifest.Labels = make(map[string]string)
+				}
+				for k, v := range pod.Labels {
+					entry.PodManifest.Labels[k] = v
+				}
+				updatedEntries = append(updatedEntries, entry)
+			} else {
+				entryID := strings.TrimSuffix(pod.Name, "-kata-pod")
+				tplRef := ""
+				if pod.Labels != nil {
+					tplRef = pod.Labels["cubepod.io/template"]
+				}
+				if tplRef == "" {
+					tplRef = p.Spec.TemplateRef
+				}
+				newEntry := &WarmPodEntry{
+					ID:               entryID,
+					PoolName:         pName,
+					TemplateRef:      tplRef,
+					PodName:          pod.Name,
+					RootfsPVCName:    entryID + "-rootfs-pvc",
+					WorkspacePVCName: entryID + "-workspace-pvc",
+					Claimed:          claimed,
+					ClaimedBy:        claimedBy,
+					CreatedAt:        time.Now().UTC(),
+					PodManifest:      pod,
+				}
+				updatedEntries = append(updatedEntries, newEntry)
+			}
+
+			if idx := parseWarmIndex(pod.Name); idx > r.warmCounter {
+				r.warmCounter = idx
 			}
 		}
+		pool.entries = updatedEntries
 	}
 
 	for name, pool := range r.warmPools {
