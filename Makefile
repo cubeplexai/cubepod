@@ -66,7 +66,7 @@ test-e2b-compat: build-gateway
 K8S_ENV := set -a; if [ -f deploy/k8s/env.local ]; then . deploy/k8s/env.local; fi; set +a
 
 test-k8s-e2e:
-	$(K8S_ENV); CUBEPOD_K8S_E2E=1 $(GO) test -v -timeout 15m ./test/k8s-e2e/ -run 'TestK8sLiveE2E|TestLoadClusterConfigLive'
+	$(K8S_ENV); CUBEPOD_K8S_E2E=1 $(GO) test -v -timeout 15m ./test/k8s-e2e/ -run 'TestK8sLiveE2E|TestLoadClusterConfigLive|TestK8sWarmPoolClaimLive'
 
 test-k8s-block test-k8s-longhorn-v2:
 	$(K8S_ENV); CUBEPOD_K8S_BLOCK=1 $(GO) test -v -timeout 10m ./test/k8s-e2e/ -run TestK8sBlockPublish

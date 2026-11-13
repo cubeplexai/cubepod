@@ -1,6 +1,7 @@
 package controller_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,18 +19,24 @@ import (
 type mockCRDServer struct {
 	mu           sync.RWMutex
 	podBoxes     map[string]v1alpha1.PodBox
+	podWarmPools map[string]v1alpha1.PodWarmPool
 	getCalls     int
 	postCalls    int
 	putCalls     int
 	putStatus    int
 	deleteCalls  int
 	listCalls    int
+	wpGetCalls   int
+	wpPostCalls  int
+	wpPutCalls   int
+	wpPutStatus  int
 	return404CRD bool
 }
 
 func newMockCRDServer() (*mockCRDServer, *httptest.Server) {
 	m := &mockCRDServer{
-		podBoxes: make(map[string]v1alpha1.PodBox),
+		podBoxes:     make(map[string]v1alpha1.PodBox),
+		podWarmPools: make(map[string]v1alpha1.PodWarmPool),
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -43,7 +50,7 @@ func newMockCRDServer() (*mockCRDServer, *httptest.Server) {
 			return
 		}
 
-		// Prefix: /apis/cubepod.io/v1alpha1/namespaces/{ns}/podboxes
+		// Prefix: /apis/cubepod.io/v1alpha1/namespaces/{ns}/{resource}
 		const prefix = "/apis/cubepod.io/v1alpha1/namespaces/"
 		if !strings.HasPrefix(path, prefix) {
 			http.NotFound(w, r)
@@ -52,12 +59,182 @@ func newMockCRDServer() (*mockCRDServer, *httptest.Server) {
 
 		trimmed := strings.TrimPrefix(path, prefix)
 		parts := strings.Split(trimmed, "/")
-		if len(parts) < 2 || parts[1] != "podboxes" {
+		if len(parts) < 2 {
 			http.NotFound(w, r)
 			return
 		}
 
 		ns := parts[0]
+		resource := parts[1]
+
+		if resource == "podwarmpools" {
+			// List or Create: /apis/cubepod.io/v1alpha1/namespaces/{ns}/podwarmpools
+			if len(parts) == 2 {
+				switch r.Method {
+				case http.MethodGet:
+					m.listCalls++
+					var items []v1alpha1.PodWarmPool
+					for _, p := range m.podWarmPools {
+						if p.Metadata.Namespace == ns || ns == "" {
+							items = append(items, p)
+						}
+					}
+					list := v1alpha1.PodWarmPoolList{
+						APIVersion: "cubepod.io/v1alpha1",
+						Kind:       "PodWarmPoolList",
+						Items:      items,
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(list)
+					return
+
+				case http.MethodPost:
+					m.postCalls++
+					m.wpPostCalls++
+					var pool v1alpha1.PodWarmPool
+					if err := json.NewDecoder(r.Body).Decode(&pool); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					key := fmt.Sprintf("%s/%s", ns, pool.Metadata.Name)
+					if _, exists := m.podWarmPools[key]; exists {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusConflict)
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"kind":    "Status",
+							"status":  "Failure",
+							"message": fmt.Sprintf("podwarmpools.cubepod.io %q already exists", pool.Metadata.Name),
+							"reason":  "AlreadyExists",
+							"code":    409,
+						})
+						return
+					}
+					if pool.Metadata.ResourceVersion == "" {
+						pool.Metadata.ResourceVersion = "1"
+					}
+					pool.Metadata.Namespace = ns
+					m.podWarmPools[key] = pool
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusCreated)
+					_ = json.NewEncoder(w).Encode(pool)
+					return
+				default:
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+					return
+				}
+			}
+
+			// Specific item: /apis/cubepod.io/v1alpha1/namespaces/{ns}/podwarmpools/{name}
+			name := parts[2]
+			key := fmt.Sprintf("%s/%s", ns, name)
+
+			if len(parts) == 3 {
+				switch r.Method {
+				case http.MethodGet:
+					m.getCalls++
+					m.wpGetCalls++
+					pool, ok := m.podWarmPools[key]
+					if !ok {
+						http.NotFound(w, r)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(pool)
+					return
+
+				case http.MethodPut:
+					m.putCalls++
+					m.wpPutCalls++
+					var pool v1alpha1.PodWarmPool
+					if err := json.NewDecoder(r.Body).Decode(&pool); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					existing, ok := m.podWarmPools[key]
+					if !ok {
+						http.NotFound(w, r)
+						return
+					}
+					if pool.Metadata.ResourceVersion != "" && pool.Metadata.ResourceVersion != existing.Metadata.ResourceVersion {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusConflict)
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"kind":    "Status",
+							"status":  "Failure",
+							"message": fmt.Sprintf("Operation cannot be fulfilled on podwarmpools.cubepod.io %q: conflicting resourceVersion", name),
+							"reason":  "Conflict",
+							"code":    409,
+						})
+						return
+					}
+					pool.Metadata.Namespace = ns
+					pool.Metadata.ResourceVersion = "2"
+					m.podWarmPools[key] = pool
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(pool)
+					return
+
+				case http.MethodDelete:
+					m.deleteCalls++
+					if _, ok := m.podWarmPools[key]; !ok {
+						http.NotFound(w, r)
+						return
+					}
+					delete(m.podWarmPools, key)
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]string{"status": "Success"})
+					return
+
+				default:
+					http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+					return
+				}
+			}
+
+			// Status subresource: /apis/cubepod.io/v1alpha1/namespaces/{ns}/podwarmpools/{name}/status
+			if len(parts) == 4 && parts[3] == "status" {
+				if r.Method == http.MethodPut {
+					m.putStatus++
+					m.wpPutStatus++
+					var pool v1alpha1.PodWarmPool
+					if err := json.NewDecoder(r.Body).Decode(&pool); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					existing, ok := m.podWarmPools[key]
+					if !ok {
+						http.NotFound(w, r)
+						return
+					}
+					if pool.Metadata.ResourceVersion != existing.Metadata.ResourceVersion {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusConflict)
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"kind":    "Status",
+							"status":  "Failure",
+							"message": fmt.Sprintf("Operation cannot be fulfilled on podwarmpools.cubepod.io %q: the object has been modified; please apply your changes to the latest version and try again", name),
+							"reason":  "Conflict",
+							"code":    409,
+						})
+						return
+					}
+					existing.Status = pool.Status
+					existing.Metadata.ResourceVersion = "3"
+					m.podWarmPools[key] = existing
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(existing)
+					return
+				}
+			}
+
+			http.NotFound(w, r)
+			return
+		}
+
+		if resource != "podboxes" {
+			http.NotFound(w, r)
+			return
+		}
 
 		// List or Create: /apis/cubepod.io/v1alpha1/namespaces/{ns}/podboxes
 		if len(parts) == 2 {
@@ -540,4 +717,202 @@ func TestMemoryKubeClient_PodBox_CRUD_And_Sync(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected GetPodBox to return error after deletion")
 	}
+}
+
+func TestRESTKubeClient_PodWarmPool_StatusPersistenceAndConflict(t *testing.T) {
+	mock, ts := newMockCRDServer()
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+	ctx := context.Background()
+
+	pool := v1alpha1.PodWarmPool{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodWarmPool",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "test-pool-1",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: v1alpha1.PodWarmPoolSpec{
+			TemplateRef: "ubuntu:24.04",
+			Replicas:    3,
+		},
+		Status: v1alpha1.PodWarmPoolStatus{
+			ReadyReplicas:     3,
+			AvailableReplicas: 3,
+		},
+	}
+
+	// 1. Initial Upsert (POST -> 201 Created -> PUT /status with rv=1 -> updated to rv=3)
+	if err := client.UpsertPodWarmPool(ctx, pool); err != nil {
+		t.Fatalf("UpsertPodWarmPool failed: %v", err)
+	}
+
+	mock.mu.RLock()
+	if mock.wpPostCalls != 1 {
+		t.Errorf("expected 1 POST call, got %d", mock.wpPostCalls)
+	}
+	if mock.wpPutStatus != 1 {
+		t.Errorf("expected 1 PUT status call, got %d", mock.wpPutStatus)
+	}
+	mock.mu.RUnlock()
+
+	// 2. Verify status persistence via GetPodWarmPool
+	got, err := client.GetPodWarmPool(ctx, "cubepod-workloads", "test-pool-1")
+	if err != nil {
+		t.Fatalf("GetPodWarmPool failed: %v", err)
+	}
+	if got.Status.AvailableReplicas != 3 || got.Status.ReadyReplicas != 3 {
+		t.Fatalf("expected 3 available/ready replicas, got %+v", got.Status)
+	}
+	if got.Metadata.ResourceVersion != "3" {
+		t.Fatalf("expected resourceVersion 3 after status update, got %s", got.Metadata.ResourceVersion)
+	}
+
+	// 3. Update status directly with matching resourceVersion (via UpdatePodWarmPoolStatus)
+	newStatus := v1alpha1.PodWarmPoolStatus{
+		ReadyReplicas:     2,
+		AvailableReplicas: 2,
+	}
+	if err := client.UpdatePodWarmPoolStatus(ctx, "cubepod-workloads", "test-pool-1", newStatus); err != nil {
+		t.Fatalf("UpdatePodWarmPoolStatus failed: %v", err)
+	}
+
+	gotAfterUpdate, err := client.GetPodWarmPool(ctx, "cubepod-workloads", "test-pool-1")
+	if err != nil {
+		t.Fatalf("GetPodWarmPool failed: %v", err)
+	}
+	if gotAfterUpdate.Status.AvailableReplicas != 2 {
+		t.Fatalf("expected 2 available replicas, got %d", gotAfterUpdate.Status.AvailableReplicas)
+	}
+
+	// 4. Test 409 Conflict on mismatched resourceVersion on /status:
+	// Manually attempt to PUT /status with a stale resourceVersion (e.g. "stale-version-99")
+	stalePool := *gotAfterUpdate
+	stalePool.Metadata.ResourceVersion = "stale-version-99"
+	stalePayload, _ := json.Marshal(stalePool)
+	statusURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podwarmpools/%s/status", ts.URL, "cubepod-workloads", "test-pool-1")
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPut, statusURL, bytes.NewReader(stalePayload))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("failed to send PUT status request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on mismatched resourceVersion, got status %d", resp.StatusCode)
+	}
+
+	// 5. UpsertPodWarmPool on 409 Conflict:
+	// Calling UpsertPodWarmPool again triggers POST (409) -> GET rv -> PUT obj -> PUT status
+	pool.Spec.Replicas = 5
+	pool.Status.AvailableReplicas = 5
+	pool.Status.ReadyReplicas = 5
+	if err := client.UpsertPodWarmPool(ctx, pool); err != nil {
+		t.Fatalf("UpsertPodWarmPool on existing pool failed: %v", err)
+	}
+
+	gotFinal, err := client.GetPodWarmPool(ctx, "cubepod-workloads", "test-pool-1")
+	if err != nil {
+		t.Fatalf("GetPodWarmPool final failed: %v", err)
+	}
+	if gotFinal.Spec.Replicas != 5 {
+		t.Errorf("expected spec replicas 5, got %d", gotFinal.Spec.Replicas)
+	}
+	if gotFinal.Status.AvailableReplicas != 5 {
+		t.Errorf("expected status available replicas 5, got %d", gotFinal.Status.AvailableReplicas)
+	}
+}
+
+func TestReconciler_SyncFromKube_WarmPoolSpecAndCounter(t *testing.T) {
+	mock, ts := newMockCRDServer()
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+	ctx := context.Background()
+
+	// Initial pool in Kube with spec replicas = 2
+	pool := v1alpha1.PodWarmPool{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodWarmPool",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "sync-pool",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: v1alpha1.PodWarmPoolSpec{
+			TemplateRef: "ubuntu:24.04",
+			Replicas:    2,
+		},
+	}
+	if err := client.UpsertPodWarmPool(ctx, pool); err != nil {
+		t.Fatalf("UpsertPodWarmPool failed: %v", err)
+	}
+
+	// Create a PodBox whose PodName reflects an existing warm pod index (e.g. 7)
+	box := v1alpha1.PodBox{
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "existing-box-7",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: v1alpha1.PodBoxSpec{
+			DesiredState: v1alpha1.DesiredStateRunning,
+		},
+		Status: v1alpha1.PodBoxStatus{
+			Phase:   v1alpha1.PodBoxPhaseRunning,
+			PodName: "sync-pool-warm-7-kata-pod",
+		},
+	}
+	if err := client.UpsertPodBox(ctx, box); err != nil {
+		t.Fatalf("UpsertPodBox failed: %v", err)
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(client),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// Initial sync recovers pool and box, and updates warmCounter to 7
+	if _, err := r.SyncFromKube(ctx); err != nil {
+		t.Fatalf("initial SyncFromKube failed: %v", err)
+	}
+
+	specs := r.GetWarmPoolSpecs()
+	if specs["sync-pool"].Replicas != 2 {
+		t.Fatalf("expected replicas 2 initially, got %d", specs["sync-pool"].Replicas)
+	}
+
+	// Now simulate external update on APIServer (e.g. kubectl scale to replicas = 5)
+	pool.Spec.Replicas = 5
+	if err := client.UpsertPodWarmPool(ctx, pool); err != nil {
+		t.Fatalf("scale update UpsertPodWarmPool failed: %v", err)
+	}
+
+	// Reconciler sync adopts new spec
+	if _, err := r.SyncFromKube(ctx); err != nil {
+		t.Fatalf("second SyncFromKube failed: %v", err)
+	}
+
+	specsAfter := r.GetWarmPoolSpecs()
+	if specsAfter["sync-pool"].Replicas != 5 {
+		t.Fatalf("expected reconciler to adopt updated replicas 5 from APIServer, got %d", specsAfter["sync-pool"].Replicas)
+	}
+
+	// Now reconcile warm pool to add replicas; next created pod must be index > 7 (i.e. 8)
+	st, err := r.ReconcileWarmPool(ctx, "sync-pool", specsAfter["sync-pool"])
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+	if st.AvailableReplicas != 5 {
+		t.Fatalf("expected 5 available replicas, got %d", st.AvailableReplicas)
+	}
+
+	claimed, err := r.ClaimWarmPod(ctx, "sync-pool", "new-box")
+	if err != nil {
+		t.Fatalf("ClaimWarmPod failed: %v", err)
+	}
+	if !strings.Contains(claimed.ID, "-warm-8") {
+		t.Fatalf("expected newly created entry to have index 8 avoiding collision with 7, got %s", claimed.ID)
+	}
+	_ = mock
 }

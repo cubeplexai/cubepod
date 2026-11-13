@@ -26,6 +26,7 @@ type KubeClient interface {
 	ListPodBoxes(ctx context.Context, namespace string) ([]v1alpha1.PodBox, error)
 	DeletePodBox(ctx context.Context, namespace, name string) error
 	UpsertPodWarmPool(ctx context.Context, pool v1alpha1.PodWarmPool) error
+	UpdatePodWarmPoolStatus(ctx context.Context, namespace, name string, status v1alpha1.PodWarmPoolStatus) error
 	GetPodWarmPool(ctx context.Context, namespace, name string) (*v1alpha1.PodWarmPool, error)
 	ListPodWarmPools(ctx context.Context, namespace string) ([]v1alpha1.PodWarmPool, error)
 	DeletePodWarmPool(ctx context.Context, namespace, name string) error
@@ -138,6 +139,23 @@ func (m *MemoryKubeClient) UpsertPodWarmPool(_ context.Context, pool v1alpha1.Po
 		ns = "default"
 	}
 	m.WarmPools[boxKey(ns, pool.Metadata.Name)] = pool
+	return nil
+}
+
+// UpdatePodWarmPoolStatus updates only the status field of a stored PodWarmPool in memory.
+func (m *MemoryKubeClient) UpdatePodWarmPoolStatus(_ context.Context, namespace, name string, status v1alpha1.PodWarmPoolStatus) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	key := boxKey(namespace, name)
+	pool, ok := m.WarmPools[key]
+	if !ok {
+		return fmt.Errorf("podwarmpool %s/%s not found", namespace, name)
+	}
+	pool.Status = status
+	m.WarmPools[key] = pool
 	return nil
 }
 

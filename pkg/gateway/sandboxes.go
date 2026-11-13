@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -100,6 +101,11 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
+	if err != nil && spec.WarmPoolRef != "" {
+		slog.Warn("warmpool claim failed, falling back to cold start", "sandboxID", id, "pool", spec.WarmPoolRef, "err", err)
+		spec.WarmPoolRef = ""
+		status, err = s.reconciler.Reconcile(r.Context(), id, spec)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

@@ -221,6 +221,30 @@ func (c *RESTKubeClient) UpsertPodWarmPool(ctx context.Context, pool v1alpha1.Po
 		return nil
 	}
 
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		var created v1alpha1.PodWarmPool
+		if err := json.NewDecoder(resp.Body).Decode(&created); err == nil && created.Metadata.ResourceVersion != "" {
+			pool.Metadata.ResourceVersion = created.Metadata.ResourceVersion
+		}
+
+		statusURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podwarmpools/%s/status", c.baseURL, ns, name)
+		statusPayload, err := json.Marshal(pool)
+		if err != nil {
+			return fmt.Errorf("failed to marshal PodWarmPool status JSON: %w", err)
+		}
+		statusResp, err := c.doRequest(ctx, http.MethodPut, statusURL, bytes.NewReader(statusPayload))
+		if err != nil {
+			return fmt.Errorf("UpsertPodWarmPool PUT status failed: %w", err)
+		}
+		defer statusResp.Body.Close()
+
+		if statusResp.StatusCode >= 400 {
+			body, _ := io.ReadAll(statusResp.Body)
+			return fmt.Errorf("UpsertPodWarmPool PUT status failed: status %d (%s)", statusResp.StatusCode, string(body))
+		}
+		return nil
+	}
+
 	if resp.StatusCode == http.StatusConflict {
 		existing, err := c.GetPodWarmPool(ctx, ns, name)
 		if err != nil {
@@ -244,10 +268,25 @@ func (c *RESTKubeClient) UpsertPodWarmPool(ctx context.Context, pool v1alpha1.Po
 			return fmt.Errorf("UpsertPodWarmPool PUT failed: status %d (%s)", putResp.StatusCode, string(body))
 		}
 
+		var updated v1alpha1.PodWarmPool
+		if err := json.NewDecoder(putResp.Body).Decode(&updated); err == nil && updated.Metadata.ResourceVersion != "" {
+			pool.Metadata.ResourceVersion = updated.Metadata.ResourceVersion
+		}
+
 		statusURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podwarmpools/%s/status", c.baseURL, ns, name)
-		statusResp, err := c.doRequest(ctx, http.MethodPut, statusURL, bytes.NewReader(putPayload))
-		if err == nil {
-			_ = statusResp.Body.Close()
+		statusPayload, err := json.Marshal(pool)
+		if err != nil {
+			return fmt.Errorf("failed to marshal PodWarmPool for status update: %w", err)
+		}
+		statusResp, err := c.doRequest(ctx, http.MethodPut, statusURL, bytes.NewReader(statusPayload))
+		if err != nil {
+			return fmt.Errorf("UpsertPodWarmPool PUT status failed: %w", err)
+		}
+		defer statusResp.Body.Close()
+
+		if statusResp.StatusCode >= 400 {
+			body, _ := io.ReadAll(statusResp.Body)
+			return fmt.Errorf("UpsertPodWarmPool PUT status failed: status %d (%s)", statusResp.StatusCode, string(body))
 		}
 		return nil
 	}
@@ -255,6 +294,35 @@ func (c *RESTKubeClient) UpsertPodWarmPool(ctx context.Context, pool v1alpha1.Po
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("UpsertPodWarmPool POST failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	return nil
+}
+
+// UpdatePodWarmPoolStatus updates only the status subresource of a PodWarmPool Custom Resource in the Kubernetes APIServer.
+func (c *RESTKubeClient) UpdatePodWarmPoolStatus(ctx context.Context, namespace, name string, status v1alpha1.PodWarmPoolStatus) error {
+	ns := c.resolveNamespace(namespace)
+	existing, err := c.GetPodWarmPool(ctx, ns, name)
+	if err != nil {
+		return fmt.Errorf("UpdatePodWarmPoolStatus failed to get existing PodWarmPool: %w", err)
+	}
+
+	existing.Status = status
+	statusURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podwarmpools/%s/status", c.baseURL, ns, name)
+	statusPayload, err := json.Marshal(existing)
+	if err != nil {
+		return fmt.Errorf("failed to marshal PodWarmPool for status update: %w", err)
+	}
+
+	statusResp, err := c.doRequest(ctx, http.MethodPut, statusURL, bytes.NewReader(statusPayload))
+	if err != nil {
+		return fmt.Errorf("UpdatePodWarmPoolStatus PUT status failed: %w", err)
+	}
+	defer statusResp.Body.Close()
+
+	if statusResp.StatusCode >= 400 {
+		body, _ := io.ReadAll(statusResp.Body)
+		return fmt.Errorf("UpdatePodWarmPoolStatus PUT status failed: status %d (%s)", statusResp.StatusCode, string(body))
 	}
 
 	return nil

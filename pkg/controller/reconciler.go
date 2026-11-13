@@ -255,6 +255,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				TemplateRef:      spec.TemplateRef,
 				DesiredState:     v1alpha1.DesiredStateRunning,
 				RootfsGeneration: 1,
+				WarmPoolRef:      poolName,
 			}
 
 			rootfsPVC, wsPVC := BuildBlockPVCs(entryID, tpl, warmBoxSpec, r.volumeMode)
@@ -272,6 +273,12 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 			}
 			podManifest := BuildKataPod(entryID, tpl, warmBoxSpec, dummyStatus, r.volumeMode)
 			podManifest.Namespace = r.namespace
+			if podManifest.Labels == nil {
+				podManifest.Labels = make(map[string]string)
+			}
+			podManifest.Labels["cubepod.io/warmpool"] = poolName
+			podManifest.Labels["cubepod.io/template"] = spec.TemplateRef
+			podManifest.Labels["cubepod.io/claimed"] = "false"
 
 			podIP, _ := r.kubeClient.EnsurePod(ctx, podManifest)
 			if podIP != "" {
@@ -293,7 +300,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 			}
 			pool.entries = append(pool.entries, entry)
 		}
-	} else if currentAvail > spec.Replicas {
+	} else if currentAvail > spec.Replicas && len(availableEntries) > 0 && len(pool.entries) > 0 {
 		// Scale down excess unclaimed entries.
 		toRemove := currentAvail - spec.Replicas
 		var filtered []*WarmPodEntry
@@ -323,19 +330,22 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 		AvailableReplicas: finalAvail,
 	}
 
-	// Persist the PodWarmPool CRD state to Kubernetes API
+	// Persist the PodWarmPool CRD state to Kubernetes API via status update (avoiding spec overwrite)
 	if r.kubeClient != nil {
-		cr := v1alpha1.PodWarmPool{
-			APIVersion: "cubepod.io/v1alpha1",
-			Kind:       "PodWarmPool",
-			Metadata: v1alpha1.ObjectMeta{
-				Name:      poolName,
-				Namespace: r.namespace,
-			},
-			Spec:   spec,
-			Status: *st,
+		err := r.kubeClient.UpdatePodWarmPoolStatus(ctx, r.namespace, poolName, *st)
+		if err != nil {
+			cr := v1alpha1.PodWarmPool{
+				APIVersion: "cubepod.io/v1alpha1",
+				Kind:       "PodWarmPool",
+				Metadata: v1alpha1.ObjectMeta{
+					Name:      poolName,
+					Namespace: r.namespace,
+				},
+				Spec:   spec,
+				Status: *st,
+			}
+			_ = r.kubeClient.UpsertPodWarmPool(ctx, cr)
 		}
-		_ = r.kubeClient.UpsertPodWarmPool(ctx, cr)
 	}
 
 	return st, nil
@@ -360,6 +370,9 @@ func (r *Reconciler) claimWarmPodLocked(poolName string, boxName string) (*WarmP
 			entry.ClaimedBy = boxName
 			now := time.Now().UTC()
 			entry.ClaimedAt = &now
+			if entry.PodManifest.Labels != nil {
+				entry.PodManifest.Labels["cubepod.io/claimed"] = "true"
+			}
 			return entry, nil
 		}
 	}
@@ -632,6 +645,23 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 	return nil
 }
 
+func parseWarmIndex(s string) int64 {
+	idx := strings.Index(s, "-warm-")
+	if idx == -1 {
+		return 0
+	}
+	rem := s[idx+len("-warm-"):]
+	var n int64
+	for _, ch := range rem {
+		if ch >= '0' && ch <= '9' {
+			n = n*10 + int64(ch-'0')
+		} else {
+			break
+		}
+	}
+	return n
+}
+
 // SyncFromKube recovers PodBox and PodWarmPool states from the Kubernetes API into memory.
 // It queries the APIServer for all PodBoxes and PodWarmPools in the reconciler's namespace,
 // populates r.boxes, r.specs, and r.warmPools in memory, and returns the count of recovered PodBoxes.
@@ -640,9 +670,18 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 		ctx = context.Background()
 	}
 
+	if r.kubeClient == nil {
+		return 0, nil
+	}
+
 	boxes, err := r.kubeClient.ListPodBoxes(ctx, r.namespace)
 	if err != nil {
 		return 0, fmt.Errorf("failed to list PodBoxes from Kubernetes: %w", err)
+	}
+
+	pools, err := r.kubeClient.ListPodWarmPools(ctx, r.namespace)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list PodWarmPools from Kubernetes: %w", err)
 	}
 
 	r.mu.Lock()
@@ -660,21 +699,35 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 			r.boxes[name] = &st
 			r.specs[name] = box.Spec
 		}
+		if idx := parseWarmIndex(box.Status.PodName); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
 		recovered++
 	}
 
-	// Also sync PodWarmPools from Kubernetes
-	if pools, err := r.kubeClient.ListPodWarmPools(ctx, r.namespace); err == nil {
-		for _, p := range pools {
-			pName := p.Metadata.Name
-			if pName == "" {
-				continue
+	// Sync PodWarmPools from Kubernetes
+	for _, p := range pools {
+		pName := p.Metadata.Name
+		if pName == "" {
+			continue
+		}
+		if pool, exists := r.warmPools[pName]; exists {
+			pool.spec = p.Spec
+		} else {
+			r.warmPools[pName] = &warmPoolState{
+				spec:    p.Spec,
+				entries: make([]*WarmPodEntry, 0),
 			}
-			if _, exists := r.warmPools[pName]; !exists {
-				r.warmPools[pName] = &warmPoolState{
-					spec:    p.Spec,
-					entries: make([]*WarmPodEntry, 0),
-				}
+		}
+	}
+
+	for _, pool := range r.warmPools {
+		for _, entry := range pool.entries {
+			if idx := parseWarmIndex(entry.ID); idx > r.warmCounter {
+				r.warmCounter = idx
+			}
+			if idx := parseWarmIndex(entry.PodName); idx > r.warmCounter {
+				r.warmCounter = idx
 			}
 		}
 	}
