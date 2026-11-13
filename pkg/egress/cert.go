@@ -3,6 +3,7 @@
 package egress
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -14,14 +15,15 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"os"
 	"time"
 )
 
 // CA manages the in-memory root certificate authority used to mint and verify
-// per-sandbox mTLS client certificates.
+// per-sandbox mTLS client certificates and selective MITM server certificates.
 type CA struct {
 	caCert    *x509.Certificate
-	caKey     *ecdsa.PrivateKey
+	caKey     crypto.Signer
 	caCertPEM []byte
 	certPool  *x509.CertPool
 }
@@ -80,6 +82,74 @@ func NewCA() (*CA, error) {
 		caCertPEM: caCertPEM,
 		certPool:  certPool,
 	}, nil
+}
+
+// LoadCA constructs a CA from PEM-encoded certificate and private key bytes.
+func LoadCA(certPEM, keyPEM []byte) (*CA, error) {
+	block, _ := pem.Decode(certPEM)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, errors.New("failed to decode CA certificate PEM")
+	}
+	caCert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse CA certificate: %w", err)
+	}
+
+	keyBlock, _ := pem.Decode(keyPEM)
+	if keyBlock == nil {
+		return nil, errors.New("failed to decode CA private key PEM")
+	}
+
+	var signer crypto.Signer
+	switch keyBlock.Type {
+	case "EC PRIVATE KEY":
+		k, err := x509.ParseECPrivateKey(keyBlock.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse EC private key: %w", err)
+		}
+		signer = k
+	case "RSA PRIVATE KEY":
+		k, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse RSA private key: %w", err)
+		}
+		signer = k
+	case "PRIVATE KEY":
+		k, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse PKCS8 private key: %w", err)
+		}
+		s, ok := k.(crypto.Signer)
+		if !ok {
+			return nil, errors.New("PKCS8 private key does not implement crypto.Signer")
+		}
+		signer = s
+	default:
+		return nil, fmt.Errorf("unsupported CA private key PEM type %q", keyBlock.Type)
+	}
+
+	certPool := x509.NewCertPool()
+	certPool.AddCert(caCert)
+
+	return &CA{
+		caCert:    caCert,
+		caKey:     signer,
+		caCertPEM: certPEM,
+		certPool:  certPool,
+	}, nil
+}
+
+// LoadCAFromFiles loads a CA from PEM-encoded certificate and private key files on disk.
+func LoadCAFromFiles(certPath, keyPath string) (*CA, error) {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA cert %q: %w", certPath, err)
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA key %q: %w", keyPath, err)
+	}
+	return LoadCA(certPEM, keyPEM)
 }
 
 // CACertPEM returns the PEM-encoded root CA certificate.
