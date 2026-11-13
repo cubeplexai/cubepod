@@ -12,10 +12,10 @@ last-updated: "2026-11-13"
 reviewers: []
 approvers: []
 stage: "alpha"
-latest-milestone: "v0.5.0"
+latest-milestone: "v0.4.0"
 milestone:
-  alpha: "v0.5.0"
-  beta: "v0.6.0"
+  alpha: "v0.4.0"
+  beta: "v0.5.0"
   stable: "v1.0.0"
 feature-gates:
   - name: "TransparentEgress"

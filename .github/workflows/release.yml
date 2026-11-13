@@ -27,6 +27,16 @@ jobs:
         with:
           go-version: 'stable'
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Build all binaries
         run: |
           make build
@@ -40,7 +50,7 @@ jobs:
           DIST_DIR="dist"
           mkdir -p ${DIST_DIR}
 
-          for binary in podd-init podd cubepod-controller cubepod-gateway cubepod-egress; do
+          for binary in podd-init podd cubepod-controller cubepod-gateway cubepod-egress cubepod; do
             if [ -f "bin/${binary}" ]; then
               cp "bin/${binary}" "${DIST_DIR}/${binary}-${TAG_NAME}-${ARCH}"
             fi
@@ -48,6 +58,13 @@ jobs:
 
           # Create a unified tarball
           tar -czf "${DIST_DIR}/cubepod-${TAG_NAME}-${ARCH}.tar.gz" -C bin .
+
+          # Build Python SDK wheel & sdist
+          python -m pip install --upgrade pip build
+          python -m build sdks/python --outdir "${DIST_DIR}"
+
+          # Pack TypeScript SDK tarball
+          npm pack ./sdks/typescript --pack-destination "${DIST_DIR}"
 
           # Generate SHA256 checksums
           cd ${DIST_DIR}
@@ -59,9 +76,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG_NAME=${GITHUB_REF#refs/tags/}
-          gh release create "${TAG_NAME}" dist/* \
-            --title "CubePod Release ${TAG_NAME}" \
-            --notes "Release ${TAG_NAME} compiled binaries for linux-amd64." || true
+          if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release upload "${TAG_NAME}" dist/* --clobber
+          else
+            gh release create "${TAG_NAME}" dist/* \
+              --title "CubePod Release ${TAG_NAME}" \
+              --generate-notes
+          fi
 
   publish-images:
     name: Build & Push GHCR Images
