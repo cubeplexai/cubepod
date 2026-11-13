@@ -90,6 +90,7 @@ type Server struct {
 	ca               *egress.CA
 	livePodRouting   bool
 	metrics          *Metrics
+	e2bTemplateAPI   bool
 }
 
 // NewServer constructs a new Gateway Server.
@@ -120,6 +121,28 @@ func (s *Server) LivePodRouting() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.livePodRouting
+}
+
+// SetE2BTemplateAPI enables or disables the E2B-compatible template API feature gate.
+func (s *Server) SetE2BTemplateAPI(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.e2bTemplateAPI = enabled
+	if s.reconciler != nil {
+		s.reconciler.SetE2BTemplateAPI(enabled)
+	}
+}
+
+// E2BTemplateAPIEnabled returns whether the E2B-compatible template API is enabled.
+func (s *Server) E2BTemplateAPIEnabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.e2bTemplateAPI
+}
+
+// EnableE2BTemplateAPI enables the E2B-compatible template API feature gate.
+func (s *Server) EnableE2BTemplateAPI() {
+	s.SetE2BTemplateAPI(true)
 }
 
 // SetWorkspaceBaseDir overrides the base directory for local sandbox workspaces.
@@ -153,10 +176,8 @@ func (s *Server) CA() *egress.CA {
 	return s.ca
 }
 
-// Handler returns the HTTP router for the CubePod Gateway.
-func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-
+// registerCommonRoutes registers all standard endpoints shared across gate states.
+func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	// Control-Plane & Lifecycle routes
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
@@ -221,10 +242,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/Remove", s.handleConnectRPCFilesystemRemove)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/MakeDir", s.handleConnectRPCFilesystemMakeDir)
 
-	// WarmPool & Template routes
+	// WarmPool & OpenAPI routes
 	mux.HandleFunc("POST /warmpools", s.handleCreateWarmPool)
 	mux.HandleFunc("GET /warmpools", s.handleListWarmPools)
-	mux.HandleFunc("GET /templates", s.handleListTemplates)
 	mux.HandleFunc("GET /openapi.yaml", s.handleGetOpenAPI)
 
 	// Host Endpoint & Panel Reverse Proxy routes
@@ -235,6 +255,31 @@ func (s *Server) Handler() http.Handler {
 
 	// Zero-Trust Egress Exchange route
 	mux.HandleFunc("POST /internal/v1/egress/exchange", s.handleEgressExchange)
+}
+
+// Handler returns the HTTP router for the CubePod Gateway.
+func (s *Server) Handler() http.Handler {
+	muxOff := http.NewServeMux()
+	s.registerCommonRoutes(muxOff)
+	muxOff.HandleFunc("GET /templates", s.handleListTemplates)
+
+	muxOn := http.NewServeMux()
+	s.registerCommonRoutes(muxOn)
+	muxOn.HandleFunc("GET /templates", s.handleE2BListTemplates)
+	muxOn.HandleFunc("GET /templates/{templateID}", s.handleGetTemplate)
+	muxOn.HandleFunc("GET /templates/aliases/{alias}", s.handleGetTemplateByAlias)
+	muxOn.HandleFunc("DELETE /templates/{templateID}", s.handleDeleteTemplate)
+	muxOn.HandleFunc("PATCH /templates/{templateID}", s.handlePatchTemplate)
+	muxOn.HandleFunc("PATCH /v2/templates/{templateID}", s.handlePatchTemplateV2)
+	muxOn.HandleFunc("POST /templates", s.handleCreateTemplate)
+	muxOn.HandleFunc("POST /v2/templates", s.handleCreateTemplate)
+	muxOn.HandleFunc("POST /v3/templates", s.handleCreateTemplate)
+	muxOn.HandleFunc("POST /v2/templates/{templateID}/builds/{buildID}", s.handleStartBuild)
+	muxOn.HandleFunc("GET /templates/{templateID}/builds/{buildID}/status", s.handleGetBuildStatus)
+	muxOn.HandleFunc("GET /templates/{templateID}/files/{hash}", s.handleTemplateFiles)
+	muxOn.HandleFunc("PUT /templates/{templateID}/files/{hash}", s.handleBetaStub)
+	muxOn.HandleFunc("GET /templates/{templateID}/builds/{buildID}/logs", s.handleBetaStub)
+	muxOn.HandleFunc("GET /v2/templates", s.handleBetaStub)
 
 	hostRouter := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Subdomain Host Router: inspect r.Host for regex ^([0-9]+)-([a-zA-Z0-9_-]+)\.(.*)$,
@@ -248,7 +293,11 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 		}
-		mux.ServeHTTP(w, r)
+		if s.E2BTemplateAPIEnabled() {
+			muxOn.ServeHTTP(w, r)
+		} else {
+			muxOff.ServeHTTP(w, r)
+		}
 	})
 
 	return s.withMetrics(hostRouter)

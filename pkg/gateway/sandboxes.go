@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
+	"github.com/cubeplexai/cubepod/pkg/controller"
 )
 
 type createSandboxReq struct {
@@ -78,12 +80,46 @@ func pollPoddHealth(ctx context.Context, poddURL string, timeout time.Duration) 
 func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	var req createSandboxReq
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	if req.TemplateID == "" && req.Template_ID != "" {
-		req.TemplateID = req.Template_ID
+
+	var cpuCount = 2
+	var memoryMB = 2048
+	var diskSizeMB = 10240
+
+	if s.E2BTemplateAPIEnabled() {
+		rawTemplateID := req.TemplateID
+		if rawTemplateID == "" && req.Template_ID != "" {
+			rawTemplateID = req.Template_ID
+		}
+		resolved, err := s.reconciler.ResolveTemplate(rawTemplateID)
+		if err != nil {
+			if errors.Is(err, controller.ErrTemplateNotReady) {
+				writeError(w, http.StatusConflict, "template is not ready")
+				return
+			}
+			if errors.Is(err, controller.ErrTemplateNotFound) {
+				writeError(w, http.StatusNotFound, "template not found")
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		cpuCount = int(resolved.CPUCount)
+		memoryMB = int(resolved.MemoryMB)
+		diskSizeMB = int(resolved.DiskSizeMB)
+		if rawTemplateID == "" {
+			req.TemplateID = "base"
+		} else {
+			req.TemplateID = rawTemplateID
+		}
+	} else {
+		if req.TemplateID == "" && req.Template_ID != "" {
+			req.TemplateID = req.Template_ID
+		}
+		if req.TemplateID == "" || req.TemplateID == "base" || req.TemplateID == "code-interpreter" || req.TemplateID == "code-interpreter-v1" || req.TemplateID == "python" {
+			req.TemplateID = "cubeplex-ubuntu24-desktop"
+		}
 	}
-	if req.TemplateID == "" || req.TemplateID == "base" || req.TemplateID == "code-interpreter" || req.TemplateID == "code-interpreter-v1" || req.TemplateID == "python" {
-		req.TemplateID = "cubeplex-ubuntu24-desktop"
-	}
+
 	timeoutSecs := req.Timeout
 	if timeoutSecs <= 0 {
 		timeoutSecs = 1800
@@ -133,6 +169,14 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
+		if errors.Is(err, controller.ErrTemplateNotReady) {
+			writeError(w, http.StatusConflict, "template is not ready")
+			return
+		}
+		if errors.Is(err, controller.ErrTemplateNotFound) {
+			writeError(w, http.StatusNotFound, "template not found")
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -159,9 +203,9 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		EnvdVersion:      "1.1.0",
 		StartedAt:        now,
 		EndAt:            endAt,
-		CPUCount:         2,
-		MemoryMB:         2048,
-		DiskSizeMB:       10240,
+		CPUCount:         cpuCount,
+		MemoryMB:         memoryMB,
+		DiskSizeMB:       diskSizeMB,
 		State:            string(status.Phase),
 		Reason:           status.Reason,
 		EnvdPort:         49983,
