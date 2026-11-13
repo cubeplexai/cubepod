@@ -6,7 +6,7 @@ owning-area: "egress"
 participating-areas:
   - "controller"
   - "gateway"
-status: "implementable"
+status: "implemented"
 creation-date: "2026-11-13"
 last-updated: "2026-11-13"
 reviewers: []

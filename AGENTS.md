@@ -19,6 +19,7 @@ CubePod is an open-source, cloud-native **Persistent Writable RootFS MicroVM Exe
 | [`cmd/cubepod-egress/`](cmd/cubepod-egress/main.go) & [`pkg/egress/`](pkg/egress/) | Zero-Trust mTLS `cpodref_` secret vault and egress forward proxy sidecar | Go |
 | [`cmd/cubepod/`](cmd/cubepod/main.go) & [`pkg/client/`](pkg/client/) | Official Go Client SDK and `cubepod` CLI | Go |
 | [`sdks/python/`](sdks/python/) | Sync & Async Python SDK (`cubepod`) | Python 3.11+ (`httpx`) |
+| [`sdks/typescript/`](sdks/typescript/) | Official Zero-Dependency TypeScript / Node.js SDK (`@cubeplex/cubepod`) | TypeScript 5+ (`fetch` / Node 20+) |
 | [`deploy/`](deploy/) | Production Helm chart (`deploy/helm/cubepod`), K8s manifests (`deploy/k8s`), and local `docker-compose` | Helm / K8s / Docker |
 
 ---
