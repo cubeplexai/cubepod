@@ -132,3 +132,4 @@ make test-e2e
 ```
 
 - **Conventional Commits**: Use `type(scope): imperative summary` (e.g., `feat(podd-init): ...`, `docs(cep): ...`).
+- **Module-Aligned File Naming**: Name source and test files strictly after their code module or domain capability (e.g., `manifests_test.go`, `reconciler_test.go`, `desktop_test.go`). Never name code or test files after CEP, PR, or issue numbers (e.g., `cep0020_test.go`).
