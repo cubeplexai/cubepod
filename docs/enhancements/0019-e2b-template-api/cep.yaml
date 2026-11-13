@@ -7,11 +7,13 @@ participating-areas:
   - "controller"
   - "runtime"
   - "sdk"
-status: "provisional"
+status: "implementable"
 creation-date: "2026-11-12"
-last-updated: "2026-11-12"
-reviewers: []
-approvers: []
+last-updated: "2026-11-13"
+reviewers:
+  - "@cubepod-maintainers"
+approvers:
+  - "@cubepod-maintainers"
 stage: "alpha"
 latest-milestone: "v0.4.0"
 milestone:

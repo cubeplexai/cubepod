@@ -3,12 +3,12 @@
 | Field | Value |
 | :--- | :--- |
 | **CEP Number** | `0019` |
-| **Status** | `provisional` (`alpha`) |
+| **Status** | `implementable` (`alpha`) |
 | **Owning Area** | `gateway` |
 | **Participating Areas** | `controller`, `runtime`, `sdk` |
 | **Authors** | @cubepod-maintainers |
 | **Created** | 2026-11-12 |
-| **Last Updated** | 2026-11-12 |
+| **Last Updated** | 2026-11-13 |
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
@@ -42,12 +42,12 @@
 
 ## Release Signoff Checklist
 
-- [ ] Enhancement scope, Goals, and Non-Goals are agreed upon (`provisional` -> `implementable`)
-- [ ] API / CRD (`cubepod.io/v1alpha1` `PodTemplate`) and E2B template OpenAPI changes are specified
-- [ ] Dual-runtime behavior (Kubernetes Kata + CSI Block AND Local Docker Loopback) is defined
-- [ ] Security boundary (rootless BuildKit, registry credentials stay out of image layers and out of the sandbox, UID 1000 default, `/workspace` untouched) is reviewed
-- [ ] Test plan includes unit tests (`go test`) and a pinned `e2b` SDK conformance test
-- [ ] Production Readiness Review (PRR) section is complete
+- [x] Enhancement scope, Goals, and Non-Goals are agreed upon (`provisional` -> `implementable`)
+- [x] API / CRD (`cubepod.io/v1alpha1` `PodTemplate`) and E2B template OpenAPI changes (`api/openapi/cubepod-v1.yaml`) are specified
+- [x] Dual-runtime behavior (Kubernetes Kata + CSI Block AND Local Docker Loopback) is defined
+- [x] Security boundary (rootless BuildKit, registry credentials stay out of image layers and out of the sandbox, UID 1000 default, `/workspace` untouched) is reviewed
+- [x] Test plan includes unit tests (`go test`) and a pinned `e2b` SDK conformance test
+- [x] Production Readiness Review (PRR) section is complete
 
 ---
 
@@ -222,9 +222,15 @@ type PodTemplateStatus struct {
     LatestBuildID string `json:"latestBuildID,omitempty"`
     // BuildStatus is the E2B enum for LatestBuildID:
     // waiting, building, uploaded, ready, error.
-    BuildStatus string `json:"buildStatus,omitempty"`
-    Reason      string `json:"reason,omitempty"`
-    Public      bool   `json:"public,omitempty"`
+    BuildStatus   string `json:"buildStatus,omitempty"`
+    Reason        string `json:"reason,omitempty"`
+    FailedStep    string `json:"failedStep,omitempty"`
+    Public        bool   `json:"public,omitempty"`
+    BuildCount    int64  `json:"buildCount,omitempty"`
+    SpawnCount    int64  `json:"spawnCount,omitempty"`
+    CreatedAt     string `json:"createdAt,omitempty"`
+    UpdatedAt     string `json:"updatedAt,omitempty"`
+    LastSpawnedAt string `json:"lastSpawnedAt,omitempty"`
 }
 
 // PodTemplate is the cluster object. The shape matches PodBox in this package.
@@ -254,27 +260,31 @@ Printer columns: `Image` (`.status.readyImage`), `Build` (`.status.buildStatus`)
 
 #### Alias index
 
-The controller indexes `status.templateID`, `metadata.name`, and every `spec.names` entry. A second template that claims an existing name is rejected with 409. The index is rebuilt from the API list on controller start.
+The controller indexes `status.templateID`, `metadata.name`, and every `spec.names` entry. The primary template name is stored in annotation `cubepod.io/primary-name`. When `POST /v3/templates` targets an already-existing template with the same primary name:
+- If `status.buildStatus == "building"`, the request is rejected with `409 Conflict` (`build already in progress`).
+- Otherwise `POST /v3/templates` **reuses `status.templateID`**, allocates a new `buildID`, sets `status.buildStatus = "waiting"`, updates requested sizing/commands, **keeps `status.readyImage` and `status.readyBuildID` intact** until the new build reaches `ready`, and returns `202 Accepted`.
+
+A request for a *different* raw name that collides on a `spec.names` entry or normalizes to an existing `metadata.name` slug (when `cubepod.io/primary-name` differs) is rejected with `409 Conflict`. The index is rebuilt from the API list on controller start.
 
 #### Routes
 
-Alpha and Beta share the catalog. Rows marked Beta return **501** `template build is not enabled` in Alpha, with body `{"code":501,"message":"..."}`.
+Alpha and Beta share the catalog. Rows marked Beta return **501** `template build is not enabled` when `--template-build=false`, with body `{"code":501,"message":"..."}`. All E2B routes documented below are also specified in [`api/openapi/cubepod-v1.yaml`](../../../api/openapi/cubepod-v1.yaml).
 
 | Phase | Method | Path | Behavior |
 | :--- | :--- | :--- | :--- |
-| Alpha | `GET` | `/templates` | JSON array of E2B template objects. Query `teamID` is ignored. More than 5000 ready-or-latest rows returns 400, matching E2B's v1 cap. |
-| Alpha | `GET` | `/templates/{templateID}` | One template plus its latest build in `builds`. Unknown id returns 404. |
-| Alpha | `GET` | `/templates/aliases/{alias}` | 200 with the same object when the alias exists, 404 when it does not. |
-| Alpha | `DELETE` | `/templates/{templateID}` | Deletes the CR when nothing references it. 409 when a live PodBox or WarmPool references it. `?force=true` deletes the CR anyway and does not delete volumes. |
-| Alpha | `PATCH` | `/templates/{templateID}` and `/v2/templates/{templateID}` | Body `{"public":true}`. Response `{"names":[...]}` for the v2 route. |
-| Alpha | `POST` | `/templates`, `/v2/templates`, `/v3/templates` | Create. 202 and the v3 response shape below. `Idempotency-Key` is honored in Beta; Alpha stores the key on the CR and replays the same 202 when the body hash matches. |
-| Alpha | `POST` | `/v2/templates/{templateID}/builds/{buildID}` | Start build. Empty `steps` and a `fromImage` or `fromTemplate` marks the build `ready` without BuildKit. Non-empty `steps` is Beta. |
-| Beta | `GET` | `/templates/{templateID}/files/{hash}` | 201 `{"present":bool,"url":"...","headers":{}}`. `present: true` when that tar is already stored. |
-| Beta | `PUT` | the `url` returned above | Tar body, gzip-compressed when the SDK default applies. Gateway streams it to the controller. |
-| Beta | `GET` | `/templates/{templateID}/builds/{buildID}/status` | `{logs, logEntries, templateID, buildID, status, reason}`. Query `logsOffset` (entry index, not a byte offset), `limit` (default 100, max 100), `level`. CR `uploaded` is returned as `building`. |
-| Beta | `GET` | `/templates/{templateID}/builds/{buildID}/logs` | `{logs:[{timestamp, message, level}]}`. Query `cursor`, `limit`, `direction`, `level`. |
-| Beta | `GET` | `/v2/templates` | Same objects as v1, with `nextToken` pagination, page size 100. |
-| Stable | `POST` / `DELETE` / `GET` | E2B tag routes under `/tags` | Assign, delete, and list tags. Alpha and Beta encode tags as `spec.names` entries of the form `name:tag` on the create body (`name`, `tags`). |
+| Alpha | `GET` | `/templates` | 200 JSON array of E2B template objects. Query `teamID` is ignored. More than 5000 ready-or-latest rows returns 400, matching E2B's v1 cap. |
+| Alpha | `GET` | `/templates/{templateID}` | 200 `TemplateWithBuilds` (`builds[]` entries include `buildID`, `status`, `createdAt`, `updatedAt`, `cpuCount`, `memoryMB`). Unknown id returns 404. |
+| Alpha | `GET` | `/templates/aliases/{alias}` | 200 with the template object when the alias exists, 404 when it does not. |
+| Alpha | `DELETE` | `/templates/{templateID}` | 204 No Content when unreferenced and not `building`. 409 when `buildStatus == "building"` or a non-terminated `PodBox` or `PodWarmPool` references it. `?force=true` deletes the CR anyway and does not delete volumes. |
+| Alpha | `PATCH` | `/templates/{templateID}` and `/v2/templates/{templateID}` | 200. Body `{"public":true\|false}`. Response `{"names":[...]}` for the v2 route. |
+| Alpha | `POST` | `/templates`, `/v2/templates`, `/v3/templates` | Create or request rebuild. 202 and the v3 response shape below. `Idempotency-Key` is honored in Beta; Alpha stores the key on the CR and replays the same 202 when the body hash matches. |
+| Alpha | `POST` | `/v2/templates/{templateID}/builds/{buildID}` | 202 Accepted. Validates request synchronously (`400`/`404`/`409`/`501`). Empty `steps` + empty `readyCmd` with `fromImage` or `fromTemplate` marks the build `ready` without BuildKit. Non-empty `steps` or `readyCmd` runs asynchronously in background. |
+| Alpha | `GET` | `/templates/{templateID}/builds/{buildID}/status` | 200 `{logs, logEntries, templateID, buildID, status, reason?}`. `reason` is **omitted** (`omitempty`) when healthy/in-progress and serialized as an object `{"message": string, "step"?: string, "logEntries"?: [...]}` (`BuildStatusReason`) when `status == "error"`. Query `logsOffset` (entry index), `limit` (default 100, max 100), `level`. CR `uploaded` is returned as `building`. Unknown `templateID`/`buildID` returns 404. |
+| Alpha/Beta | `GET` | `/v2/templates` | 200 JSON array of E2B template objects with `limit` and `nextToken` cursor pagination (page size 100). Pagination cursor is returned in response header `X-Next-Token`. |
+| Beta | `GET` | `/templates/{templateID}/files/{hash}` | 201 `{"present":bool,"url":"<absolute-http(s)-url>","headers":{}}`. `present: true` when that tar is already stored. `url` MUST be an absolute URL because the `e2b` SDK uploads with a standalone `httpx.Client`. |
+| Beta | `PUT` | the `url` returned above | 201 Created. Tar body, gzip-compressed when the SDK default applies. Gateway forwards it to the controller when `--controller-url` is configured. |
+| Beta | `GET` | `/templates/{templateID}/builds/{buildID}/logs` | 200 `{logs:[{timestamp, message, level}]}`. Query `cursor`, `limit`, `direction`, `level`. |
+| Stable | `POST` / `DELETE` / `GET` | `/templates/tags` and `/templates/{templateID}/tags` | Assign (`201`), delete (`204`), and list (`200`) tags. Alpha and Beta also encode tags as `spec.names` entries of the form `name:tag` on the create body (`name`, `tags`). |
 
 `POST /v3/templates` request (the fields the SDK sends):
 
@@ -483,7 +493,7 @@ Rules:
 
 | Step `type` | Dockerfile | Notes |
 | :--- | :--- | :--- |
-| `ENV` | none | `args` is a list of key, value, key, value. An odd length returns 400. Values are accumulated and prefixed on later `RUN` lines as `KEY=VAL`. Not an image `ENV`. |
+| `ENV` | none | `args` is a list of key, value, key, value. An odd length returns 400. Values are tracked in an ordered map (later keys override earlier keys), POSIX single-quote escaped, and prefixed onto later `RUN` lines as `export KEY='VAL'; ` so compound `cmd1 && cmd2` invocations and values with spaces work without emitting an image `ENV`. |
 | `WORKDIR` | `WORKDIR` | A value of `/workspace` or a path under it returns 400. |
 | `USER` | `USER` | The arg is copied unchanged. `1000` sets `runAsUser`. `0` sets `runAsUser` to 0. `1000:1000` sets `runAsUser` and `runAsGroup`. Any other token sets `runAsUsername` and leaves the pointers nil. |
 | `COPY` / `ADD` | `COPY` | `args[0]` is the source inside the tar, `args[1]` is the destination. Non-empty `args[2]` becomes `--chown`. Non-empty `args[3]` becomes `--chmod` and must match `^[0-7]{3,4}$`. Missing tar returns 400 before the build starts. A destination of `/workspace` or a path under it returns 400. |
@@ -524,7 +534,7 @@ Warm-pool create uses the same resolver. A pool bound to a template that is not 
 
 - Catalog state is the `PodTemplate` CR in the workload namespace.
 - Alpha from-image registration does not start a pod. The next sandbox Pod uses `spec.image` / `status.readyImage` as the container image. containerd pulls it. `podd-init` mounts the new `rootfs-pvc` block device as the OverlayFS upper and mounts `workspace-pvc` on `/workspace`. Neither volume is copied from the template.
-- Beta runs the BuildKit Deployment described in [Where the builder runs](#where-the-builder-runs). The controller streams the context from the RWO PVC `cubepod-template-context`, mounted only by the controller. Gateway uploads go to `POST /internal/v1/template-builds/context/{hash}` on the controller, the same style as `/internal/v1/egress/exchange`. The body is gunzipped when it starts with the gzip magic `1f 8b`. Anything that is neither gzip nor a tar returns 400 and is not stored. A second body whose bytes differ from the stored tar returns 409.
+- Beta runs the BuildKit Deployment described in [Where the builder runs](#where-the-builder-runs). The controller streams the context from the RWO PVC `cubepod-template-context`, mounted only by the controller. When Gateway runs separately (`--controller-url`), Gateway forwards context checks/uploads, build triggers, and build log reads to the controller (`HEAD`/`PUT /internal/v1/template-builds/context/{hash}`, `POST /internal/v1/template-builds/{templateID}/{buildID}/start`, `GET /internal/v1/template-builds/{buildID}/logs`), the same style as `/internal/v1/egress/exchange`. The body is gunzipped when it starts with the gzip magic `1f 8b`. Anything that is neither gzip nor a tar returns 400 and is not stored. A second body whose bytes differ from the stored tar returns 409.
 - While `templateBuild.enabled=true`, the controller Deployment is `replicas: 1` because the context PVC is RWO. Stable removes this cap by storing tars in an object store.
 - The pushed image reference is `<registry>/cubepod-templates/<slug>:<buildID>`. BuildKit pushes it with `templateBuild.registry.pushSecret`. Sandbox Pods and the probe Pod list `templateBuild.registry.pullSecret` under `imagePullSecrets`. That pull Secret is created by the cluster install, not by the build request, and the controller does not delete it. `fromImageRegistry` is a different, build-scoped Secret used only to pull the base image. It is not attached to sandbox Pods.
 - The ready probe is a short-lived runc Pod, not a Kata PodBox. It uses the new image, an `emptyDir` for writable space, no `rootfs-pvc`, and no `workspace-pvc`. The probe command starts `startCmd` in the background and polls `readyCmd` against localhost. The controller deletes the Pod when the probe finishes. A probe failure does not allocate a CSI volume.
@@ -658,6 +668,7 @@ When `status.readyImage` changes, the controller deletes unclaimed warm-pool ent
 - 2026-11-12: Proposal drafted (`provisional`). Prior art reviewed against the E2B OpenAPI on `docs.e2b.dev`, the E2B template manager in `e2b-dev/infra`, BuildKit, `kubernetes-sigs/agent-sandbox` `SandboxTemplate`, and Docker Sandboxes OCI templates.
 - 2026-11-12: Review revisions. Source-pull credentials are build-scoped. The template registry pull Secret stays on sandbox Pods. Template steps must not use `/workspace`, and no other directory is prescribed. `PodTemplate` and `PodTemplateList` are specified, and the in-memory map is filled from the CRD. A new `readyImage` retires unclaimed warm standbys. An empty `templateID` becomes `base`. `startCmd` logs, reaping, and the create-time 503 are specified. Local builds are driven by the in-process reconciler through `pkg/runtime`. `podd` is not a feature-gate component. `GET /templates/{templateID}/files/{hash}` stays **201**, which is the status in the E2B OpenAPI.
 - 2026-11-12: Builder placement and SDK step translation. The builder is one runc Deployment in `cubepod-system`, not a per-build Job. Controller restart fails the in-flight solve and leaves the daemon and cache PVC in place. `filesHash` is the SDK's content hash, and the upload body is a gzip tar. HTTP status reports the internal `uploaded` phase as `building`, because the JS SDK stops polling on any other value. `COPY` steps share one BuildKit context, unpacked under the hash prefix. `USER 0` is root.
+- 2026-11-13: Wire contract review amendments (`implementable`). Clarified `BuildStatusReason` object shape (`reason` omitted when empty, `{"message", "step"}` on `error`), same-name rebuild reuse of `templateID` in `POST /v3/templates`, Alpha inclusion of `GET .../status`, POSIX single-quoted `export KEY='VAL'; ` prefix for build-time `ENV`, `202`/`204`/`201` status codes, `TemplateWithBuilds` fields, `PodTemplateStatus` counters, and controller internal build/context endpoints (`HEAD`/`PUT /internal/v1/template-builds/context/{hash}`, `POST /internal/v1/template-builds/{templateID}/{buildID}/start`, `GET /internal/v1/template-builds/{buildID}/logs`). Synced OpenAPI spec in [`api/openapi/cubepod-v1.yaml`](../../../api/openapi/cubepod-v1.yaml).
 
 ---
 
