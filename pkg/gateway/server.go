@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -357,8 +358,10 @@ func (s *Server) handleCreateWarmPool(w http.ResponseWriter, r *http.Request) {
 		Replicas:    replicas,
 	}
 
-	if _, syncErr := s.reconciler.SyncFromKube(r.Context()); syncErr != nil {
-		slog.Warn("SyncFromKube failed before ReconcileWarmPool", "pool", name, "err", syncErr)
+	if _, syncErr := s.reconciler.SyncFromKube(r.Context()); syncErr != nil && !errors.Is(syncErr, controller.ErrCRDNotInstalled) {
+		slog.Error("SyncFromKube failed before ReconcileWarmPool", "pool", name, "err", syncErr)
+		http.Error(w, "failed to sync cluster state before creating warm pool: "+syncErr.Error(), http.StatusInternalServerError)
+		return
 	}
 
 	status, err := s.reconciler.ReconcileWarmPool(r.Context(), name, spec)

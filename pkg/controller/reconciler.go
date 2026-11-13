@@ -264,12 +264,56 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 		if idx := parseWarmIndex(entry.PodName); idx > r.warmCounter {
 			r.warmCounter = idx
 		}
+		if idx := parseWarmIndex(entry.RootfsPVCName); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
+		if idx := parseWarmIndex(entry.WorkspacePVCName); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
+	}
+	for _, box := range r.boxes {
+		if box == nil {
+			continue
+		}
+		if idx := parseWarmIndex(box.PodName); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
+		if idx := parseWarmIndex(box.RootfsPVCName); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
+		if idx := parseWarmIndex(box.WorkspacePVCName); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
 	}
 
 	// Scale up if needed.
 	if currentAvail < spec.Replicas {
 		for attempts := 0; currentAvail < spec.Replicas && attempts < int(spec.Replicas)*3; attempts++ {
 			r.warmCounter++
+			for {
+				entryID := fmt.Sprintf("%s-warm-%d", poolName, r.warmCounter)
+				rootfsName := entryID + "-rootfs-pvc"
+				wsName := entryID + "-workspace-pvc"
+				conflict := false
+				for _, b := range r.boxes {
+					if b != nil && (b.RootfsPVCName == rootfsName || b.WorkspacePVCName == wsName) {
+						conflict = true
+						break
+					}
+				}
+				if !conflict {
+					for _, entry := range pool.entries {
+						if entry != nil && (entry.ID == entryID || entry.RootfsPVCName == rootfsName || entry.WorkspacePVCName == wsName) {
+							conflict = true
+							break
+						}
+					}
+				}
+				if !conflict {
+					break
+				}
+				r.warmCounter++
+			}
 			entryID := fmt.Sprintf("%s-warm-%d", poolName, r.warmCounter)
 			warmBoxSpec := v1alpha1.PodBoxSpec{
 				TemplateRef:      spec.TemplateRef,
@@ -837,6 +881,12 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 		if idx := parseWarmIndex(box.Status.PodName); idx > r.warmCounter {
 			r.warmCounter = idx
 		}
+		if idx := parseWarmIndex(box.Status.RootfsPVCName); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
+		if idx := parseWarmIndex(box.Status.WorkspacePVCName); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
 		recovered++
 	}
 
@@ -944,6 +994,26 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 			if idx := parseWarmIndex(entry.PodName); idx > r.warmCounter {
 				r.warmCounter = idx
 			}
+			if idx := parseWarmIndex(entry.RootfsPVCName); idx > r.warmCounter {
+				r.warmCounter = idx
+			}
+			if idx := parseWarmIndex(entry.WorkspacePVCName); idx > r.warmCounter {
+				r.warmCounter = idx
+			}
+		}
+	}
+	for _, box := range r.boxes {
+		if box == nil {
+			continue
+		}
+		if idx := parseWarmIndex(box.PodName); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
+		if idx := parseWarmIndex(box.RootfsPVCName); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
+		if idx := parseWarmIndex(box.WorkspacePVCName); idx > r.warmCounter {
+			r.warmCounter = idx
 		}
 	}
 
@@ -1219,4 +1289,11 @@ func (r *Reconciler) SetPoolCreatedAt(name string, t time.Time) {
 	if pool, ok := r.warmPools[name]; ok {
 		pool.createdAt = t
 	}
+}
+
+// WarmCounter returns the current warm replica counter.
+func (r *Reconciler) WarmCounter() int64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.warmCounter
 }
