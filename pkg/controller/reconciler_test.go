@@ -963,13 +963,13 @@ func TestReconciler_ClaimWarmPod_PatchFailureSkipsPod(t *testing.T) {
 		t.Fatalf("ReconcileWarmPool failed: %v", err)
 	}
 
-	pods, err := memKube.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=patch-fail-pool")
-	if err != nil || len(pods) != 2 {
-		t.Fatalf("expected 2 pods in kubeClient, got %d (err: %v)", len(pods), err)
+	entries := r.GetWarmPoolEntries("patch-fail-pool")
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 warm pool entries, got %d", len(entries))
 	}
 
-	pod1 := pods[0].Name
-	pod2 := pods[1].Name
+	pod1 := entries[0].PodName
+	pod2 := entries[1].PodName
 
 	// Inject failure on pod1
 	failingKube.failPodNames[pod1] = true
@@ -1462,19 +1462,22 @@ func TestReconciler_ClaimWarmPod_CASFailureMarksOtherReplica(t *testing.T) {
 		t.Fatalf("ReconcileWarmPool failed: %v", err)
 	}
 
-	pods, err := memKube.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=cas-test-pool")
-	if err != nil || len(pods) != 2 {
-		t.Fatalf("expected 2 pods, got %d", len(pods))
+	entries := r.GetWarmPoolEntries("cas-test-pool")
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 warm pool entries, got %d", len(entries))
 	}
 
+	pod1 := entries[0].PodName
+	pod2 := entries[1].PodName
+
 	// Inject CAS failure on first pod
-	failingKube.failPodNames[pods[0].Name] = true
+	failingKube.failPodNames[pod1] = true
 
 	claimed, err := r.ClaimWarmPod(ctx, "cas-test-pool", "claimer-box")
 	if err != nil {
 		t.Fatalf("ClaimWarmPod failed: %v", err)
 	}
-	if claimed.PodName != pods[1].Name {
+	if claimed.PodName != pod2 {
 		t.Fatalf("expected pod2 to be claimed, got: %s", claimed.PodName)
 	}
 
@@ -1508,19 +1511,22 @@ func TestReconciler_ClaimWarmPod_TransientErrorLeavesUnclaimedForRetry(t *testin
 		t.Fatalf("ReconcileWarmPool failed: %v", err)
 	}
 
-	pods, err := memKube.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=transient-pool")
-	if err != nil || len(pods) != 2 {
-		t.Fatalf("expected 2 pods, got %d", len(pods))
+	entries := r.GetWarmPoolEntries("transient-pool")
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 warm pool entries, got %d", len(entries))
 	}
 
+	pod1 := entries[0].PodName
+	pod2 := entries[1].PodName
+
 	// Inject transient failure on pod1 (NOT ErrCASConflict)
-	failingKube.failPodNames[pods[0].Name] = true
+	failingKube.failPodNames[pod1] = true
 
 	claimed, err := r.ClaimWarmPod(ctx, "transient-pool", "claimer-box")
 	if err != nil {
 		t.Fatalf("ClaimWarmPod failed: %v", err)
 	}
-	if claimed.PodName != pods[1].Name {
+	if claimed.PodName != pod2 {
 		t.Fatalf("expected pod2 to be claimed, got: %s", claimed.PodName)
 	}
 
