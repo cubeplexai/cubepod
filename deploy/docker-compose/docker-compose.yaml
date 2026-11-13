@@ -5,6 +5,7 @@ services:
       dockerfile: images/gateway/Dockerfile
     ports:
       - "8080:8080"
+    command: ["/usr/local/bin/cubepod-gateway", "-addr=:8080", "--e2b-template-api=false", "--template-build=false"]
     environment:
       - CUBEPOD_RUNTIME_MODE=docker-loopback
     volumes:
@@ -17,7 +18,7 @@ services:
       dockerfile: images/controller/Dockerfile
     ports:
       - "8081:8081"
-    command: ["/usr/local/bin/cubepod-controller", "-addr=:8081"]
+    command: ["/usr/local/bin/cubepod-controller", "-addr=:8081", "--e2b-template-api=false", "--template-build=false"]
 
   cubepod-egress:
     build:

@@ -24,6 +24,11 @@ spec:
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
           args:
             - "--addr=:{{ .Values.gateway.port }}"
+            - "--e2b-template-api={{ .Values.featureGates.e2bTemplateAPI }}"
+            - "--template-build={{ .Values.templateBuild.enabled }}"
+            {{- if .Values.templateBuild.enabled }}
+            - "--buildkit-addr={{ .Values.templateBuild.buildkit.address }}"
+            {{- end }}
           env:
             {{- if .Values.gateway.panelSecret }}
             - name: CUBEPOD_PANEL_SECRET

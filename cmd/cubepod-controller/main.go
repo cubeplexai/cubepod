@@ -16,16 +16,20 @@ import (
 
 func main() {
 	var (
-		namespace    = flag.String("namespace", "cubepod-workloads", "Kubernetes namespace for PodBox workloads")
-		addr         = flag.String("addr", ":8081", "HTTP server address for health and metrics")
-		syncInterval = flag.Duration("sync-interval", 5*time.Second, "Reconcile background loop sync interval")
-		kubeAPI      = flag.String("kube-api", "", "Kubernetes API Server URL (empty to auto-detect from in-cluster / env)")
-		kubeToken    = flag.String("kube-token", "", "Kubernetes API Bearer token")
-		storageClass = flag.String("storage-class", "nfs-storage", "Default StorageClass name")
-		volumeMode   = flag.String("volume-mode", "Filesystem", "Storage volume mode (Block or Filesystem)")
-		runtimeClass = flag.String("runtime-class", "", "Container runtime class name (empty for standard runc/containerd)")
-		poddImage    = flag.String("podd-image", "hub.sensedeal.vip/library/cubepod-podd:v0.3.0-k8s", "Image for podd-installer initContainer")
-		sandboxImage = flag.String("sandbox-image", "hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917", "Default sandbox image")
+		namespace      = flag.String("namespace", "cubepod-workloads", "Kubernetes namespace for PodBox workloads")
+		addr           = flag.String("addr", ":8081", "HTTP server address for health and metrics")
+		syncInterval   = flag.Duration("sync-interval", 5*time.Second, "Reconcile background loop sync interval")
+		kubeAPI        = flag.String("kube-api", "", "Kubernetes API Server URL (empty to auto-detect from in-cluster / env)")
+		kubeToken      = flag.String("kube-token", "", "Kubernetes API Bearer token")
+		storageClass   = flag.String("storage-class", "nfs-storage", "Default StorageClass name")
+		volumeMode     = flag.String("volume-mode", "Filesystem", "Storage volume mode (Block or Filesystem)")
+		runtimeClass   = flag.String("runtime-class", "", "Container runtime class name (empty for standard runc/containerd)")
+		poddImage      = flag.String("podd-image", "hub.sensedeal.vip/library/cubepod-podd:v0.3.0-k8s", "Image for podd-installer initContainer")
+		sandboxImage   = flag.String("sandbox-image", "hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917", "Default sandbox image")
+		e2bTemplateAPI = flag.Bool("e2b-template-api", false, "Enable E2B template API feature gate")
+		templateBuild  = flag.Bool("template-build", false, "Enable template image build Beta pipeline")
+		buildkitAddr   = flag.String("buildkit-addr", "", "BuildKit daemon gRPC address (e.g. tcp://cubepod-buildkit:1234)")
+		stateDir       = flag.String("state-dir", "", "State directory for template contexts and logs")
 	)
 	flag.Parse()
 
@@ -40,6 +44,10 @@ func main() {
 		"runtimeClass", *runtimeClass,
 		"poddImage", *poddImage,
 		"sandboxImage", *sandboxImage,
+		"e2bTemplateAPI", *e2bTemplateAPI,
+		"templateBuild", *templateBuild,
+		"buildkitAddr", *buildkitAddr,
+		"stateDir", *stateDir,
 	)
 
 	var kubeClient controller.KubeClient
@@ -51,15 +59,19 @@ func main() {
 		kubeClient = controller.NewMemoryKubeClient()
 	}
 
-	reconciler := controller.NewReconciler(
-		controller.WithKubeClient(kubeClient),
-		controller.WithNamespace(*namespace),
-		controller.WithVolumeMode(*volumeMode),
-		controller.WithDefaultStorageClass(*storageClass),
-		controller.WithDefaultRuntimeClass(*runtimeClass),
-		controller.WithPoddInjectorImage(*poddImage),
-		controller.WithDefaultSandboxImage(*sandboxImage),
-	)
+	reconciler := controller.NewProcessReconciler(controller.ProcessConfig{
+		KubeClient:          kubeClient,
+		Namespace:           *namespace,
+		VolumeMode:          *volumeMode,
+		DefaultStorageClass: *storageClass,
+		DefaultRuntimeClass: *runtimeClass,
+		PoddInjectorImage:   *poddImage,
+		DefaultSandboxImage: *sandboxImage,
+		E2BTemplateAPI:      *e2bTemplateAPI,
+		TemplateBuild:       *templateBuild,
+		BuildKitAddr:        *buildkitAddr,
+		StateDir:            *stateDir,
+	})
 
 	mgr := controller.NewControllerManager(reconciler, *addr, *syncInterval)
 
