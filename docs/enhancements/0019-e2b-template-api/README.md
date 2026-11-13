@@ -24,6 +24,7 @@
 - [Design Details](#design-details)
   - [API / CRD / Wire Changes](#api--crd--wire-changes)
   - [Architecture & State Machine](#architecture--state-machine)
+  - [Where the builder runs](#where-the-builder-runs)
   - [BuildKit translation](#buildkit-translation)
   - [Sandbox resolution](#sandbox-resolution)
   - [Dual-Runtime Behavior (K8s Kata vs. Local Docker)](#dual-runtime-behavior-k8s-kata-vs-local-docker)
@@ -89,10 +90,11 @@ Workarounds that are not enough:
 - Baking `podd-init`, `podd`, or `envd` into the template image.
 - Turning a live sandbox into a template (`docker commit`, CSI snapshot of the upper). E2B treats that as a sandbox snapshot, which CEP-0018 already distinguishes from a template. A later CEP can cover it.
 - Multi-tenant `teamID`, cross-project public templates, and E2B tag-group pagination. The deprecated `teamID` field is accepted and ignored. `public` is stored and returned.
-- Dockerfile instructions E2B itself skips (`EXPOSE`, `VOLUME`, `ARG` build-args beyond the cache-bust this CEP inserts).
+- Dockerfile instructions E2B itself skips (`EXPOSE`, `VOLUME`, `ARG` build-args beyond the cache-bust this CEP inserts). An incoming step whose `type` is `ARG` returns 400. The only `ARG` line in the rendered Dockerfile is the cache-bust this CEP inserts.
 - Multi-architecture images. Builds target the node's amd64 userspace, which is the Kata guest architecture this cluster runs.
 - Replacing `cubepod` SDK template helpers. They gain the new calls. The official `e2b` SDK remains the conformance client.
 - A highly available builder. Beta runs a single builder replica. Shared object storage for context tars is a Stable item.
+- mTLS on the BuildKit port. Beta allows only the controller to connect, through a NetworkPolicy. The Service is not published outside the cluster.
 
 ---
 
@@ -141,12 +143,15 @@ As a developer running `docker-compose`, I want the same API to `docker build` i
 - Kubernetes object names are DNS-1123. An alias such as `ubuntu:24.04` or `my-template:v1` cannot be `metadata.name`. The object name is a slug (`ubuntu-24-04`). The E2B name and tags live in `spec.names`. Lookup is by `status.templateID`, `metadata.name`, or any entry in `spec.names`.
 - `GET /templates` in the E2B API returns a JSON array, not an object. Official clients will not read `{"templates":[...]}`. The feature gate switches this response. With the gate off, the handler stays the current stub so existing gateway tests keep passing.
 - E2B `diskSizeMB` on the template resource is an output. The input that sizes the disk is `minFreeDiskMb` on `POST /v3/templates` ([Build](https://docs.e2b.dev/template/build)). CubePod does not grow an ext4 image inside BuildKit. It sets `spec.storage.rootfsSize` to at least `minFreeDiskMb` (MiB converted to a Kubernetes quantity, minimum `10Gi`) on the per-sandbox upper block device. `workspaceSize` stays on its own field and defaults to `20Gi`.
-- `COPY` steps require a context tar whose SHA-256 is `filesHash` (`^[0-9a-f]{64}$`). E2B's `GET /templates/{templateID}/files/{hash}` returns 201 `{present, url, headers}`. When `present` is true the SDK skips the upload. The URL we return is an internal upload endpoint on the gateway, not a third-party object store.
+- `COPY` steps carry a `filesHash` of 64 lowercase hex characters. That hash is computed by the official SDK over the text `COPY <src> <dest>` plus each file's relative path, mode, size, and bytes (`e2b` JS SDK `calculateFilesHash`). It is not the SHA-256 of the HTTP body. The default upload is a gzip-compressed tar (`GZIP = true` in that SDK). The gateway stores the decompressed tar under the path hash and does not recompute the SDK's hash.
+- E2B's `GET /templates/{templateID}/files/{hash}` returns 201 `{present, url, headers}`. When `present` is true the SDK skips the upload. The URL we return is an internal upload endpoint on the gateway, not a third-party object store.
 - Two registry credentials stay separate. `fromImageRegistry` (`registry`, `aws`, or `gcp`) is only the pull credential for the base image named in the build request. The controller writes it to Secret `cubepod-template-src-<buildID>`, passes that Secret only to the BuildKit session, and deletes it when the build reaches `ready` or `error`. The registry that stores `<registry>/cubepod-templates/...` is different. Helm sets `templateBuild.registry.pushSecret` and `templateBuild.registry.pullSecret` (they may name the same Secret). The controller uses the push Secret for the BuildKit push and never creates or deletes it from the client request. Every sandbox Pod and the build probe Pod sets `imagePullSecrets` to the pull Secret. A node that has not cached the image can still pull it. Neither Secret is mounted as a file in the sandbox, passed as image `ENV`, or written into build logs. Sandbox secrets remain `cpodref_` placeholders (CEP-0005).
 - A template build must not place files at `/workspace`. `COPY` / `ADD` destinations and `WORKDIR` values of `/workspace` or a path under it return 400 before BuildKit starts. The CEP does not name a replacement directory. Any other path in the image is left as the recipe wrote it. At runtime `workspace-pvc` is mounted on `/workspace`, so anything a `RUN` step still wrote there is hidden for the life of the sandbox. The workspace volume is not seeded from the image.
 - Template `ENV` steps are build-time only, matching the current E2B SDK contract. They are prefixed onto each following `RUN`. They are not committed as image environment. A user who needs runtime env sets `envVars` on sandbox create.
-- `USER` is stored on the template. When it is unset, agent commands and uploaded files stay `cubeplex` `1000:1000`. When it is set, `podd` runs agent commands and writes uploads as that user. `podd` does the ownership change. The image build does not require a follow-up `chown` in the sandbox shell.
-- The builder runs on a normal `runc` node. It does not run as a Kata MicroVM. Kata node pools often lack the user namespaces a rootless BuildKit daemon wants, and a build must not take a warm-pool slot.
+- `USER` is stored on the template. When `runAsUser` and `runAsUsername` are both unset, agent commands and uploaded files stay `cubeplex` `1000:1000`. When either is set, `podd` runs agent commands and writes uploads as that user. Numeric `0` is root. `podd` does the ownership change. The image build does not require a follow-up `chown` in the sandbox shell.
+- The builder is one long-lived rootless BuildKit Deployment in `cubepod-system`, scheduled as an ordinary runc Pod. It is not a per-build Job and it is not a Kata MicroVM. See [Where the builder runs](#where-the-builder-runs).
+- Alpha `fromImage` with empty `steps` marks the template `ready` without pulling the image. containerd pulls it on the first sandbox create. A missing or unauthorized image fails that Pod and does not change `buildStatus`.
+- The official JS SDK (`waitForBuildFinish` in `packages/js-sdk/src/template/buildApi.ts`) keeps polling only while build status is `waiting` or `building`. The CR may store `uploaded` after the push. The status and list routes report that phase as `building`. Returning `uploaded` on those routes makes `Template.build` throw `Unknown build error occurred.`
 - Build-time `ENV` values can still leak through shell history inside a `RUN` layer if the Dockerfile author echoes them. The gateway rejects a step whose args contain a registry password or a `cpodref_` raw secret. It does not try to scan arbitrary `RUN` scripts for other secrets.
 
 ### Risks and Mitigations
@@ -160,10 +165,11 @@ As a developer running `docker-compose`, I want the same API to `docker build` i
 | Files baked at `/workspace` disappear once the workspace volume mounts | High | Med | `COPY` and `WORKDIR` onto `/workspace` are rejected. The workspace volume is not seeded from the image. |
 | `RUN` as root during build produces root-owned files the sandbox user cannot write | Med | High | Documented. Default sandbox user remains `1000:1000`. Authors who `USER` another account get that account for agent exec. The probe runs the ready command as that user. |
 | BuildKit cache grows without bound on the node | Med | Med | Cache PVC has a size limit in Helm. Eviction is BuildKit's own GC (`gckeepstorage`). Cache loss only slows the next build. |
-| Controller restarts mid-build | Med | Med | Build phase is on the CR. On restart the controller reattaches to the BuildKit job / local build record. If the job is gone, the build becomes `error` and `readyImage` is unchanged. |
+| Controller restarts mid-build | Med | Med | The CR keeps the phase. Restart sets `error` with reason `builder disappeared` and does not adopt the in-flight solve. The BuildKit Deployment and its cache PVC stay. `readyImage` is unchanged. The client retries against the warm cache. Local mode keeps watching a `docker build` pid that is still alive. |
 | `startCmd` semantic differs from an E2B memory snapshot | Med | High | Stated in the proposal. Ready command runs against a freshly started process. Templates that depend on in-memory state captured at snapshot time are out of scope. |
 | Deleting a template strands a warm pool | Med | Med | Delete returns 409 when a `PodWarmPool` or a non-terminated `PodBox` references the template. `?force=true` removes the catalog row only. Volumes are not deleted. |
-| Context tar hash does not match the bytes | Med | Low | Upload handler hashes the body. Mismatch returns 400 and does not keep the object. |
+| Status route returns `uploaded` while the probe runs | High | High if unmapped | The CR stores `uploaded`. The status and list routes report `building` until `ready` or `error`. |
+| Two different bodies arrive for one `filesHash` | Med | Low | The first complete body is stored. A later body with different bytes returns 409 and does not replace it. The gateway does not compare the body to the SDK's `filesHash`. |
 
 ---
 
@@ -194,9 +200,12 @@ type PodTemplateSpec struct {
     StartCmd string `json:"startCmd,omitempty"`
     // ReadyCmd is probed during the build and after each sandbox start. Empty skips the probe.
     ReadyCmd string `json:"readyCmd,omitempty"`
-    // RunAsUser overrides the sandbox command uid. 0 means "unset" and podd uses 1000.
-    RunAsUser int64 `json:"runAsUser,omitempty"`
-    // RunAsUsername is set when USER is not numeric. podd resolves it inside the image.
+    // RunAsUser is the uid from a numeric USER step. Nil means unset and podd uses 1000.
+    // A pointer is required so USER 0 (root) is distinct from unset.
+    RunAsUser *int64 `json:"runAsUser,omitempty"`
+    // RunAsGroup is set when USER is "<uid>:<gid>" and gid is numeric.
+    RunAsGroup *int64 `json:"runAsGroup,omitempty"`
+    // RunAsUsername is set when USER is not a bare integer. podd resolves it inside the image.
     RunAsUsername string `json:"runAsUsername,omitempty"`
 }
 ```
@@ -261,8 +270,8 @@ Alpha and Beta share the catalog. Rows marked Beta return **501** `template buil
 | Alpha | `POST` | `/templates`, `/v2/templates`, `/v3/templates` | Create. 202 and the v3 response shape below. `Idempotency-Key` is honored in Beta; Alpha stores the key on the CR and replays the same 202 when the body hash matches. |
 | Alpha | `POST` | `/v2/templates/{templateID}/builds/{buildID}` | Start build. Empty `steps` and a `fromImage` or `fromTemplate` marks the build `ready` without BuildKit. Non-empty `steps` is Beta. |
 | Beta | `GET` | `/templates/{templateID}/files/{hash}` | 201 `{"present":bool,"url":"...","headers":{}}`. `present: true` when that tar is already stored. |
-| Beta | `PUT` | the `url` returned above | Raw tar body. Gateway streams it to the controller. |
-| Beta | `GET` | `/templates/{templateID}/builds/{buildID}/status` | `{logs, logEntries, templateID, buildID, status, reason}`. Query `logsOffset`, `limit` (default 100, max 100), `level`. |
+| Beta | `PUT` | the `url` returned above | Tar body, gzip-compressed when the SDK default applies. Gateway streams it to the controller. |
+| Beta | `GET` | `/templates/{templateID}/builds/{buildID}/status` | `{logs, logEntries, templateID, buildID, status, reason}`. Query `logsOffset` (entry index, not a byte offset), `limit` (default 100, max 100), `level`. CR `uploaded` is returned as `building`. |
 | Beta | `GET` | `/templates/{templateID}/builds/{buildID}/logs` | `{logs:[{timestamp, message, level}]}`. Query `cursor`, `limit`, `direction`, `level`. |
 | Beta | `GET` | `/v2/templates` | Same objects as v1, with `nextToken` pagination, page size 100. |
 | Stable | `POST` / `DELETE` / `GET` | E2B tag routes under `/tags` | Assign, delete, and list tags. Alpha and Beta encode tags as `spec.names` entries of the form `name:tag` on the create body (`name`, `tags`). |
@@ -315,7 +324,11 @@ Response 202:
 }
 ```
 
-Exactly one of `fromImage` and `fromTemplate` is non-empty. `fromTemplate` must name a template whose `buildStatus` is `ready`. The builder uses that template's `readyImage` as `FROM`. Unknown `steps[].type` returns 400. The types this CEP implements are the uppercase forms the E2B orchestrator dispatches on: `RUN`, `COPY`, `WORKDIR`, `USER`, `ENV`. `ADD` is accepted as `COPY`. A step with `force: true` and every step after it skips the cache.
+Exactly one of `fromImage` and `fromTemplate` is non-empty. `fromTemplate` must name a template whose `buildStatus` is `ready`. The builder uses that template's `readyImage` as `FROM`. Unknown `steps[].type` returns 400. The types this CEP implements are `RUN`, `COPY`, `WORKDIR`, `USER`, and `ENV`. `ADD` is accepted as `COPY`. A step with `force: true` and every step after it skips the cache.
+
+The official SDK lowers helper methods before this request. `from_python_image("3.13")` becomes `fromImage: "python:3.13"`. `from_base_image()` becomes `fromImage: "e2bdev/base"`. `aptInstall`, `pipInstall`, `npmInstall`, `bunInstall`, `gitClone`, `remove`, `rename`, `makeDir`, and `makeSymlink` become `RUN` steps. `copyItems` and `copy` of several sources become one `COPY` step per source. `fromDockerfile` is parsed by the SDK into the same step list. CubePod does not accept a Dockerfile body and does not see those method names. Extra JSON fields, including `maxCpuCount` on `POST /v3/templates`, are ignored.
+
+`COPY` args are `[src, dest]`, or `[src, dest, user, mode]` when the SDK sends the four-element form. Empty `user` and `mode` are empty strings. `RUN` args are `[command]` or `[command, user]`. `ENV` args are key/value pairs. `USER` args are `[user]`. The rendering rules are in [BuildKit translation](#buildkit-translation).
 
 List item shape (every field the E2B list schema marks required, so the official client can decode the array):
 
@@ -377,7 +390,7 @@ sequenceDiagram
     participant SDK as e2b SDK
     participant GW as cubepod-gateway
     participant CTL as cubepod-controller
-    participant BK as BuildKit or dockerd
+    participant BK as BuildKit Deployment or dockerd
     participant REG as OCI registry or local image store
 
     SDK->>GW: POST /v3/templates
@@ -415,6 +428,10 @@ stateDiagram-v2
 
 A transition to `building` does not clear `readyImage` or `readyBuildID`. Sandbox create and warm-pool stamping read `readyImage` only.
 
+`uploaded` is an internal phase on the CR. The HTTP status and list fields report it as `building`. See [Where the builder runs](#where-the-builder-runs).
+
+`podd` reads the template user from the sandbox Pod environment. `CUBEPOD_START_CMD` is the start command. `CUBEPOD_RUN_AS_USER` and `CUBEPOD_RUN_AS_GROUP` are set only when the corresponding pointer is non-nil, including when the value is `0`. `CUBEPOD_RUN_AS_USERNAME` is set when `runAsUsername` is non-empty. Absent user env means `1000:1000`.
+
 `podd-init` still `exec`s `/opt/cubepod/bin/podd`, so `podd` is PID 1. The template image's `ENTRYPOINT` is not used. When the Pod env `CUBEPOD_START_CMD` is set, `podd` starts that command once as the template user and does not restart it after it exits. stdout and stderr are appended to `/var/log/cubepod/start-cmd.log` on the rootfs upper, mode `0644`, owned by the template user. The exit code is written to `/var/log/cubepod/start-cmd.status`. `podd` reaps `startCmd` and any children it leaves behind, because those `SIGCHLD` signals are delivered to PID 1. The log lives on the rootfs upper: `reset-rootfs` removes it, and the workspace volume is not involved.
 
 The build probe polls `readyCmd` inside the short-lived probe Pod. On sandbox create, the gateway polls the same command through `podd` until it exits 0 or `templateBuild.probeTimeout` (default 120s) elapses. On timeout the PodBox phase becomes `Failed` and the API returns **503**:
@@ -430,27 +447,48 @@ The build probe polls `readyCmd` inside the short-lived probe Pod. On sandbox cr
 
 The sandbox is not deleted, so the file API can read that log. An empty `readyCmd` skips the probe. The gateway's existing `podd` health wait still runs.
 
+### Where the builder runs
+
+Production Beta does not start a Pod or a Job for each build. Helm installs one long-lived Deployment, `cubepod-buildkit`, in the same namespace as the controller and the gateway (`cubepod-system` on the test cluster). `replicas` is 1. The container image is `moby/buildkit:rootless` (Helm `templateBuild.buildkit.image`). The process is rootless `buildkitd`, listening on `tcp://0.0.0.0:1234`. The Service DNS is `cubepod-buildkit.cubepod-system.svc`. Helm `templateBuild.buildkit.address` defaults to `tcp://cubepod-buildkit.cubepod-system.svc:1234`.
+
+The Pod does not set `runtimeClassName`. containerd starts it with runc, the same way it starts `cubepod-controller`. It is not a Kata MicroVM and it does not take a warm-pool slot. Helm `templateBuild.buildkit.nodeSelector` defaults to `{}`. An operator whose default runtime is Kata, or whose nodes cannot create user namespaces, sets that selector so the Pod lands on a runc node. The container security context follows the upstream rootless example (`moby/buildkit` `examples/kubernetes/pod.rootless.yaml`): `runAsUser: 1000`, `runAsGroup: 1000`, `seccompProfile.type: Unconfined`, `appArmorProfile.type: Unconfined`. It is not privileged and it does not mount `docker.sock`. The args are `--addr tcp://0.0.0.0:1234`, `--oci-worker-no-process-sandbox`, `--oci-worker-gc`, and `--oci-worker-gc-keepstorage` sized to the cache volume. `--oci-worker-no-process-sandbox` can leave a process in this container after a `RUN` finishes. That process is inside the builder, not inside a sandbox. Restarting the Deployment clears it. The cache volume keeps the layers across that restart.
+
+The cache volume is PVC `cubepod-buildkit-cache`, default `20Gi`, mounted only on this Pod at `/home/user/.local/share/buildkit`. BuildKit GC (`gckeepstorage`) keeps usage inside that size. This is the hot cache. BuildKit also imports and exports the registry cache ref `<registry>/cubepod-templates/<slug>-cache`, so a Pod that is rescheduled onto an empty volume can refill it. The context tar PVC `cubepod-template-context` is a different volume. It is mounted only on the controller.
+
+The controller process is the BuildKit client, through the BuildKit Go client linked into `cubepod-controller`. There is no `buildctl` sidecar. Registry credentials for one solve are BuildKit session secrets. They are not written into the daemon config and they are not mounted into the BuildKit Pod. A NetworkPolicy allows only the controller to open port 1234.
+
+The ready probe is a different, short-lived runc Pod. It runs after the image is already in the registry. It does not build.
+
+Local `docker-compose` does not install this Deployment. The in-process reconciler calls `pkg/runtime` for `docker build` on the host Docker daemon.
+
+When the controller restarts while the CR says `building`, it does not adopt the in-flight solve. The client session is gone, so BuildKit cancels that solve. The controller sets `error` with reason `builder disappeared`. The Deployment and the cache PVC stay. `readyImage` stays. The SDK retries, and the next solve uses the cache already on the PVC. Local mode records the `docker build` pid and keeps watching it when the process is still alive. If the registry already has the build tag and the controller died after the push, before it wrote `uploaded`, restart moves the CR to `uploaded` and runs the probe.
+
+The controller appends scrubbed build lines to `logs/<buildID>.log` on the context volume. Locally that path is `${CUBEPOD_STATE}/template-context/logs/<buildID>.log`. `logsOffset` counts entries already returned. The file is kept for `contextTTL` (default 24h).
+
 ### BuildKit translation
 
 The controller renders a Dockerfile in memory. It does not write it into the user's workspace. The paths in the example are only there to show the translation. Any path other than `/workspace` is acceptable.
 
+The SDK request for `from_python_image("3.13").copy("requirements.txt", "/home/user/requirements.txt").run_cmd("pip install -r /home/user/requirements.txt")` arrives with `fromImage: "python:3.13"` and two steps. With `filesHash` `abc123` (shortened here) the rendered file is:
+
 ```dockerfile
 FROM python:3.13
-USER 1000
-COPY requirements.txt /home/user/requirements.txt
+COPY abc123/requirements.txt /home/user/requirements.txt
 RUN pip install -r /home/user/requirements.txt
 ```
+
+Every distinct `filesHash` tar is unpacked into one BuildKit context directory, under a prefix named by that hash. Two steps that share a hash share one unpacked tree. The rendered `COPY` source is `<filesHash>/<src>`, where `<src>` is `args[0]`. A source that is absolute or contains `..` returns 400. A tar member that would extract outside its prefix returns 400 and the build does not start.
 
 Rules:
 
 | Step `type` | Dockerfile | Notes |
 | :--- | :--- | :--- |
-| `ENV` | none | Accumulated and prefixed on later `RUN` lines as `KEY=VAL`. Not an image `ENV`. |
+| `ENV` | none | `args` is a list of key, value, key, value. An odd length returns 400. Values are accumulated and prefixed on later `RUN` lines as `KEY=VAL`. Not an image `ENV`. |
 | `WORKDIR` | `WORKDIR` | A value of `/workspace` or a path under it returns 400. |
-| `USER` | `USER` | Also stored on `spec.runAsUser` or `spec.runAsUsername`. |
-| `COPY` | `COPY` | Context is the tar for this step's `filesHash`, unpacked as the BuildKit context. Missing tar returns 400 before the build starts. A destination of `/workspace` or a path under it returns 400. |
-| `RUN` | `RUN` | Prefixed with the accumulated build-time env. A `RUN` that writes under `/workspace` is not rejected by parsing the shell. Those files are hidden once `workspace-pvc` mounts, and they are not copied into the volume. |
-| `startCmd` | not a `CMD` | Passed to `podd` through the Pod env. |
+| `USER` | `USER` | The arg is copied unchanged. `1000` sets `runAsUser`. `0` sets `runAsUser` to 0. `1000:1000` sets `runAsUser` and `runAsGroup`. Any other token sets `runAsUsername` and leaves the pointers nil. |
+| `COPY` / `ADD` | `COPY` | `args[0]` is the source inside the tar, `args[1]` is the destination. Non-empty `args[2]` becomes `--chown`. Non-empty `args[3]` becomes `--chmod` and must match `^[0-7]{3,4}$`. Missing tar returns 400 before the build starts. A destination of `/workspace` or a path under it returns 400. |
+| `RUN` | `RUN` | `args[0]` is the shell command, prefixed with the accumulated build-time env. Non-empty `args[1]` is the user for that command only: the renderer emits `USER <args[1]>` before the `RUN` and `USER <previous>` after it. `<previous>` is the last `USER` step, or it is omitted when no `USER` step has been seen. This does not change `runAsUser`. A `RUN` that writes under `/workspace` is not rejected by parsing the shell. |
+| `startCmd` | not a `CMD` | Passed to `podd` through `CUBEPOD_START_CMD`. |
 | `readyCmd` | not a `RUN` | Probe after push. |
 
 `force: true` on the build request invokes BuildKit with no cache. `force: true` on a single step inserts
@@ -473,7 +511,7 @@ With the gate on, `POST /sandboxes` resolves `templateID` in this order:
 1. Alias index hit with `buildStatus=ready` (or a non-empty `readyImage`): use `readyImage`, CPU, memory, rootfs size, `startCmd`, `readyCmd`, and run-as user.
 2. Alias index hit without `readyImage`: **409** `template is not ready`.
 3. No hit, and the string is one of `base`, `code-interpreter`, `code-interpreter-v1`, `python`: use the seeded `cubeplex-ubuntu24-desktop` template. This preserves CEP-0018.
-4. No hit, and the string contains `/` or `:`, so it looks like an OCI reference: keep today's `defaultTemplate` behavior and stamp a Pod from that image. This keeps `templateID: "ghcr.io/org/app:1.2"` working without a catalog row.
+4. No hit, and the string contains `/` or `:`, so it looks like an OCI reference: keep today's `defaultTemplate` behavior and stamp a Pod from that image. This keeps `templateID: "ghcr.io/org/app:1.2"` working without a catalog row. The literal placeholder `cubepod.io/unbuilt:waiting` is not an OCI fallback. It returns 409 `template is not ready`.
 5. Otherwise **404** `template not found`.
 
 With the gate off, step 0 still runs, and steps 1, 2, and 5 are skipped. The current rewrite plus `defaultTemplate` stays.
@@ -486,8 +524,7 @@ Warm-pool create uses the same resolver. A pool bound to a template that is not 
 
 - Catalog state is the `PodTemplate` CR in the workload namespace.
 - Alpha from-image registration does not start a pod. The next sandbox Pod uses `spec.image` / `status.readyImage` as the container image. containerd pulls it. `podd-init` mounts the new `rootfs-pvc` block device as the OverlayFS upper and mounts `workspace-pvc` on `/workspace`. Neither volume is copied from the template.
-- Beta runs a rootless BuildKit Deployment (`moby/buildkit`, rootless image, non-root, `seccompProfile: RuntimeClass`, no privileged flag, no `docker.sock`, no Kata `runtimeClassName`). Helm value `templateBuild.buildkit.address` defaults to `tcp://cubepod-buildkit.cubepod-system.svc:1234`. A NetworkPolicy allows only the controller to connect.
-- The controller is the BuildKit client (`buildctl` in-process via the BuildKit Go client, or a sidecar binary in the controller image). It streams the context from a RWO PVC `cubepod-template-context` mounted only by the controller. Gateway uploads go to `POST /internal/v1/template-builds/context/{hash}` on the controller, the same style as `/internal/v1/egress/exchange`.
+- Beta runs the BuildKit Deployment described in [Where the builder runs](#where-the-builder-runs). The controller streams the context from the RWO PVC `cubepod-template-context`, mounted only by the controller. Gateway uploads go to `POST /internal/v1/template-builds/context/{hash}` on the controller, the same style as `/internal/v1/egress/exchange`. The body is gunzipped when it starts with the gzip magic `1f 8b`. Anything that is neither gzip nor a tar returns 400 and is not stored. A second body whose bytes differ from the stored tar returns 409.
 - While `templateBuild.enabled=true`, the controller Deployment is `replicas: 1` because the context PVC is RWO. Stable removes this cap by storing tars in an object store.
 - The pushed image reference is `<registry>/cubepod-templates/<slug>:<buildID>`. BuildKit pushes it with `templateBuild.registry.pushSecret`. Sandbox Pods and the probe Pod list `templateBuild.registry.pullSecret` under `imagePullSecrets`. That pull Secret is created by the cluster install, not by the build request, and the controller does not delete it. `fromImageRegistry` is a different, build-scoped Secret used only to pull the base image. It is not attached to sandbox Pods.
 - The ready probe is a short-lived runc Pod, not a Kata PodBox. It uses the new image, an `emptyDir` for writable space, no `rootfs-pvc`, and no `workspace-pvc`. The probe command starts `startCmd` in the background and polls `readyCmd` against localhost. The controller deletes the Pod when the probe finishes. A probe failure does not allocate a CSI volume.
@@ -508,8 +545,8 @@ The reconciler is the builder in both modes. `cmd/cubepod-gateway` already const
 | Condition | Result |
 | :--- | :--- |
 | BuildKit or dockerd returns non-zero | `buildStatus=error`, `reason` is the last non-empty log line. `readyImage` unchanged. Context tar kept until TTL. |
-| Controller process dies while `building` | On start, if the BuildKit job or the recorded local build pid is still running, keep watching. If it is gone, set `error` with reason `builder disappeared`. |
-| Gateway dies during tar upload | Client retries `PUT`. The hash check replaces a partial file only after the full body matches. A partial file is named `*.partial` and is not `present`. |
+| Controller process dies while `building` | On start, set `error` with reason `builder disappeared`. Do not adopt the BuildKit solve. The Deployment stays up. Local mode keeps watching the recorded `docker build` pid when it is still running. |
+| Gateway dies during tar upload | Client retries `PUT`. A partial file is named `*.partial` and is not `present`. A completed object is replaced only when the new body has the same bytes. |
 | Idempotency-Key replay with the same body hash | Return the stored 202 body and the same ids. Do not start a second build. |
 | Idempotency-Key replay with a different body | 409 `idempotency_request_mismatch`. |
 | Probe exceeds `templateBuild.probeTimeout` (default 120s) | `error`. Probe Pod or container is deleted. |
@@ -530,7 +567,9 @@ The reconciler is the builder in both modes. `cmd/cubepod-gateway` already const
   - Create from `fromImage` with empty steps sets `ready` and does not invoke the builder interface.
   - Create with steps and the Beta builder disabled returns 501.
   - Alias collision returns 409. Unknown step type returns 400. Both `fromImage` and `fromTemplate` set returns 400. Neither set returns 400.
-  - `filesHash` that is not 64 hex chars returns 400. Upload whose SHA-256 does not match the path returns 400 and leaves `present` false.
+  - `filesHash` that is not 64 hex chars returns 400. A gzip upload is stored as a tar and `present` becomes true. A second, different body for that hash returns 409. A partial file stays `present: false`.
+  - Status while the CR is `uploaded` is `building`. `USER 0` sets `runAsUser` to 0. An omitted `USER` leaves both pointers nil.
+  - Two `COPY` steps with different hashes render `COPY <hash>/<src> <dest>` and unpack under those prefixes. `COPY` args `[src, dest, "appuser", "0644"]` render `--chown=appuser --chmod=0644`. `RUN` args `["npm install", "node"]` wrap that `RUN` in `USER` lines and do not change `runAsUser`.
   - Rebuild failure does not change `readyImage`. Sandbox create during `building` still uses the old image.
   - Delete of a template referenced by a PodBox returns 409 and the CR remains.
   - Dockerfile renderer: `ENV` does not appear as an `ENV` instruction. `RUN` lines contain the prefix. A step `force` inserts `ARG CUBEPOD_CACHEBUST` before that step only.
@@ -544,7 +583,7 @@ The reconciler is the builder in both modes. `cmd/cubepod-gateway` already const
 - **Integration / E2E**:
   - Local Docker: `POST` a from-image template, `POST /sandboxes` with the alias, `podd` answers health, a file written under `/workspace` is still there after `reset-rootfs`. The template image id does not change that file.
   - Local Docker Beta: build `FROM busybox`, `RUN echo cube > /etc/cubepod-build`, probe with `readyCmd` of `true`. New sandbox `cat /etc/cubepod-build` prints `cube`. A second sandbox has an empty upper and does not see a file written in the first sandbox's upper.
-  - Kubernetes: the same two flows against the test cluster. The build Pod is not Kata. The sandbox Pod is Kata (or the cluster's configured runtime class) and has two PVCs. Deleting the template CR does not delete those PVCs.
+  - Kubernetes: the same two flows against the test cluster. The `cubepod-buildkit` Pod and the ready-probe Pod are runc. The sandbox Pod is Kata (or the cluster's configured runtime class) and has two PVCs. Deleting the template CR does not delete those PVCs. Restarting the controller during `building` sets `error` with reason `builder disappeared` and leaves the BuildKit Pod running.
   - Conformance: with `E2B_DOMAIN` pointed at the gateway, the pinned `e2b` Python SDK `Template.build` of an image-only recipe (Alpha) and of a `run_cmd` plus `copy` recipe (Beta) returns, and `Sandbox.create(alias)` runs a command. The test records the SDK version in the test file.
 
 ### Graduation Criteria
@@ -602,7 +641,9 @@ When `status.readyImage` changes, the controller deletes unclaimed warm-pool ent
 | Symptom | What to look at | Recovery |
 | :--- | :--- | :--- |
 | `GET /templates` is still the wrapped stub | Gate is off | Enable `E2BTemplateAPI` and restart the gateway |
-| SDK polls `building` until timeout | BuildKit Pod logs, controller log `template build` | Fix the recipe. `readyImage` of the previous build is still used for create |
+| SDK polls `building` until timeout | `cubepod-buildkit` Pod logs, controller log `template build` | Fix the recipe. `readyImage` of the previous build is still used for create |
+| `Template.build` throws `Unknown build error occurred` while the CR is `uploaded` | Status route returned the CR value `uploaded` | That route must report `building` until `ready` or `error` |
+| Build `error` reason `builder disappeared` | Controller restarted during the solve | Retry the build. The BuildKit Deployment and the cache PVC are still there |
 | Sandbox 409 `template is not ready` | `kubectl get podtemplate -o yaml` status | Wait for `ready`, or create from an alias that has `readyImage` |
 | `COPY` 400 missing context | `present` was false and the PUT did not complete | Re-run the SDK build. The client uploads again |
 | Probe `error` with a good image push | Probe Pod logs before deletion, also status `reason` | `readyCmd` must succeed against localhost with no dependency on `podd` |
@@ -616,6 +657,7 @@ When `status.readyImage` changes, the controller deletes unclaimed warm-pool ent
 
 - 2026-11-12: Proposal drafted (`provisional`). Prior art reviewed against the E2B OpenAPI on `docs.e2b.dev`, the E2B template manager in `e2b-dev/infra`, BuildKit, `kubernetes-sigs/agent-sandbox` `SandboxTemplate`, and Docker Sandboxes OCI templates.
 - 2026-11-12: Review revisions. Source-pull credentials are build-scoped. The template registry pull Secret stays on sandbox Pods. Template steps must not use `/workspace`, and no other directory is prescribed. `PodTemplate` and `PodTemplateList` are specified, and the in-memory map is filled from the CRD. A new `readyImage` retires unclaimed warm standbys. An empty `templateID` becomes `base`. `startCmd` logs, reaping, and the create-time 503 are specified. Local builds are driven by the in-process reconciler through `pkg/runtime`. `podd` is not a feature-gate component. `GET /templates/{templateID}/files/{hash}` stays **201**, which is the status in the E2B OpenAPI.
+- 2026-11-12: Builder placement and SDK step translation. The builder is one runc Deployment in `cubepod-system`, not a per-build Job. Controller restart fails the in-flight solve and leaves the daemon and cache PVC in place. `filesHash` is the SDK's content hash, and the upload body is a gzip tar. HTTP status reports the internal `uploaded` phase as `building`, because the JS SDK stops polling on any other value. `COPY` steps share one BuildKit context, unpacked under the hash prefix. `USER 0` is root.
 
 ---
 
@@ -639,8 +681,10 @@ When `status.readyImage` changes, the controller deletes unclaimed warm-pool ent
 
 4. **Build with Kaniko.** Rejected. Kaniko is unmaintained. BuildKit is the rootless builder Kubernetes and Docker tooling use, including registry-backed layer cache. A Job-per-build Kaniko pod also cannot share a warm cache without extra registry round trips, which BuildKit's daemon already does.
 
-5. **Commit a running sandbox (`docker commit` or a CSI snapshot of `rootfs-pvc`) and call that a template.** Rejected for this CEP. The upper can contain workspace-adjacent writes, shell history, and files the agent downloaded. E2B separates that artifact (sandbox snapshot) from a template rebuilt from a recipe. CSI snapshots are also driver-specific (Longhorn versus loopback) and would not exist in local Docker the same way. A later CEP can add an explicit snapshot API.
+5. **Run rootless BuildKit as a Kubernetes Job per build (`buildctl-daemonless`).** Rejected for Beta. `Template.build` is iterative: the next recipe often changes one `RUN`. A resident `buildkitd` keeps its local layer cache open. A Job pays Pod scheduling, rootless startup, and a cache-database open on every build, and it still needs the same unconfined seccomp profile. A Job that does not mount the cache PVC also pushes and pulls the registry cache on every build. The control plane would be smaller, and this remains a reasonable later choice for a cluster that builds rarely. It is the wrong default for the SDK workflow this CEP serves.
 
-6. **Run the build steps inside a Kata PodBox and snapshot the upper block device.** Rejected. It couples template build latency to CSI attach, risks leaving a half-written ext4 if the Pod is killed, and copies the upper into the next sandbox's lower by a driver-specific clone. BuildKit already produces a content-addressed image the node can pull. The per-sandbox upper stays empty at create, which is the dual-volume model.
+6. **Commit a running sandbox (`docker commit` or a CSI snapshot of `rootfs-pvc`) and call that a template.** Rejected for this CEP. The upper can contain workspace-adjacent writes, shell history, and files the agent downloaded. E2B separates that artifact (sandbox snapshot) from a template rebuilt from a recipe. CSI snapshots are also driver-specific (Longhorn versus loopback) and would not exist in local Docker the same way. A later CEP can add an explicit snapshot API.
 
-7. **Write template `ENV` into the image config so it matches `docker build`.** Rejected for the E2B-compatible path. The current `e2b` SDK documents those variables as build-time only. Runtime env stays on `POST /sandboxes`. Authors who want image-level env can put an explicit `RUN` that writes a file the process reads.
+7. **Run the build steps inside a Kata PodBox and snapshot the upper block device.** Rejected. It couples template build latency to CSI attach, risks leaving a half-written ext4 if the Pod is killed, and copies the upper into the next sandbox's lower by a driver-specific clone. BuildKit already produces a content-addressed image the node can pull. The per-sandbox upper stays empty at create, which is the dual-volume model.
+
+8. **Write template `ENV` into the image config so it matches `docker build`.** Rejected for the E2B-compatible path. The current `e2b` SDK documents those variables as build-time only. Runtime env stays on `POST /sandboxes`. Authors who want image-level env can put an explicit `RUN` that writes a file the process reads.
