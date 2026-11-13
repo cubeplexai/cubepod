@@ -1,0 +1,42 @@
+# CubePod Kata Containers RuntimeClass manifests for hardware-isolated MicroVMs.
+# Apply with: kubectl apply -f deploy/k8s/kata/runtimeclasses.yaml
+#
+# Ensure target worker nodes are prepared with configure-containerd-kata.sh
+# and labeled (when using the optional nodeSelector below):
+#   kubectl label node <node-name> katacontainers.io/kata-runtime=true --overwrite
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-qemu
+  labels:
+    app.kubernetes.io/part-of: cubepod
+    cubepod.io/hypervisor: qemu
+handler: kata-qemu
+overhead:
+  podFixed:
+    memory: "160Mi"
+    cpu: "250m"
+scheduling:
+  # Optional: remove or adjust this nodeSelector if every worker node in the
+  # cluster has Kata + /dev/kvm configured.
+  nodeSelector:
+    katacontainers.io/kata-runtime: "true"
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata-clh
+  labels:
+    app.kubernetes.io/part-of: cubepod
+    cubepod.io/hypervisor: cloud-hypervisor
+handler: kata-clh
+overhead:
+  podFixed:
+    memory: "128Mi"
+    cpu: "250m"
+scheduling:
+  # Optional: remove or adjust this nodeSelector if every worker node in the
+  # cluster has Kata + /dev/kvm configured.
+  nodeSelector:
+    katacontainers.io/kata-runtime: "true"
