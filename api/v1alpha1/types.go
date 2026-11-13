@@ -127,6 +127,18 @@ const (
 	BuildStatusError    = "error"
 )
 
+// PodTemplateBuildRecord tracks an individual build attempt on a PodTemplate.
+type PodTemplateBuildRecord struct {
+	BuildID    string `json:"buildID"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason,omitempty"`
+	FailedStep string `json:"failedStep,omitempty"`
+	CreatedAt  string `json:"createdAt,omitempty"`
+	UpdatedAt  string `json:"updatedAt,omitempty"`
+	CPUCount   int32  `json:"cpuCount,omitempty"`
+	MemoryMB   int32  `json:"memoryMB,omitempty"`
+}
+
 // PodTemplateStatus reports the observed state of a PodTemplate instance.
 type PodTemplateStatus struct {
 	TemplateID    string `json:"templateID,omitempty"`
@@ -135,9 +147,16 @@ type PodTemplateStatus struct {
 	LatestBuildID string `json:"latestBuildID,omitempty"`
 	// BuildStatus is the E2B enum for LatestBuildID:
 	// waiting, building, uploaded, ready, error.
-	BuildStatus string `json:"buildStatus,omitempty"`
-	Reason      string `json:"reason,omitempty"`
-	Public      bool   `json:"public,omitempty"`
+	BuildStatus   string                   `json:"buildStatus,omitempty"`
+	Reason        string                   `json:"reason,omitempty"`
+	FailedStep    string                   `json:"failedStep,omitempty"`
+	Public        bool                     `json:"public,omitempty"`
+	BuildCount    int64                    `json:"buildCount,omitempty"`
+	SpawnCount    int64                    `json:"spawnCount,omitempty"`
+	CreatedAt     string                   `json:"createdAt,omitempty"`
+	UpdatedAt     string                   `json:"updatedAt,omitempty"`
+	LastSpawnedAt string                   `json:"lastSpawnedAt,omitempty"`
+	Builds        []PodTemplateBuildRecord `json:"builds,omitempty"`
 }
 
 // PodWarmPoolSpec defines a pool of pre-warmed Kata MicroVMs with pre-attached thin block PVCs.

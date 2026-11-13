@@ -120,6 +120,7 @@ func WithContextDir(dir string) ReconcilerOption {
 	return func(r *Reconciler) {
 		if dir != "" {
 			r.contextDir = dir
+			r.contextDirSet = true
 		}
 	}
 }
@@ -131,12 +132,57 @@ func WithTemplatePullSecret(secret string) ReconcilerOption {
 	}
 }
 
+// WithTemplateRegistry configures the target OCI registry used when pushing built templates.
+func WithTemplateRegistry(registry string) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.templateRegistry = strings.TrimRight(strings.TrimSpace(registry), "/")
+	}
+}
+
+// WithTemplateRepoPrefix configures the repository prefix under the target template registry.
+func WithTemplateRepoPrefix(prefix string) ReconcilerOption {
+	return func(r *Reconciler) {
+		if strings.TrimSpace(prefix) != "" {
+			r.templateRepoPrefix = strings.Trim(strings.TrimSpace(prefix), "/")
+		}
+	}
+}
+
+// WithTemplatePushSecret configures the Kubernetes dockerconfigjson secret used to push built templates.
+func WithTemplatePushSecret(secret string) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.templatePushSecret = strings.TrimSpace(secret)
+	}
+}
+
+// WithTemplateProbeTimeout configures the timeout for template ReadyCmd probes.
+func WithTemplateProbeTimeout(timeout time.Duration) ReconcilerOption {
+	return func(r *Reconciler) {
+		if timeout > 0 {
+			r.templateProbeTimeout = timeout
+		}
+	}
+}
+
+// WithStateDir configures the local state directory for persisted template JSON files, context tars, and logs.
+func WithStateDir(dir string) ReconcilerOption {
+	return func(r *Reconciler) {
+		if dir != "" {
+			r.stateDir = dir
+			if !r.contextDirSet {
+				r.contextDir = filepath.Join(dir, "template-context")
+			}
+		}
+	}
+}
+
 // Reconciler manages the lifecycle of PodBox instances, pre-attached PodWarmPools,
 // and dual Raw Block PVCs.
 type Reconciler struct {
 	mu                   sync.RWMutex
 	boxes                map[string]*v1alpha1.PodBoxStatus
 	specs                map[string]v1alpha1.PodBoxSpec
+	resolvedImages       map[string]string
 	templates            map[string]v1alpha1.PodTemplateSpec
 	warmPools            map[string]*warmPoolState
 	warmCounter          int64
@@ -154,11 +200,18 @@ type Reconciler struct {
 	imageBuilder         ImageBuilder
 	contextStore         ContextStore
 	contextDir           string
+	contextDirSet        bool
+	stateDir             string
 	templatePullSecret   string
+	templatePushSecret   string
+	templateRegistry     string
+	templateRepoPrefix   string
+	templateProbeTimeout time.Duration
 	templateObjects      map[string]*v1alpha1.PodTemplate
 	templateIndex        map[string]string
 	idempotency          map[string]idempotencyRecord
 	buildingPids         map[string]int
+	buildMetrics         templateBuildMetricsCollector
 }
 
 // SetFailWarmPoolClaim sets whether warm pool claims should fail (used for testing fallback).
@@ -173,6 +226,7 @@ func NewReconciler(opts ...ReconcilerOption) *Reconciler {
 	r := &Reconciler{
 		boxes:                make(map[string]*v1alpha1.PodBoxStatus),
 		specs:                make(map[string]v1alpha1.PodBoxSpec),
+		resolvedImages:       make(map[string]string),
 		templates:            make(map[string]v1alpha1.PodTemplateSpec),
 		warmPools:            make(map[string]*warmPoolState),
 		kubeClient:           NewMemoryKubeClient(),
@@ -187,6 +241,9 @@ func NewReconciler(opts ...ReconcilerOption) *Reconciler {
 		imageBuilder:         NewFakeImageBuilder(),
 		contextStore:         NewMemoryContextStore(),
 		contextDir:           filepath.Join(os.TempDir(), "cubepod-context"),
+		stateDir:             os.Getenv("CUBEPOD_STATE"),
+		templateRepoPrefix:   "cubepod-templates",
+		templateProbeTimeout: 120 * time.Second,
 		templateObjects:      make(map[string]*v1alpha1.PodTemplate),
 		templateIndex:        make(map[string]string),
 		idempotency:          make(map[string]idempotencyRecord),
@@ -195,6 +252,13 @@ func NewReconciler(opts ...ReconcilerOption) *Reconciler {
 	for _, opt := range opts {
 		opt(r)
 	}
+	if r.stateDir != "" {
+		if mk, ok := r.kubeClient.(*MemoryKubeClient); ok {
+			mk.LoadLocalTemplates(r.stateDir)
+		}
+		_ = r.loadLocalTemplates(context.Background())
+	}
+	_ = r.SyncTemplatesFromKube(context.Background())
 	_ = r.EnsureSeededTemplates(context.Background())
 	return r
 }
@@ -758,8 +822,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	if err != nil {
 		return nil, err
 	}
+	effectiveImage := resolved.Image
+	if exists {
+		if pinned := r.resolvedImages[name]; pinned != "" {
+			effectiveImage = pinned
+		} else if existingBox, getErr := r.kubeClient.GetPodBox(ctx, r.namespace, name); getErr == nil && existingBox.Metadata.Annotations != nil {
+			if pinned := existingBox.Metadata.Annotations["cubepod.io/resolved-image"]; pinned != "" {
+				effectiveImage = pinned
+				r.resolvedImages[name] = pinned
+			}
+		}
+	} else if effectiveImage != "" {
+		r.resolvedImages[name] = effectiveImage
+	}
+
 	tpl := resolved.TemplateSpec
-	tpl.Image = resolved.Image
+	tpl.Image = effectiveImage
 	tpl.StartCmd = resolved.StartCmd
 	tpl.ReadyCmd = resolved.ReadyCmd
 	tpl.RunAsUser = resolved.RunAsUser
@@ -907,11 +985,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		APIVersion: "cubepod.io/v1alpha1",
 		Kind:       "PodBox",
 		Metadata: v1alpha1.ObjectMeta{
-			Name:      name,
-			Namespace: r.namespace,
-			Annotations: map[string]string{
-				"cubepod.io/resolved-image": resolved.Image,
-			},
+			Name:        name,
+			Namespace:   r.namespace,
+			Annotations: r.podBoxAnnotationsLocked(name, effectiveImage),
 		},
 		Spec:   spec,
 		Status: cp,
@@ -919,6 +995,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	_ = r.kubeClient.UpsertPodBox(ctx, box)
 
 	return &cp, nil
+}
+
+func (r *Reconciler) podBoxAnnotationsLocked(name, fallbackImage string) map[string]string {
+	img := r.resolvedImages[name]
+	if img == "" {
+		img = fallbackImage
+	}
+	if img == "" {
+		return nil
+	}
+	return map[string]string{
+		"cubepod.io/resolved-image": img,
+	}
 }
 
 // Pause pauses a running PodBox by updating its DesiredState to Paused and reconciling.
@@ -948,12 +1037,17 @@ func (r *Reconciler) Pause(ctx context.Context, name string) (*v1alpha1.PodBoxSt
 		return nil, err
 	}
 
+	r.mu.RLock()
+	anns := r.podBoxAnnotationsLocked(name, "")
+	r.mu.RUnlock()
+
 	box := v1alpha1.PodBox{
 		APIVersion: "cubepod.io/v1alpha1",
 		Kind:       "PodBox",
 		Metadata: v1alpha1.ObjectMeta{
-			Name:      name,
-			Namespace: r.namespace,
+			Name:        name,
+			Namespace:   r.namespace,
+			Annotations: anns,
 		},
 		Spec:   spec,
 		Status: *status,
@@ -993,6 +1087,7 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 
 	delete(r.boxes, name)
 	delete(r.specs, name)
+	delete(r.resolvedImages, name)
 	return nil
 }
 
@@ -1057,6 +1152,10 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 		}
 	}
 
+	if err := r.SyncTemplatesFromKube(ctx); err != nil {
+		return 0, fmt.Errorf("failed to sync PodTemplates from Kubernetes: %w", err)
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -1069,6 +1168,11 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 		st := box.Status
 		r.boxes[name] = &st
 		r.specs[name] = box.Spec
+		if box.Metadata.Annotations != nil {
+			if img := box.Metadata.Annotations["cubepod.io/resolved-image"]; img != "" {
+				r.resolvedImages[name] = img
+			}
+		}
 		if idx := parseWarmIndex(box.Status.PodName); idx > r.warmCounter {
 			r.warmCounter = idx
 		}
@@ -1275,8 +1379,9 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 								APIVersion: "cubepod.io/v1alpha1",
 								Kind:       "PodBox",
 								Metadata: v1alpha1.ObjectMeta{
-									Name:      name,
-									Namespace: r.namespace,
+									Name:        name,
+									Namespace:   r.namespace,
+									Annotations: r.podBoxAnnotationsLocked(name, ""),
 								},
 								Spec:   specWithPaused,
 								Status: statusWithPaused,
@@ -1423,8 +1528,9 @@ func (r *Reconciler) TouchActivity(name string, t time.Time) error {
 			APIVersion: "cubepod.io/v1alpha1",
 			Kind:       "PodBox",
 			Metadata: v1alpha1.ObjectMeta{
-				Name:      name,
-				Namespace: r.namespace,
+				Name:        name,
+				Namespace:   r.namespace,
+				Annotations: r.podBoxAnnotationsLocked(name, ""),
 			},
 			Spec:   spec,
 			Status: *status,
@@ -1449,8 +1555,9 @@ func (r *Reconciler) SetPausedAt(name string, t time.Time) error {
 			APIVersion: "cubepod.io/v1alpha1",
 			Kind:       "PodBox",
 			Metadata: v1alpha1.ObjectMeta{
-				Name:      name,
-				Namespace: r.namespace,
+				Name:        name,
+				Namespace:   r.namespace,
+				Annotations: r.podBoxAnnotationsLocked(name, ""),
 			},
 			Spec:   spec,
 			Status: *status,

@@ -53,6 +53,11 @@ type KubeClient interface {
 	UpdatePodTemplate(ctx context.Context, template v1alpha1.PodTemplate) error
 	UpdatePodTemplateStatus(ctx context.Context, template v1alpha1.PodTemplate) error
 	DeletePodTemplate(ctx context.Context, namespace, name string) error
+
+	GetPodPhase(ctx context.Context, namespace, name string) (string, error)
+	CreateSecret(ctx context.Context, secret KubeSecret) error
+	GetSecret(ctx context.Context, namespace, name string) (*KubeSecret, error)
+	DeleteSecret(ctx context.Context, namespace, name string) error
 }
 
 // MemoryKubeClient is an in-memory, thread-safe implementation of KubeClient
@@ -61,21 +66,67 @@ type MemoryKubeClient struct {
 	mu        sync.RWMutex
 	PVCs      map[string]BlockPVCManifest
 	Pods      map[string]PodManifest
+	PodPhases map[string]string
 	IPs       map[string]string
 	Boxes     map[string]v1alpha1.PodBox
 	WarmPools map[string]v1alpha1.PodWarmPool
 	Templates map[string]v1alpha1.PodTemplate
+	Secrets   map[string]KubeSecret
 }
 
 // NewMemoryKubeClient creates a new in-memory KubeClient.
 func NewMemoryKubeClient() *MemoryKubeClient {
-	return &MemoryKubeClient{
+	m := &MemoryKubeClient{
 		PVCs:      make(map[string]BlockPVCManifest),
 		Pods:      make(map[string]PodManifest),
+		PodPhases: make(map[string]string),
 		IPs:       make(map[string]string),
 		Boxes:     make(map[string]v1alpha1.PodBox),
 		WarmPools: make(map[string]v1alpha1.PodWarmPool),
 		Templates: make(map[string]v1alpha1.PodTemplate),
+		Secrets:   make(map[string]KubeSecret),
+	}
+	if stateDir := os.Getenv("CUBEPOD_STATE"); stateDir != "" {
+		m.LoadLocalTemplates(stateDir)
+	}
+	return m
+}
+
+// LoadLocalTemplates loads persisted PodTemplate JSON files from <stateDir>/templates/*.json.
+func (m *MemoryKubeClient) LoadLocalTemplates(stateDir string) {
+	if stateDir == "" {
+		return
+	}
+	dir := filepath.Join(stateDir, "templates")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Templates == nil {
+		m.Templates = make(map[string]v1alpha1.PodTemplate)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var tpl v1alpha1.PodTemplate
+		if err := json.Unmarshal(data, &tpl); err != nil || tpl.Metadata.Name == "" {
+			continue
+		}
+		ns := tpl.Metadata.Namespace
+		if ns == "" {
+			ns = "default"
+		}
+		key := templateKey(ns, tpl.Metadata.Name)
+		if _, exists := m.Templates[key]; !exists {
+			m.Templates[key] = tpl
+		}
 	}
 }
 
@@ -420,6 +471,84 @@ func (m *MemoryKubeClient) DeletePod(_ context.Context, namespace, name string) 
 	key := podKey(namespace, name)
 	delete(m.Pods, key)
 	delete(m.IPs, key)
+	delete(m.PodPhases, key)
+	return nil
+}
+
+// GetPodPhase returns the phase for a Pod in memory (defaults to "Running" when present).
+func (m *MemoryKubeClient) GetPodPhase(_ context.Context, namespace, name string) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	key := podKey(namespace, name)
+	if _, ok := m.Pods[key]; !ok {
+		return "", fmt.Errorf("pod %s/%s not found", namespace, name)
+	}
+	if phase, ok := m.PodPhases[key]; ok && phase != "" {
+		return phase, nil
+	}
+	return "Running", nil
+}
+
+// CreateSecret stores a KubeSecret in memory.
+func (m *MemoryKubeClient) CreateSecret(_ context.Context, secret KubeSecret) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Secrets == nil {
+		m.Secrets = make(map[string]KubeSecret)
+	}
+	ns := secret.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	secret.Metadata.Namespace = ns
+	if secret.APIVersion == "" {
+		secret.APIVersion = "v1"
+	}
+	if secret.Kind == "" {
+		secret.Kind = "Secret"
+	}
+	key := podKey(ns, secret.Metadata.Name)
+	if _, exists := m.Secrets[key]; exists {
+		return fmt.Errorf("secret %s/%s already exists: status 409", ns, secret.Metadata.Name)
+	}
+	cp := secret
+	cp.Data = make(map[string][]byte, len(secret.Data)+len(secret.StringData))
+	for k, v := range secret.Data {
+		b := make([]byte, len(v))
+		copy(b, v)
+		cp.Data[k] = b
+	}
+	for k, v := range secret.StringData {
+		cp.Data[k] = []byte(v)
+	}
+	cp.StringData = nil
+	m.Secrets[key] = cp
+	return nil
+}
+
+// GetSecret retrieves a KubeSecret from memory by namespace and name.
+func (m *MemoryKubeClient) GetSecret(_ context.Context, namespace, name string) (*KubeSecret, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	sec, ok := m.Secrets[podKey(namespace, name)]
+	if !ok {
+		return nil, fmt.Errorf("secret %s/%s not found", namespace, name)
+	}
+	cp := sec
+	return &cp, nil
+}
+
+// DeleteSecret removes a KubeSecret from memory.
+func (m *MemoryKubeClient) DeleteSecret(_ context.Context, namespace, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	delete(m.Secrets, podKey(namespace, name))
 	return nil
 }
 
@@ -868,7 +997,7 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 
 	for {
 		ip, phase, err := c.getPodStatus(pollCtx, namespace, name)
-		if err == nil && phase == "Running" && ip != "" {
+		if err == nil && ((phase == "Running" && ip != "") || phase == "Succeeded") {
 			return ip, nil
 		}
 		if phase == "Failed" {
@@ -884,6 +1013,13 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 		case <-ticker.C:
 		}
 	}
+}
+
+// GetPodPhase returns the current status.phase of a Pod.
+func (c *RESTKubeClient) GetPodPhase(ctx context.Context, namespace, name string) (string, error) {
+	ns := c.resolveNamespace(namespace)
+	_, phase, err := c.getPodStatus(ctx, ns, name)
+	return phase, err
 }
 
 func (c *RESTKubeClient) getPodStatus(ctx context.Context, namespace, name string) (string, string, error) {

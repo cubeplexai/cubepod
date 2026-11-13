@@ -595,3 +595,87 @@ func (c *RESTKubeClient) DeletePodTemplate(ctx context.Context, namespace, name 
 	body, _ := io.ReadAll(resp.Body)
 	return fmt.Errorf("DeletePodTemplate failed: status %d (%s)", resp.StatusCode, string(body))
 }
+
+// CreateSecret creates a Kubernetes core/v1 Secret in the given namespace.
+func (c *RESTKubeClient) CreateSecret(ctx context.Context, secret KubeSecret) error {
+	ns := c.resolveNamespace(secret.Metadata.Namespace)
+	secret.Metadata.Namespace = ns
+	name := secret.Metadata.Name
+	if name == "" {
+		return fmt.Errorf("Secret metadata.name is required")
+	}
+	if secret.APIVersion == "" {
+		secret.APIVersion = "v1"
+	}
+	if secret.Kind == "" {
+		secret.Kind = "Secret"
+	}
+
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets", c.baseURL, ns)
+	payload, err := json.Marshal(secret)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Secret JSON: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPost, reqURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("CreateSecret POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+	if resp.StatusCode == http.StatusConflict {
+		return fmt.Errorf("secret %s/%s already exists: status 409", ns, name)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("CreateSecret failed: status %d (%s)", resp.StatusCode, string(body))
+}
+
+// GetSecret retrieves a Kubernetes core/v1 Secret by namespace and name.
+func (c *RESTKubeClient) GetSecret(ctx context.Context, namespace, name string) (*KubeSecret, error) {
+	ns := c.resolveNamespace(namespace)
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets/%s", c.baseURL, ns, name)
+
+	resp, err := c.doRequest(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GetSecret GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("secret %s/%s not found (404)", ns, name)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GetSecret failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	var sec KubeSecret
+	if err := json.NewDecoder(resp.Body).Decode(&sec); err != nil {
+		return nil, fmt.Errorf("failed to decode Secret: %w", err)
+	}
+	return &sec, nil
+}
+
+// DeleteSecret removes a Kubernetes core/v1 Secret by namespace and name, ignoring 404 NotFound.
+func (c *RESTKubeClient) DeleteSecret(ctx context.Context, namespace, name string) error {
+	ns := c.resolveNamespace(namespace)
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets/%s", c.baseURL, ns, name)
+
+	resp, err := c.doRequest(ctx, http.MethodDelete, reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("DeleteSecret DELETE failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted ||
+		resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("DeleteSecret failed: status %d (%s)", resp.StatusCode, string(body))
+}

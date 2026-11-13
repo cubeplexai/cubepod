@@ -5,14 +5,20 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
@@ -98,7 +104,10 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 	// 4. sandbox create uses cpuCount memoryMB diskSizeMB
 	t.Run("sandbox create uses cpuCount memoryMB diskSizeMB", func(t *testing.T) {
 		ctx := context.Background()
-		r := controller.NewReconciler(controller.WithE2BTemplateAPI(true))
+		r := controller.NewReconciler(
+			controller.WithE2BTemplateAPI(true),
+			controller.WithTemplateBuildEnabled(true),
+		)
 		resp, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{
 			Name:          "custom-sized",
 			CPUCount:      4,
@@ -273,7 +282,7 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 		if !strings.Contains(df, fmt.Sprintf("COPY %s/src.txt /app/dest.txt\n", filesHash)) {
 			t.Fatalf("missing COPY in: %s", df)
 		}
-		if !strings.Contains(df, "RUN FOO=BAR KEY=VALUE echo hello\n") {
+		if !strings.Contains(df, "RUN export FOO='BAR'; export KEY='VALUE'; echo hello\n") {
 			t.Fatalf("missing RUN with accumulated env in: %s", df)
 		}
 		if meta.RunAsUser == nil || *meta.RunAsUser != 1001 {
@@ -301,7 +310,7 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 				t.Fatalf("found forbidden ENV instruction in Dockerfile: %s", line)
 			}
 		}
-		if !strings.Contains(df, "RUN SECRET_VAR=supersecret setup.sh") {
+		if !strings.Contains(df, "RUN export SECRET_VAR='supersecret'; setup.sh") {
 			t.Fatalf("expected RUN with prefixed env, got: %s", df)
 		}
 	})
@@ -1200,6 +1209,578 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 		if tplPrivate.Spec.Public || tplPrivate.Status.Public {
 			t.Fatalf("expected template public false, got spec=%v status=%v",
 				tplPrivate.Spec.Public, tplPrivate.Status.Public)
+		}
+	})
+
+	// 32. same-name rebuild reuses templateID, increments buildCount, keeps readyImage, rejects different primary name slug collision
+	t.Run("same-name rebuild reuses templateID and rejects different primary name slug collision", func(t *testing.T) {
+		ctx := context.Background()
+		stateDir := t.TempDir()
+		fakeBuilder := controller.NewFakeImageBuilder()
+		r := controller.NewReconciler(
+			controller.WithE2BTemplateAPI(true),
+			controller.WithTemplateBuildEnabled(true),
+			controller.WithImageBuilder(fakeBuilder),
+			controller.WithStateDir(stateDir),
+		)
+
+		resp1, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{
+			Name:          "my_app",
+			CPUCount:      2,
+			MemoryMB:      1024,
+			MinFreeDiskMB: 512, // below 10Gi minimum -> clamped to 10240
+		}, "")
+		if err != nil {
+			t.Fatalf("CreateTemplate 1 failed: %v", err)
+		}
+
+		tpl1, ok := r.GetPodTemplate(resp1.TemplateID)
+		if !ok {
+			t.Fatalf("GetPodTemplate failed")
+		}
+		if tpl1.Spec.DiskSizeMB != 10240 || tpl1.Spec.Storage.RootfsSize != "10240Mi" || tpl1.Spec.Storage.WorkspaceSize != "20Gi" {
+			t.Fatalf("unexpected sizing: disk=%d rootfs=%s ws=%s", tpl1.Spec.DiskSizeMB, tpl1.Spec.Storage.RootfsSize, tpl1.Spec.Storage.WorkspaceSize)
+		}
+		if tpl1.Spec.Resources.CPULimit != "2" || tpl1.Spec.Resources.MemoryLimit != "1024Mi" || tpl1.Spec.Resources.MemoryRequest != "1024Mi" {
+			t.Fatalf("unexpected resources: %+v", tpl1.Spec.Resources)
+		}
+		if tpl1.Metadata.Annotations["cubepod.io/primary-name"] != "my_app" {
+			t.Fatalf("expected primary-name annotation my_app, got %v", tpl1.Metadata.Annotations)
+		}
+		if tpl1.Status.BuildCount != 1 {
+			t.Fatalf("expected BuildCount 1, got %d", tpl1.Status.BuildCount)
+		}
+
+		if err := r.StartBuild(ctx, resp1.TemplateID, resp1.BuildID, controller.StartBuildRequest{
+			FromImage: "alpine:3.20",
+		}); err != nil {
+			t.Fatalf("StartBuild 1 failed: %v", err)
+		}
+
+		// Same-name rebuild while ready
+		resp2, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{
+			Name:     "my_app",
+			CPUCount: 4,
+			MemoryMB: 4096,
+		}, "")
+		if err != nil {
+			t.Fatalf("CreateTemplate same-name rebuild failed: %v", err)
+		}
+		if resp2.TemplateID != resp1.TemplateID {
+			t.Fatalf("expected reused templateID %s, got %s", resp1.TemplateID, resp2.TemplateID)
+		}
+		if resp2.BuildID == resp1.BuildID {
+			t.Fatalf("expected fresh buildID, got same %s", resp2.BuildID)
+		}
+		tpl2, _ := r.GetPodTemplate(resp1.TemplateID)
+		if tpl2.Status.BuildStatus != v1alpha1.BuildStatusWaiting {
+			t.Fatalf("expected waiting status after rebuild CreateTemplate, got %s", tpl2.Status.BuildStatus)
+		}
+		if tpl2.Status.ReadyImage != "alpine:3.20" || tpl2.Status.ReadyBuildID != resp1.BuildID {
+			t.Fatalf("expected ReadyImage/ReadyBuildID preserved, got %s / %s", tpl2.Status.ReadyImage, tpl2.Status.ReadyBuildID)
+		}
+		if tpl2.Status.BuildCount != 2 || len(tpl2.Status.Builds) != 2 {
+			t.Fatalf("expected BuildCount=2 and 2 build records, got %d / %d", tpl2.Status.BuildCount, len(tpl2.Status.Builds))
+		}
+
+		// Different primary name that slugifies to same "my-app" must return 409 Conflict
+		_, err = r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "my-app"}, "")
+		if !errors.Is(err, controller.ErrTemplateConflict) {
+			t.Fatalf("expected ErrTemplateConflict on different primary name collision, got %v", err)
+		}
+
+		// Reloading from stateDir recovers persisted template JSON
+		rReloaded := controller.NewReconciler(
+			controller.WithE2BTemplateAPI(true),
+			controller.WithStateDir(stateDir),
+		)
+		loaded, ok := rReloaded.GetPodTemplate(resp1.TemplateID)
+		if !ok || loaded.Status.ReadyImage != "alpine:3.20" || loaded.Status.BuildCount != 2 {
+			t.Fatalf("expected reloaded template from stateDir, ok=%v loaded=%+v", ok, loaded)
+		}
+	})
+
+	// 33. RenderDockerfile secret safety, ordered env override, invalid env key, and POSIX quoting
+	t.Run("RenderDockerfile secret safety ordered env override and quoting", func(t *testing.T) {
+		_, _, err := controller.RenderDockerfile("alpine:latest", "bld_1", controller.StartBuildRequest{
+			Steps: []controller.BuildStep{
+				{Type: "RUN", Args: []string{"echo cpodref_openai"}},
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "cpodref_") {
+			t.Fatalf("expected 400 error on cpodref_ in step arg, got %v", err)
+		}
+
+		_, _, err = controller.RenderDockerfile("alpine:latest", "bld_1", controller.StartBuildRequest{
+			FromImageRegistry: &controller.RegistryAuth{Username: "u", Password: "top-secret-password"},
+			Steps: []controller.BuildStep{
+				{Type: "RUN", Args: []string{"echo top-secret-password"}},
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "400:") {
+			t.Fatalf("expected 400 error when step arg leaks registry password, got %v", err)
+		}
+
+		_, _, err = controller.RenderDockerfile("alpine:latest", "bld_1", controller.StartBuildRequest{
+			Steps: []controller.BuildStep{
+				{Type: "ENV", Args: []string{"1BAD", "val"}},
+			},
+		})
+		if err == nil || !strings.Contains(err.Error(), "400:") {
+			t.Fatalf("expected 400 error on invalid env key, got %v", err)
+		}
+
+		df, _, err := controller.RenderDockerfile("alpine:latest", "bld_1", controller.StartBuildRequest{
+			Steps: []controller.BuildStep{
+				{Type: "ENV", Args: []string{"A", "old", "B", "it's"}},
+				{Type: "ENV", Args: []string{"A", "new"}},
+				{Type: "RUN", Args: []string{"env"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("RenderDockerfile failed: %v", err)
+		}
+		want := `RUN export A='new'; export B='it'"'"'s'; env`
+		if !strings.Contains(df, want) {
+			t.Fatalf("expected %q in dockerfile:\n%s", want, df)
+		}
+	})
+
+	// 34. fromTemplate 404, 409 unready, inheritance, and len(steps)==0 && readyCmd!="" requires templateBuild
+	t.Run("fromTemplate 404/409 inheritance and readyCmd gating", func(t *testing.T) {
+		ctx := context.Background()
+		fakeBuilder := controller.NewFakeImageBuilder()
+		rDisabled := controller.NewReconciler(controller.WithE2BTemplateAPI(true))
+		respDis, _ := rDisabled.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "gate-check"}, "")
+		err := rDisabled.StartBuild(ctx, respDis.TemplateID, respDis.BuildID, controller.StartBuildRequest{
+			FromImage: "alpine:latest",
+			ReadyCmd:  "true",
+		})
+		if !errors.Is(err, controller.ErrTemplateBuildDisabled) {
+			t.Fatalf("expected ErrTemplateBuildDisabled when steps empty but readyCmd non-empty, got %v", err)
+		}
+
+		r := controller.NewReconciler(
+			controller.WithE2BTemplateAPI(true),
+			controller.WithTemplateBuildEnabled(true),
+			controller.WithImageBuilder(fakeBuilder),
+		)
+
+		// Missing parent -> 404
+		childResp, _ := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "child-missing"}, "")
+		err = r.StartBuild(ctx, childResp.TemplateID, childResp.BuildID, controller.StartBuildRequest{
+			FromTemplate: "does-not-exist",
+		})
+		if !errors.Is(err, controller.ErrTemplateNotFound) {
+			t.Fatalf("expected ErrTemplateNotFound, got %v", err)
+		}
+
+		// Unready parent -> 409
+		unreadyParent, _ := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "unready-parent"}, "")
+		childUnready, _ := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "child-unready"}, "")
+		err = r.StartBuild(ctx, childUnready.TemplateID, childUnready.BuildID, controller.StartBuildRequest{
+			FromTemplate: unreadyParent.TemplateID,
+		})
+		if !errors.Is(err, controller.ErrTemplateNotReady) {
+			t.Fatalf("expected ErrTemplateNotReady, got %v", err)
+		}
+
+		// Ready parent with USER + StartCmd + ReadyCmd -> child inherits when unset
+		parentResp, _ := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "parent-ready"}, "")
+		err = r.StartBuild(ctx, parentResp.TemplateID, parentResp.BuildID, controller.StartBuildRequest{
+			FromImage: "ubuntu:24.04",
+			StartCmd:  "sleep infinity",
+			ReadyCmd:  "true",
+			Steps:     []controller.BuildStep{{Type: "USER", Args: []string{"1001:1002"}}},
+		})
+		if err != nil {
+			t.Fatalf("parent StartBuild failed: %v", err)
+		}
+
+		childInherit, _ := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "child-inherit"}, "")
+		err = r.StartBuild(ctx, childInherit.TemplateID, childInherit.BuildID, controller.StartBuildRequest{
+			FromTemplate: parentResp.TemplateID,
+		})
+		if err != nil {
+			t.Fatalf("child StartBuild failed: %v", err)
+		}
+		cTpl, _ := r.GetPodTemplate(childInherit.TemplateID)
+		if cTpl.Spec.StartCmd != "sleep infinity" || cTpl.Spec.ReadyCmd != "true" ||
+			cTpl.Spec.RunAsUser == nil || *cTpl.Spec.RunAsUser != 1001 ||
+			cTpl.Spec.RunAsGroup == nil || *cTpl.Spec.RunAsGroup != 1002 {
+			t.Fatalf("expected child to inherit parent runtime fields, got %+v", cTpl.Spec)
+		}
+	})
+
+	// 35. StartBuildAsync, ephemeral secret cleanup, metrics, RecordTemplateSpawn, Paused->Running pinned image, DeleteTemplate & WarmPool retirement
+	t.Run("async build ephemeral secret metrics spawn tracking resume pin and delete rules", func(t *testing.T) {
+		ctx := context.Background()
+		stateDir := t.TempDir()
+		fakeBuilder := controller.NewFakeImageBuilder()
+		buildStarted := make(chan struct{})
+		releaseBuild := make(chan struct{})
+		var sawSecretDuringBuild bool
+
+		r := controller.NewReconciler(
+			controller.WithE2BTemplateAPI(true),
+			controller.WithTemplateBuildEnabled(true),
+			controller.WithImageBuilder(fakeBuilder),
+			controller.WithStateDir(stateDir),
+			controller.WithTemplateRegistry("registry.example.com"),
+			controller.WithTemplateRepoPrefix("org/templates"),
+			controller.WithTemplatePullSecret("cubepod-template-pull"),
+		)
+
+		fakeBuilder.BuildHook = func(opts controller.BuildOptions) error {
+			secName := fmt.Sprintf("cubepod-template-src-%s", opts.BuildID)
+			if sec, secErr := r.KubeClient().GetSecret(ctx, "cubepod-workloads", secName); secErr == nil && sec != nil {
+				sawSecretDuringBuild = true
+			}
+			close(buildStarted)
+			<-releaseBuild
+			return nil
+		}
+
+		resp, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "async-app"}, "")
+		if err != nil {
+			t.Fatalf("CreateTemplate failed: %v", err)
+		}
+
+		err = r.StartBuildAsync(ctx, resp.TemplateID, resp.BuildID, controller.StartBuildRequest{
+			FromImage:         "private.reg.io/base:1.0",
+			FromImageRegistry: &controller.RegistryAuth{Username: "bot", Password: "pw"},
+			Steps:             []controller.BuildStep{{Type: "RUN", Args: []string{"echo hi"}}},
+		})
+		if err != nil {
+			t.Fatalf("StartBuildAsync failed: %v", err)
+		}
+
+		<-buildStarted
+
+		// Cannot delete while building
+		if delErr := r.DeleteTemplate(ctx, resp.TemplateID, true); !errors.Is(delErr, controller.ErrTemplateConflict) {
+			t.Fatalf("expected 409 deleting building template, got %v", delErr)
+		}
+
+		close(releaseBuild)
+
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			tpl, ok := r.GetPodTemplate(resp.TemplateID)
+			if ok && tpl.Status.BuildStatus == v1alpha1.BuildStatusReady {
+				break
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+
+		tpl, _ := r.GetPodTemplate(resp.TemplateID)
+		if tpl.Status.BuildStatus != v1alpha1.BuildStatusReady {
+			t.Fatalf("expected ready status, got %s (%s)", tpl.Status.BuildStatus, tpl.Status.Reason)
+		}
+		wantTag := fmt.Sprintf("registry.example.com/org/templates/async-app:%s", resp.BuildID)
+		if tpl.Status.ReadyImage != wantTag {
+			t.Fatalf("expected tag %s, got %s", wantTag, tpl.Status.ReadyImage)
+		}
+		if !sawSecretDuringBuild {
+			t.Fatalf("expected ephemeral secret cubepod-template-src-%s to exist during Build", resp.BuildID)
+		}
+		if _, secErr := r.KubeClient().GetSecret(ctx, "cubepod-workloads", "cubepod-template-src-"+resp.BuildID); secErr == nil {
+			t.Fatalf("expected ephemeral source secret to be deleted after build")
+		}
+		if metrics := r.TemplateBuildMetrics(); metrics.TemplateBuildsTotal["ready"] < 1 || metrics.TemplateBuildDurationCount < 1 {
+			t.Fatalf("expected build metrics recorded, got %+v", metrics)
+		}
+
+		// RecordTemplateSpawn increments SpawnCount & LastSpawnedAt
+		r.RecordTemplateSpawn(ctx, "async-app")
+		tplAfterSpawn, _ := r.GetPodTemplate(resp.TemplateID)
+		if tplAfterSpawn.Status.SpawnCount != 1 || tplAfterSpawn.Status.LastSpawnedAt == "" {
+			t.Fatalf("expected SpawnCount=1 and LastSpawnedAt set, got %+v", tplAfterSpawn.Status)
+		}
+
+		// Reconcile sandbox & check templatePullSecret attached (and never cubepod-template-src-*)
+		_, err = r.Reconcile(ctx, "box-pinned", v1alpha1.PodBoxSpec{
+			TemplateRef:  resp.TemplateID,
+			DesiredState: v1alpha1.DesiredStateRunning,
+		})
+		if err != nil {
+			t.Fatalf("Reconcile box-pinned failed: %v", err)
+		}
+		podManifest := r.KubeClient().(*controller.MemoryKubeClient).Pods["cubepod-workloads/box-pinned-kata-pod"]
+		if !slices.Contains(podManifest.ImagePullSecrets, "cubepod-template-pull") {
+			t.Fatalf("expected cubepod-template-pull secret on sandbox pod, got %v", podManifest.ImagePullSecrets)
+		}
+		for _, sec := range podManifest.ImagePullSecrets {
+			if strings.HasPrefix(sec, "cubepod-template-src-") {
+				t.Fatalf("unexpected ephemeral source secret leaked into sandbox pod: %v", podManifest.ImagePullSecrets)
+			}
+		}
+
+		// Pause box, rebuild template, resume box -> resolved-image must stay pinned to v1 tag!
+		if _, err := r.Pause(ctx, "box-pinned"); err != nil {
+			t.Fatalf("Pause failed: %v", err)
+		}
+		fakeBuilder.BuildHook = nil
+		resp2, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "async-app"}, "")
+		if err != nil {
+			t.Fatalf("rebuild CreateTemplate failed: %v", err)
+		}
+		if err := r.StartBuild(ctx, resp2.TemplateID, resp2.BuildID, controller.StartBuildRequest{
+			FromImage: "alpine:3.20",
+		}); err != nil {
+			t.Fatalf("rebuild StartBuild failed: %v", err)
+		}
+		if _, err := r.Reconcile(ctx, "box-pinned", v1alpha1.PodBoxSpec{
+			TemplateRef:  resp.TemplateID,
+			DesiredState: v1alpha1.DesiredStateRunning,
+		}); err != nil {
+			t.Fatalf("Resume failed: %v", err)
+		}
+		resumedBox, _ := r.KubeClient().GetPodBox(ctx, "cubepod-workloads", "box-pinned")
+		if resumedBox.Metadata.Annotations["cubepod.io/resolved-image"] != wantTag {
+			t.Fatalf("expected resumed PodBox to stay pinned to %s, got %s", wantTag, resumedBox.Metadata.Annotations["cubepod.io/resolved-image"])
+		}
+
+		// DeleteTemplate blocked while box is Running, allowed once box is Terminated
+		if delErr := r.DeleteTemplate(ctx, resp.TemplateID, false); !errors.Is(delErr, controller.ErrTemplateConflict) {
+			t.Fatalf("expected ErrTemplateConflict while box is Running, got %v", delErr)
+		}
+		// Expire box via ReapIdle to mark Terminated
+		_ = r.SetPausedAt("box-pinned", time.Now().Add(-2*time.Hour))
+		_, _ = r.Pause(ctx, "box-pinned")
+		_ = r.SetPausedAt("box-pinned", time.Now().Add(-2*time.Hour))
+		_, err = r.Reconcile(ctx, "box-pinned", v1alpha1.PodBoxSpec{
+			TemplateRef:  resp.TemplateID,
+			DesiredState: v1alpha1.DesiredStatePaused,
+			Lifecycle:    v1alpha1.LifecyclePolicy{PausedTTLSeconds: 60},
+		})
+		if err != nil {
+			t.Fatalf("Reconcile paused failed: %v", err)
+		}
+		_ = r.SetPausedAt("box-pinned", time.Now().Add(-2*time.Hour))
+		_, term := r.ReapIdle(ctx, time.Now())
+		if len(term) != 1 || term[0] != "box-pinned" {
+			t.Fatalf("expected box-pinned terminated, got %v", term)
+		}
+
+		if err := r.DeleteTemplate(ctx, resp.TemplateID, false); err != nil {
+			t.Fatalf("expected DeleteTemplate to succeed when referencing PodBox is Terminated, got %v", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(stateDir, "templates", resp.TemplateID+".json")); !os.IsNotExist(statErr) {
+			t.Fatalf("expected local template file removed after DeleteTemplate, statErr=%v", statErr)
+		}
+	})
+
+	// 36. ContextStore 512Mi limit, symlink/hardlink/fifo rejection, ReadLogs & SweepExpired
+	t.Run("ContextStore size limit link traversal fifo ReadLogs and SweepExpired", func(t *testing.T) {
+		ctxDir := t.TempDir()
+		store := controller.NewMemoryContextStore(ctxDir)
+		store.SetMaxBytes(1024)
+
+		// Exceeds configured maxBytes -> 413 ErrContextTooLarge
+		var bigBuf bytes.Buffer
+		tw := tar.NewWriter(&bigBuf)
+		payload := bytes.Repeat([]byte("a"), 1500)
+		_ = tw.WriteHeader(&tar.Header{Name: "big.txt", Mode: 0644, Size: int64(len(payload))})
+		_, _ = tw.Write(payload)
+		_ = tw.Close()
+		if err := store.Store(strings.Repeat("1", 64), &bigBuf); !errors.Is(err, controller.ErrContextTooLarge) {
+			t.Fatalf("expected ErrContextTooLarge, got %v", err)
+		}
+		store.SetMaxBytes(1024 * 1024)
+
+		// Symlink escaping context prefix -> rejected
+		var symBuf bytes.Buffer
+		twSym := tar.NewWriter(&symBuf)
+		_ = twSym.WriteHeader(&tar.Header{Name: "sub/escape", Typeflag: tar.TypeSymlink, Linkname: "../../etc/passwd"})
+		_ = twSym.Close()
+		if err := store.Store(strings.Repeat("2", 64), &symBuf); !errors.Is(err, controller.ErrPathTraversal) {
+			t.Fatalf("expected ErrPathTraversal on escaping symlink, got %v", err)
+		}
+
+		// Hardlink escaping context prefix -> rejected
+		var linkBuf bytes.Buffer
+		twLink := tar.NewWriter(&linkBuf)
+		_ = twLink.WriteHeader(&tar.Header{Name: "hard", Typeflag: tar.TypeLink, Linkname: "../secret"})
+		_ = twLink.Close()
+		if err := store.Store(strings.Repeat("3", 64), &linkBuf); !errors.Is(err, controller.ErrPathTraversal) {
+			t.Fatalf("expected ErrPathTraversal on escaping hardlink, got %v", err)
+		}
+
+		// FIFO / device node -> rejected
+		var fifoBuf bytes.Buffer
+		twFifo := tar.NewWriter(&fifoBuf)
+		_ = twFifo.WriteHeader(&tar.Header{Name: "pipe", Typeflag: tar.TypeFifo, Mode: 0644})
+		_ = twFifo.Close()
+		if err := store.Store(strings.Repeat("4", 64), &fifoBuf); !errors.Is(err, controller.ErrInvalidContextTar) {
+			t.Fatalf("expected ErrInvalidContextTar on FIFO entry, got %v", err)
+		}
+
+		// AppendLog + ReadLogs filtering & pagination
+		_ = store.AppendLog("bld_logs1", []string{"starting build", "warning: deprecated flag", "error: step failed"})
+		errsOnly, err := store.ReadLogs("bld_logs1", 0, 10, "error")
+		if err != nil || len(errsOnly) != 1 || errsOnly[0].Level != "error" {
+			t.Fatalf("expected 1 error log entry, got %+v (err=%v)", errsOnly, err)
+		}
+		paged, err := store.ReadLogs("bld_logs1", 1, 1, "")
+		if err != nil || len(paged) != 1 || !strings.Contains(paged[0].Message, "warning") {
+			t.Fatalf("expected 2nd entry on offset=1 limit=1, got %+v (err=%v)", paged, err)
+		}
+
+		// Valid context tar + SweepExpired
+		var validBuf bytes.Buffer
+		twVal := tar.NewWriter(&validBuf)
+		_ = twVal.WriteHeader(&tar.Header{Name: "ok.txt", Mode: 0644, Size: 2})
+		_, _ = twVal.Write([]byte("ok"))
+		_ = twVal.Close()
+		validHash := strings.Repeat("5", 64)
+		if err := store.Store(validHash, &validBuf); err != nil {
+			t.Fatalf("Store valid tar failed: %v", err)
+		}
+		if err := store.SweepExpired(time.Now().Add(2*time.Hour), 1*time.Hour, 1*time.Hour); err != nil {
+			t.Fatalf("SweepExpired failed: %v", err)
+		}
+		if store.IsPresent(validHash) {
+			t.Fatalf("expected expired tar to be swept")
+		}
+		if afterLogs, _ := store.ReadLogs("bld_logs1", 0, 10, ""); len(afterLogs) != 0 {
+			t.Fatalf("expected expired logs to be swept, got %+v", afterLogs)
+		}
+	})
+
+	// 37. Secret CRUD (Memory + REST httptest) & BuildKitBuilder TagExists + Probe
+	t.Run("Secret CRUD REST httptest and BuildKitBuilder TagExists and Probe", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Registry mock with Bearer token exchange + V2 manifest HEAD
+		var tokenHits atomic.Int32
+		regSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/token":
+				tokenHits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]string{"token": "tok-abc"})
+			case "/v2/org/my-tpl/manifests/bld_123":
+				if r.Header.Get("Authorization") != "Bearer tok-abc" {
+					w.Header().Set("WWW-Authenticate", fmt.Sprintf(`Bearer realm="http://%s/token",service="reg",scope="repository:org/my-tpl:pull"`, r.Host))
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer regSrv.Close()
+
+		// Mock Kubernetes APIServer for Secrets and Probe Pods
+		secrets := make(map[string]controller.KubeSecret)
+		var createdPodJSON map[string]any
+		var deletedProbePod atomic.Bool
+		var probePollCount atomic.Int32
+
+		kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/secrets":
+				var sec controller.KubeSecret
+				_ = json.NewDecoder(r.Body).Decode(&sec)
+				secrets[sec.Metadata.Name] = sec
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(sec)
+			case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/cubepod-workloads/secrets/"):
+				name := strings.TrimPrefix(r.URL.Path, "/api/v1/namespaces/cubepod-workloads/secrets/")
+				sec, ok := secrets[name]
+				if !ok {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(sec)
+			case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/v1/namespaces/cubepod-workloads/secrets/"):
+				name := strings.TrimPrefix(r.URL.Path, "/api/v1/namespaces/cubepod-workloads/secrets/")
+				delete(secrets, name)
+				w.WriteHeader(http.StatusOK)
+			case r.Method == http.MethodPost && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods":
+				_ = json.NewDecoder(r.Body).Decode(&createdPodJSON)
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(createdPodJSON)
+			case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods/cubepod-probe-bld-123":
+				phase := "Running"
+				if probePollCount.Add(1) >= 2 {
+					phase = "Succeeded"
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"metadata": map[string]any{"name": "cubepod-probe-bld-123"},
+					"status":   map[string]any{"phase": phase},
+				})
+			case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods/cubepod-probe-bld-123":
+				deletedProbePod.Store(true)
+				w.WriteHeader(http.StatusOK)
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer kubeSrv.Close()
+
+		restKC := controller.NewRESTKubeClient(kubeSrv.URL, "", "cubepod-workloads", kubeSrv.Client())
+		err := restKC.CreateSecret(ctx, controller.KubeSecret{
+			APIVersion: "v1",
+			Kind:       "Secret",
+			Metadata:   v1alpha1.ObjectMeta{Name: "push-sec", Namespace: "cubepod-workloads"},
+			Type:       "kubernetes.io/dockerconfigjson",
+			StringData: map[string]string{
+				".dockerconfigjson": fmt.Sprintf(`{"auths":{%q:{"username":"u","password":"p"}}}`, strings.TrimPrefix(regSrv.URL, "http://")),
+			},
+		})
+		if err != nil {
+			t.Fatalf("REST CreateSecret failed: %v", err)
+		}
+
+		bk := controller.NewBuildKitBuilder("tcp://127.0.0.1:1234",
+			controller.WithBuildKitKubeClient(restKC, "cubepod-workloads"),
+			controller.WithBuildKitPushSecret("push-sec"),
+			controller.WithBuildKitHTTPClient(regSrv.Client()),
+			controller.WithBuildKitInsecureRegistry(true),
+		)
+
+		regHost := strings.TrimPrefix(regSrv.URL, "http://")
+		exists, err := bk.TagExists(ctx, regHost+"/org/my-tpl:bld_123")
+		if err != nil || !exists {
+			t.Fatalf("expected TagExists=true, got exists=%v err=%v", exists, err)
+		}
+		if tokenHits.Load() == 0 {
+			t.Fatalf("expected Bearer token exchange during TagExists")
+		}
+		missing, err := bk.TagExists(ctx, regHost+"/org/my-tpl:missing")
+		if err != nil || missing {
+			t.Fatalf("expected TagExists=false on missing tag, got %v err=%v", missing, err)
+		}
+
+		uid := int64(1001)
+		err = bk.Probe(ctx, regHost+"/org/my-tpl:bld_123", controller.ProbeOptions{
+			BuildID:        "bld_123",
+			Namespace:      "cubepod-workloads",
+			StartCmd:       "python3 -m http.server 8080",
+			ReadyCmd:       "true",
+			RunAsUser:      &uid,
+			Timeout:        10 * time.Second,
+			PullSecretName: "push-sec",
+		})
+		if err != nil {
+			t.Fatalf("BuildKit Probe failed: %v", err)
+		}
+		if !deletedProbePod.Load() {
+			t.Fatalf("expected probe pod to be deleted in defer")
+		}
+		specMap := createdPodJSON["spec"].(map[string]any)
+		if rc, hasRC := specMap["runtimeClassName"]; hasRC && rc != "" {
+			t.Fatalf("expected probe pod without kata runtimeClassName, got %v", rc)
+		}
+		if specMap["restartPolicy"] != "Never" {
+			t.Fatalf("expected probe pod restartPolicy=Never, got %v", specMap["restartPolicy"])
+		}
+
+		if delErr := restKC.DeleteSecret(ctx, "cubepod-workloads", "push-sec"); delErr != nil {
+			t.Fatalf("REST DeleteSecret failed: %v", delErr)
 		}
 	})
 }

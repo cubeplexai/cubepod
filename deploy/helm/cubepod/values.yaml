@@ -84,6 +84,7 @@ templateBuild:
   cacheSize: "20Gi"
   probeTimeout: "120s"
   registry:
+    url: ""
     pushSecret: "cubepod-buildkit-push"
     pullSecret: "cubepod-buildkit-pull"
     repositoryPrefix: "cubepod-templates"

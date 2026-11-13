@@ -7,7 +7,11 @@ metadata:
     {{- include "cubepod.labels" . | nindent 4 }}
     app.kubernetes.io/component: controller
 spec:
+  {{- if .Values.templateBuild.enabled }}
+  replicas: 1
+  {{- else }}
   replicas: {{ .Values.controller.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "cubepod.selectorLabels" . | nindent 6 }}
@@ -32,6 +36,29 @@ spec:
             {{- end }}
             {{- if .Values.controller.kubeToken }}
             - "--kube-token={{ .Values.controller.kubeToken }}"
+            {{- end }}
+            {{- if .Values.featureGates.e2bTemplateAPI }}
+            - "--e2b-template-api=true"
+            {{- end }}
+            {{- if .Values.templateBuild.enabled }}
+            - "--template-build=true"
+            - "--buildkit-addr={{ .Values.templateBuild.buildkit.address }}"
+            - "--state-dir=/var/lib/cubepod/context"
+            {{- if .Values.templateBuild.registry.url }}
+            - "--template-registry={{ .Values.templateBuild.registry.url }}"
+            {{- end }}
+            {{- if .Values.templateBuild.registry.repositoryPrefix }}
+            - "--template-repo-prefix={{ .Values.templateBuild.registry.repositoryPrefix }}"
+            {{- end }}
+            {{- if .Values.templateBuild.registry.pushSecret }}
+            - "--template-push-secret={{ .Values.templateBuild.registry.pushSecret }}"
+            {{- end }}
+            {{- if .Values.templateBuild.registry.pullSecret }}
+            - "--template-pull-secret={{ .Values.templateBuild.registry.pullSecret }}"
+            {{- end }}
+            {{- if .Values.templateBuild.probeTimeout }}
+            - "--template-probe-timeout={{ .Values.templateBuild.probeTimeout }}"
+            {{- end }}
             {{- end }}
           ports:
             - name: healthz

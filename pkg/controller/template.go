@@ -4,16 +4,19 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -140,12 +143,19 @@ type ResolvedTemplate struct {
 	TemplateSpec  v1alpha1.PodTemplateSpec
 }
 
+var envKeyRegexp = regexp.MustCompile("^[A-Za-z_][A-Za-z0-9_]*$")
+
 // RenderedMeta contains metadata extracted from build steps.
 type RenderedMeta struct {
 	RunAsUser     *int64
 	RunAsGroup    *int64
 	RunAsUsername string
+	HasUserStep   bool
 	FilesHashes   []string
+}
+
+func posixSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
 // RenderDockerfile translates E2B build steps into a Dockerfile in memory.
@@ -154,14 +164,29 @@ func RenderDockerfile(fromImage, buildID string, req StartBuildRequest) (string,
 		return "", nil, fmt.Errorf("400: fromImage cannot be empty")
 	}
 
+	var srcPassword string
+	if req.FromImageRegistry != nil {
+		srcPassword = req.FromImageRegistry.Password
+	}
+
 	var lines []string
 	lines = append(lines, fmt.Sprintf("FROM %s", fromImage))
 
 	meta := &RenderedMeta{}
-	var accumulatedEnv []string
+	var envOrder []string
+	envMap := make(map[string]string)
 	var lastUserStep string
 
 	for _, step := range req.Steps {
+		for _, arg := range step.Args {
+			if strings.Contains(arg, "cpodref_") {
+				return "", nil, fmt.Errorf("400: build step arguments must not contain cpodref_ secret references")
+			}
+			if srcPassword != "" && strings.Contains(arg, srcPassword) {
+				return "", nil, fmt.Errorf("400: build step arguments must not contain registry credentials")
+			}
+		}
+
 		stepType := strings.ToUpper(strings.TrimSpace(step.Type))
 		if stepType == "ARG" {
 			return "", nil, fmt.Errorf("400: incoming step type ARG is not allowed")
@@ -177,7 +202,15 @@ func RenderDockerfile(fromImage, buildID string, req StartBuildRequest) (string,
 				return "", nil, fmt.Errorf("400: ENV args length must be even, got %d", len(step.Args))
 			}
 			for i := 0; i < len(step.Args); i += 2 {
-				accumulatedEnv = append(accumulatedEnv, fmt.Sprintf("%s=%s", step.Args[i], step.Args[i+1]))
+				k := step.Args[i]
+				v := step.Args[i+1]
+				if !envKeyRegexp.MatchString(k) {
+					return "", nil, fmt.Errorf("400: invalid environment variable key %q", k)
+				}
+				if _, exists := envMap[k]; !exists {
+					envOrder = append(envOrder, k)
+				}
+				envMap[k] = v
 			}
 			// ENV instruction is NOT emitted into Dockerfile.
 
@@ -199,6 +232,7 @@ func RenderDockerfile(fromImage, buildID string, req StartBuildRequest) (string,
 			u := step.Args[0]
 			lines = append(lines, fmt.Sprintf("USER %s", u))
 			lastUserStep = u
+			meta.HasUserStep = true
 
 			// Parse user for spec fields:
 			if strings.Contains(u, ":") {
@@ -289,11 +323,15 @@ func RenderDockerfile(fromImage, buildID string, req StartBuildRequest) (string,
 				lines = append(lines, fmt.Sprintf("USER %s", runUser))
 			}
 
-			fullCmd := cmd
-			if len(accumulatedEnv) > 0 {
-				fullCmd = strings.Join(accumulatedEnv, " ") + " " + cmd
+			var envPrefix strings.Builder
+			for _, k := range envOrder {
+				envPrefix.WriteString("export ")
+				envPrefix.WriteString(k)
+				envPrefix.WriteString("=")
+				envPrefix.WriteString(posixSingleQuote(envMap[k]))
+				envPrefix.WriteString("; ")
 			}
-			lines = append(lines, fmt.Sprintf("RUN %s", fullCmd))
+			lines = append(lines, fmt.Sprintf("RUN %s%s", envPrefix.String(), cmd))
 
 			if runUser != "" {
 				if lastUserStep != "" {
@@ -614,8 +652,241 @@ func (r *Reconciler) resolveTemplateLocked(templateID string) (*ResolvedTemplate
 	return nil, fmt.Errorf("%w: %s", ErrTemplateNotFound, target)
 }
 
-// CreateTemplate handles POST /templates creation of a new template.
+// TemplateBuildMetricsSnapshot holds Prometheus-ready counters and duration histogram buckets.
+type TemplateBuildMetricsSnapshot struct {
+	TemplateBuildsTotal          map[string]int64
+	TemplateBuildDurationBuckets map[string]int64
+	TemplateBuildDurationSum     float64
+	TemplateBuildDurationCount   int64
+}
+
+type templateBuildMetricsCollector struct {
+	mu       sync.Mutex
+	total    map[string]int64
+	buckets  map[string]int64
+	sumSecs  float64
+	countObs int64
+}
+
+func (m *templateBuildMetricsCollector) observe(result string, dur time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.total == nil {
+		m.total = make(map[string]int64)
+	}
+	if m.buckets == nil {
+		m.buckets = map[string]int64{
+			"le_5":   0,
+			"le_15":  0,
+			"le_60":  0,
+			"le_300": 0,
+			"le_inf": 0,
+		}
+	}
+	m.total[result]++
+	secs := dur.Seconds()
+	if secs < 0 {
+		secs = 0
+	}
+	m.sumSecs += secs
+	m.countObs++
+	if secs <= 5 {
+		m.buckets["le_5"]++
+	}
+	if secs <= 15 {
+		m.buckets["le_15"]++
+	}
+	if secs <= 60 {
+		m.buckets["le_60"]++
+	}
+	if secs <= 300 {
+		m.buckets["le_300"]++
+	}
+	m.buckets["le_inf"]++
+}
+
+func (m *templateBuildMetricsCollector) snapshot() TemplateBuildMetricsSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tot := make(map[string]int64, len(m.total))
+	for k, v := range m.total {
+		tot[k] = v
+	}
+	bkt := make(map[string]int64, len(m.buckets))
+	for k, v := range m.buckets {
+		bkt[k] = v
+	}
+	return TemplateBuildMetricsSnapshot{
+		TemplateBuildsTotal:          tot,
+		TemplateBuildDurationBuckets: bkt,
+		TemplateBuildDurationSum:     m.sumSecs,
+		TemplateBuildDurationCount:   m.countObs,
+	}
+}
+
+// TemplateBuildMetrics returns a snapshot of template build counters and duration histogram buckets.
+func (r *Reconciler) TemplateBuildMetrics() TemplateBuildMetricsSnapshot {
+	return r.buildMetrics.snapshot()
+}
+
+func computeResourcesForTemplate(cpu, mem int32) v1alpha1.ResourceRequirements {
+	cpuReq := "1"
+	if cpu < 1 {
+		cpuReq = fmt.Sprintf("%d", cpu)
+	}
+	memReq := "2Gi"
+	if mem < 2048 {
+		memReq = fmt.Sprintf("%dMi", mem)
+	}
+	return v1alpha1.ResourceRequirements{
+		CPURequest:    cpuReq,
+		CPULimit:      fmt.Sprintf("%d", cpu),
+		MemoryRequest: memReq,
+		MemoryLimit:   fmt.Sprintf("%dMi", mem),
+	}
+}
+
+func upsertBuildRecord(builds []v1alpha1.PodTemplateBuildRecord, rec v1alpha1.PodTemplateBuildRecord) []v1alpha1.PodTemplateBuildRecord {
+	for i := range builds {
+		if builds[i].BuildID == rec.BuildID {
+			if builds[i].CreatedAt != "" && rec.CreatedAt == "" {
+				rec.CreatedAt = builds[i].CreatedAt
+			}
+			if builds[i].CPUCount != 0 && rec.CPUCount == 0 {
+				rec.CPUCount = builds[i].CPUCount
+			}
+			if builds[i].MemoryMB != 0 && rec.MemoryMB == 0 {
+				rec.MemoryMB = builds[i].MemoryMB
+			}
+			builds[i] = rec
+			return builds
+		}
+	}
+	return append(builds, rec)
+}
+
+func primaryNameOfTemplate(tpl *v1alpha1.PodTemplate) string {
+	if tpl == nil {
+		return ""
+	}
+	if tpl.Metadata.Annotations != nil {
+		if pn := tpl.Metadata.Annotations["cubepod.io/primary-name"]; pn != "" {
+			return pn
+		}
+	}
+	if len(tpl.Spec.Names) > 0 && tpl.Spec.Names[0] != "" {
+		return tpl.Spec.Names[0]
+	}
+	return tpl.Metadata.Name
+}
+
+func (r *Reconciler) persistLocalTemplateLocked(tpl *v1alpha1.PodTemplate) {
+	stateDir := r.stateDir
+	if stateDir == "" {
+		stateDir = os.Getenv("CUBEPOD_STATE")
+	}
+	if stateDir == "" || tpl == nil || tpl.Status.TemplateID == "" {
+		return
+	}
+	dir := filepath.Join(stateDir, "templates")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
+	data, err := json.MarshalIndent(tpl, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(dir, tpl.Status.TemplateID+".json"), data, 0644)
+}
+
+func (r *Reconciler) removeLocalTemplateLocked(templateID string) {
+	stateDir := r.stateDir
+	if stateDir == "" {
+		stateDir = os.Getenv("CUBEPOD_STATE")
+	}
+	if stateDir == "" || templateID == "" {
+		return
+	}
+	_ = os.Remove(filepath.Join(stateDir, "templates", templateID+".json"))
+}
+
+func (r *Reconciler) loadLocalTemplates(ctx context.Context) error {
+	if r.stateDir == "" {
+		return nil
+	}
+	dir := filepath.Join(r.stateDir, "templates")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if readErr != nil {
+			continue
+		}
+		var tpl v1alpha1.PodTemplate
+		if jsonErr := json.Unmarshal(data, &tpl); jsonErr != nil || tpl.Metadata.Name == "" {
+			continue
+		}
+		if r.kubeClient != nil {
+			if err := r.kubeClient.CreatePodTemplate(ctx, tpl); err != nil {
+				_ = r.kubeClient.UpdatePodTemplate(ctx, tpl)
+				_ = r.kubeClient.UpdatePodTemplateStatus(ctx, tpl)
+			}
+		}
+	}
+	return nil
+}
+
+// SyncTemplatesFromKube synchronizes PodTemplate CRs from Kubernetes into memory.
+func (r *Reconciler) SyncTemplatesFromKube(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if r.kubeClient == nil {
+		return nil
+	}
+	list, err := r.kubeClient.ListPodTemplates(ctx, r.namespace)
+	if err != nil {
+		if errors.Is(err, ErrCRDNotInstalled) {
+			return nil
+		}
+		return err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, tpl := range list {
+		if tpl.Metadata.Name == "" {
+			continue
+		}
+		cp := tpl
+		r.templateObjects[tpl.Metadata.Name] = &cp
+		_ = r.indexTemplateLocked(&cp)
+		r.templates[tpl.Metadata.Name] = cp.Spec
+	}
+	return nil
+}
+
+func (r *Reconciler) targetImageTagLocked(slug, buildID string) string {
+	if r.templateRegistry != "" {
+		prefix := strings.Trim(r.templateRepoPrefix, "/")
+		if prefix != "" {
+			return fmt.Sprintf("%s/%s/%s:%s", r.templateRegistry, prefix, slug, buildID)
+		}
+		return fmt.Sprintf("%s/%s:%s", r.templateRegistry, slug, buildID)
+	}
+	return fmt.Sprintf("cubepod-templates/%s:%s", slug, buildID)
+}
+
+// CreateTemplate handles POST /templates creation of a new template or same-name rebuild.
 func (r *Reconciler) CreateTemplate(ctx context.Context, req CreateTemplateRequest, idempotencyKey string) (*CreateTemplateResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -660,18 +931,11 @@ func (r *Reconciler) CreateTemplate(ctx context.Context, req CreateTemplateReque
 
 	slug := Slugify(primaryName)
 
-	if existingObj, ok := r.templateObjects[slug]; ok {
-		return nil, fmt.Errorf("%w: slug %q collision with template %s", ErrTemplateConflict, slug, existingObj.Status.TemplateID)
-	}
-
 	for _, n := range names {
 		if existingObjName, exists := r.templateIndex[n]; exists && existingObjName != slug {
 			return nil, fmt.Errorf("%w: name %q already claimed by %q", ErrTemplateConflict, n, existingObjName)
 		}
 	}
-
-	templateID := fmt.Sprintf("tpl_%s", randomHex(8))
-	buildID := fmt.Sprintf("bld_%s", randomHex(8))
 
 	cpu := req.CPUCount
 	if cpu <= 0 {
@@ -681,10 +945,92 @@ func (r *Reconciler) CreateTemplate(ctx context.Context, req CreateTemplateReque
 	if mem <= 0 {
 		mem = 2048
 	}
-	disk := req.MinFreeDiskMB
-	if disk <= 0 {
-		disk = 10240
+	disk := max(req.MinFreeDiskMB, int32(10240))
+	resources := computeResourcesForTemplate(cpu, mem)
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	if existingObj, ok := r.templateObjects[slug]; ok {
+		if primaryNameOfTemplate(existingObj) != primaryName {
+			return nil, fmt.Errorf("%w: slug %q collision with template %s", ErrTemplateConflict, slug, existingObj.Status.TemplateID)
+		}
+		if existingObj.Status.BuildStatus == v1alpha1.BuildStatusBuilding || existingObj.Status.BuildStatus == v1alpha1.BuildStatusUploaded {
+			return nil, fmt.Errorf("%w: build %s already in progress", ErrTemplateConflict, existingObj.Status.LatestBuildID)
+		}
+
+		// Same-name rebuild: reuse TemplateID, allocate new buildID, keep ReadyImage and ReadyBuildID unchanged.
+		templateID := existingObj.Status.TemplateID
+		if templateID == "" {
+			templateID = fmt.Sprintf("tpl_%s", randomHex(8))
+			existingObj.Status.TemplateID = templateID
+		}
+		buildID := fmt.Sprintf("bld_%s", randomHex(8))
+
+		for _, oldName := range existingObj.Spec.Names {
+			if mapped, mappedOk := r.templateIndex[oldName]; mappedOk && mapped == slug {
+				delete(r.templateIndex, oldName)
+			}
+		}
+
+		if existingObj.Metadata.Annotations == nil {
+			existingObj.Metadata.Annotations = make(map[string]string)
+		}
+		existingObj.Metadata.Annotations["cubepod.io/primary-name"] = primaryName
+		existingObj.Spec.Names = names
+		existingObj.Spec.CPUCount = cpu
+		existingObj.Spec.MemoryMB = mem
+		existingObj.Spec.DiskSizeMB = disk
+		existingObj.Spec.Resources = resources
+		existingObj.Spec.Storage.StorageClassName = r.defaultStorageClass
+		existingObj.Spec.Storage.RootfsSize = fmt.Sprintf("%dMi", disk)
+		existingObj.Spec.Storage.WorkspaceSize = "20Gi"
+
+		if existingObj.Status.CreatedAt == "" {
+			existingObj.Status.CreatedAt = now
+		}
+		existingObj.Status.UpdatedAt = now
+		existingObj.Status.LatestBuildID = buildID
+		existingObj.Status.BuildStatus = v1alpha1.BuildStatusWaiting
+		existingObj.Status.Reason = ""
+		existingObj.Status.FailedStep = ""
+		existingObj.Status.BuildCount++
+		existingObj.Status.Builds = upsertBuildRecord(existingObj.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+			BuildID:   buildID,
+			Status:    v1alpha1.BuildStatusWaiting,
+			CreatedAt: now,
+			UpdatedAt: now,
+			CPUCount:  cpu,
+			MemoryMB:  mem,
+		})
+
+		if err := r.kubeClient.UpdatePodTemplate(ctx, *existingObj); err != nil {
+			return nil, err
+		}
+		if err := r.kubeClient.UpdatePodTemplateStatus(ctx, *existingObj); err != nil {
+			return nil, err
+		}
+		_ = r.indexTemplateLocked(existingObj)
+		r.templates[slug] = existingObj.Spec
+		r.persistLocalTemplateLocked(existingObj)
+
+		resp := CreateTemplateResponse{
+			TemplateID: templateID,
+			BuildID:    buildID,
+			Public:     existingObj.Spec.Public,
+			Aliases:    []string{primaryName},
+			Names:      names,
+			Tags:       tags,
+		}
+		if idempotencyKey != "" {
+			r.idempotency[idempotencyKey] = idempotencyRecord{
+				requestHash: reqHash,
+				response:    resp,
+			}
+		}
+		return &resp, nil
 	}
+
+	templateID := fmt.Sprintf("tpl_%s", randomHex(8))
+	buildID := fmt.Sprintf("bld_%s", randomHex(8))
 
 	tpl := v1alpha1.PodTemplate{
 		APIVersion: "cubepod.io/v1alpha1",
@@ -692,6 +1038,9 @@ func (r *Reconciler) CreateTemplate(ctx context.Context, req CreateTemplateReque
 		Metadata: v1alpha1.ObjectMeta{
 			Name:      slug,
 			Namespace: r.namespace,
+			Annotations: map[string]string{
+				"cubepod.io/primary-name": primaryName,
+			},
 		},
 		Spec: v1alpha1.PodTemplateSpec{
 			RuntimeClassName: r.defaultRuntimeClass,
@@ -701,6 +1050,7 @@ func (r *Reconciler) CreateTemplate(ctx context.Context, req CreateTemplateReque
 			CPUCount:         cpu,
 			MemoryMB:         mem,
 			DiskSizeMB:       disk,
+			Resources:        resources,
 			Storage: v1alpha1.StorageSpec{
 				StorageClassName: r.defaultStorageClass,
 				RootfsSize:       fmt.Sprintf("%dMi", disk),
@@ -711,6 +1061,19 @@ func (r *Reconciler) CreateTemplate(ctx context.Context, req CreateTemplateReque
 			TemplateID:    templateID,
 			LatestBuildID: buildID,
 			BuildStatus:   v1alpha1.BuildStatusWaiting,
+			BuildCount:    1,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+			Builds: []v1alpha1.PodTemplateBuildRecord{
+				{
+					BuildID:   buildID,
+					Status:    v1alpha1.BuildStatusWaiting,
+					CreatedAt: now,
+					UpdatedAt: now,
+					CPUCount:  cpu,
+					MemoryMB:  mem,
+				},
+			},
 		},
 	}
 
@@ -721,6 +1084,7 @@ func (r *Reconciler) CreateTemplate(ctx context.Context, req CreateTemplateReque
 	r.templateObjects[slug] = &tpl
 	_ = r.indexTemplateLocked(&tpl)
 	r.templates[slug] = tpl.Spec
+	r.persistLocalTemplateLocked(&tpl)
 
 	resp := CreateTemplateResponse{
 		TemplateID: templateID,
@@ -741,14 +1105,41 @@ func (r *Reconciler) CreateTemplate(ctx context.Context, req CreateTemplateReque
 	return &resp, nil
 }
 
-// StartBuild initiates a template build or fast-path image registration.
-func (r *Reconciler) StartBuild(ctx context.Context, templateID, buildID string, req StartBuildRequest) error {
+type preparedBuildPlan struct {
+	slug              string
+	templateID        string
+	buildID           string
+	baseImage         string
+	targetTag         string
+	rendered          string
+	filesHashes       []string
+	effectiveStartCmd string
+	effectiveReadyCmd string
+	runAsUser         *int64
+	runAsGroup        *int64
+	runAsUsername     string
+	fromImageRegistry *RegistryAuth
+	noCache           bool
+	skipBuild         bool
+	builder           ImageBuilder
+	pullSecretName    string
+	pushSecretName    string
+	templateRegistry  string
+	repoPrefix        string
+	cpuCount          int32
+	memoryMB          int32
+}
+
+func (r *Reconciler) prepareBuild(ctx context.Context, templateID, buildID string, req StartBuildRequest) (*preparedBuildPlan, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 
 	// 1. Validate fromImage vs fromTemplate
 	if (req.FromImage == "" && req.FromTemplate == "") || (req.FromImage != "" && req.FromTemplate != "") {
-		r.mu.Unlock()
-		return fmt.Errorf("400: exactly one of fromImage or fromTemplate must be set")
+		return nil, false, fmt.Errorf("400: exactly one of fromImage or fromTemplate must be set")
 	}
 
 	// 2. Find template object by templateID
@@ -760,183 +1151,497 @@ func (r *Reconciler) StartBuild(ctx context.Context, templateID, buildID string,
 		}
 	}
 	if tpl == nil {
-		r.mu.Unlock()
-		return fmt.Errorf("%w: %s", ErrTemplateNotFound, templateID)
+		return nil, false, fmt.Errorf("%w: %s", ErrTemplateNotFound, templateID)
 	}
 
 	// 3. Second build while latest is waiting or building: 409
 	if tpl.Status.LatestBuildID != "" && tpl.Status.LatestBuildID != buildID {
 		if tpl.Status.BuildStatus == v1alpha1.BuildStatusWaiting || tpl.Status.BuildStatus == v1alpha1.BuildStatusBuilding || tpl.Status.BuildStatus == v1alpha1.BuildStatusUploaded {
-			r.mu.Unlock()
-			return fmt.Errorf("%w: build %s already in progress", ErrTemplateConflict, tpl.Status.LatestBuildID)
+			return nil, false, fmt.Errorf("%w: build %s already in progress", ErrTemplateConflict, tpl.Status.LatestBuildID)
 		}
 	}
+	if tpl.Status.LatestBuildID == buildID && (tpl.Status.BuildStatus == v1alpha1.BuildStatusBuilding || tpl.Status.BuildStatus == v1alpha1.BuildStatusUploaded) {
+		return nil, false, fmt.Errorf("%w: build %s already in progress", ErrTemplateConflict, buildID)
+	}
 
-	// 4. Resolve base image
+	// 4. Resolve base image and inherited runtime metadata
 	baseImage := req.FromImage
+	effectiveStartCmd := req.StartCmd
+	effectiveReadyCmd := req.ReadyCmd
+	var inheritedUser *int64
+	var inheritedGroup *int64
+	var inheritedUsername string
+
 	if req.FromTemplate != "" {
 		fromObjName, ok := r.templateIndex[req.FromTemplate]
 		if !ok {
-			r.mu.Unlock()
-			return fmt.Errorf("400: fromTemplate %q not found", req.FromTemplate)
+			return nil, false, fmt.Errorf("%w: fromTemplate %q not found", ErrTemplateNotFound, req.FromTemplate)
 		}
 		fromObj := r.templateObjects[fromObjName]
-		if fromObj == nil || (fromObj.Status.BuildStatus != v1alpha1.BuildStatusReady && fromObj.Status.ReadyImage == "") {
-			r.mu.Unlock()
-			return fmt.Errorf("400: fromTemplate %q is not ready", req.FromTemplate)
+		if fromObj == nil {
+			return nil, false, fmt.Errorf("%w: fromTemplate %q not found", ErrTemplateNotFound, req.FromTemplate)
+		}
+		if fromObj.Status.ReadyImage == "" {
+			return nil, false, fmt.Errorf("%w: fromTemplate %q is not ready", ErrTemplateNotReady, req.FromTemplate)
 		}
 		baseImage = fromObj.Status.ReadyImage
-		if baseImage == "" {
-			baseImage = fromObj.Spec.Image
+		if effectiveStartCmd == "" {
+			effectiveStartCmd = fromObj.Spec.StartCmd
+		}
+		if effectiveReadyCmd == "" {
+			effectiveReadyCmd = fromObj.Spec.ReadyCmd
+		}
+		inheritedUser = fromObj.Spec.RunAsUser
+		inheritedGroup = fromObj.Spec.RunAsGroup
+		inheritedUsername = fromObj.Spec.RunAsUsername
+	}
+
+	// 5. Render and validate Dockerfile/steps synchronously
+	now := time.Now().UTC().Format(time.RFC3339)
+	rendered, meta, err := RenderDockerfile(baseImage, buildID, req)
+	if err != nil {
+		tpl.Status.BuildStatus = v1alpha1.BuildStatusError
+		tpl.Status.LatestBuildID = buildID
+		tpl.Status.Reason = err.Error()
+		tpl.Status.UpdatedAt = now
+		tpl.Status.Builds = upsertBuildRecord(tpl.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+			BuildID:   buildID,
+			Status:    v1alpha1.BuildStatusError,
+			Reason:    err.Error(),
+			UpdatedAt: now,
+			CPUCount:  tpl.Spec.CPUCount,
+			MemoryMB:  tpl.Spec.MemoryMB,
+		})
+		_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
+		r.persistLocalTemplateLocked(tpl)
+		return nil, false, err
+	}
+
+	runAsUser := inheritedUser
+	runAsGroup := inheritedGroup
+	runAsUsername := inheritedUsername
+	if meta.HasUserStep {
+		runAsUser = meta.RunAsUser
+		runAsGroup = meta.RunAsGroup
+		runAsUsername = meta.RunAsUsername
+	}
+
+	// 6. Validate context tars synchronously
+	for _, hash := range meta.FilesHashes {
+		if !r.contextStore.IsPresent(hash) {
+			reason := fmt.Sprintf("missing context tar for hash %s", hash)
+			tpl.Status.BuildStatus = v1alpha1.BuildStatusError
+			tpl.Status.LatestBuildID = buildID
+			tpl.Status.Reason = reason
+			tpl.Status.UpdatedAt = now
+			tpl.Status.Builds = upsertBuildRecord(tpl.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+				BuildID:   buildID,
+				Status:    v1alpha1.BuildStatusError,
+				Reason:    reason,
+				UpdatedAt: now,
+				CPUCount:  tpl.Spec.CPUCount,
+				MemoryMB:  tpl.Spec.MemoryMB,
+			})
+			_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
+			r.persistLocalTemplateLocked(tpl)
+			return nil, false, fmt.Errorf("400: %s", reason)
 		}
 	}
 
-	// 5. If steps are empty: fromImage or fromTemplate with empty steps -> ready immediately without builder!
-	if len(req.Steps) == 0 {
+	// 7. Fast-path to ready ONLY when len(req.Steps) == 0 && effectiveReadyCmd == ""
+	if len(req.Steps) == 0 && effectiveReadyCmd == "" {
 		tpl.Status.BuildStatus = v1alpha1.BuildStatusReady
 		tpl.Status.ReadyBuildID = buildID
 		tpl.Status.ReadyImage = baseImage
 		tpl.Status.LatestBuildID = buildID
 		tpl.Status.Reason = ""
+		tpl.Status.FailedStep = ""
+		tpl.Status.UpdatedAt = now
+		tpl.Status.Builds = upsertBuildRecord(tpl.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+			BuildID:   buildID,
+			Status:    v1alpha1.BuildStatusReady,
+			CreatedAt: now,
+			UpdatedAt: now,
+			CPUCount:  tpl.Spec.CPUCount,
+			MemoryMB:  tpl.Spec.MemoryMB,
+		})
 		tpl.Spec.Image = baseImage
-		tpl.Spec.StartCmd = req.StartCmd
-		tpl.Spec.ReadyCmd = req.ReadyCmd
+		tpl.Spec.StartCmd = effectiveStartCmd
+		tpl.Spec.ReadyCmd = effectiveReadyCmd
+		tpl.Spec.RunAsUser = runAsUser
+		tpl.Spec.RunAsGroup = runAsGroup
+		tpl.Spec.RunAsUsername = runAsUsername
 
 		_ = r.kubeClient.UpdatePodTemplate(ctx, *tpl)
 		_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
 		r.templates[tpl.Metadata.Name] = tpl.Spec
+		r.persistLocalTemplateLocked(tpl)
 		r.retireUnclaimedWarmEntriesForTemplateLocked(tpl.Metadata.Name, baseImage)
-		r.mu.Unlock()
-		return nil
+
+		r.buildMetrics.observe(v1alpha1.BuildStatusReady, 0)
+		slog.Info("template build finished",
+			"templateID", tpl.Status.TemplateID,
+			"buildID", buildID,
+			"result", v1alpha1.BuildStatusReady,
+		)
+		return nil, true, nil
 	}
 
-	// 6. Non-empty steps while template builds are disabled: return ErrTemplateBuildDisabled
-	if !r.templateBuildEnabled {
-		r.mu.Unlock()
-		return ErrTemplateBuildDisabled
+	// 8. Otherwise require templateBuildEnabled && imageBuilder != nil
+	if !r.templateBuildEnabled || r.imageBuilder == nil {
+		return nil, false, ErrTemplateBuildDisabled
 	}
 
-	// 7. Transition to building: does NOT clear readyImage or readyBuildID
+	skipBuild := len(req.Steps) == 0
+	targetTag := r.targetImageTagLocked(tpl.Metadata.Name, buildID)
+	if skipBuild {
+		targetTag = baseImage
+	}
+
+	// Transition to building without touching ReadyImage / ReadyBuildID
 	tpl.Status.BuildStatus = v1alpha1.BuildStatusBuilding
 	tpl.Status.LatestBuildID = buildID
+	tpl.Status.Reason = ""
+	tpl.Status.FailedStep = ""
+	tpl.Status.UpdatedAt = now
+	tpl.Status.Builds = upsertBuildRecord(tpl.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+		BuildID:   buildID,
+		Status:    v1alpha1.BuildStatusBuilding,
+		CreatedAt: now,
+		UpdatedAt: now,
+		CPUCount:  tpl.Spec.CPUCount,
+		MemoryMB:  tpl.Spec.MemoryMB,
+	})
 	_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
+	r.persistLocalTemplateLocked(tpl)
 
-	// Render Dockerfile
-	rendered, meta, err := RenderDockerfile(baseImage, buildID, req)
-	if err != nil {
-		tpl.Status.BuildStatus = v1alpha1.BuildStatusError
-		tpl.Status.Reason = err.Error()
-		_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
-		r.mu.Unlock()
+	return &preparedBuildPlan{
+		slug:              tpl.Metadata.Name,
+		templateID:        tpl.Status.TemplateID,
+		buildID:           buildID,
+		baseImage:         baseImage,
+		targetTag:         targetTag,
+		rendered:          rendered,
+		filesHashes:       meta.FilesHashes,
+		effectiveStartCmd: effectiveStartCmd,
+		effectiveReadyCmd: effectiveReadyCmd,
+		runAsUser:         runAsUser,
+		runAsGroup:        runAsGroup,
+		runAsUsername:     runAsUsername,
+		fromImageRegistry: req.FromImageRegistry,
+		noCache:           req.Force,
+		skipBuild:         skipBuild,
+		builder:           r.imageBuilder,
+		pullSecretName:    r.templatePullSecret,
+		pushSecretName:    r.templatePushSecret,
+		templateRegistry:  r.templateRegistry,
+		repoPrefix:        r.templateRepoPrefix,
+		cpuCount:          tpl.Spec.CPUCount,
+		memoryMB:          tpl.Spec.MemoryMB,
+	}, false, nil
+}
+
+// StartBuild validates and executes a template build or fast-path registration synchronously.
+func (r *Reconciler) StartBuild(ctx context.Context, templateID, buildID string, req StartBuildRequest) error {
+	plan, fastPath, err := r.prepareBuild(ctx, templateID, buildID, req)
+	if err != nil || fastPath {
 		return err
 	}
+	return r.executeBuild(ctx, plan)
+}
 
-	// Check missing tars in context store
-	for _, hash := range meta.FilesHashes {
-		if !r.contextStore.IsPresent(hash) {
-			tpl.Status.BuildStatus = v1alpha1.BuildStatusError
-			tpl.Status.Reason = fmt.Sprintf("missing context tar for hash %s", hash)
-			_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
-			r.mu.Unlock()
-			return fmt.Errorf("400: missing context tar for hash %s", hash)
+// StartBuildAsync validates synchronously, sets status to "building", and launches the build in a background goroutine.
+func (r *Reconciler) StartBuildAsync(ctx context.Context, templateID, buildID string, req StartBuildRequest) error {
+	plan, fastPath, err := r.prepareBuild(ctx, templateID, buildID, req)
+	if err != nil || fastPath {
+		return err
+	}
+	go func() {
+		_ = r.executeBuild(context.Background(), plan)
+	}()
+	return nil
+}
+
+func (r *Reconciler) createEphemeralSourceSecret(ctx context.Context, buildID, baseImage string, auth *RegistryAuth) (string, error) {
+	if auth == nil || (auth.Username == "" && auth.Password == "") || r.kubeClient == nil {
+		return "", nil
+	}
+	host := extractImageRegistryHost(baseImage)
+	encoded := base64.StdEncoding.EncodeToString([]byte(auth.Username + ":" + auth.Password))
+	cfg := dockerConfigJSON{
+		Auths: map[string]dockerConfigAuthEntry{
+			host: {
+				Username: auth.Username,
+				Password: auth.Password,
+				Auth:     encoded,
+			},
+		},
+	}
+	rawCfg, err := json.Marshal(cfg)
+	if err != nil {
+		return "", err
+	}
+	secretName := fmt.Sprintf("cubepod-template-src-%s", buildID)
+	sec := KubeSecret{
+		APIVersion: "v1",
+		Kind:       "Secret",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      secretName,
+			Namespace: r.namespace,
+			Labels: map[string]string{
+				"cubepod.io/ephemeral-build-secret": "true",
+				"cubepod.io/build-id":               buildID,
+			},
+		},
+		Type: "kubernetes.io/dockerconfigjson",
+		Data: map[string][]byte{
+			".dockerconfigjson": rawCfg,
+		},
+	}
+	if err := r.kubeClient.CreateSecret(ctx, sec); err != nil {
+		return "", err
+	}
+	return secretName, nil
+}
+
+func (r *Reconciler) executeBuild(ctx context.Context, plan *preparedBuildPlan) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	startTime := time.Now()
+	result := v1alpha1.BuildStatusError
+	defer func() {
+		r.buildMetrics.observe(result, time.Since(startTime))
+		slog.Info("template build finished",
+			"templateID", plan.templateID,
+			"buildID", plan.buildID,
+			"result", result,
+		)
+	}()
+
+	var passwords []string
+	if plan.fromImageRegistry != nil && plan.fromImageRegistry.Password != "" {
+		passwords = append(passwords, plan.fromImageRegistry.Password)
+	}
+
+	srcSecretName, secErr := r.createEphemeralSourceSecret(ctx, plan.buildID, plan.baseImage, plan.fromImageRegistry)
+	if secErr != nil {
+		r.markBuildError(ctx, plan, ScrubString(secErr.Error(), passwords))
+		return secErr
+	}
+	if srcSecretName != "" {
+		defer func() {
+			delCtx, delCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer delCancel()
+			_ = r.kubeClient.DeleteSecret(delCtx, r.namespace, srcSecretName)
+		}()
+	}
+
+	workDir := filepath.Join(r.contextDir, "work", plan.buildID)
+	_ = os.MkdirAll(workDir, 0755)
+	defer func() {
+		_ = os.RemoveAll(workDir)
+	}()
+
+	for _, hash := range plan.filesHashes {
+		if unpackErr := r.contextStore.Unpack(hash, workDir); unpackErr != nil {
+			r.markBuildError(ctx, plan, ScrubString(unpackErr.Error(), passwords))
+			return unpackErr
 		}
 	}
 
-	builder := r.imageBuilder
-	targetTag := fmt.Sprintf("cubepod-templates/%s:%s", tpl.Metadata.Name, buildID)
-	contextDir := filepath.Join(r.contextDir, buildID)
-	_ = os.MkdirAll(contextDir, 0755)
+	if !plan.skipBuild {
+		buildOpts := BuildOptions{
+			Tag:            plan.targetTag,
+			ContextDir:     workDir,
+			LogDir:         r.contextDir,
+			Dockerfile:     plan.rendered,
+			BuildID:        plan.buildID,
+			Passwords:      passwords,
+			NoCache:        plan.noCache,
+			Registry:       plan.templateRegistry,
+			RepoPrefix:     plan.repoPrefix,
+			Slug:           plan.slug,
+			SourceImage:    plan.baseImage,
+			SourceAuth:     plan.fromImageRegistry,
+			PushSecretName: plan.pushSecretName,
+			Namespace:      r.namespace,
+			KubeClient:     r.kubeClient,
+		}
 
-	for _, hash := range meta.FilesHashes {
-		_ = r.contextStore.Unpack(hash, contextDir)
-	}
+		if buildErr := plan.builder.Build(ctx, buildOpts); buildErr != nil {
+			r.markBuildError(ctx, plan, ScrubString(buildErr.Error(), passwords))
+			return buildErr
+		}
 
-	var passwords []string
-	if req.FromImageRegistry != nil && req.FromImageRegistry.Password != "" {
-		passwords = append(passwords, req.FromImageRegistry.Password)
-	}
-
-	buildOpts := BuildOptions{
-		Tag:        targetTag,
-		ContextDir: contextDir,
-		Dockerfile: rendered,
-		BuildID:    buildID,
-		Passwords:  passwords,
-		NoCache:    req.Force,
-	}
-
-	r.mu.Unlock()
-
-	buildErr := builder.Build(ctx, buildOpts)
-
-	r.mu.Lock()
-	if buildErr != nil {
-		tpl.Status.BuildStatus = v1alpha1.BuildStatusError
-		tpl.Status.Reason = buildErr.Error()
-		_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
+		r.mu.Lock()
+		if tpl, ok := r.templateObjects[plan.slug]; ok {
+			now := time.Now().UTC().Format(time.RFC3339)
+			tpl.Status.BuildStatus = v1alpha1.BuildStatusUploaded
+			tpl.Status.UpdatedAt = now
+			tpl.Status.Builds = upsertBuildRecord(tpl.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+				BuildID:   plan.buildID,
+				Status:    v1alpha1.BuildStatusUploaded,
+				UpdatedAt: now,
+				CPUCount:  plan.cpuCount,
+				MemoryMB:  plan.memoryMB,
+			})
+			_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
+			r.persistLocalTemplateLocked(tpl)
+		}
 		r.mu.Unlock()
-		return buildErr
 	}
 
-	// Success: uploaded
-	tpl.Status.BuildStatus = v1alpha1.BuildStatusUploaded
-	_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
-	r.mu.Unlock()
-
-	// Probe outside r.mu lock
-	var probeErr error
-	if req.ReadyCmd != "" {
-		probeErr = builder.Probe(ctx, targetTag, req.ReadyCmd, 120*time.Second)
+	if plan.effectiveReadyCmd != "" {
+		probeSrcSecret := ""
+		if plan.skipBuild {
+			probeSrcSecret = srcSecretName
+		}
+		timeout := r.templateProbeTimeout
+		if timeout <= 0 {
+			timeout = 120 * time.Second
+		}
+		probeErr := plan.builder.Probe(ctx, plan.targetTag, ProbeOptions{
+			BuildID:          plan.buildID,
+			Namespace:        r.namespace,
+			StartCmd:         plan.effectiveStartCmd,
+			ReadyCmd:         plan.effectiveReadyCmd,
+			RunAsUser:        plan.runAsUser,
+			RunAsGroup:       plan.runAsGroup,
+			RunAsUsername:    plan.runAsUsername,
+			Timeout:          timeout,
+			PullSecretName:   plan.pullSecretName,
+			SourceSecretName: probeSrcSecret,
+		})
+		if probeErr != nil {
+			r.markBuildError(ctx, plan, ScrubString(probeErr.Error(), passwords))
+			return probeErr
+		}
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
-	if probeErr != nil {
-		tpl.Status.BuildStatus = v1alpha1.BuildStatusError
-		tpl.Status.Reason = probeErr.Error()
-		_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
-		return probeErr
+	tpl, ok := r.templateObjects[plan.slug]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrTemplateNotFound, plan.templateID)
 	}
-
-	// Ready: and only then set spec.image = readyImage
+	now := time.Now().UTC().Format(time.RFC3339)
 	tpl.Status.BuildStatus = v1alpha1.BuildStatusReady
-	tpl.Status.ReadyBuildID = buildID
-	tpl.Status.ReadyImage = targetTag
+	tpl.Status.ReadyBuildID = plan.buildID
+	tpl.Status.ReadyImage = plan.targetTag
 	tpl.Status.Reason = ""
-	tpl.Spec.Image = targetTag
-	tpl.Spec.StartCmd = req.StartCmd
-	tpl.Spec.ReadyCmd = req.ReadyCmd
-	tpl.Spec.RunAsUser = meta.RunAsUser
-	tpl.Spec.RunAsGroup = meta.RunAsGroup
-	tpl.Spec.RunAsUsername = meta.RunAsUsername
+	tpl.Status.FailedStep = ""
+	tpl.Status.UpdatedAt = now
+	tpl.Status.Builds = upsertBuildRecord(tpl.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+		BuildID:   plan.buildID,
+		Status:    v1alpha1.BuildStatusReady,
+		UpdatedAt: now,
+		CPUCount:  plan.cpuCount,
+		MemoryMB:  plan.memoryMB,
+	})
+	tpl.Spec.Image = plan.targetTag
+	tpl.Spec.StartCmd = plan.effectiveStartCmd
+	tpl.Spec.ReadyCmd = plan.effectiveReadyCmd
+	tpl.Spec.RunAsUser = plan.runAsUser
+	tpl.Spec.RunAsGroup = plan.runAsGroup
+	tpl.Spec.RunAsUsername = plan.runAsUsername
 
 	_ = r.kubeClient.UpdatePodTemplate(ctx, *tpl)
 	_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
 	r.templates[tpl.Metadata.Name] = tpl.Spec
-	r.retireUnclaimedWarmEntriesForTemplateLocked(tpl.Metadata.Name, targetTag)
-
+	r.persistLocalTemplateLocked(tpl)
+	r.retireUnclaimedWarmEntriesForTemplateLocked(tpl.Metadata.Name, plan.targetTag)
+	result = v1alpha1.BuildStatusReady
 	return nil
 }
 
-// DeleteTemplate deletes a PodTemplate if not referenced by any PodBox or WarmPool, or if force is true.
-func (r *Reconciler) DeleteTemplate(ctx context.Context, templateID string, force bool) error {
+func (r *Reconciler) markBuildError(ctx context.Context, plan *preparedBuildPlan, reason string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tpl, ok := r.templateObjects[plan.slug]
+	if !ok {
+		return
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	tpl.Status.BuildStatus = v1alpha1.BuildStatusError
+	tpl.Status.Reason = reason
+	tpl.Status.UpdatedAt = now
+	tpl.Status.Builds = upsertBuildRecord(tpl.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+		BuildID:   plan.buildID,
+		Status:    v1alpha1.BuildStatusError,
+		Reason:    reason,
+		UpdatedAt: now,
+		CPUCount:  plan.cpuCount,
+		MemoryMB:  plan.memoryMB,
+	})
+	_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
+	r.persistLocalTemplateLocked(tpl)
+}
+
+// RecordTemplateSpawn increments SpawnCount and updates LastSpawnedAt when a sandbox is created from a template.
+func (r *Reconciler) RecordTemplateSpawn(ctx context.Context, idOrAlias string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	var tpl *v1alpha1.PodTemplate
 	for _, obj := range r.templateObjects {
-		if obj.Status.TemplateID == templateID || obj.Metadata.Name == templateID {
+		if obj.Status.TemplateID == idOrAlias || obj.Metadata.Name == idOrAlias || slices.Contains(obj.Spec.Names, idOrAlias) {
 			tpl = obj
 			break
+		}
+	}
+	if tpl == nil {
+		if objName, ok := r.templateIndex[idOrAlias]; ok {
+			tpl = r.templateObjects[objName]
+		}
+	}
+	if tpl == nil {
+		return
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	tpl.Status.SpawnCount++
+	tpl.Status.LastSpawnedAt = now
+	_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
+	r.persistLocalTemplateLocked(tpl)
+}
+
+// DeleteTemplate deletes a PodTemplate if not currently building/uploaded and not referenced by active PodBoxes or WarmPools.
+func (r *Reconciler) DeleteTemplate(ctx context.Context, templateID string, force bool) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var tpl *v1alpha1.PodTemplate
+	for _, obj := range r.templateObjects {
+		if obj.Status.TemplateID == templateID || obj.Metadata.Name == templateID || slices.Contains(obj.Spec.Names, templateID) {
+			tpl = obj
+			break
+		}
+	}
+	if tpl == nil {
+		if objName, ok := r.templateIndex[templateID]; ok {
+			tpl = r.templateObjects[objName]
 		}
 	}
 	if tpl == nil {
 		return fmt.Errorf("%w: %s", ErrTemplateNotFound, templateID)
 	}
 
+	if tpl.Status.BuildStatus == v1alpha1.BuildStatusBuilding || tpl.Status.BuildStatus == v1alpha1.BuildStatusUploaded {
+		return fmt.Errorf("%w: build %s is currently %s", ErrTemplateConflict, tpl.Status.LatestBuildID, tpl.Status.BuildStatus)
+	}
+
 	if !force {
 		for boxName, spec := range r.specs {
+			if st := r.boxes[boxName]; st != nil && st.Phase == v1alpha1.PodBoxPhaseTerminated {
+				continue
+			}
 			if r.templateMatchesRef(tpl, spec.TemplateRef) {
 				return fmt.Errorf("%w: referenced by PodBox %s", ErrTemplateConflict, boxName)
 			}
@@ -949,6 +1654,7 @@ func (r *Reconciler) DeleteTemplate(ctx context.Context, templateID string, forc
 	}
 
 	_ = r.kubeClient.DeletePodTemplate(ctx, r.namespace, tpl.Metadata.Name)
+	r.removeLocalTemplateLocked(tpl.Status.TemplateID)
 
 	delete(r.templateIndex, tpl.Metadata.Name)
 	if tpl.Status.TemplateID != "" {
@@ -1005,6 +1711,8 @@ func (r *Reconciler) SetTemplatePublic(ctx context.Context, templateID string, p
 
 	tpl.Spec.Public = public
 	tpl.Status.Public = public
+	now := time.Now().UTC().Format(time.RFC3339)
+	tpl.Status.UpdatedAt = now
 
 	if err := r.kubeClient.UpdatePodTemplate(ctx, *tpl); err != nil {
 		return err
@@ -1014,6 +1722,7 @@ func (r *Reconciler) SetTemplatePublic(ctx context.Context, templateID string, p
 	}
 
 	r.templates[tpl.Metadata.Name] = tpl.Spec
+	r.persistLocalTemplateLocked(tpl)
 	return nil
 }
 
@@ -1040,40 +1749,90 @@ func (r *Reconciler) matchesTemplateNameLocked(ref, tplName string) bool {
 }
 
 func (r *Reconciler) retireUnclaimedWarmEntriesForTemplateLocked(tplName, newReadyImage string) {
-	for _, pool := range r.warmPools {
+	for poolName, pool := range r.warmPools {
 		if pool.spec.TemplateRef == tplName || r.matchesTemplateNameLocked(pool.spec.TemplateRef, tplName) {
 			var kept []*WarmPodEntry
+			var avail int32
+			retired := false
 			for _, entry := range pool.entries {
 				if !entry.Claimed && entry.Image != "" && entry.Image != newReadyImage {
+					retired = true
 					_ = r.kubeClient.DeletePod(context.Background(), r.namespace, entry.PodName)
 					_ = r.kubeClient.DeletePVC(context.Background(), r.namespace, entry.RootfsPVCName)
 					_ = r.kubeClient.DeletePVC(context.Background(), r.namespace, entry.WorkspacePVCName)
 					continue
 				}
+				if !entry.Claimed {
+					avail++
+				}
 				kept = append(kept, entry)
 			}
 			pool.entries = kept
+			if retired && r.kubeClient != nil {
+				_ = r.kubeClient.UpdatePodWarmPoolStatus(context.Background(), r.namespace, poolName, v1alpha1.PodWarmPoolStatus{
+					ReadyReplicas:     avail,
+					AvailableReplicas: avail,
+				})
+			}
 		}
 	}
 }
 
-// RecoverInFlightBuilds checks all templates in building state after a controller restart.
+func (r *Reconciler) isBuildPIDAliveLocked(buildID string) bool {
+	if pid, hasPid := r.buildingPids[buildID]; hasPid && pid > 0 && syscall.Kill(pid, 0) == nil {
+		return true
+	}
+	var candidateDirs []string
+	if r.contextDir != "" {
+		candidateDirs = append(candidateDirs, r.contextDir)
+	}
+	if r.stateDir != "" {
+		candidateDirs = append(candidateDirs, r.stateDir, filepath.Join(r.stateDir, "template-context"))
+	}
+	if env := os.Getenv("CUBEPOD_STATE"); env != "" {
+		candidateDirs = append(candidateDirs, env, filepath.Join(env, "template-context"))
+	}
+	for _, dir := range candidateDirs {
+		pidPath := filepath.Join(dir, "pids", buildID+".pid")
+		data, err := os.ReadFile(pidPath)
+		if err != nil {
+			continue
+		}
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+		if parseErr == nil && pid > 0 && syscall.Kill(pid, 0) == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// RecoverInFlightBuilds checks all templates in building or uploaded state after a controller restart.
 func (r *Reconciler) RecoverInFlightBuilds(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r.mu.Lock()
 	var inFlight []*v1alpha1.PodTemplate
 	for _, tpl := range r.templateObjects {
-		if tpl.Status.BuildStatus == v1alpha1.BuildStatusBuilding {
+		if tpl.Status.BuildStatus == v1alpha1.BuildStatusBuilding || tpl.Status.BuildStatus == v1alpha1.BuildStatusUploaded {
 			cp := *tpl
 			inFlight = append(inFlight, &cp)
 		}
 	}
 	builder := r.imageBuilder
+	probeTimeout := r.templateProbeTimeout
+	if probeTimeout <= 0 {
+		probeTimeout = 120 * time.Second
+	}
 	r.mu.Unlock()
 
 	for _, tpl := range inFlight {
 		buildID := tpl.Status.LatestBuildID
 		slug := tpl.Metadata.Name
-		targetTag := fmt.Sprintf("cubepod-templates/%s:%s", slug, buildID)
+
+		r.mu.RLock()
+		targetTag := r.targetImageTagLocked(slug, buildID)
+		r.mu.RUnlock()
 
 		tagExists, _ := builder.TagExists(ctx, targetTag)
 		if tagExists {
@@ -1084,15 +1843,35 @@ func (r *Reconciler) RecoverInFlightBuilds(ctx context.Context) {
 				r.mu.Unlock()
 				continue
 			}
+			now := time.Now().UTC().Format(time.RFC3339)
 			current.Status.BuildStatus = v1alpha1.BuildStatusUploaded
+			current.Status.UpdatedAt = now
+			current.Status.Builds = upsertBuildRecord(current.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+				BuildID:   buildID,
+				Status:    v1alpha1.BuildStatusUploaded,
+				UpdatedAt: now,
+				CPUCount:  current.Spec.CPUCount,
+				MemoryMB:  current.Spec.MemoryMB,
+			})
 			_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *current)
-			readyCmd := current.Spec.ReadyCmd
+			r.persistLocalTemplateLocked(current)
+			probeOpts := ProbeOptions{
+				BuildID:        buildID,
+				Namespace:      r.namespace,
+				StartCmd:       current.Spec.StartCmd,
+				ReadyCmd:       current.Spec.ReadyCmd,
+				RunAsUser:      current.Spec.RunAsUser,
+				RunAsGroup:     current.Spec.RunAsGroup,
+				RunAsUsername:  current.Spec.RunAsUsername,
+				Timeout:        probeTimeout,
+				PullSecretName: r.templatePullSecret,
+			}
 			r.mu.Unlock()
 
 			// Run probe outside r.mu lock
 			var probeErr error
-			if readyCmd != "" {
-				probeErr = builder.Probe(ctx, targetTag, readyCmd, 120*time.Second)
+			if probeOpts.ReadyCmd != "" {
+				probeErr = builder.Probe(ctx, targetTag, probeOpts)
 			}
 
 			r.mu.Lock()
@@ -1101,22 +1880,43 @@ func (r *Reconciler) RecoverInFlightBuilds(ctx context.Context) {
 				r.mu.Unlock()
 				continue
 			}
+			now = time.Now().UTC().Format(time.RFC3339)
 			if probeErr != nil {
 				// Failed probe sets error and leaves previous readyImage
 				current.Status.BuildStatus = v1alpha1.BuildStatusError
 				current.Status.Reason = probeErr.Error()
+				current.Status.UpdatedAt = now
+				current.Status.Builds = upsertBuildRecord(current.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+					BuildID:   buildID,
+					Status:    v1alpha1.BuildStatusError,
+					Reason:    probeErr.Error(),
+					UpdatedAt: now,
+					CPUCount:  current.Spec.CPUCount,
+					MemoryMB:  current.Spec.MemoryMB,
+				})
 				_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *current)
+				r.persistLocalTemplateLocked(current)
 			} else {
 				// Probe succeeds: set ready, readyImage, and spec.image
 				current.Status.BuildStatus = v1alpha1.BuildStatusReady
 				current.Status.ReadyBuildID = buildID
 				current.Status.ReadyImage = targetTag
 				current.Status.Reason = ""
+				current.Status.FailedStep = ""
+				current.Status.UpdatedAt = now
+				current.Status.Builds = upsertBuildRecord(current.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+					BuildID:   buildID,
+					Status:    v1alpha1.BuildStatusReady,
+					UpdatedAt: now,
+					CPUCount:  current.Spec.CPUCount,
+					MemoryMB:  current.Spec.MemoryMB,
+				})
 				current.Spec.Image = targetTag
 
 				_ = r.kubeClient.UpdatePodTemplate(ctx, *current)
 				_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *current)
 				r.templates[current.Metadata.Name] = current.Spec
+				r.persistLocalTemplateLocked(current)
 				r.retireUnclaimedWarmEntriesForTemplateLocked(current.Metadata.Name, targetTag)
 			}
 			r.mu.Unlock()
@@ -1128,16 +1928,26 @@ func (r *Reconciler) RecoverInFlightBuilds(ctx context.Context) {
 				r.mu.Unlock()
 				continue
 			}
-			pid, hasPid := r.buildingPids[buildID]
-			if hasPid && pid > 0 && syscall.Kill(pid, 0) == nil {
+			if r.isBuildPIDAliveLocked(buildID) {
 				// Local mode: pid is still running, keep watching
 				r.mu.Unlock()
 				continue
 			}
 
+			now := time.Now().UTC().Format(time.RFC3339)
 			current.Status.BuildStatus = v1alpha1.BuildStatusError
 			current.Status.Reason = "builder disappeared"
+			current.Status.UpdatedAt = now
+			current.Status.Builds = upsertBuildRecord(current.Status.Builds, v1alpha1.PodTemplateBuildRecord{
+				BuildID:   buildID,
+				Status:    v1alpha1.BuildStatusError,
+				Reason:    "builder disappeared",
+				UpdatedAt: now,
+				CPUCount:  current.Spec.CPUCount,
+				MemoryMB:  current.Spec.MemoryMB,
+			})
 			_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *current)
+			r.persistLocalTemplateLocked(current)
 			r.mu.Unlock()
 		}
 	}

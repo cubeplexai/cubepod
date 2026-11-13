@@ -144,8 +144,45 @@ spec:
                   type: string
                 reason:
                   type: string
+                failedStep:
+                  type: string
                 public:
                   type: boolean
+                buildCount:
+                  type: integer
+                  format: int64
+                spawnCount:
+                  type: integer
+                  format: int64
+                createdAt:
+                  type: string
+                updatedAt:
+                  type: string
+                lastSpawnedAt:
+                  type: string
+                builds:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      buildID:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      failedStep:
+                        type: string
+                      createdAt:
+                        type: string
+                      updatedAt:
+                        type: string
+                      cpuCount:
+                        type: integer
+                        format: int32
+                      memoryMB:
+                        type: integer
+                        format: int32
       additionalPrinterColumns:
         - name: Image
           type: string

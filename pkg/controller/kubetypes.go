@@ -1,5 +1,17 @@
 package controller
 
+import "github.com/cubeplexai/cubepod/api/v1alpha1"
+
+// KubeSecret represents a Kubernetes core/v1 Secret payload.
+type KubeSecret struct {
+	APIVersion string              `json:"apiVersion,omitempty"`
+	Kind       string              `json:"kind,omitempty"`
+	Metadata   v1alpha1.ObjectMeta `json:"metadata"`
+	Type       string              `json:"type,omitempty"`
+	Data       map[string][]byte   `json:"data,omitempty"`
+	StringData map[string]string   `json:"stringData,omitempty"`
+}
+
 // coreV1Metadata represents common object metadata in the Kubernetes v1 API.
 type coreV1Metadata struct {
 	Name      string            `json:"name"`
@@ -83,7 +95,9 @@ type coreV1LocalObjectReference struct {
 
 // coreV1SecurityContext holds container-level security attributes.
 type coreV1SecurityContext struct {
-	Privileged *bool `json:"privileged,omitempty"`
+	Privileged *bool  `json:"privileged,omitempty"`
+	RunAsUser  *int64 `json:"runAsUser,omitempty"`
+	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
 }
 
 // coreV1Container represents a single container that is expected to be run on the host.
@@ -106,6 +120,7 @@ type coreV1PodSpec struct {
 	Containers       []coreV1Container            `json:"containers,omitempty"`
 	Volumes          []coreV1Volume               `json:"volumes,omitempty"`
 	RuntimeClassName string                       `json:"runtimeClassName,omitempty"`
+	RestartPolicy    string                       `json:"restartPolicy,omitempty"`
 	ImagePullSecrets []coreV1LocalObjectReference `json:"imagePullSecrets,omitempty"`
 }
 
@@ -200,11 +215,16 @@ func toCoreV1Container(c ContainerManifest) coreV1Container {
 			Value: ev.Value,
 		})
 	}
-	if c.Privileged {
-		priv := true
-		res.SecurityContext = &coreV1SecurityContext{
-			Privileged: &priv,
+	if c.Privileged || c.RunAsUser != nil || c.RunAsGroup != nil {
+		sc := &coreV1SecurityContext{
+			RunAsUser:  c.RunAsUser,
+			RunAsGroup: c.RunAsGroup,
 		}
+		if c.Privileged {
+			priv := true
+			sc.Privileged = &priv
+		}
+		res.SecurityContext = sc
 	}
 	return res
 }
@@ -248,7 +268,7 @@ func toCoreV1Pod(pod PodManifest, namespace string) coreV1Pod {
 	}
 
 	var imagePullSecrets []coreV1LocalObjectReference
-	if len(pod.ImagePullSecrets) > 0 {
+	if pod.ImagePullSecrets != nil {
 		for _, s := range pod.ImagePullSecrets {
 			imagePullSecrets = append(imagePullSecrets, coreV1LocalObjectReference{Name: s})
 		}
@@ -272,6 +292,7 @@ func toCoreV1Pod(pod PodManifest, namespace string) coreV1Pod {
 			Containers:       containers,
 			Volumes:          volumes,
 			RuntimeClassName: pod.RuntimeClassName,
+			RestartPolicy:    pod.RestartPolicy,
 			ImagePullSecrets: imagePullSecrets,
 		},
 	}
