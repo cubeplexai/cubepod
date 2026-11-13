@@ -91,12 +91,22 @@ type Server struct {
 	livePodRouting   bool
 	metrics          *Metrics
 	e2bTemplateAPI   bool
+	templateBuild    bool
+	controllerURL    string
+	probeTimeout     time.Duration
+	httpClient       *http.Client
 }
 
 // NewServer constructs a new Gateway Server.
 func NewServer(reconciler *controller.Reconciler) *Server {
 	v := egress.NewVault()
 	ca, _ := egress.NewCA()
+	e2bAPI := false
+	tplBuild := false
+	if reconciler != nil {
+		e2bAPI = reconciler.E2BTemplateAPIEnabled()
+		tplBuild = reconciler.TemplateBuildEnabled()
+	}
 	return &Server{
 		reconciler:       reconciler,
 		sandboxes:        make(map[string]*SandboxRecord),
@@ -106,6 +116,10 @@ func NewServer(reconciler *controller.Reconciler) *Server {
 		vault:            v,
 		ca:               ca,
 		metrics:          &Metrics{},
+		e2bTemplateAPI:   e2bAPI,
+		templateBuild:    tplBuild,
+		probeTimeout:     120 * time.Second,
+		httpClient:       &http.Client{Timeout: 60 * time.Second},
 	}
 }
 
@@ -145,6 +159,78 @@ func (s *Server) EnableE2BTemplateAPI() {
 	s.SetE2BTemplateAPI(true)
 }
 
+// SetTemplateBuild enables or disables Beta template image builds.
+func (s *Server) SetTemplateBuild(enabled bool) {
+	s.mu.Lock()
+	s.templateBuild = enabled
+	r := s.reconciler
+	s.mu.Unlock()
+	if r != nil {
+		r.SetTemplateBuildEnabled(enabled)
+	}
+}
+
+// TemplateBuildEnabled returns whether Beta template image builds are enabled.
+func (s *Server) TemplateBuildEnabled() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.templateBuild
+}
+
+// SetControllerURL configures the optional controller base URL for forwarding template build operations.
+func (s *Server) SetControllerURL(controllerURL string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.controllerURL = strings.TrimRight(strings.TrimSpace(controllerURL), "/")
+}
+
+// ControllerURL returns the configured controller base URL.
+func (s *Server) ControllerURL() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.controllerURL
+}
+
+// SetProbeTimeout configures the timeout for runtime readyCmd probing on sandbox creation.
+func (s *Server) SetProbeTimeout(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if d > 0 {
+		s.probeTimeout = d
+	}
+}
+
+// ProbeTimeout returns the configured timeout for runtime readyCmd probing.
+func (s *Server) ProbeTimeout() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.probeTimeout <= 0 {
+		return 120 * time.Second
+	}
+	return s.probeTimeout
+}
+
+// ApplyProcess applies legacy feature gate settings to the Gateway Server.
+func ApplyProcess(srv *Server, e2bTemplateAPI bool) {
+	if srv == nil {
+		return
+	}
+	srv.SetE2BTemplateAPI(e2bTemplateAPI)
+}
+
+// ApplyTemplateConfig applies full E2B template API and build settings to the Gateway Server.
+func ApplyTemplateConfig(srv *Server, e2bTemplateAPI, templateBuild bool, controllerURL string, probeTimeout time.Duration) {
+	if srv == nil {
+		return
+	}
+	srv.SetE2BTemplateAPI(e2bTemplateAPI)
+	srv.SetTemplateBuild(templateBuild)
+	srv.SetControllerURL(controllerURL)
+	if probeTimeout > 0 {
+		srv.SetProbeTimeout(probeTimeout)
+	}
+}
+
 // SetWorkspaceBaseDir overrides the base directory for local sandbox workspaces.
 func (s *Server) SetWorkspaceBaseDir(dir string) {
 	s.mu.Lock()
@@ -182,6 +268,7 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("GET /metrics", s.handleMetrics)
 	mux.HandleFunc("POST /sandboxes", s.handleCreateSandbox)
+	mux.HandleFunc("POST /v2/sandboxes", s.handleCreateSandbox)
 	mux.HandleFunc("GET /sandboxes", s.handleListSandboxes)
 	mux.HandleFunc("GET /sandboxes/{sandboxID}", s.handleGetSandbox)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/pause", s.handlePauseSandbox)
@@ -266,8 +353,23 @@ func (s *Server) Handler() http.Handler {
 	muxOn := http.NewServeMux()
 	s.registerCommonRoutes(muxOn)
 	muxOn.HandleFunc("GET /templates", s.handleE2BListTemplates)
+	muxOn.HandleFunc("GET /v2/templates", s.handleE2BListTemplatesV2)
 	muxOn.HandleFunc("GET /templates/{templateID}", s.handleGetTemplate)
-	muxOn.HandleFunc("GET /templates/aliases/{alias}", s.handleGetTemplateByAlias)
+	muxOn.HandleFunc("GET /templates/{seg1}/{seg2}", func(w http.ResponseWriter, r *http.Request) {
+		seg1 := r.PathValue("seg1")
+		seg2 := r.PathValue("seg2")
+		if seg1 == "aliases" {
+			r.SetPathValue("alias", seg2)
+			s.handleGetTemplateByAlias(w, r)
+			return
+		}
+		if seg2 == "tags" {
+			r.SetPathValue("templateID", seg1)
+			s.handleGetTemplateTags(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	})
 	muxOn.HandleFunc("DELETE /templates/{templateID}", s.handleDeleteTemplate)
 	muxOn.HandleFunc("PATCH /templates/{templateID}", s.handlePatchTemplate)
 	muxOn.HandleFunc("PATCH /v2/templates/{templateID}", s.handlePatchTemplateV2)
@@ -276,10 +378,11 @@ func (s *Server) Handler() http.Handler {
 	muxOn.HandleFunc("POST /v3/templates", s.handleCreateTemplate)
 	muxOn.HandleFunc("POST /v2/templates/{templateID}/builds/{buildID}", s.handleStartBuild)
 	muxOn.HandleFunc("GET /templates/{templateID}/builds/{buildID}/status", s.handleGetBuildStatus)
-	muxOn.HandleFunc("GET /templates/{templateID}/files/{hash}", s.handleTemplateFiles)
-	muxOn.HandleFunc("PUT /templates/{templateID}/files/{hash}", s.handleBetaStub)
-	muxOn.HandleFunc("GET /templates/{templateID}/builds/{buildID}/logs", s.handleBetaStub)
-	muxOn.HandleFunc("GET /v2/templates", s.handleBetaStub)
+	muxOn.HandleFunc("GET /templates/{templateID}/files/{hash}", s.handleGetTemplateFiles)
+	muxOn.HandleFunc("PUT /templates/{templateID}/files/{hash}", s.handlePutTemplateFiles)
+	muxOn.HandleFunc("GET /templates/{templateID}/builds/{buildID}/logs", s.handleGetBuildLogs)
+	muxOn.HandleFunc("POST /templates/tags", s.handleAssignTemplateTags)
+	muxOn.HandleFunc("DELETE /templates/tags", s.handleDeleteTemplateTags)
 
 	hostRouter := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Subdomain Host Router: inspect r.Host for regex ^([0-9]+)-([a-zA-Z0-9_-]+)\.(.*)$,
