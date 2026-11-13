@@ -32,9 +32,25 @@ type dockerInstance struct {
 
 // DockerBackend implements Backend using Docker containers with runtime binary injection.
 type DockerBackend struct {
-	cfg       DockerConfig
-	mu        sync.RWMutex
-	instances map[string]*dockerInstance
+	cfg        DockerConfig
+	mu         sync.RWMutex
+	instances  map[string]*dockerInstance
+	runDocker  func(ctx context.Context, args []string) ([]byte, error)
+	httpClient *http.Client
+}
+
+func (d *DockerBackend) execDocker(ctx context.Context, args ...string) ([]byte, error) {
+	if d.runDocker != nil {
+		return d.runDocker(ctx, args)
+	}
+	return exec.CommandContext(ctx, "docker", args...).CombinedOutput()
+}
+
+func (d *DockerBackend) client() *http.Client {
+	if d.httpClient != nil {
+		return d.httpClient
+	}
+	return &http.Client{Timeout: 2 * time.Second}
 }
 
 // NewDockerBackend creates a new DockerBackend.
@@ -172,8 +188,7 @@ func (d *DockerBackend) EnsureRunning(ctx context.Context, spec SandboxSpec) (*I
 		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	out, err := cmd.CombinedOutput()
+	out, err := d.execDocker(ctx, args...)
 	if err != nil {
 		return nil, fmt.Errorf("docker run failed (%s): %w", string(out), err)
 	}
@@ -214,15 +229,14 @@ func (d *DockerBackend) Pause(ctx context.Context, sandboxID string) error {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, inst.info.PoddURL+"/v1/lifecycle/prepare-stop", nil)
 	if err == nil {
-		client := &http.Client{Timeout: 2 * time.Second}
-		resp, err := client.Do(req)
+		resp, err := d.client().Do(req)
 		if err == nil {
 			_ = resp.Body.Close()
 		}
 	}
 
 	containerName := fmt.Sprintf("cubepod-%s", sandboxID)
-	_ = exec.CommandContext(ctx, "docker", "stop", containerName).Run()
+	_, _ = d.execDocker(ctx, "stop", containerName)
 	inst.running = false
 
 	return nil
@@ -286,6 +300,10 @@ func (d *DockerBackend) ResetRootFS(ctx context.Context, sandboxID string) error
 
 // Fork clones source sandbox storage to new sandbox.
 func (d *DockerBackend) Fork(ctx context.Context, sourceSandboxID, newSandboxID string) (*InstanceInfo, error) {
+	if newSandboxID == "" {
+		return nil, errors.New("new sandbox ID is required")
+	}
+
 	d.mu.RLock()
 	sourceInst, ok := d.instances[sourceSandboxID]
 	if !ok {
@@ -298,29 +316,16 @@ func (d *DockerBackend) Fork(ctx context.Context, sourceSandboxID, newSandboxID 
 	isRunning := sourceInst.running
 	d.mu.RUnlock()
 
-	if isRunning {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, sourceURL+"/v1/lifecycle/prepare-stop", nil)
-		if err == nil {
-			client := &http.Client{Timeout: 2 * time.Second}
-			resp, err := client.Do(req)
-			if err == nil {
-				_ = resp.Body.Close()
-			}
-		}
-	}
-
 	newDir := d.getSandboxDir(newSandboxID)
-	_ = os.RemoveAll(newDir)
-	if err := os.MkdirAll(newDir, 0755); err != nil {
-		return nil, fmt.Errorf("create new sandbox dir: %w", err)
+	if err := cloneWithQuiesce(ctx, d.client(), sourceURL, isRunning, sourceDir, newDir); err != nil {
+		return nil, err
 	}
 
-	cmd := exec.CommandContext(ctx, "cp", "-a", "--reflink=auto", sourceDir+"/.", newDir)
-	if err := cmd.Run(); err != nil {
-		if err := copyDir(sourceDir, newDir); err != nil {
-			return nil, fmt.Errorf("copy sandbox storage: %w", err)
-		}
+	env := copyEnv(sourceSpec.Env)
+	if env == nil {
+		env = make(map[string]string)
 	}
+	env["CUBEPOD_FORKED"] = "1"
 
 	newSpec := SandboxSpec{
 		SandboxID:        newSandboxID,
@@ -328,7 +333,7 @@ func (d *DockerBackend) Fork(ctx context.Context, sourceSandboxID, newSandboxID 
 		VolumeKey:        newSandboxID,
 		RootfsGeneration: sourceSpec.RootfsGeneration,
 		Image:            sourceSpec.Image,
-		Env:              copyEnv(sourceSpec.Env),
+		Env:              env,
 	}
 
 	return d.EnsureRunning(ctx, newSpec)
@@ -345,7 +350,7 @@ func (d *DockerBackend) Delete(ctx context.Context, sandboxID string) error {
 	}
 
 	containerName := fmt.Sprintf("cubepod-%s", sandboxID)
-	_ = exec.CommandContext(ctx, "docker", "rm", "-f", containerName).Run()
+	_, _ = d.execDocker(ctx, "rm", "-f", containerName)
 	_ = os.RemoveAll(inst.sandboxDir)
 	delete(d.instances, sandboxID)
 
@@ -374,7 +379,7 @@ func (d *DockerBackend) Close() error {
 	for sandboxID, inst := range d.instances {
 		if inst.running {
 			containerName := fmt.Sprintf("cubepod-%s", sandboxID)
-			_ = exec.Command("docker", "stop", containerName).Run()
+			_, _ = d.execDocker(context.Background(), "stop", containerName)
 			inst.running = false
 		}
 	}

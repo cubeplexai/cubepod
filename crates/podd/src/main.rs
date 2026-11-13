@@ -7,6 +7,7 @@
 //! - Process group termination (`POST /v1/commands/{id}/kill`)
 //! - UID/GID-aware file read/write, deletion, directory listing, and atomic archive-sync (`PUT/GET/DELETE /v1/files`, `GET /v1/files/list`, `POST /v1/files/archive-sync`)
 //! - Pre-suspend filesystem flush (`POST /v1/lifecycle/prepare-stop`)
+//! - Bounded CoW fork filesystem quiesce/thaw (`POST /v1/lifecycle/quiesce`, `POST /v1/lifecycle/thaw`)
 //! - Daemon health (`GET /health`)
 
 pub mod commands;
@@ -14,6 +15,7 @@ pub mod files;
 pub mod http;
 pub mod interpreter;
 pub mod json;
+pub mod lifecycle;
 pub mod startcmd;
 
 #[cfg(test)]
@@ -39,6 +41,7 @@ pub use interpreter::{
     handle_context_restart, handle_execute, ContextRegistry, ExecutionContext,
 };
 pub use json::{escape_json, parse_target, url_decode, JsonParser, JsonValue};
+pub use lifecycle::{handle_quiesce, handle_thaw, QuiesceOutcome, QuiesceState};
 pub use startcmd::{
     configure_command_credentials, ensure_sigchld_handler, ensure_subreaper, exit_code_from_status,
     install_zombie_reaper, lookup_passwd_by_name, lookup_passwd_by_uid, maybe_spawn_start_cmd,
@@ -74,10 +77,21 @@ pub fn handle_health(stream: &mut TcpStream, config: &DaemonConfig, registry: &P
 }
 
 pub fn route_request(
+    stream: TcpStream,
+    config: &DaemonConfig,
+    registry: &ProcessRegistry,
+    contexts: &ContextRegistry,
+) {
+    let quiesce = QuiesceState::new();
+    route_request_with_quiesce(stream, config, registry, contexts, &quiesce);
+}
+
+pub fn route_request_with_quiesce(
     mut stream: TcpStream,
     config: &DaemonConfig,
     registry: &ProcessRegistry,
     contexts: &ContextRegistry,
+    quiesce: &QuiesceState,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(120)));
@@ -96,6 +110,12 @@ pub fn route_request(
         }
         ("POST", "/v1/lifecycle/prepare-stop") => {
             handle_prepare_stop(&mut stream, registry);
+        }
+        ("POST", "/v1/lifecycle/quiesce") => {
+            handle_quiesce(&mut stream, &req, config, quiesce);
+        }
+        ("POST", "/v1/lifecycle/thaw") => {
+            handle_thaw(&mut stream, quiesce);
         }
         ("POST", "/v1/commands/run") => {
             handle_command_run(&mut stream, &req, config, registry);
@@ -197,14 +217,25 @@ pub fn run_server(
     registry: ProcessRegistry,
     contexts: ContextRegistry,
 ) {
+    run_server_with_quiesce(listener, config, registry, contexts, QuiesceState::new());
+}
+
+pub fn run_server_with_quiesce(
+    listener: TcpListener,
+    config: DaemonConfig,
+    registry: ProcessRegistry,
+    contexts: ContextRegistry,
+    quiesce: QuiesceState,
+) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let config = config.clone();
                 let registry = registry.clone();
                 let contexts = contexts.clone();
+                let quiesce = quiesce.clone();
                 std::thread::spawn(move || {
-                    route_request(stream, &config, &registry, &contexts);
+                    route_request_with_quiesce(stream, &config, &registry, &contexts, &quiesce);
                 });
             }
             Err(e) => {
@@ -218,7 +249,13 @@ pub fn serve(listener: TcpListener, config: DaemonConfig, registry: ProcessRegis
     ensure_subreaper();
     install_zombie_reaper();
     spawn_start_cmd_if_configured(&config.workdir);
-    run_server(listener, config, registry, ContextRegistry::new());
+    run_server_with_quiesce(
+        listener,
+        config,
+        registry,
+        ContextRegistry::new(),
+        QuiesceState::new(),
+    );
 }
 
 fn main() {
@@ -238,7 +275,8 @@ fn main() {
     let config = DaemonConfig { workdir };
     let registry = ProcessRegistry::new();
     let contexts = ContextRegistry::new();
+    let quiesce = QuiesceState::new();
     let listener = TcpListener::bind(&addr).expect("failed to bind podd listener");
     spawn_start_cmd_if_configured(&config.workdir);
-    run_server(listener, config, registry, contexts);
+    run_server_with_quiesce(listener, config, registry, contexts, quiesce);
 }

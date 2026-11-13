@@ -2,11 +2,15 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -385,4 +389,194 @@ func TestLocalTemplateTag(t *testing.T) {
 			t.Fatalf("expected tag %q, got %q", expected, got)
 		}
 	})
+}
+
+func TestDockerBackend_CoWForkIsolationAndQuiesceThawOrder(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	var (
+		mu         sync.Mutex
+		events     []string
+		quiesceReq map[string]any
+	)
+	recordEvent := func(ev string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, ev)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/lifecycle/quiesce":
+			body, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body, &quiesceReq)
+			recordEvent("quiesce")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"quiesced","synced":true,"frozen":true,"maxFreezeMs":1500}`))
+		case "/v1/lifecycle/thaw":
+			recordEvent("thaw")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"thawed"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	baseDir := t.TempDir()
+	docker := NewDockerBackend(DockerConfig{
+		BinDir:           "/opt/cubepod/bin",
+		BaseDir:          baseDir,
+		EnableSparseExt4: true,
+		SparseExt4Size:   1024 * 1024,
+	})
+	docker.runDocker = func(_ context.Context, args []string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "run" {
+			recordEvent("docker_run")
+		}
+		return []byte("mock-container-id"), nil
+	}
+
+	parentDir := filepath.Join(baseDir, "sb-parent")
+	parentWs := filepath.Join(parentDir, "workspace")
+	parentRootfs := filepath.Join(parentDir, "rootfs")
+	if err := os.MkdirAll(parentWs, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(parentRootfs, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parentWs, "hello.txt"), []byte("parent-ws"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parentRootfs, "pkg.conf"), []byte("parent-rootfs"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := createSparseFile(filepath.Join(parentDir, "workspace.ext4"), 1024*1024); err != nil {
+		t.Fatal(err)
+	}
+	if err := createSparseFile(filepath.Join(parentDir, "rootfs.ext4"), 1024*1024); err != nil {
+		t.Fatal(err)
+	}
+	// Write non-zero bytes into parent workspace.ext4 to verify loopback image contents clone cleanly.
+	f, err := os.OpenFile(filepath.Join(parentDir, "workspace.ext4"), os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("EXT4-PARENT-MARKER"), 4096); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	docker.mu.Lock()
+	docker.instances["sb-parent"] = &dockerInstance{
+		spec: SandboxSpec{
+			SandboxID:  "sb-parent",
+			TemplateID: "ubuntu-test",
+		},
+		info: InstanceInfo{
+			SandboxID:    "sb-parent",
+			PoddURL:      srv.URL,
+			WorkspaceDir: parentWs,
+			RootfsDir:    parentRootfs,
+			ContainerID:  "cubepod-sb-parent",
+		},
+		running:     true,
+		containerID: "cubepod-sb-parent",
+		sandboxDir:  parentDir,
+	}
+	docker.mu.Unlock()
+
+	childInfo, err := docker.Fork(ctx, "sb-parent", "sb-child")
+	if err != nil {
+		t.Fatalf("DockerBackend.Fork failed: %v", err)
+	}
+
+	// Verify quiesce -> thaw -> docker_run ordering and maxFreezeMs=1500
+	expectedEvents := []string{"quiesce", "thaw", "docker_run"}
+	if !slices.Equal(events, expectedEvents) {
+		t.Fatalf("unexpected call order: got %v, want %v", events, expectedEvents)
+	}
+	if got, ok := quiesceReq["maxFreezeMs"].(float64); !ok || int(got) != 1500 {
+		t.Fatalf("expected quiesce maxFreezeMs=1500, got %v", quiesceReq)
+	}
+
+	// Verify child inherited workspace, rootfs, and sparse loopback .ext4 contents
+	gotWs, err := os.ReadFile(filepath.Join(childInfo.WorkspaceDir, "hello.txt"))
+	if err != nil || string(gotWs) != "parent-ws" {
+		t.Fatalf("child workspace mismatch: %q, err=%v", string(gotWs), err)
+	}
+	gotRootfs, err := os.ReadFile(filepath.Join(childInfo.RootfsDir, "pkg.conf"))
+	if err != nil || string(gotRootfs) != "parent-rootfs" {
+		t.Fatalf("child rootfs mismatch: %q, err=%v", string(gotRootfs), err)
+	}
+
+	childExt4 := filepath.Join(baseDir, "sb-child", "workspace.ext4")
+	cf, err := os.OpenFile(childExt4, os.O_RDWR, 0644)
+	if err != nil {
+		t.Fatalf("open child workspace.ext4: %v", err)
+	}
+	buf := make([]byte, len("EXT4-PARENT-MARKER"))
+	if _, err := cf.ReadAt(buf, 4096); err != nil {
+		_ = cf.Close()
+		t.Fatal(err)
+	}
+	if string(buf) != "EXT4-PARENT-MARKER" {
+		_ = cf.Close()
+		t.Fatalf("child ext4 marker mismatch: got %q", string(buf))
+	}
+
+	// Mutate child files and ext4 image; verify parent remains completely isolated
+	if _, err := cf.WriteAt([]byte("CHILD-MUTATED-DATA"), 4096); err != nil {
+		_ = cf.Close()
+		t.Fatal(err)
+	}
+	_ = cf.Close()
+
+	if err := os.WriteFile(filepath.Join(childInfo.WorkspaceDir, "hello.txt"), []byte("child-only"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(childInfo.RootfsDir, "child-file.txt"), []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	parentWsAfter, _ := os.ReadFile(filepath.Join(parentWs, "hello.txt"))
+	if string(parentWsAfter) != "parent-ws" {
+		t.Fatalf("child mutation leaked into parent workspace: %q", string(parentWsAfter))
+	}
+	if _, err := os.Stat(filepath.Join(parentRootfs, "child-file.txt")); !os.IsNotExist(err) {
+		t.Fatalf("child rootfs file leaked into parent rootfs")
+	}
+
+	pf, err := os.Open(filepath.Join(parentDir, "workspace.ext4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pbuf := make([]byte, len("EXT4-PARENT-MARKER"))
+	_, _ = pf.ReadAt(pbuf, 4096)
+	_ = pf.Close()
+	if string(pbuf) != "EXT4-PARENT-MARKER" {
+		t.Fatalf("child ext4 write mutated parent ext4: got %q", string(pbuf))
+	}
+}
+
+func TestQuiesceSandbox_ThawsOnCloneError(t *testing.T) {
+	ctx := context.Background()
+	var calls []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	err := cloneWithQuiesce(ctx, srv.Client(), srv.URL, true, "/nonexistent-cubepod-src-dir", filepath.Join(t.TempDir(), "dst"))
+	if err == nil {
+		t.Fatalf("expected cloneWithQuiesce to fail for nonexistent source dir")
+	}
+	expected := []string{"/v1/lifecycle/quiesce", "/v1/lifecycle/thaw"}
+	if !slices.Equal(calls, expected) {
+		t.Fatalf("expected thaw to still execute on clone failure: got %v, want %v", calls, expected)
+	}
 }

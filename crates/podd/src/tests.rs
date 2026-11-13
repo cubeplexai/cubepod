@@ -1811,3 +1811,450 @@ fn test_run_request_serde() {
     assert_eq!(custom.gid, Some(1002));
     assert_eq!(custom.user.as_deref(), Some("cubeplex"));
 }
+
+fn parse_ndjson_lines(body: &[u8]) -> Vec<JsonValue> {
+    std::str::from_utf8(body)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| JsonValue::parse(l).unwrap_or_else(|e| panic!("bad ndjson line {l:?}: {e}")))
+        .collect()
+}
+
+#[test]
+fn test_interpreter_python_stateful_and_aliases() {
+    let (addr, _) = start_test_server("/tmp");
+    let (st, _, ctx_body) = post_json(&addr, "/contexts", r#"{"language":"py","cwd":"/tmp"}"#);
+    assert_eq!(st, 200);
+    let ctx_json = JsonValue::parse(std::str::from_utf8(&ctx_body).unwrap()).unwrap();
+    assert_eq!(ctx_json.get("language").unwrap().as_str(), Some("python"));
+    let ctx_id = ctx_json.get("id").unwrap().as_str().unwrap().to_string();
+
+    let run1 = format!(
+        r#"{{"context_id":"{ctx_id}","code":"x = 41\nprint('py-out')\nimport sys\nsys.stderr.write('py-err\\n')"}}"#
+    );
+    let (s1, _, b1) = post_raw(&addr, "/execute", "application/json", run1.as_bytes());
+    assert_eq!(s1, 200);
+    let msgs1 = parse_ndjson_lines(&b1);
+    assert!(msgs1.iter().any(|m| {
+        m.get("type").and_then(|v| v.as_str()) == Some("stdout")
+            && m.get("text").and_then(|v| v.as_str()) == Some("py-out\n")
+    }));
+    assert!(msgs1.iter().any(|m| {
+        m.get("type").and_then(|v| v.as_str()) == Some("stderr")
+            && m.get("text").and_then(|v| v.as_str()) == Some("py-err\n")
+    }));
+
+    let run2 = format!(r#"{{"context_id":"{ctx_id}","code":"x + 1"}}"#);
+    let (s2, _, b2) = post_raw(&addr, "/execute", "application/json", run2.as_bytes());
+    assert_eq!(s2, 200);
+    let msgs2 = parse_ndjson_lines(&b2);
+    assert!(msgs2.iter().any(|m| {
+        m.get("type").and_then(|v| v.as_str()) == Some("result")
+            && m.get("text").and_then(|v| v.as_str()) == Some("42")
+    }));
+}
+
+#[test]
+fn test_interpreter_bash_stateful_pwd_vars_and_exit_error() {
+    let (addr, _) = start_test_server("/tmp");
+    let (st, _, ctx_body) = post_json(&addr, "/contexts", r#"{"language":"bash","cwd":"/tmp"}"#);
+    assert_eq!(st, 200);
+    let ctx_json = JsonValue::parse(std::str::from_utf8(&ctx_body).unwrap()).unwrap();
+    assert_eq!(ctx_json.get("language").unwrap().as_str(), Some("bash"));
+    let ctx_id = ctx_json.get("id").unwrap().as_str().unwrap().to_string();
+
+    let run1 = format!(
+        r#"{{"context_id":"{ctx_id}","code":"cd /tmp\nx=41\nexport EXP_VAR=cubepod\necho bash-out\necho bash-err >&2"}}"#
+    );
+    let (s1, _, b1) = post_raw(&addr, "/execute", "application/json", run1.as_bytes());
+    assert_eq!(s1, 200);
+    let msgs1 = parse_ndjson_lines(&b1);
+    assert!(
+        msgs1.iter().any(|m| {
+            m.get("type").and_then(|v| v.as_str()) == Some("stdout")
+                && m.get("text").and_then(|v| v.as_str()) == Some("bash-out\n")
+        }),
+        "missing bash stdout: {msgs1:?}"
+    );
+    assert!(
+        msgs1.iter().any(|m| {
+            m.get("type").and_then(|v| v.as_str()) == Some("stderr")
+                && m.get("text").and_then(|v| v.as_str()) == Some("bash-err\n")
+        }),
+        "missing bash stderr: {msgs1:?}"
+    );
+
+    let run2 = format!(r#"{{"context_id":"{ctx_id}","code":"pwd\necho \"$((x + 1))-$EXP_VAR\""}}"#);
+    let (s2, _, b2) = post_raw(&addr, "/execute", "application/json", run2.as_bytes());
+    assert_eq!(s2, 200);
+    let msgs2 = parse_ndjson_lines(&b2);
+    let stdout_all: String = msgs2
+        .iter()
+        .filter(|m| m.get("type").and_then(|v| v.as_str()) == Some("stdout"))
+        .filter_map(|m| m.get("text").and_then(|v| v.as_str()))
+        .collect();
+    assert!(stdout_all.contains("/tmp\n"), "pwd lost: {stdout_all:?}");
+    assert!(
+        stdout_all.contains("42-cubepod\n"),
+        "bash vars lost: {stdout_all:?}"
+    );
+
+    let run3 = format!(r#"{{"context_id":"{ctx_id}","code":"false"}}"#);
+    let (s3, _, b3) = post_raw(&addr, "/execute", "application/json", run3.as_bytes());
+    assert_eq!(s3, 200);
+    let msgs3 = parse_ndjson_lines(&b3);
+    assert!(
+        msgs3.iter().any(|m| {
+            m.get("type").and_then(|v| v.as_str()) == Some("error")
+                && m.get("name").and_then(|v| v.as_str()) == Some("ProcessExitError")
+        }),
+        "expected ProcessExitError on non-zero exit: {msgs3:?}"
+    );
+}
+
+#[test]
+fn test_interpreter_javascript_stateful_and_top_level_await() {
+    use crate::interpreter::find_runtime_binary;
+    if find_runtime_binary(
+        Some("CUBEPOD_NODE_BIN"),
+        &["node", "/usr/bin/node", "/usr/local/bin/node"],
+        "node",
+    )
+    .is_err()
+    {
+        eprintln!("skipping javascript test: node not installed on host");
+        return;
+    }
+
+    let (addr, _) = start_test_server("/tmp");
+    let (st, _, ctx_body) = post_json(&addr, "/contexts", r#"{"language":"js","cwd":"/tmp"}"#);
+    assert_eq!(st, 200);
+    let ctx_json = JsonValue::parse(std::str::from_utf8(&ctx_body).unwrap()).unwrap();
+    assert_eq!(
+        ctx_json.get("language").unwrap().as_str(),
+        Some("javascript")
+    );
+    let ctx_id = ctx_json.get("id").unwrap().as_str().unwrap().to_string();
+
+    let run1 = format!(
+        r#"{{"context_id":"{ctx_id}","code":"const x = 41;\nconsole.log('js-out');\nconsole.error('js-err');\nprocess.stdout.write('raw-out');"}}"#
+    );
+    let (s1, _, b1) = post_raw(&addr, "/execute", "application/json", run1.as_bytes());
+    assert_eq!(s1, 200);
+    let msgs1 = parse_ndjson_lines(&b1);
+    let out1: String = msgs1
+        .iter()
+        .filter(|m| m.get("type").and_then(|v| v.as_str()) == Some("stdout"))
+        .filter_map(|m| m.get("text").and_then(|v| v.as_str()))
+        .collect();
+    let err1: String = msgs1
+        .iter()
+        .filter(|m| m.get("type").and_then(|v| v.as_str()) == Some("stderr"))
+        .filter_map(|m| m.get("text").and_then(|v| v.as_str()))
+        .collect();
+    assert!(out1.contains("js-out\n"), "out1={out1:?}");
+    assert!(out1.contains("raw-out"), "out1={out1:?}");
+    assert!(err1.contains("js-err\n"), "err1={err1:?}");
+
+    let run2 = format!(r#"{{"context_id":"{ctx_id}","code":"x + 1"}}"#);
+    let (s2, _, b2) = post_raw(&addr, "/execute", "application/json", run2.as_bytes());
+    assert_eq!(s2, 200);
+    let msgs2 = parse_ndjson_lines(&b2);
+    assert!(
+        msgs2.iter().any(|m| {
+            m.get("type").and_then(|v| v.as_str()) == Some("result")
+                && m.get("text").and_then(|v| v.as_str()) == Some("42")
+        }),
+        "expected result 42: {msgs2:?}"
+    );
+
+    let run3 = format!(
+        r#"{{"context_id":"{ctx_id}","code":"const z = await Promise.resolve(10);\nz + 32"}}"#
+    );
+    let (s3, _, b3) = post_raw(&addr, "/execute", "application/json", run3.as_bytes());
+    assert_eq!(s3, 200);
+    let msgs3 = parse_ndjson_lines(&b3);
+    assert!(
+        msgs3.iter().any(|m| {
+            m.get("type").and_then(|v| v.as_str()) == Some("result")
+                && m.get("text").and_then(|v| v.as_str()) == Some("42")
+        }),
+        "expected async result 42: {msgs3:?}"
+    );
+
+    let run4 = format!(r#"{{"context_id":"{ctx_id}","code":"throw new Error('boom-js')"}}"#);
+    let (s4, _, b4) = post_raw(&addr, "/execute", "application/json", run4.as_bytes());
+    assert_eq!(s4, 200);
+    let msgs4 = parse_ndjson_lines(&b4);
+    assert!(
+        msgs4.iter().any(|m| {
+            m.get("type").and_then(|v| v.as_str()) == Some("error")
+                && m.get("value").and_then(|v| v.as_str()) == Some("boom-js")
+                && !m
+                    .get("traceback")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .is_empty()
+        }),
+        "expected error with stack trace: {msgs4:?}"
+    );
+}
+
+#[test]
+fn test_interpreter_typescript_stateful() {
+    use crate::interpreter::find_runtime_binary;
+    if find_runtime_binary(
+        Some("CUBEPOD_NODE_BIN"),
+        &["node", "/usr/bin/node", "/usr/local/bin/node"],
+        "node",
+    )
+    .is_err()
+    {
+        eprintln!("skipping typescript test: node not installed on host");
+        return;
+    }
+
+    let (addr, _) = start_test_server("/tmp");
+    let (st, _, ctx_body) = post_json(&addr, "/contexts", r#"{"language":"ts","cwd":"/tmp"}"#);
+    assert_eq!(st, 200);
+    let ctx_json = JsonValue::parse(std::str::from_utf8(&ctx_body).unwrap()).unwrap();
+    assert_eq!(
+        ctx_json.get("language").unwrap().as_str(),
+        Some("typescript")
+    );
+    let ctx_id = ctx_json.get("id").unwrap().as_str().unwrap().to_string();
+
+    let run1 = format!(
+        r#"{{"context_id":"{ctx_id}","code":"interface Box {{ val: number }}\nconst box: Box = {{ val: 41 }};\nconsole.log('ts-ready');"}}"#
+    );
+    let (s1, _, b1) = post_raw(&addr, "/execute", "application/json", run1.as_bytes());
+    assert_eq!(s1, 200);
+    let msgs1 = parse_ndjson_lines(&b1);
+    assert!(msgs1.iter().any(|m| {
+        m.get("type").and_then(|v| v.as_str()) == Some("stdout")
+            && m.get("text").and_then(|v| v.as_str()) == Some("ts-ready\n")
+    }));
+
+    let run2 = format!(
+        r#"{{"context_id":"{ctx_id}","code":"const add = (a: number, b: number): number => a + b;\nadd(box.val, 1)"}}"#
+    );
+    let (s2, _, b2) = post_raw(&addr, "/execute", "application/json", run2.as_bytes());
+    assert_eq!(s2, 200);
+    let msgs2 = parse_ndjson_lines(&b2);
+    assert!(
+        msgs2.iter().any(|m| {
+            m.get("type").and_then(|v| v.as_str()) == Some("result")
+                && m.get("text").and_then(|v| v.as_str()) == Some("42")
+        }),
+        "expected ts result 42: {msgs2:?}"
+    );
+}
+
+#[test]
+fn test_interpreter_java_stateful() {
+    use crate::interpreter::find_runtime_binary;
+    let has_java = find_runtime_binary(
+        Some("CUBEPOD_JAVA_BIN"),
+        &["java", "/usr/bin/java", "/usr/local/bin/java"],
+        "java",
+    )
+    .is_ok();
+    let has_jshell = find_runtime_binary(
+        Some("CUBEPOD_JSHELL_BIN"),
+        &["jshell", "/usr/bin/jshell", "/usr/local/bin/jshell"],
+        "jshell",
+    )
+    .is_ok();
+    if !has_java || !has_jshell {
+        eprintln!("skipping java stateful test: java/jshell not installed on host");
+        return;
+    }
+
+    let (addr, _) = start_test_server("/tmp");
+    let (st, _, ctx_body) = post_json(&addr, "/contexts", r#"{"language":"java","cwd":"/tmp"}"#);
+    assert_eq!(st, 200);
+    let ctx_json = JsonValue::parse(std::str::from_utf8(&ctx_body).unwrap()).unwrap();
+    let ctx_id = ctx_json.get("id").unwrap().as_str().unwrap().to_string();
+
+    let run1 = format!(
+        r#"{{"context_id":"{ctx_id}","code":"int x = 41;\nSystem.out.println(\"java-ok\");"}}"#
+    );
+    let (s1, _, b1) = post_raw(&addr, "/execute", "application/json", run1.as_bytes());
+    assert_eq!(s1, 200);
+    let msgs1 = parse_ndjson_lines(&b1);
+    assert!(msgs1.iter().any(|m| {
+        m.get("type").and_then(|v| v.as_str()) == Some("stdout")
+            && m.get("text").and_then(|v| v.as_str()) == Some("java-ok\n")
+    }));
+
+    let run2 = format!(r#"{{"context_id":"{ctx_id}","code":"x + 1"}}"#);
+    let (s2, _, b2) = post_raw(&addr, "/execute", "application/json", run2.as_bytes());
+    assert_eq!(s2, 200);
+    let msgs2 = parse_ndjson_lines(&b2);
+    assert!(
+        msgs2.iter().any(|m| {
+            m.get("type").and_then(|v| v.as_str()) == Some("result")
+                && m.get("text").and_then(|v| v.as_str()) == Some("42")
+        }),
+        "expected java result 42: {msgs2:?}"
+    );
+}
+
+#[test]
+fn test_interpreter_unsupported_language_and_missing_runtime() {
+    use crate::interpreter::{find_runtime_binary, WorkerSpawnError};
+
+    match find_runtime_binary(None, &["__cubepod_nonexistent_runtime_xyz__"], "fake_rt") {
+        Err(WorkerSpawnError::NotInstalled { bin }) => assert_eq!(bin, "fake_rt"),
+        other => panic!("expected NotInstalled error, got {other:?}"),
+    }
+
+    let (addr, _) = start_test_server("/tmp");
+
+    let (s1, _, b1) = post_json(&addr, "/contexts", r#"{"language":"brainfuck"}"#);
+    assert_eq!(s1, 400);
+    let j1 = JsonValue::parse(std::str::from_utf8(&b1).unwrap()).unwrap();
+    assert_eq!(
+        j1.get("name").and_then(|v| v.as_str()),
+        Some("UnsupportedLanguageError")
+    );
+
+    let (s2, _, b2) = post_json(&addr, "/execute", r#"{"code":"1+1","language":"cobol"}"#);
+    assert_eq!(s2, 400);
+    let j2 = JsonValue::parse(std::str::from_utf8(&b2).unwrap()).unwrap();
+    assert_eq!(
+        j2.get("name").and_then(|v| v.as_str()),
+        Some("UnsupportedLanguageError")
+    );
+
+    // Verify end-to-end KernelNotInstalledError for R when R/Rscript is absent on host.
+    if find_runtime_binary(
+        Some("CUBEPOD_R_BIN"),
+        &[
+            "R",
+            "/usr/bin/R",
+            "/usr/local/bin/R",
+            "Rscript",
+            "/usr/bin/Rscript",
+            "/usr/local/bin/Rscript",
+        ],
+        "R",
+    )
+    .is_err()
+    {
+        let (sr, _, br) = post_json(&addr, "/execute", r#"{"code":"41 + 1","language":"r"}"#);
+        assert_eq!(sr, 200);
+        let msgs = parse_ndjson_lines(&br);
+        assert!(
+            msgs.iter().any(|m| {
+                m.get("type").and_then(|v| v.as_str()) == Some("error")
+                    && m.get("name").and_then(|v| v.as_str()) == Some("KernelNotInstalledError")
+                    && m.get("value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .contains("not installed in this sandbox image")
+            }),
+            "expected KernelNotInstalledError for missing R: {msgs:?}"
+        );
+    }
+}
+
+#[test]
+fn test_lifecycle_quiesce_thaw_and_watchdog() {
+    use crate::lifecycle::{FreezeOps, QuiesceState};
+    use std::any::Any;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // 1. HTTP endpoints (unprivileged host gracefully reports synced:true, frozen:false)
+    let (addr, _) = start_test_server("/tmp");
+
+    let (q1_st, _, q1_body) = post_json(&addr, "/v1/lifecycle/quiesce", "");
+    assert_eq!(q1_st, 200);
+    let q1 = JsonValue::parse(std::str::from_utf8(&q1_body).unwrap()).unwrap();
+    assert_eq!(q1.get("status").and_then(|v| v.as_str()), Some("quiesced"));
+    assert_eq!(q1.get("synced").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(q1.get("maxFreezeMs").and_then(|v| v.as_u64()), Some(1500));
+
+    let (q2_st, _, q2_body) = post_json(&addr, "/v1/lifecycle/quiesce", r#"{"maxFreezeMs": 10}"#);
+    assert_eq!(q2_st, 200);
+    let q2 = JsonValue::parse(std::str::from_utf8(&q2_body).unwrap()).unwrap();
+    assert_eq!(q2.get("maxFreezeMs").and_then(|v| v.as_u64()), Some(100));
+
+    let (q3_st, _, q3_body) =
+        post_json(&addr, "/v1/lifecycle/quiesce", r#"{"maxFreezeMs": 99999}"#);
+    assert_eq!(q3_st, 200);
+    let q3 = JsonValue::parse(std::str::from_utf8(&q3_body).unwrap()).unwrap();
+    assert_eq!(q3.get("maxFreezeMs").and_then(|v| v.as_u64()), Some(5000));
+
+    // Idempotent thaw
+    let (t1_st, _, t1_body) = http_request(&addr, "POST", "/v1/lifecycle/thaw", &[], &[]);
+    assert_eq!(t1_st, 200);
+    let t1 = JsonValue::parse(std::str::from_utf8(&t1_body).unwrap()).unwrap();
+    assert_eq!(t1.get("status").and_then(|v| v.as_str()), Some("thawed"));
+
+    let (t2_st, _, _) = http_request(&addr, "POST", "/v1/lifecycle/thaw", &[], &[]);
+    assert_eq!(t2_st, 200);
+
+    // 2. Bounded monotonic watchdog auto-thaw test with MockFreezeOps
+    struct MockFreezeOps {
+        syncs: AtomicUsize,
+        freezes: AtomicUsize,
+        thaws: AtomicUsize,
+    }
+    impl FreezeOps for MockFreezeOps {
+        fn sync_all(&self) {
+            self.syncs.fetch_add(1, Ordering::SeqCst);
+        }
+        fn freeze_paths(&self, _paths: &[&Path]) -> Vec<Box<dyn Any + Send>> {
+            self.freezes.fetch_add(1, Ordering::SeqCst);
+            vec![Box::new(42u64)]
+        }
+        fn thaw_handle(&self, _handle: Box<dyn Any + Send>) {
+            self.thaws.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let ops = Arc::new(MockFreezeOps {
+        syncs: AtomicUsize::new(0),
+        freezes: AtomicUsize::new(0),
+        thaws: AtomicUsize::new(0),
+    });
+    let state = QuiesceState::with_ops(ops.clone());
+
+    let out = state.quiesce("/tmp", 100);
+    assert!(out.synced);
+    assert!(out.frozen);
+    assert_eq!(out.max_freeze_ms, 100);
+    assert!(state.is_frozen());
+    assert_eq!(ops.thaws.load(Ordering::SeqCst), 0);
+
+    // Wait for watchdog thread to auto-thaw
+    let mut thawed = false;
+    for _ in 0..40 {
+        if !state.is_frozen() {
+            thawed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(thawed, "watchdog must auto-thaw frozen handles");
+    assert_eq!(ops.thaws.load(Ordering::SeqCst), 1);
+    assert_eq!(state.auto_thawed_count(), 1);
+
+    // Subsequent explicit thaw is idempotent and does not double-thaw
+    assert_eq!(state.thaw(), 0);
+    assert_eq!(ops.thaws.load(Ordering::SeqCst), 1);
+
+    // Explicit thaw before watchdog expires cancels auto-thaw
+    let out2 = state.quiesce("/tmp", 300);
+    assert!(out2.frozen);
+    assert_eq!(state.thaw(), 1);
+    assert!(!state.is_frozen());
+    assert_eq!(ops.thaws.load(Ordering::SeqCst), 2);
+    std::thread::sleep(Duration::from_millis(350));
+    assert_eq!(ops.thaws.load(Ordering::SeqCst), 2);
+    assert_eq!(state.auto_thawed_count(), 1);
+}

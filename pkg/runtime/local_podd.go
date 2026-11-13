@@ -83,6 +83,8 @@ func resolvePoddBinary(explicit string) (string, error) {
 		"bin/podd",
 		"../bin/podd",
 		"../../bin/podd",
+		"../../target/release/podd",
+		"../../target/debug/podd",
 		"/tmp/cubepod-wt-cep7/bin/podd",
 	}
 
@@ -403,6 +405,10 @@ func (b *PoddProcessBackend) ResetRootFS(ctx context.Context, sandboxID string) 
 
 // Fork copies rootfs/ and workspace/ to a new sandbox and starts it.
 func (b *PoddProcessBackend) Fork(ctx context.Context, sourceSandboxID, newSandboxID string) (*InstanceInfo, error) {
+	if newSandboxID == "" {
+		return nil, errors.New("new sandbox ID is required")
+	}
+
 	b.mu.RLock()
 	sourceInst, ok := b.instances[sourceSandboxID]
 	if !ok {
@@ -415,28 +421,9 @@ func (b *PoddProcessBackend) Fork(ctx context.Context, sourceSandboxID, newSandb
 	isRunning := sourceInst.running
 	b.mu.RUnlock()
 
-	if isRunning {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, sourceURL+"/v1/lifecycle/prepare-stop", nil)
-		if err == nil {
-			client := &http.Client{Timeout: 2 * time.Second}
-			resp, err := client.Do(req)
-			if err == nil {
-				_ = resp.Body.Close()
-			}
-		}
-	}
-
 	newDir := filepath.Join(b.cfg.BaseDir, newSandboxID)
-	_ = os.RemoveAll(newDir)
-	if err := os.MkdirAll(newDir, 0755); err != nil {
-		return nil, fmt.Errorf("create new sandbox dir: %w", err)
-	}
-
-	cmd := exec.CommandContext(ctx, "cp", "-a", "--reflink=auto", sourceDir+"/.", newDir)
-	if err := cmd.Run(); err != nil {
-		if err := copyDir(sourceDir, newDir); err != nil {
-			return nil, fmt.Errorf("copy sandbox storage: %w", err)
-		}
+	if err := cloneWithQuiesce(ctx, &http.Client{Timeout: 2 * time.Second}, sourceURL, isRunning, sourceDir, newDir); err != nil {
+		return nil, err
 	}
 
 	newSpec := SandboxSpec{
