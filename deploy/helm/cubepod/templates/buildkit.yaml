@@ -74,6 +74,19 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- $cacheSize := .Values.templateBuild.cacheSize | default "20Gi" | toString }}
+      {{- $cacheSizeMB := 20480 }}
+      {{- if hasSuffix "Gi" $cacheSize }}
+        {{- $cacheSizeMB = mul (trimSuffix "Gi" $cacheSize | int) 1024 }}
+      {{- else if hasSuffix "G" $cacheSize }}
+        {{- $cacheSizeMB = mul (trimSuffix "G" $cacheSize | int) 1000 }}
+      {{- else if hasSuffix "Mi" $cacheSize }}
+        {{- $cacheSizeMB = trimSuffix "Mi" $cacheSize | int }}
+      {{- else if hasSuffix "M" $cacheSize }}
+        {{- $cacheSizeMB = trimSuffix "M" $cacheSize | int }}
+      {{- else if regexMatch "^[0-9]+$" $cacheSize }}
+        {{- $cacheSizeMB = $cacheSize | int }}
+      {{- end }}
       containers:
         - name: buildkitd
           image: {{ .Values.templateBuild.buildkit.image }}
@@ -81,7 +94,7 @@ spec:
             - "--addr=tcp://0.0.0.0:1234"
             - "--oci-worker-no-process-sandbox"
             - "--oci-worker-gc"
-            - "--oci-worker-gc-keepstorage={{ .Values.templateBuild.cacheSize }}"
+            - "--oci-worker-gc-keepstorage={{ $cacheSizeMB }}"
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000

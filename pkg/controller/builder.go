@@ -25,6 +25,7 @@ type BuildOptions struct {
 type ImageBuilder interface {
 	Build(ctx context.Context, opts BuildOptions) error
 	Probe(ctx context.Context, tag string, readyCmd string, timeout time.Duration) error
+	TagExists(ctx context.Context, tag string) (bool, error)
 }
 
 // ScrubString replaces sensitive passwords with [REDACTED].
@@ -63,20 +64,24 @@ func WriteScrubbedLog(baseDir, buildID string, lines []string, passwords []strin
 
 // FakeImageBuilder is an in-memory test double for ImageBuilder.
 type FakeImageBuilder struct {
-	mu         sync.Mutex
-	BuildCalls []BuildOptions
-	ProbeCalls []string
-	BuildErr   error
-	ProbeErr   error
-	BuildHook  func(opts BuildOptions) error
-	ProbeHook  func(tag, readyCmd string) error
-	Logs       map[string][]string
+	mu            sync.Mutex
+	BuildCalls    []BuildOptions
+	ProbeCalls    []string
+	ExistingTags  map[string]bool
+	BuildErr      error
+	ProbeErr      error
+	TagExistsErr  error
+	BuildHook     func(opts BuildOptions) error
+	ProbeHook     func(tag, readyCmd string) error
+	TagExistsHook func(tag string) (bool, error)
+	Logs          map[string][]string
 }
 
 // NewFakeImageBuilder creates a new FakeImageBuilder.
 func NewFakeImageBuilder() *FakeImageBuilder {
 	return &FakeImageBuilder{
-		Logs: make(map[string][]string),
+		ExistingTags: make(map[string]bool),
+		Logs:         make(map[string][]string),
 	}
 }
 
@@ -85,6 +90,7 @@ func (f *FakeImageBuilder) Build(_ context.Context, opts BuildOptions) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.BuildCalls = append(f.BuildCalls, opts)
+	f.ExistingTags[opts.Tag] = true
 
 	logLines := []string{
 		fmt.Sprintf("Step 1/1 : Building %s", opts.Tag),
@@ -113,6 +119,19 @@ func (f *FakeImageBuilder) Probe(_ context.Context, tag string, readyCmd string,
 		return f.ProbeHook(tag, readyCmd)
 	}
 	return f.ProbeErr
+}
+
+// TagExists checks if the image tag exists in FakeImageBuilder.
+func (f *FakeImageBuilder) TagExists(_ context.Context, tag string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.TagExistsHook != nil {
+		return f.TagExistsHook(tag)
+	}
+	if f.TagExistsErr != nil {
+		return false, f.TagExistsErr
+	}
+	return f.ExistingTags[tag], nil
 }
 
 // LocalDockerBuilder implements ImageBuilder using the host Docker daemon.
@@ -164,4 +183,13 @@ func (b *LocalDockerBuilder) Probe(ctx context.Context, tag string, readyCmd str
 		return fmt.Errorf("probe failed: %w (output: %s)", err, string(out))
 	}
 	return nil
+}
+
+// TagExists checks whether the docker image tag exists locally.
+func (b *LocalDockerBuilder) TagExists(ctx context.Context, tag string) (bool, error) {
+	cmd := exec.CommandContext(ctx, "docker", "image", "inspect", tag)
+	if err := cmd.Run(); err != nil {
+		return false, nil
+	}
+	return true, nil
 }

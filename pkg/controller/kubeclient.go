@@ -50,6 +50,7 @@ type KubeClient interface {
 	ListPodTemplates(ctx context.Context, namespace string) ([]v1alpha1.PodTemplate, error)
 	GetPodTemplate(ctx context.Context, namespace, name string) (*v1alpha1.PodTemplate, error)
 	CreatePodTemplate(ctx context.Context, template v1alpha1.PodTemplate) error
+	UpdatePodTemplate(ctx context.Context, template v1alpha1.PodTemplate) error
 	UpdatePodTemplateStatus(ctx context.Context, template v1alpha1.PodTemplate) error
 	DeletePodTemplate(ctx context.Context, namespace, name string) error
 }
@@ -192,7 +193,27 @@ func (m *MemoryKubeClient) ListPodTemplates(_ context.Context, namespace string)
 	return res, nil
 }
 
-// UpdatePodTemplateStatus updates the status and spec of an existing PodTemplate in memory.
+// UpdatePodTemplate updates the spec and metadata of an existing PodTemplate in memory.
+func (m *MemoryKubeClient) UpdatePodTemplate(_ context.Context, template v1alpha1.PodTemplate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ns := template.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	key := templateKey(ns, template.Metadata.Name)
+	existing, ok := m.Templates[key]
+	if !ok {
+		return fmt.Errorf("podtemplate %s/%s not found", ns, template.Metadata.Name)
+	}
+	existing.Spec = template.Spec
+	existing.Metadata = template.Metadata
+	m.Templates[key] = existing
+	persistLocalTemplate(existing)
+	return nil
+}
+
+// UpdatePodTemplateStatus updates the status only of an existing PodTemplate in memory.
 func (m *MemoryKubeClient) UpdatePodTemplateStatus(_ context.Context, template v1alpha1.PodTemplate) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -206,24 +227,6 @@ func (m *MemoryKubeClient) UpdatePodTemplateStatus(_ context.Context, template v
 		return fmt.Errorf("podtemplate %s/%s not found", ns, template.Metadata.Name)
 	}
 	existing.Status = template.Status
-	if template.Spec.Image != "" {
-		existing.Spec.Image = template.Spec.Image
-	}
-	if template.Spec.StartCmd != "" {
-		existing.Spec.StartCmd = template.Spec.StartCmd
-	}
-	if template.Spec.ReadyCmd != "" {
-		existing.Spec.ReadyCmd = template.Spec.ReadyCmd
-	}
-	if template.Spec.RunAsUser != nil {
-		existing.Spec.RunAsUser = template.Spec.RunAsUser
-	}
-	if template.Spec.RunAsGroup != nil {
-		existing.Spec.RunAsGroup = template.Spec.RunAsGroup
-	}
-	if template.Spec.RunAsUsername != "" {
-		existing.Spec.RunAsUsername = template.Spec.RunAsUsername
-	}
 	m.Templates[key] = existing
 	persistLocalTemplate(existing)
 	return nil

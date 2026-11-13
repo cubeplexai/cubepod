@@ -496,6 +496,46 @@ func (c *RESTKubeClient) CreatePodTemplate(ctx context.Context, template v1alpha
 	return fmt.Errorf("CreatePodTemplate failed: status %d (%s)", resp.StatusCode, string(body))
 }
 
+// UpdatePodTemplate updates the spec and metadata of a PodTemplate Custom Resource.
+func (c *RESTKubeClient) UpdatePodTemplate(ctx context.Context, template v1alpha1.PodTemplate) error {
+	ns := c.resolveNamespace(template.Metadata.Namespace)
+	name := template.Metadata.Name
+	if name == "" {
+		return fmt.Errorf("PodTemplate metadata.name is required")
+	}
+
+	existing, err := c.GetPodTemplate(ctx, ns, name)
+	if err != nil {
+		return fmt.Errorf("failed to get existing PodTemplate for update: %w", err)
+	}
+	template.Metadata.ResourceVersion = existing.Metadata.ResourceVersion
+	if template.APIVersion == "" {
+		template.APIVersion = "cubepod.io/v1alpha1"
+	}
+	if template.Kind == "" {
+		template.Kind = "PodTemplate"
+	}
+
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podtemplates/%s", c.baseURL, ns, name)
+	payload, err := json.Marshal(template)
+	if err != nil {
+		return fmt.Errorf("failed to marshal PodTemplate JSON: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPut, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("UpdatePodTemplate PUT failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("UpdatePodTemplate failed: status %d (%s)", resp.StatusCode, string(body))
+}
+
 // UpdatePodTemplateStatus updates the status subresource of a PodTemplate Custom Resource.
 func (c *RESTKubeClient) UpdatePodTemplateStatus(ctx context.Context, template v1alpha1.PodTemplate) error {
 	ns := c.resolveNamespace(template.Metadata.Namespace)

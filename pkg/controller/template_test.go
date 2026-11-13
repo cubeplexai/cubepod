@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -349,17 +350,84 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 
 	// 13. USER 0 sets runAsUser
 	t.Run("USER 0 sets runAsUser", func(t *testing.T) {
-		req := controller.StartBuildRequest{
+		// USER 0
+		req0 := controller.StartBuildRequest{
 			Steps: []controller.BuildStep{
 				{Type: "USER", Args: []string{"0"}},
 			},
 		}
-		_, meta, err := controller.RenderDockerfile("ubuntu:24.04", "bld_12345678", req)
+		_, meta0, err := controller.RenderDockerfile("ubuntu:24.04", "bld_12345678", req0)
 		if err != nil {
 			t.Fatalf("RenderDockerfile failed: %v", err)
 		}
-		if meta.RunAsUser == nil || *meta.RunAsUser != 0 {
-			t.Fatalf("expected meta.RunAsUser to be &0, got %v", meta.RunAsUser)
+		if meta0.RunAsUser == nil || *meta0.RunAsUser != 0 {
+			t.Fatalf("expected meta.RunAsUser to be &0, got %v", meta0.RunAsUser)
+		}
+		if meta0.RunAsUsername != "" {
+			t.Fatalf("expected nil/empty username for USER 0, got %q", meta0.RunAsUsername)
+		}
+
+		// USER 0abc sets RunAsUsername and leaves both pointers nil
+		req0abc := controller.StartBuildRequest{
+			Steps: []controller.BuildStep{
+				{Type: "USER", Args: []string{"0abc"}},
+			},
+		}
+		_, meta0abc, err := controller.RenderDockerfile("ubuntu:24.04", "bld_12345678", req0abc)
+		if err != nil {
+			t.Fatalf("RenderDockerfile failed: %v", err)
+		}
+		if meta0abc.RunAsUsername != "0abc" || meta0abc.RunAsUser != nil || meta0abc.RunAsGroup != nil {
+			t.Fatalf("expected 0abc to set username only and nil pointers, got user=%v group=%v username=%q",
+				meta0abc.RunAsUser, meta0abc.RunAsGroup, meta0abc.RunAsUsername)
+		}
+
+		// USER root sets RunAsUsername and leaves both pointers nil
+		reqRoot := controller.StartBuildRequest{
+			Steps: []controller.BuildStep{
+				{Type: "USER", Args: []string{"root"}},
+			},
+		}
+		_, metaRoot, err := controller.RenderDockerfile("ubuntu:24.04", "bld_12345678", reqRoot)
+		if err != nil {
+			t.Fatalf("RenderDockerfile failed: %v", err)
+		}
+		if metaRoot.RunAsUsername != "root" || metaRoot.RunAsUser != nil || metaRoot.RunAsGroup != nil {
+			t.Fatalf("expected root to set username only and nil pointers, got user=%v group=%v username=%q",
+				metaRoot.RunAsUser, metaRoot.RunAsGroup, metaRoot.RunAsUsername)
+		}
+
+		// USER 1000:1000 sets both pointers
+		req1000 := controller.StartBuildRequest{
+			Steps: []controller.BuildStep{
+				{Type: "USER", Args: []string{"1000:1000"}},
+			},
+		}
+		_, meta1000, err := controller.RenderDockerfile("ubuntu:24.04", "bld_12345678", req1000)
+		if err != nil {
+			t.Fatalf("RenderDockerfile failed: %v", err)
+		}
+		if meta1000.RunAsUser == nil || *meta1000.RunAsUser != 1000 || meta1000.RunAsGroup == nil || *meta1000.RunAsGroup != 1000 {
+			t.Fatalf("expected 1000:1000 to set both pointers, got user=%v group=%v",
+				meta1000.RunAsUser, meta1000.RunAsGroup)
+		}
+		if meta1000.RunAsUsername != "" {
+			t.Fatalf("expected empty username for 1000:1000, got %q", meta1000.RunAsUsername)
+		}
+
+		// USER 1000:1000x sets RunAsUsername only
+		req1000x := controller.StartBuildRequest{
+			Steps: []controller.BuildStep{
+				{Type: "USER", Args: []string{"1000:1000x"}},
+			},
+		}
+		_, meta1000x, err := controller.RenderDockerfile("ubuntu:24.04", "bld_12345678", req1000x)
+		if err != nil {
+			t.Fatalf("RenderDockerfile failed: %v", err)
+		}
+		if meta1000x.RunAsUsername != "1000:1000x" || meta1000x.RunAsUser != nil || meta1000x.RunAsGroup != nil {
+			t.Fatalf("expected 1000:1000x to set username only and nil pointers, got user=%v group=%v username=%q",
+				meta1000x.RunAsUser, meta1000x.RunAsGroup, meta1000x.RunAsUsername)
 		}
 
 		// Verify BuildKataPod sets CUBEPOD_RUN_AS_USER: "0"
@@ -500,6 +568,23 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 			t.Fatalf("manifest must not contain per-build Job")
 		}
 
+		// Assert that --oci-worker-gc-keepstorage= is followed by digits only
+		reg := regexp.MustCompile(`--oci-worker-gc-keepstorage=([^\s"]+)`)
+		matches := reg.FindStringSubmatch(manifestStr)
+		if len(matches) < 2 {
+			t.Fatalf("missing --oci-worker-gc-keepstorage in manifests: %s", manifestStr)
+		}
+		val := matches[1]
+		digitReg := regexp.MustCompile(`^[0-9]+$`)
+		if !digitReg.MatchString(val) {
+			t.Fatalf("expected --oci-worker-gc-keepstorage= to be digits only, got %q", val)
+		}
+
+		// Assert cache PVC request is still 20Gi
+		if !strings.Contains(manifestStr, "storage: 20Gi") {
+			t.Fatalf("expected cache PVC request to be 20Gi in manifests")
+		}
+
 		// 2. With templateBuild.enabled=false
 		outFalse, err := exec.Command(helmPath, "template", chartPath, "--set", "templateBuild.enabled=false").CombinedOutput()
 		if err != nil {
@@ -523,7 +608,43 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 			t.Fatalf("expected error for Dockerfile containing podd-init")
 		}
 
-		// Valid build steps do not contain podd-init or podd
+		// Reject COPY whose source base name is podd
+		reqCopyPodd := controller.StartBuildRequest{
+			Steps: []controller.BuildStep{
+				{Type: "COPY", Args: []string{"bin/podd", "/opt/podd"}},
+			},
+		}
+		_, _, err = controller.RenderDockerfile("alpine:latest", "bld_12345678", reqCopyPodd)
+		if err == nil {
+			t.Fatalf("expected error for COPY whose source base name is podd")
+		}
+
+		// Reject ADD whose source base name is podd-init
+		reqAddPoddInit := controller.StartBuildRequest{
+			Steps: []controller.BuildStep{
+				{Type: "ADD", Args: []string{"podd-init", "/opt/podd-init"}},
+			},
+		}
+		_, _, err = controller.RenderDockerfile("alpine:latest", "bld_12345678", reqAddPoddInit)
+		if err == nil {
+			t.Fatalf("expected error for ADD whose source base name is podd-init")
+		}
+
+		// A RUN whose command is "echo podd" must render!
+		reqEchoPodd := controller.StartBuildRequest{
+			Steps: []controller.BuildStep{
+				{Type: "RUN", Args: []string{"echo podd"}},
+			},
+		}
+		dfPodd, _, err := controller.RenderDockerfile("alpine:latest", "bld_12345678", reqEchoPodd)
+		if err != nil {
+			t.Fatalf("expected RUN echo podd to render successfully, got err: %v", err)
+		}
+		if !strings.Contains(dfPodd, "RUN echo podd\n") {
+			t.Fatalf("expected RUN echo podd in Dockerfile, got: %s", dfPodd)
+		}
+
+		// Valid build steps do not contain podd-init
 		reqGood := controller.StartBuildRequest{
 			Steps: []controller.BuildStep{
 				{Type: "WORKDIR", Args: []string{"/app"}},
@@ -534,8 +655,8 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 		if err != nil {
 			t.Fatalf("RenderDockerfile failed: %v", err)
 		}
-		if strings.Contains(df, "podd-init") || strings.Contains(df, "podd") {
-			t.Fatalf("rendered Dockerfile contains podd or podd-init: %s", df)
+		if strings.Contains(df, "podd-init") {
+			t.Fatalf("rendered Dockerfile contains podd-init: %s", df)
 		}
 	})
 
@@ -899,46 +1020,186 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 		}
 	})
 
-	// 29. RecoverInFlightBuilds sets error builder disappeared and keeps readyImage
-	t.Run("RecoverInFlightBuilds sets error builder disappeared and keeps readyImage", func(t *testing.T) {
+	// 29. RecoverInFlightBuilds tag present and probe success ends ready; tag absent ends with reason
+	t.Run("RecoverInFlightBuilds tag present and probe success ends ready; tag absent ends with reason", func(t *testing.T) {
+		ctx := context.Background()
+		fakeBuilder := controller.NewFakeImageBuilder()
+		r := controller.NewReconciler(
+			controller.WithE2BTemplateAPI(true),
+			controller.WithTemplateBuildEnabled(true),
+			controller.WithImageBuilder(fakeBuilder),
+		)
+
+		// 1. Tag present and probe success ends ready
+		resp1, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "recover-success"}, "")
+		if err != nil {
+			t.Fatalf("CreateTemplate 1 failed: %v", err)
+		}
+		tpl1, _ := r.GetPodTemplate(resp1.TemplateID)
+		tpl1.Status.BuildStatus = v1alpha1.BuildStatusBuilding
+		tpl1.Status.LatestBuildID = "bld_succ1"
+		tpl1.Spec.ReadyCmd = "true"
+		_ = r.KubeClient().UpdatePodTemplateStatus(ctx, *tpl1)
+		_ = r.EnsureSeededTemplates(ctx)
+
+		tag1 := fmt.Sprintf("cubepod-templates/%s:%s", tpl1.Metadata.Name, "bld_succ1")
+		fakeBuilder.ExistingTags[tag1] = true
+
+		r.RecoverInFlightBuilds(ctx)
+
+		recovered1, ok := r.GetPodTemplate(resp1.TemplateID)
+		if !ok {
+			t.Fatalf("GetPodTemplate 1 failed")
+		}
+		if recovered1.Status.BuildStatus != v1alpha1.BuildStatusReady {
+			t.Fatalf("expected ready status when tag exists and probe succeeds, got %s", recovered1.Status.BuildStatus)
+		}
+		if recovered1.Status.ReadyImage != tag1 {
+			t.Fatalf("expected readyImage %s, got %s", tag1, recovered1.Status.ReadyImage)
+		}
+		if recovered1.Spec.Image != tag1 {
+			t.Fatalf("expected spec.image %s, got %s", tag1, recovered1.Spec.Image)
+		}
+
+		// 2. Tag absent ends with reason "builder disappeared" and previous readyImage unchanged
+		resp2, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "recover-absent"}, "")
+		if err != nil {
+			t.Fatalf("CreateTemplate 2 failed: %v", err)
+		}
+		// Set initial ready image
+		err = r.StartBuild(ctx, resp2.TemplateID, resp2.BuildID, controller.StartBuildRequest{
+			FromImage: "initial-stable:1.0",
+		})
+		if err != nil {
+			t.Fatalf("StartBuild initial failed: %v", err)
+		}
+
+		tpl2, _ := r.GetPodTemplate(resp2.TemplateID)
+		tpl2.Status.BuildStatus = v1alpha1.BuildStatusBuilding
+		tpl2.Status.LatestBuildID = "bld_absent"
+		_ = r.KubeClient().UpdatePodTemplateStatus(ctx, *tpl2)
+		_ = r.EnsureSeededTemplates(ctx)
+
+		r.RecoverInFlightBuilds(ctx)
+
+		recovered2, ok := r.GetPodTemplate(resp2.TemplateID)
+		if !ok {
+			t.Fatalf("GetPodTemplate 2 failed")
+		}
+		if recovered2.Status.BuildStatus != v1alpha1.BuildStatusError {
+			t.Fatalf("expected error status when tag absent, got %s", recovered2.Status.BuildStatus)
+		}
+		if recovered2.Status.Reason != "builder disappeared" {
+			t.Fatalf("expected reason 'builder disappeared', got %s", recovered2.Status.Reason)
+		}
+		if recovered2.Status.ReadyImage != "initial-stable:1.0" {
+			t.Fatalf("expected previous readyImage initial-stable:1.0 unchanged, got %s", recovered2.Status.ReadyImage)
+		}
+	})
+
+	// 30. status subresource does not persist spec
+	t.Run("status subresource does not persist spec", func(t *testing.T) {
 		ctx := context.Background()
 		r := controller.NewReconciler(
 			controller.WithE2BTemplateAPI(true),
 			controller.WithTemplateBuildEnabled(true),
 		)
-		resp, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "recover-tpl"}, "")
+		resp, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "subresource-test"}, "")
 		if err != nil {
 			t.Fatalf("CreateTemplate failed: %v", err)
 		}
-		_ = r.StartBuild(ctx, resp.TemplateID, resp.BuildID, controller.StartBuildRequest{
-			FromImage: "initial-stable:1.0",
+
+		// 1. Empty steps build with startCmd "sleep 1"
+		err = r.StartBuild(ctx, resp.TemplateID, resp.BuildID, controller.StartBuildRequest{
+			FromImage: "custom-img:1.0",
+			StartCmd:  "sleep 1",
 		})
+		if err != nil {
+			t.Fatalf("StartBuild 1 failed: %v", err)
+		}
 
-		// Simulate restart while a new build was in building status
-		tpl, ok := r.GetPodTemplate(resp.TemplateID)
-		if !ok {
-			t.Fatalf("GetPodTemplate failed")
+		// Reload object from KubeClient
+		obj1, err := r.KubeClient().GetPodTemplate(ctx, "cubepod-workloads", "subresource-test")
+		if err != nil {
+			t.Fatalf("GetPodTemplate 1 failed: %v", err)
 		}
-		tpl.Status.BuildStatus = v1alpha1.BuildStatusBuilding
-		tpl.Status.LatestBuildID = "bld_interrupted"
-		_ = r.KubeClient().UpdatePodTemplateStatus(ctx, *tpl)
-		_ = r.EnsureSeededTemplates(ctx)
+		if obj1.Spec.Image != "custom-img:1.0" {
+			t.Fatalf("expected spec.image to be persisted as custom-img:1.0, got %s", obj1.Spec.Image)
+		}
+		if obj1.Spec.StartCmd != "sleep 1" {
+			t.Fatalf("expected spec.startCmd to be persisted as 'sleep 1', got %s", obj1.Spec.StartCmd)
+		}
 
-		// Run recovery
-		r.RecoverInFlightBuilds(ctx)
+		// 2. Second build whose USER step is "0"
+		err = r.StartBuild(ctx, resp.TemplateID, "bld_second", controller.StartBuildRequest{
+			FromImage: "custom-img:1.0",
+			Steps: []controller.BuildStep{
+				{Type: "USER", Args: []string{"0"}},
+			},
+		})
+		if err != nil {
+			t.Fatalf("StartBuild 2 failed: %v", err)
+		}
 
-		recovered, ok := r.GetPodTemplate(resp.TemplateID)
-		if !ok {
-			t.Fatalf("GetPodTemplate failed")
+		// Reload object from KubeClient
+		obj2, err := r.KubeClient().GetPodTemplate(ctx, "cubepod-workloads", "subresource-test")
+		if err != nil {
+			t.Fatalf("GetPodTemplate 2 failed: %v", err)
 		}
-		if recovered.Status.BuildStatus != v1alpha1.BuildStatusError {
-			t.Fatalf("expected BuildStatus error, got %s", recovered.Status.BuildStatus)
+		if obj2.Spec.RunAsUser == nil || *obj2.Spec.RunAsUser != 0 {
+			t.Fatalf("expected spec.runAsUser 0, got %v", obj2.Spec.RunAsUser)
 		}
-		if recovered.Status.Reason != "builder disappeared" {
-			t.Fatalf("expected reason 'builder disappeared', got %s", recovered.Status.Reason)
+		if obj2.Spec.Image == "" || obj2.Spec.Image == "cubepod.io/unbuilt:waiting" {
+			t.Fatalf("expected spec.image to be updated to target tag, got %s", obj2.Spec.Image)
 		}
-		if recovered.Status.ReadyImage != "initial-stable:1.0" {
-			t.Fatalf("expected ReadyImage initial-stable:1.0 to be retained, got %s", recovered.Status.ReadyImage)
+	})
+
+	// 31. mark public and get by alias
+	t.Run("mark public and get by alias", func(t *testing.T) {
+		ctx := context.Background()
+		r := controller.NewReconciler(controller.WithE2BTemplateAPI(true))
+
+		// 1. GetPodTemplate by alias "python" returns the seeded cubeplex-ubuntu24-desktop object
+		tpl, ok := r.GetPodTemplate("python")
+		if !ok || tpl == nil {
+			t.Fatalf("expected GetPodTemplate(\"python\") to find template")
+		}
+		if tpl.Metadata.Name != "cubeplex-ubuntu24-desktop" {
+			t.Fatalf("expected cubeplex-ubuntu24-desktop, got %s", tpl.Metadata.Name)
+		}
+
+		// 2. SetTemplatePublic to true
+		err := r.SetTemplatePublic(ctx, "python", true)
+		if err != nil {
+			t.Fatalf("SetTemplatePublic true failed: %v", err)
+		}
+
+		// In-memory object has public=true
+		tplPublic, ok := r.GetPodTemplate("python")
+		if !ok || !tplPublic.Spec.Public || !tplPublic.Status.Public {
+			t.Fatalf("expected in-memory template public true, got spec=%v status=%v",
+				tplPublic.Spec.Public, tplPublic.Status.Public)
+		}
+
+		// Persisted object in KubeClient has public=true
+		kubeObj, err := r.KubeClient().GetPodTemplate(ctx, "cubepod-workloads", "cubeplex-ubuntu24-desktop")
+		if err != nil {
+			t.Fatalf("GetPodTemplate from KubeClient failed: %v", err)
+		}
+		if !kubeObj.Spec.Public || !kubeObj.Status.Public {
+			t.Fatalf("expected persisted template public true, got spec=%v status=%v",
+				kubeObj.Spec.Public, kubeObj.Status.Public)
+		}
+
+		// 3. SetTemplatePublic back to false
+		err = r.SetTemplatePublic(ctx, "python", false)
+		if err != nil {
+			t.Fatalf("SetTemplatePublic false failed: %v", err)
+		}
+		tplPrivate, _ := r.GetPodTemplate("python")
+		if tplPrivate.Spec.Public || tplPrivate.Status.Public {
+			t.Fatalf("expected template public false, got spec=%v status=%v",
+				tplPrivate.Spec.Public, tplPrivate.Status.Public)
 		}
 	})
 }
