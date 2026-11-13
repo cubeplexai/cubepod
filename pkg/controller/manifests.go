@@ -140,8 +140,16 @@ func BuildBlockPVCs(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.
 
 	if spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != "" {
 		if !strings.EqualFold(vm, "Filesystem") {
-			rootfsPVC.DataSourcePVC = fmt.Sprintf("%s-rootfs-pvc", spec.ForkFrom.PodBoxName)
-			workspacePVC.DataSourcePVC = fmt.Sprintf("%s-workspace-pvc", spec.ForkFrom.PodBoxName)
+			rootfsSource := fmt.Sprintf("%s-rootfs-pvc", spec.ForkFrom.PodBoxName)
+			if len(volumeMode) > 1 && volumeMode[1] != "" {
+				rootfsSource = volumeMode[1]
+			}
+			wsSource := fmt.Sprintf("%s-workspace-pvc", spec.ForkFrom.PodBoxName)
+			if len(volumeMode) > 2 && volumeMode[2] != "" {
+				wsSource = volumeMode[2]
+			}
+			rootfsPVC.DataSourcePVC = rootfsSource
+			workspacePVC.DataSourcePVC = wsSource
 		}
 	}
 
@@ -310,17 +318,56 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 		})
 	}
 
-	containers := []ContainerManifest{mainContainer}
+	var containers []ContainerManifest
 
 	if tpl.Egress.Enabled {
-		volumes = append(volumes, VolumeManifest{
-			Name:       "egress-mtls",
-			SecretName: fmt.Sprintf("%s-egress-mtls", boxName),
+		volumes = append(volumes,
+			VolumeManifest{
+				Name:       "egress-mtls",
+				SecretName: fmt.Sprintf("%s-egress-mtls", boxName),
+			},
+			VolumeManifest{
+				Name:       "egress-ca",
+				SecretName: fmt.Sprintf("%s-egress-ca", boxName),
+			},
+		)
+
+		mainContainer.VolumeMounts = append(mainContainer.VolumeMounts, VolumeMount{
+			Name:      "egress-ca",
+			MountPath: "/etc/cubepod/ca",
+			ReadOnly:  true,
 		})
+		mainContainer.Env = append(mainContainer.Env,
+			EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: "/etc/cubepod/ca/mitm-ca.crt"},
+			EnvVar{Name: "CUBEPOD_EXTRA_CA_CERT", Value: "/etc/cubepod/ca/mitm-ca.crt"},
+			EnvVar{Name: "HTTP_PROXY", Value: "http://127.0.0.1:18080"},
+			EnvVar{Name: "HTTPS_PROXY", Value: "http://127.0.0.1:18080"},
+			EnvVar{Name: "NO_PROXY", Value: "127.0.0.1,localhost"},
+		)
 
 		egressImg := tpl.Egress.Image
 		if egressImg == "" {
 			egressImg = "cubepod-egress:latest"
+		}
+
+		egressEnv := []EnvVar{
+			{Name: "EXCHANGE_URL", Value: tpl.Egress.ExchangeURL},
+			{Name: "SANDBOX_ID", Value: boxName},
+			{Name: "CUBEPOD_EXCHANGE_URL", Value: tpl.Egress.ExchangeURL},
+			{Name: "CUBEPOD_SANDBOX_ID", Value: boxName},
+			{Name: "CUBEPOD_CERT_FILE", Value: "/etc/cubepod/certs/tls.crt"},
+			{Name: "CUBEPOD_KEY_FILE", Value: "/etc/cubepod/certs/tls.key"},
+			{Name: "CUBEPOD_CA_FILE", Value: "/etc/cubepod/certs/ca.crt"},
+			{Name: "CUBEPOD_POLICY_FILE", Value: "/etc/cubepod/certs/policy.json"},
+			{Name: "CUBEPOD_MITM_CA_CERT", Value: "/etc/cubepod/certs/mitm-ca.crt"},
+			{Name: "CUBEPOD_MITM_CA_KEY", Value: "/etc/cubepod/certs/mitm-ca.key"},
+			{Name: "CUBEPOD_ENABLE_MITM", Value: "true"},
+		}
+		if spec.NetworkPolicy != nil && spec.NetworkPolicy.UpstreamProxy != "" {
+			egressEnv = append(egressEnv, EnvVar{
+				Name:  "CUBEPOD_UPSTREAM_PROXY",
+				Value: spec.NetworkPolicy.UpstreamProxy,
+			})
 		}
 
 		egressContainer := ContainerManifest{
@@ -333,18 +380,11 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 					ReadOnly:  true,
 				},
 			},
-			Env: []EnvVar{
-				{
-					Name:  "EXCHANGE_URL",
-					Value: tpl.Egress.ExchangeURL,
-				},
-				{
-					Name:  "SANDBOX_ID",
-					Value: boxName,
-				},
-			},
+			Env: egressEnv,
 		}
-		containers = append(containers, egressContainer)
+		containers = append(containers, mainContainer, egressContainer)
+	} else {
+		containers = append(containers, mainContainer)
 	}
 
 	labels := map[string]string{
@@ -362,10 +402,18 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 		}
 	}
 
-	pullSecrets := []string{"regcred", "hub.sensedeal.vip"}
-	if len(volumeMode) > 1 && volumeMode[1] != "" && !strings.HasPrefix(volumeMode[1], "cubepod-template-src-") {
-		if !slices.Contains(pullSecrets, volumeMode[1]) {
-			pullSecrets = append(pullSecrets, volumeMode[1])
+	var pullSecrets []string
+	if len(volumeMode) > 1 {
+		for _, raw := range volumeMode[1:] {
+			for _, s := range strings.Split(raw, ",") {
+				s = strings.TrimSpace(s)
+				if s == "" || strings.HasPrefix(s, "cubepod-template-src-") {
+					continue
+				}
+				if !slices.Contains(pullSecrets, s) {
+					pullSecrets = append(pullSecrets, s)
+				}
+			}
 		}
 	}
 

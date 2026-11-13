@@ -268,14 +268,9 @@ func toCoreV1Pod(pod PodManifest, namespace string) coreV1Pod {
 	}
 
 	var imagePullSecrets []coreV1LocalObjectReference
-	if pod.ImagePullSecrets != nil {
-		for _, s := range pod.ImagePullSecrets {
+	for _, s := range pod.ImagePullSecrets {
+		if s != "" {
 			imagePullSecrets = append(imagePullSecrets, coreV1LocalObjectReference{Name: s})
-		}
-	} else {
-		imagePullSecrets = []coreV1LocalObjectReference{
-			{Name: "regcred"},
-			{Name: "hub.sensedeal.vip"},
 		}
 	}
 

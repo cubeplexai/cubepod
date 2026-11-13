@@ -59,6 +59,7 @@ func main() {
 		templateRepoPrefix   = flag.String("template-repo-prefix", "cubepod-templates", "Repository prefix under target template registry")
 		templatePushSecret   = flag.String("template-push-secret", "", "Kubernetes dockerconfigjson secret used to push built templates")
 		templatePullSecret   = flag.String("template-pull-secret", "", "Kubernetes imagePullSecret attached to sandbox and probe pods")
+		imagePullSecrets     = flag.String("image-pull-secrets", os.Getenv("CUBEPOD_IMAGE_PULL_SECRETS"), "Comma-separated Kubernetes imagePullSecrets attached to sandbox Pods")
 		templateProbeTimeout = flag.Duration("template-probe-timeout", 120*time.Second, "Timeout for template readyCmd probe")
 	)
 	flag.Parse()
@@ -90,6 +91,7 @@ func main() {
 		"templateRepoPrefix", *templateRepoPrefix,
 		"templatePushSecret", *templatePushSecret,
 		"templatePullSecret", *templatePullSecret,
+		"imagePullSecrets", *imagePullSecrets,
 		"templateProbeTimeout", *templateProbeTimeout,
 	)
 
@@ -138,6 +140,7 @@ func main() {
 		controller.WithTemplateRepoPrefix(*templateRepoPrefix),
 		controller.WithTemplatePushSecret(*templatePushSecret),
 		controller.WithTemplatePullSecret(*templatePullSecret),
+		controller.WithDefaultImagePullSecrets(*imagePullSecrets),
 		controller.WithTemplateProbeTimeout(*templateProbeTimeout),
 	}
 	if effectiveStateDir != "" {

@@ -358,8 +358,8 @@ func TestReconciler_WithRESTKubeClient_FullLifecycle(t *testing.T) {
 	}
 	forkSpecMap := forkRootfsPVC["spec"].(map[string]any)
 	ds, ok := forkSpecMap["dataSource"].(map[string]any)
-	if !ok || ds["name"] != "sandbox-app-rootfs-pvc" {
-		t.Fatalf("expected dataSource pointing to parent rootfs PVC, got %v", ds)
+	if !ok || ds["name"] != "sandbox-app-rootfs-gen2-pvc" {
+		t.Fatalf("expected dataSource pointing to parent active rootfs PVC (sandbox-app-rootfs-gen2-pvc), got %v", ds)
 	}
 	mock.mu.RUnlock()
 

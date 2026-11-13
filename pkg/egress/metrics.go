@@ -50,6 +50,8 @@ func (m *Metrics) IncSecretExchange(result string) {
 	m.mu.Unlock()
 }
 
+const maxTrackedBlockedHosts = 1024
+
 // IncBlockedHost increments cubepod_egress_blocked_hosts_total{host}.
 func (m *Metrics) IncBlockedHost(host string) {
 	if m == nil {
@@ -60,6 +62,15 @@ func (m *Metrics) IncBlockedHost(host string) {
 		h = "unknown"
 	}
 	m.mu.Lock()
+	if _, exists := m.blockedHosts[h]; !exists {
+		limit := maxTrackedBlockedHosts - 1
+		if _, hasOther := m.blockedHosts["_other"]; hasOther {
+			limit = maxTrackedBlockedHosts
+		}
+		if len(m.blockedHosts) >= limit {
+			h = "_other"
+		}
+	}
 	m.blockedHosts[h]++
 	m.mu.Unlock()
 }
