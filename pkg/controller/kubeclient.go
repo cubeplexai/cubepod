@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,6 +15,13 @@ import (
 	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
+)
+
+var (
+	// ErrPodAlreadyExists is returned when attempting to create a pod that already exists (409 Conflict).
+	ErrPodAlreadyExists = errors.New("pod already exists")
+	// ErrCRDNotInstalled is returned when a CustomResourceDefinition is not installed on the Kubernetes APIServer (404 NotFound).
+	ErrCRDNotInstalled = errors.New("CRD not installed (404 NotFound)")
 )
 
 // KubeClient abstracts Kubernetes resource operations for PodBox workloads.
@@ -223,7 +231,7 @@ func (m *MemoryKubeClient) DeletePVC(_ context.Context, namespace, name string) 
 }
 
 // EnsurePod records the Pod manifest in memory and returns a mock Pod IP.
-// If the Pod already exists, it preserves existing labels and returns 409 Conflict.
+// If the Pod already exists, it preserves existing labels and returns ErrPodAlreadyExists.
 func (m *MemoryKubeClient) EnsurePod(_ context.Context, pod PodManifest) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -234,7 +242,7 @@ func (m *MemoryKubeClient) EnsurePod(_ context.Context, pod PodManifest) (string
 			ip = "10.244.0.42"
 			m.IPs[key] = ip
 		}
-		return ip, fmt.Errorf("pod %s/%s already exists (409 Conflict)", pod.Namespace, pod.Name)
+		return ip, fmt.Errorf("%w: pod %s/%s already exists (409 Conflict)", ErrPodAlreadyExists, pod.Namespace, pod.Name)
 	}
 	m.Pods[key] = pod
 	ip, ok := m.IPs[key]
@@ -637,7 +645,7 @@ func (c *RESTKubeClient) DeletePVC(ctx context.Context, namespace, name string) 
 // EnsurePod applies a Kata MicroVM Pod via POST.
 // In volumeMode: Block, privileged containers have securityContext.privileged=true
 // serialized into the Pod JSON payload so podd-init has CAP_SYS_ADMIN.
-// 409 Conflict is treated as idempotent success.
+// If the APIServer returns 409 Conflict, it returns ErrPodAlreadyExists.
 func (c *RESTKubeClient) EnsurePod(ctx context.Context, pod PodManifest) (string, error) {
 	ns := c.podNamespace(pod)
 	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods", c.baseURL, ns)
@@ -655,11 +663,13 @@ func (c *RESTKubeClient) EnsurePod(ctx context.Context, pod PodManifest) (string
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusConflict {
-		// Idempotent success: fetch existing Pod IP if possible.
+		var podIP string
 		if c.waitForRunning {
-			return c.waitForPodRunning(ctx, ns, pod.Name)
+			podIP, _ = c.waitForPodRunning(ctx, ns, pod.Name)
+		} else {
+			podIP, _ = c.getPodIP(ctx, ns, pod.Name)
 		}
-		return c.getPodIP(ctx, ns, pod.Name)
+		return podIP, fmt.Errorf("%w: %s/%s", ErrPodAlreadyExists, ns, pod.Name)
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {

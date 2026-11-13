@@ -741,7 +741,10 @@ func TestReconciler_SyncFromKube_WarmPoolDeletionCleanup(t *testing.T) {
 		t.Fatalf("DeletePodWarmPool failed: %v", err)
 	}
 
-	// 4. SyncFromKube should detect that delete-pool is gone, delete unclaimed Pod & PVCs, and remove from r.warmPools
+	// 4. Set pool createdAt to > 10s ago to pass the stale deletion window guard
+	r.SetPoolCreatedAt("delete-pool", time.Now().Add(-15*time.Second))
+
+	// SyncFromKube should detect that delete-pool is gone, delete unclaimed Pod & PVCs, and remove from r.warmPools
 	_, err = r.SyncFromKube(ctx)
 	if err != nil {
 		t.Fatalf("SyncFromKube failed: %v", err)
@@ -973,13 +976,13 @@ func TestReconciler_ClaimWarmPod_PatchFailureSkipsPod(t *testing.T) {
 		t.Fatalf("expected claimed entry to be %s, got %s", pod2, claimedEntry.PodName)
 	}
 
-	// pod1 should remain unclaimed in memory
+	// pod1 CAS claim failed, so it was marked Claimed with ClaimedBy = other-replica in local memory
 	status, ok := r.GetWarmPoolStatus("patch-fail-pool")
-	if !ok || status.AvailableReplicas != 1 {
-		t.Fatalf("expected 1 available replica remaining, got %d", status.AvailableReplicas)
+	if !ok || status.AvailableReplicas != 0 {
+		t.Fatalf("expected 0 available replicas remaining, got %d", status.AvailableReplicas)
 	}
 
-	// Second claim should attempt pod1, fail, and return an error since no other standby pod is available
+	// Second claim should fail since pod1 was marked claimed by other replica and no other standby is available
 	_, err = r.ClaimWarmPod(ctx, "patch-fail-pool", "claimer-box-2")
 	if err == nil {
 		t.Fatal("expected ClaimWarmPod to fail when all available pods fail PatchPodLabels")
@@ -1310,5 +1313,161 @@ func TestReconciler_SyncFromKube_RefreshesExistingPodBoxStatus(t *testing.T) {
 	refreshedSpec, ok := r.GetBoxSpec("refresh-box")
 	if !ok || refreshedSpec.DesiredState != v1alpha1.DesiredStatePaused {
 		t.Fatalf("expected refreshed desired state Paused, got: %+v", refreshedSpec)
+	}
+}
+
+func TestReconciler_ReapIdle_PersistsPauseToKubeAndPreservedOnSync(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	now := time.Now().UTC()
+	past := now.Add(-120 * time.Second)
+
+	spec := v1alpha1.PodBoxSpec{
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		Lifecycle: v1alpha1.LifecyclePolicy{
+			IdleTimeoutSeconds: 60,
+		},
+	}
+	_, err := r.Reconcile(ctx, "idle-persist-box", spec)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	_ = r.TouchActivity("idle-persist-box", past)
+
+	// Ensure initially Running in memKube
+	initialKubeBox, err := memKube.GetPodBox(ctx, "cubepod-workloads", "idle-persist-box")
+	if err != nil {
+		t.Fatalf("GetPodBox failed: %v", err)
+	}
+	if initialKubeBox.Status.Phase != v1alpha1.PodBoxPhaseRunning {
+		t.Fatalf("expected initial Kube phase Running, got %s", initialKubeBox.Status.Phase)
+	}
+
+	// Run ReapIdle: must pause sandbox and persist paused status to K8s
+	paused, terminated := r.ReapIdle(ctx, now)
+	if len(paused) != 1 || paused[0] != "idle-persist-box" {
+		t.Fatalf("expected idle-persist-box to be paused, got: %v (terminated: %v)", paused, terminated)
+	}
+
+	// Verify K8s has updated paused status and DesiredStatePaused
+	kBox, err := memKube.GetPodBox(ctx, "cubepod-workloads", "idle-persist-box")
+	if err != nil {
+		t.Fatalf("GetPodBox after ReapIdle failed: %v", err)
+	}
+	if kBox.Status.Phase != v1alpha1.PodBoxPhasePaused {
+		t.Fatalf("expected K8s status to be Paused, got: %s", kBox.Status.Phase)
+	}
+	if kBox.Spec.DesiredState != v1alpha1.DesiredStatePaused {
+		t.Fatalf("expected K8s spec desired state to be Paused, got: %s", kBox.Spec.DesiredState)
+	}
+
+	// On next tick, SyncFromKube runs: MUST NOT overwrite paused state back to Running!
+	recovered, err := r.SyncFromKube(ctx)
+	if err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("expected 1 recovered box, got %d", recovered)
+	}
+
+	box, ok := r.GetBox("idle-persist-box")
+	if !ok {
+		t.Fatal("expected idle-persist-box in memory")
+	}
+	if box.Phase != v1alpha1.PodBoxPhasePaused {
+		t.Fatalf("expected box phase to remain Paused after SyncFromKube, got %s", box.Phase)
+	}
+}
+
+func TestReconciler_SyncFromKube_StaleListDeletionWindow(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	poolSpec := v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    2,
+	}
+	_, err := r.ReconcileWarmPool(ctx, "grace-pool", poolSpec)
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	// Delete from Kubernetes (stale snapshot where pool is missing)
+	if err := memKube.DeletePodWarmPool(ctx, "cubepod-workloads", "grace-pool"); err != nil {
+		t.Fatalf("DeletePodWarmPool failed: %v", err)
+	}
+
+	// 1. Fresh pool (< 10s old): SyncFromKube must NOT delete it
+	_, err = r.SyncFromKube(ctx)
+	if err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+	if _, exists := r.GetWarmPoolSpecs()["grace-pool"]; !exists {
+		t.Fatal("expected grace-pool to be protected from deletion within 10s grace window")
+	}
+
+	// 2. Set createdAt to > 10s ago: SyncFromKube should now delete it
+	r.SetPoolCreatedAt("grace-pool", time.Now().Add(-15*time.Second))
+	_, err = r.SyncFromKube(ctx)
+	if err != nil {
+		t.Fatalf("second SyncFromKube failed: %v", err)
+	}
+	if _, exists := r.GetWarmPoolSpecs()["grace-pool"]; exists {
+		t.Fatal("expected grace-pool to be deleted after 10s grace window expired")
+	}
+}
+
+func TestReconciler_ClaimWarmPod_CASFailureMarksOtherReplica(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+
+	failingKube := &failingPatchKubeClient{
+		MemoryKubeClient: memKube,
+		failPodNames:     make(map[string]bool),
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(failingKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	_, err := r.ReconcileWarmPool(ctx, "cas-test-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    2,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	pods, err := memKube.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=cas-test-pool")
+	if err != nil || len(pods) != 2 {
+		t.Fatalf("expected 2 pods, got %d", len(pods))
+	}
+
+	// Inject CAS failure on first pod
+	failingKube.failPodNames[pods[0].Name] = true
+
+	claimed, err := r.ClaimWarmPod(ctx, "cas-test-pool", "claimer-box")
+	if err != nil {
+		t.Fatalf("ClaimWarmPod failed: %v", err)
+	}
+	if claimed.PodName != pods[1].Name {
+		t.Fatalf("expected pod2 to be claimed, got: %s", claimed.PodName)
+	}
+
+	// Available replicas should now be 0 (pod1 marked Claimed by other replica, pod2 claimed by claimer-box)
+	st, ok := r.GetWarmPoolStatus("cas-test-pool")
+	if !ok || st.AvailableReplicas != 0 {
+		t.Fatalf("expected 0 available replicas, got %d", st.AvailableReplicas)
 	}
 }

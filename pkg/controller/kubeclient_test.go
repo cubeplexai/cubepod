@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -197,14 +198,14 @@ func TestRESTKubeClient_Direct(t *testing.T) {
 		t.Fatalf("expected podIP 10.244.2.55, got %s", ip)
 	}
 
-	// 4. EnsurePod with 409 Conflict -> should succeed idempotently
+	// 4. EnsurePod with 409 Conflict -> should return ErrPodAlreadyExists and existing IP
 	mock.mu.Lock()
 	mock.conflictNext["pod"] = true
 	mock.mu.Unlock()
 
 	ip2, err := client.EnsurePod(ctx, pod)
-	if err != nil {
-		t.Fatalf("EnsurePod on 409 Conflict should succeed, got: %v", err)
+	if !errors.Is(err, controller.ErrPodAlreadyExists) {
+		t.Fatalf("EnsurePod on 409 Conflict should return ErrPodAlreadyExists, got: %v", err)
 	}
 	if ip2 != "10.244.2.55" {
 		t.Fatalf("expected podIP 10.244.2.55 from GET, got %s", ip2)

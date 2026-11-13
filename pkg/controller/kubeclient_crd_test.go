@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -45,15 +46,15 @@ func newMockCRDServer() (*mockCRDServer, *httptest.Server) {
 
 		path := r.URL.Path
 
-		if m.return404CRD {
-			http.Error(w, `{"kind":"Status","status":"Failure","message":"the server could not find the requested resource","reason":"NotFound","code":404}`, http.StatusNotFound)
-			return
-		}
-
 		if strings.HasPrefix(path, "/api/v1/namespaces/") {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "Success"})
+			return
+		}
+
+		if m.return404CRD {
+			http.Error(w, `{"kind":"Status","status":"Failure","message":"the server could not find the requested resource","reason":"NotFound","code":404}`, http.StatusNotFound)
 			return
 		}
 
@@ -922,4 +923,65 @@ func TestReconciler_SyncFromKube_WarmPoolSpecAndCounter(t *testing.T) {
 		t.Fatalf("expected newly created entry to have index 8 avoiding collision with 7, got %s", claimed.ID)
 	}
 	_ = mock
+}
+
+func TestRESTKubeClient_PodWarmPool_MissingCRD(t *testing.T) {
+	mock, ts := newMockCRDServer()
+	defer ts.Close()
+
+	mock.mu.Lock()
+	mock.return404CRD = true
+	mock.mu.Unlock()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+	ctx := context.Background()
+
+	pool := v1alpha1.PodWarmPool{
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "test-pool",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: v1alpha1.PodWarmPoolSpec{
+			TemplateRef: "base-tpl",
+			Replicas:    2,
+		},
+	}
+
+	// 1. UpsertPodWarmPool should return ErrCRDNotInstalled when APIServer returns 404
+	err := client.UpsertPodWarmPool(ctx, pool)
+	if !errors.Is(err, controller.ErrCRDNotInstalled) {
+		t.Fatalf("expected ErrCRDNotInstalled from UpsertPodWarmPool, got: %v", err)
+	}
+
+	// 2. ListPodWarmPools should return ErrCRDNotInstalled when APIServer returns 404
+	pools, err := client.ListPodWarmPools(ctx, "cubepod-workloads")
+	if !errors.Is(err, controller.ErrCRDNotInstalled) {
+		t.Fatalf("expected ErrCRDNotInstalled from ListPodWarmPools, got: %v (pools=%v)", err, pools)
+	}
+
+	// 3. Reconciler with missing CRD: pool is created in memory, but not persisted
+	r := controller.NewReconciler(
+		controller.WithKubeClient(client),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	st, err := r.ReconcileWarmPool(ctx, "missing-crd-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    2,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+	if st.AvailableReplicas != 2 {
+		t.Fatalf("expected 2 available replicas, got %d", st.AvailableReplicas)
+	}
+
+	// 4. SyncFromKube with missing CRD should NOT wipe in-memory pools
+	if _, err := r.SyncFromKube(ctx); err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+
+	specs := r.GetWarmPoolSpecs()
+	if _, exists := specs["missing-crd-pool"]; !exists {
+		t.Fatal("expected missing-crd-pool to NOT be deleted when CRD is not installed")
+	}
 }
