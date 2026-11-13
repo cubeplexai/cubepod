@@ -340,6 +340,14 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/panel/{token}/{rest...}", s.handlePanelProxy)
 	mux.HandleFunc("/panel/{token}", s.handlePanelProxy)
 
+	// Interactive Desktop Lifecycle routes (CEP-0021)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/desktop/start", s.handleDesktopStart)
+	mux.HandleFunc("GET /sandboxes/{sandboxID}/desktop/status", s.handleDesktopStatus)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/desktop/stop", s.handleDesktopStop)
+	mux.HandleFunc("POST /v1/sandboxes/{sandboxID}/desktop/start", s.handleDesktopStart)
+	mux.HandleFunc("GET /v1/sandboxes/{sandboxID}/desktop/status", s.handleDesktopStatus)
+	mux.HandleFunc("POST /v1/sandboxes/{sandboxID}/desktop/stop", s.handleDesktopStop)
+
 	// Zero-Trust Egress Exchange route
 	mux.HandleFunc("POST /internal/v1/egress/exchange", s.handleEgressExchange)
 }
@@ -641,9 +649,7 @@ func (s *Server) handleOpenAPISpec(w http.ResponseWriter, _ *http.Request) {
 // handleSubdomainProxy reverse-proxies inbound requests matching ^([0-9]+)-([a-zA-Z0-9_-]+)\.(.*)$
 // to the target sandbox on targetPort (e.g. 49999 for Jupyter, 49983 for envd/podd, 8080 for web).
 func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sandboxID string, port int) {
-	s.mu.RLock()
-	rec, ok := s.sandboxes[sandboxID]
-	s.mu.RUnlock()
+	rec, ok := s.resolveSandbox(r.Context(), sandboxID)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
@@ -734,9 +740,7 @@ func (s *Server) handleGetEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.RLock()
-	_, ok := s.sandboxes[sandboxID]
-	s.mu.RUnlock()
+	_, ok := s.resolveSandbox(r.Context(), sandboxID)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
@@ -798,9 +802,7 @@ func (s *Server) handleExecute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) executeCodeForSandbox(w http.ResponseWriter, r *http.Request, sandboxID string) {
-	s.mu.RLock()
-	rec, ok := s.sandboxes[sandboxID]
-	s.mu.RUnlock()
+	rec, ok := s.resolveSandbox(r.Context(), sandboxID)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return

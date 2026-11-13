@@ -692,6 +692,92 @@ paths:
                   extracted:
                     type: integer
 
+  /sandboxes/{sandboxID}/desktop/start:
+    post:
+      summary: Lazily start interactive desktop, browser (CDP), and web terminal stack (CEP-0021)
+      operationId: startDesktop
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DesktopStartRequest"
+      responses:
+        "200":
+          description: Desktop stack running with signed /panel/{token}/ URLs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DesktopStartResponse"
+        "400":
+          description: Invalid resolution format or malformed request body
+        "404":
+          description: Sandbox not found
+        "422":
+          description: Sandbox image does not include cubepod-desktop stack
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DesktopNotInstalledError"
+
+  /sandboxes/{sandboxID}/desktop/status:
+    get:
+      summary: Query interactive desktop stack status and daemon PIDs (CEP-0021)
+      operationId: getDesktopStatus
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Desktop stack status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DesktopStatusResponse"
+        "404":
+          description: Sandbox not found
+        "422":
+          description: Sandbox image does not include cubepod-desktop stack
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DesktopNotInstalledError"
+
+  /sandboxes/{sandboxID}/desktop/stop:
+    post:
+      summary: Stop interactive desktop, browser, and web terminal daemons (CEP-0021)
+      operationId: stopDesktop
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Desktop stack stopped
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DesktopStatusResponse"
+        "404":
+          description: Sandbox not found
+        "422":
+          description: Sandbox image does not include cubepod-desktop stack
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DesktopNotInstalledError"
+
   /sandboxes/{sandboxID}/endpoints/{port}:
     get:
       summary: Get public ingress host/URL for sandbox port (E2B get_host compatible)
@@ -1903,3 +1989,78 @@ components:
           type: string
         buildID:
           type: string
+
+    DesktopStartRequest:
+      type: object
+      properties:
+        resolution:
+          type: string
+          pattern: "^[0-9]{3,5}x[0-9]{3,5}x(16|24|32)$"
+          example: "1280x800x24"
+        initialUrl:
+          type: string
+          example: "about:blank"
+        expiresInSeconds:
+          type: integer
+          default: 3600
+
+    DesktopStartResponse:
+      type: object
+      required: [status, desktopUrl, terminalUrl, cdpUrl, expiresAt]
+      properties:
+        status:
+          type: string
+          example: "running"
+        desktopUrl:
+          type: string
+          example: "/panel/<token>/vnc.html?autoconnect=true&resize=scale"
+        terminalUrl:
+          type: string
+          example: "/panel/<token>/"
+        cdpUrl:
+          type: string
+          example: "/panel/<token>/"
+        expiresAt:
+          type: string
+          format: date-time
+
+    DesktopStatusResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [running, degraded, stopped]
+        display:
+          type: string
+          example: ":99"
+        resolution:
+          type: string
+          example: "1280x800x24"
+        ports:
+          type: object
+          properties:
+            desktop:
+              type: integer
+              example: 8080
+            terminal:
+              type: integer
+              example: 7681
+            cdp:
+              type: integer
+              example: 9222
+        pids:
+          type: object
+          additionalProperties:
+            type: integer
+
+    DesktopNotInstalledError:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          example: "desktop_not_installed"
+        message:
+          type: string
+          example: "sandbox image does not include cubepod-desktop stack"

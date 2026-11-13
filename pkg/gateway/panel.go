@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -81,6 +82,46 @@ func (s *Server) handleCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	s.handleMintEndpointToken(w, r)
 }
 
+func (s *Server) mintPanelToken(sandboxID string, port int, expiresInSeconds int) (string, time.Time) {
+	if expiresInSeconds == 0 {
+		expiresInSeconds = 3600
+	}
+	expTime := time.Now().UTC().Add(time.Duration(expiresInSeconds) * time.Second)
+	expUnix := expTime.Unix()
+
+	payload := fmt.Sprintf("%s:%d:%d", sandboxID, port, expUnix)
+	mac := hmac.New(sha256.New, s.getPanelSecret())
+	mac.Write([]byte(payload))
+	sig := mac.Sum(nil)
+
+	payloadB64 := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	sigB64 := base64.RawURLEncoding.EncodeToString(sig)
+	return payloadB64 + "." + sigB64, expTime
+}
+
+func (s *Server) resolveSandboxHost(rec *SandboxRecord) string {
+	if rec == nil {
+		return ""
+	}
+	if s.reconciler != nil {
+		if boxStatus, ok := s.reconciler.GetBox(rec.SandboxID); ok && boxStatus.PodIP != "" && boxStatus.PodIP != "10.244.0.42" {
+			if host, _, err := net.SplitHostPort(boxStatus.PodIP); err == nil && host != "" {
+				return host
+			}
+			return boxStatus.PodIP
+		}
+	}
+	s.mu.RLock()
+	poddURL := rec.PoddURL
+	s.mu.RUnlock()
+	if poddURL != "" {
+		if u, err := url.Parse(poddURL); err == nil && u.Hostname() != "" && u.Hostname() != "10.244.0.42" {
+			return u.Hostname()
+		}
+	}
+	return ""
+}
+
 // handleMintEndpointToken mints an HMAC-SHA256 signed panel token for (sandboxID, port).
 // POST /sandboxes/{sandboxID}/endpoints/{port}
 func (s *Server) handleMintEndpointToken(w http.ResponseWriter, r *http.Request) {
@@ -92,9 +133,7 @@ func (s *Server) handleMintEndpointToken(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	s.mu.RLock()
-	rec, ok := s.sandboxes[sandboxID]
-	s.mu.RUnlock()
+	rec, ok := s.resolveSandbox(r.Context(), sandboxID)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
@@ -108,32 +147,16 @@ func (s *Server) handleMintEndpointToken(w http.ResponseWriter, r *http.Request)
 	if targetURL == "" {
 		targetURL = req.UpstreamURL
 	}
-	if targetURL == "" && rec != nil && rec.PoddURL != "" {
-		if boxStatus, ok := s.reconciler.GetBox(sandboxID); ok && boxStatus.PodIP != "" {
-			targetURL = fmt.Sprintf("http://%s:%d", boxStatus.PodIP, port)
-		} else if u, err := url.Parse(rec.PoddURL); err == nil && u.Hostname() != "" {
-			targetURL = fmt.Sprintf("http://%s:%d", u.Hostname(), port)
+	if targetURL == "" {
+		if host := s.resolveSandboxHost(rec); host != "" {
+			targetURL = fmt.Sprintf("http://%s:%d", host, port)
 		}
 	}
 	if targetURL != "" {
 		s.RegisterPort(sandboxID, port, targetURL)
 	}
 
-	expiresIn := req.ExpiresInSeconds
-	if expiresIn == 0 {
-		expiresIn = 3600
-	}
-	expTime := time.Now().UTC().Add(time.Duration(expiresIn) * time.Second)
-	expUnix := expTime.Unix()
-
-	payload := fmt.Sprintf("%s:%d:%d", sandboxID, port, expUnix)
-	mac := hmac.New(sha256.New, s.getPanelSecret())
-	mac.Write([]byte(payload))
-	sig := mac.Sum(nil)
-
-	payloadB64 := base64.RawURLEncoding.EncodeToString([]byte(payload))
-	sigB64 := base64.RawURLEncoding.EncodeToString(sig)
-	token := payloadB64 + "." + sigB64
+	token, expTime := s.mintPanelToken(sandboxID, port, req.ExpiresInSeconds)
 	urlPath := fmt.Sprintf("/panel/%s/", token)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -228,9 +251,7 @@ func (s *Server) handlePanelProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.mu.RLock()
-	rec, ok := s.sandboxes[claims.SandboxID]
-	s.mu.RUnlock()
+	rec, ok := s.resolveSandbox(r.Context(), claims.SandboxID)
 	if !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
@@ -244,6 +265,11 @@ func (s *Server) handlePanelProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetURLStr := s.GetRegisteredPort(claims.SandboxID, claims.Port)
+	if targetURLStr == "" {
+		if host := s.resolveSandboxHost(rec); host != "" {
+			targetURLStr = fmt.Sprintf("http://%s:%d", host, claims.Port)
+		}
+	}
 	if targetURLStr == "" {
 		http.Error(w, fmt.Sprintf("no upstream registered for sandbox %s port %d", claims.SandboxID, claims.Port), http.StatusBadGateway)
 		return

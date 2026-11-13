@@ -134,16 +134,16 @@ func (s *Server) resolveConnectRPCSandbox(r *http.Request) (*SandboxRecord, erro
 		}
 	}
 
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	if sandboxID != "" {
-		rec, ok := s.sandboxes[sandboxID]
+		rec, ok := s.resolveSandbox(r.Context(), sandboxID)
 		if !ok {
 			return nil, fmt.Errorf("sandbox %q not found", sandboxID)
 		}
 		return rec, nil
 	}
 
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	// Fallback if exactly one sandbox is active
 	if len(s.sandboxes) == 1 {
 		for _, rec := range s.sandboxes {
