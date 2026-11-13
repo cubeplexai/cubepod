@@ -40,10 +40,14 @@ pub use interpreter::{
 };
 pub use json::{escape_json, parse_target, url_decode, JsonParser, JsonValue};
 pub use startcmd::{
-    ensure_sigchld_handler, ensure_subreaper, get_reaped_pids, lookup_reaped_exit_code,
-    maybe_spawn_start_cmd, reap_zombies, resolve_credentials, resolve_username, spawn_start_cmd,
+    configure_command_credentials, ensure_sigchld_handler, ensure_subreaper, exit_code_from_status,
+    install_zombie_reaper, lookup_passwd_by_name, lookup_passwd_by_uid, maybe_spawn_start_cmd,
+    reap_zombies, reaped_orphan_count, reaped_status_count, resolve_credentials,
+    resolve_credentials_with_euid, resolve_default_credentials,
+    resolve_default_credentials_from_getter, resolve_username, spawn_start_cmd,
+    spawn_start_cmd_if_configured, spawn_tracked, tracked_pid_count, PasswdEntry,
     ResolvedCredentials, StartCmdConfig, StartCmdCredentials, StartCmdRunner, StartCmdStatus,
-    TemplateUserCredentials,
+    TemplateUserCredentials, TrackedChild,
 };
 
 #[derive(Clone, Debug)]
@@ -212,8 +216,8 @@ pub fn run_server(
 
 pub fn serve(listener: TcpListener, config: DaemonConfig, registry: ProcessRegistry) {
     ensure_subreaper();
-    ensure_sigchld_handler();
-    maybe_spawn_start_cmd(&config.workdir);
+    install_zombie_reaper();
+    spawn_start_cmd_if_configured(&config.workdir);
     run_server(listener, config, registry, ContextRegistry::new());
 }
 
@@ -229,12 +233,12 @@ fn main() {
     );
 
     ensure_subreaper();
-    ensure_sigchld_handler();
+    install_zombie_reaper();
 
     let config = DaemonConfig { workdir };
     let registry = ProcessRegistry::new();
     let contexts = ContextRegistry::new();
     let listener = TcpListener::bind(&addr).expect("failed to bind podd listener");
-    maybe_spawn_start_cmd(&config.workdir);
+    spawn_start_cmd_if_configured(&config.workdir);
     run_server(listener, config, registry, contexts);
 }

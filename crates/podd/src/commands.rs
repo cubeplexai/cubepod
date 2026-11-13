@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::io::FromRawFd;
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +14,77 @@ use std::sync::{Arc, Mutex};
 use crate::files::decompress_if_gzip;
 use crate::http::{write_json, write_response, HttpRequest};
 use crate::json::{escape_json, JsonValue};
+use crate::startcmd::{configure_command_credentials, exit_code_from_status, spawn_tracked};
 use crate::DaemonConfig;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunRequest {
+    pub command: Option<String>,
+    pub id: Option<String>,
+    pub workdir: Option<String>,
+    pub background: bool,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub user: Option<String>,
+    pub envs: HashMap<String, String>,
+}
+
+impl RunRequest {
+    pub fn from_json(json: &JsonValue) -> Self {
+        let command = json
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let id = json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let workdir = json
+            .get("workdir")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let background = json
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let uid = json.get("uid").and_then(|v| v.as_u64()).map(|u| u as u32);
+        let gid = json.get("gid").and_then(|v| v.as_u64()).map(|g| g as u32);
+        let user = json
+            .get("user")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let mut envs = HashMap::new();
+        if let Some(env_obj) = json
+            .get("envs")
+            .or_else(|| json.get("envVars"))
+            .and_then(|v| v.as_object())
+        {
+            for (k, v) in env_obj {
+                if let Some(val) = v.as_str() {
+                    envs.insert(k.clone(), val.to_string());
+                }
+            }
+        }
+
+        Self {
+            command,
+            id,
+            workdir,
+            background,
+            uid,
+            gid,
+            user,
+            envs,
+        }
+    }
+
+    pub fn from_json_str(raw: &str) -> Result<Self, String> {
+        let json = JsonValue::parse(raw)?;
+        Ok(Self::from_json(&json))
+    }
+}
 
 pub type ProcessOutputBuffer = Vec<u8>;
 
@@ -130,8 +200,10 @@ pub fn handle_command_run(
         }
     };
 
-    let command_str = match json.get("command").and_then(|v| v.as_str()) {
-        Some(c) => c.to_string(),
+    let run_req = RunRequest::from_json(&json);
+
+    let command_str = match run_req.command {
+        Some(c) => c,
         None => {
             write_json(
                 stream,
@@ -142,38 +214,9 @@ pub fn handle_command_run(
         }
     };
 
-    let id = json
-        .get("id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| registry.next_id());
-
-    let eff_workdir = json
-        .get("workdir")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| config.workdir.clone());
-
-    let background = json
-        .get("background")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let uid = json.get("uid").and_then(|v| v.as_u64()).map(|u| u as u32);
-    let gid = json.get("gid").and_then(|v| v.as_u64()).map(|g| g as u32);
-
-    let mut envs = HashMap::new();
-    if let Some(env_obj) = json
-        .get("envs")
-        .or_else(|| json.get("envVars"))
-        .and_then(|v| v.as_object())
-    {
-        for (k, v) in env_obj {
-            if let Some(val) = v.as_str() {
-                envs.insert(k.clone(), val.to_string());
-            }
-        }
-    }
+    let id = run_req.id.unwrap_or_else(|| registry.next_id());
+    let eff_workdir = run_req.workdir.unwrap_or_else(|| config.workdir.clone());
+    let background = run_req.background;
 
     let _ = std::fs::create_dir_all(&eff_workdir);
 
@@ -186,18 +229,21 @@ pub fn handle_command_run(
     let mut cmd = Command::new(shell);
     cmd.arg("-c").arg(&command_str);
     cmd.current_dir(&eff_workdir);
-    for (k, v) in &envs {
-        cmd.env(k, v);
-    }
     cmd.process_group(0);
 
-    if unsafe { libc::geteuid() == 0 } {
-        if let Some(u) = uid {
-            cmd.uid(u);
-        }
-        if let Some(g) = gid {
-            cmd.gid(g);
-        }
+    if let Err(e) =
+        configure_command_credentials(&mut cmd, run_req.uid, run_req.gid, run_req.user.as_deref())
+    {
+        let resp = format!(
+            r#"{{"error":"invalid_credentials","details":"{}"}}"#,
+            escape_json(&e)
+        );
+        write_json(stream, "400 Bad Request", &resp);
+        return;
+    }
+
+    for (k, v) in &run_req.envs {
+        cmd.env(k, v);
     }
 
     let mut fds = [0i32; 2];
@@ -227,7 +273,7 @@ pub fn handle_command_run(
     cmd.stdout(std::process::Stdio::from(write_file));
     cmd.stderr(std::process::Stdio::from(write_file_dup));
 
-    let mut child = match cmd.spawn() {
+    let mut child = match spawn_tracked(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             let resp = format!(
@@ -268,10 +314,8 @@ pub fn handle_command_run(
                 }
             }
             let exit_code = match child.wait() {
-                Ok(status) => status
-                    .code()
-                    .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(-1)),
-                Err(_) => crate::startcmd::lookup_reaped_exit_code(pid).unwrap_or(-1),
+                Ok(status) => exit_code_from_status(&status),
+                Err(_) => -1,
             };
             let mut proc = entry_clone.lock().unwrap();
             proc.running = false;
@@ -297,10 +341,8 @@ pub fn handle_command_run(
             }
         }
         let exit_code = match child.wait() {
-            Ok(status) => status
-                .code()
-                .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(-1)),
-            Err(_) => crate::startcmd::lookup_reaped_exit_code(pid).unwrap_or(-1),
+            Ok(status) => exit_code_from_status(&status),
+            Err(_) => -1,
         };
         let cursor = output.len();
         let output_str = String::from_utf8_lossy(&output).to_string();
@@ -590,6 +632,12 @@ pub fn handle_connectrpc_process_start(
         .or_else(|| json.get("gid"))
         .and_then(|v| v.as_u64())
         .map(|g| g as u32);
+    let req_user = proc_obj
+        .get("user")
+        .or_else(|| json.get("user"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
 
     let _ = std::fs::create_dir_all(&eff_workdir);
 
@@ -602,32 +650,31 @@ pub fn handle_connectrpc_process_start(
     let mut cmd = Command::new(shell);
     cmd.arg("-c").arg(&command_str);
     cmd.current_dir(&eff_workdir);
+    // Spawn process in a dedicated process group
+    cmd.process_group(0);
+
+    if let Err(e) = configure_command_credentials(&mut cmd, uid, gid, req_user) {
+        let err_json = format!(
+            r#"{{"code":"invalid_argument","message":"{}"}}"#,
+            escape_json(&e)
+        );
+        write_response(
+            stream,
+            "400 Bad Request",
+            "application/json",
+            err_json.as_bytes(),
+        );
+        return;
+    }
+
     for (k, v) in &envs {
         cmd.env(k, v);
-    }
-
-    // Spawn process in a dedicated process group (libc::setpgid)
-    cmd.process_group(0);
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setpgid(0, 0);
-            Ok(())
-        });
-    }
-
-    if unsafe { libc::geteuid() == 0 } {
-        if let Some(u) = uid {
-            cmd.uid(u);
-        }
-        if let Some(g) = gid {
-            cmd.gid(g);
-        }
     }
 
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    let mut child = match cmd.spawn() {
+    let mut child = match spawn_tracked(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
             let err_json = format!(
@@ -655,8 +702,8 @@ pub fn handle_connectrpc_process_start(
         output: Vec::new(),
     });
 
-    let child_stdout = child.stdout.take();
-    let child_stderr = child.stderr.take();
+    let child_stdout = child.stdout().take();
+    let child_stderr = child.stderr().take();
 
     let header =
         "HTTP/1.1 200 OK\r\nContent-Type: application/connect+json\r\nConnection: close\r\n\r\n";
@@ -740,10 +787,8 @@ pub fn handle_connectrpc_process_start(
     }
 
     let exit_code = match child.wait() {
-        Ok(status) => status
-            .code()
-            .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(-1)),
-        Err(_) => crate::startcmd::lookup_reaped_exit_code(pid).unwrap_or(-1),
+        Ok(status) => exit_code_from_status(&status),
+        Err(_) => -1,
     };
 
     {

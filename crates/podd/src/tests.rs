@@ -1327,16 +1327,17 @@ fn test_start_cmd_set_runs_once_outputs_logs_and_second_poll_no_op() {
 #[test]
 fn test_child_that_exits_is_reaped_no_zombie() {
     use crate::startcmd::{
-        ensure_sigchld_handler, ensure_subreaper, get_reaped_pids, StartCmdConfig, StartCmdRunner,
-        StartCmdStatus, TemplateUserCredentials,
+        ensure_subreaper, install_zombie_reaper, is_pid_tracked_or_cached, reaped_orphan_count,
+        StartCmdConfig, StartCmdRunner, StartCmdStatus, TemplateUserCredentials,
     };
     use std::fs;
 
-    // 3. A child that exits is reaped. Spawn a command that forks a grandchild which exits immediately,
-    // and assert no zombie remains (assert get_reaped_pids contains its pid via SIGCHLD).
+    // 3. A child that exits is reaped. Spawn a command that forks an untracked grandchild
+    // which exits immediately, and assert it is reaped without leaking into TRACKED_PIDS/REAPED_STATUSES.
     ensure_subreaper();
-    ensure_sigchld_handler();
+    install_zombie_reaper();
 
+    let orphans_before = reaped_orphan_count();
     let temp_dir = std::env::temp_dir().join(format!("podd-test-reap-{}", std::process::id()));
     let _ = fs::create_dir_all(&temp_dir);
 
@@ -1393,10 +1394,12 @@ fn test_child_that_exits_is_reaped_no_zombie() {
     let gpid = gpid.expect("could not parse grandchild pid from start-cmd.log");
     assert_ne!(gpid, child_pid);
 
-    // Wait for grandchild to exit and be reaped by the SIGCHLD thread (without calling reap_zombies directly)
+    // Wait for grandchild to exit and be reaped by the SIGCHLD thread (without calling reap_zombies directly).
+    // Once reaped, kill(gpid, 0) fails with ESRCH and /proc/<gpid>/status disappears (not a zombie).
     let mut reaped = false;
     for _ in 0..150 {
-        if get_reaped_pids().contains(&(gpid as libc::pid_t)) {
+        let rc = unsafe { libc::kill(gpid as libc::pid_t, 0) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
             reaped = true;
             break;
         }
@@ -1405,9 +1408,17 @@ fn test_child_that_exits_is_reaped_no_zombie() {
 
     assert!(
         reaped,
-        "grandchild pid {} was not collected by the SIGCHLD reaper thread (collected: {:?})",
-        gpid,
-        get_reaped_pids()
+        "grandchild pid {} was not reaped by the SIGCHLD reaper thread",
+        gpid
+    );
+    assert!(
+        reaped_orphan_count() > orphans_before,
+        "expected untracked orphan reap counter to increment"
+    );
+    assert!(
+        !is_pid_tracked_or_cached(gpid as i32),
+        "untracked grandchild pid {} must not be cached in TRACKED_PIDS/REAPED_STATUSES",
+        gpid
     );
 
     // Verify /proc/<gpid>/status if still accessible: must not be in Zombie state
@@ -1554,4 +1565,237 @@ fn test_numeric_user_takes_precedence_over_username() {
     let resolved = resolve_credentials(&creds).unwrap();
     assert_eq!(resolved.uid, Some(1000));
     assert_eq!(resolved.gid, Some(1000));
+}
+
+#[test]
+fn test_tracked_child_concurrent_gzip_and_sh_no_echild_no_leaks() {
+    use crate::files::decompress_if_gzip;
+    use crate::startcmd::{
+        ensure_subreaper, exit_code_from_status, install_zombie_reaper, is_pid_tracked_or_cached,
+        spawn_tracked,
+    };
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+
+    ensure_subreaper();
+    install_zombie_reaper();
+
+    let payload = b"hello cubepod tracked child concurrency payload ".repeat(64);
+    let mut gz_cmd = Command::new("gzip");
+    gz_cmd
+        .arg("-c")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut gz_child = spawn_tracked(&mut gz_cmd).expect("spawn gzip -c");
+    {
+        let mut stdin = gz_child.stdin().take().expect("gzip stdin");
+        stdin.write_all(&payload).expect("write gzip stdin");
+    }
+    let gz_out = gz_child.wait_with_output().expect("wait_with_output gzip");
+    assert!(gz_out.status.success());
+    let gz_bytes = Arc::new(gz_out.stdout);
+
+    let spawned_pids = Arc::new(Mutex::new(Vec::<i32>::new()));
+    let mut handles = Vec::new();
+
+    for _ in 0..10 {
+        let gz_bytes = Arc::clone(&gz_bytes);
+        let payload = payload.clone();
+        let spawned_pids = Arc::clone(&spawned_pids);
+        handles.push(std::thread::spawn(move || {
+            for i in 0..6 {
+                let decompressed = decompress_if_gzip(&gz_bytes).expect("decompress_if_gzip");
+                assert_eq!(decompressed, payload);
+
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c").arg("exit 7");
+                let mut child = spawn_tracked(&mut cmd).expect("spawn sh exit 7");
+                let pid = child.id() as i32;
+                spawned_pids.lock().unwrap().push(pid);
+                let status = child.wait().expect("wait must not fail with ECHILD");
+                assert_eq!(exit_code_from_status(&status), 7);
+                assert!(
+                    !is_pid_tracked_or_cached(pid),
+                    "pid {pid} leaked after wait"
+                );
+
+                let mut out_cmd = Command::new("/bin/sh");
+                out_cmd
+                    .arg("-c")
+                    .arg("printf 'ok'")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut out_child = spawn_tracked(&mut out_cmd).expect("spawn sh printf");
+                let out_pid = out_child.id() as i32;
+                spawned_pids.lock().unwrap().push(out_pid);
+                let _ = out_child.try_wait().expect("try_wait must not ECHILD");
+                let output = out_child.wait_with_output().expect("wait_with_output");
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"ok");
+                assert!(
+                    !is_pid_tracked_or_cached(out_pid),
+                    "pid {out_pid} leaked after wait_with_output"
+                );
+
+                if i % 2 == 0 {
+                    let mut drop_cmd = Command::new("/bin/sh");
+                    drop_cmd.arg("-c").arg("exit 0");
+                    let drop_child = spawn_tracked(&mut drop_cmd).expect("spawn drop child");
+                    let drop_pid = drop_child.id() as i32;
+                    spawned_pids.lock().unwrap().push(drop_pid);
+                    drop(drop_child);
+                    assert!(
+                        !is_pid_tracked_or_cached(drop_pid),
+                        "pid {drop_pid} leaked after drop"
+                    );
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
+
+    for pid in spawned_pids.lock().unwrap().iter() {
+        assert!(
+            !is_pid_tracked_or_cached(*pid),
+            "pid {} still present in TRACKED_PIDS/REAPED_STATUSES",
+            pid
+        );
+    }
+}
+
+#[test]
+fn test_resolve_default_credentials_cases() {
+    use crate::startcmd::{
+        configure_command_credentials, lookup_passwd_by_name, lookup_passwd_by_uid,
+        resolve_default_credentials_from_getter,
+    };
+    use std::process::Stdio;
+
+    // 1. CUBEPOD_RUN_AS_USER=0 -> (0, 0) regardless of euid
+    let get_root = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USER" => Some("0".to_string()),
+        _ => None,
+    };
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_root, 0, 0).unwrap(),
+        Some((0, 0))
+    );
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_root, 1000, 1000).unwrap(),
+        Some((0, 0))
+    );
+
+    // 2. CUBEPOD_RUN_AS_USER=1001, CUBEPOD_RUN_AS_GROUP=1002 -> (1001, 1002)
+    let get_1001 = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USER" => Some("1001".to_string()),
+        "CUBEPOD_RUN_AS_GROUP" => Some("1002".to_string()),
+        _ => None,
+    };
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_1001, 0, 0).unwrap(),
+        Some((1001, 1002))
+    );
+
+    // 3. CUBEPOD_RUN_AS_USERNAME
+    let get_root_name = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USERNAME" => Some("root".to_string()),
+        _ => None,
+    };
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_root_name, 0, 0).unwrap(),
+        Some((0, 0))
+    );
+
+    let get_uid_gid_str = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USERNAME" => Some("1001:1002".to_string()),
+        _ => None,
+    };
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_uid_gid_str, 0, 0).unwrap(),
+        Some((1001, 1002))
+    );
+
+    let get_bad_name = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USERNAME" => Some("nonexistent_cubepod_user_xyz_123".to_string()),
+        _ => None,
+    };
+    assert!(resolve_default_credentials_from_getter(get_bad_name, 0, 0).is_err());
+
+    // 4. All CUBEPOD_RUN_AS_* unset:
+    //    euid == 0 -> Some((1000, 1000)); euid != 0 -> None.
+    let get_unset = |_: &str| None;
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_unset, 0, 0).unwrap(),
+        Some((1000, 1000))
+    );
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_unset, 1000, 1000).unwrap(),
+        None
+    );
+
+    // 5. Reentrant getpwnam_r / getpwuid_r sanity check
+    let pw_by_name = lookup_passwd_by_name("root").unwrap().expect("root passwd");
+    assert_eq!(pw_by_name.uid, 0);
+    assert_eq!(pw_by_name.gid, 0);
+    assert_eq!(pw_by_name.username, "root");
+    assert!(!pw_by_name.home_dir.is_empty());
+
+    let pw_by_uid = lookup_passwd_by_uid(0).unwrap().expect("uid 0 passwd");
+    assert_eq!(pw_by_uid.username, "root");
+
+    // 6. configure_command_credentials sets HOME/USER/LOGNAME and allows caller envs override
+    let current_euid = unsafe { libc::geteuid() };
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(r#"printf '%s|%s|%s' "$HOME" "$USER" "$LOGNAME""#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let resolved = configure_command_credentials(&mut cmd, Some(current_euid), None, None).unwrap();
+    let expected_home = resolved.home_dir.unwrap();
+    let expected_user = resolved.username.unwrap();
+    let out = cmd.output().expect("run sh");
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{expected_home}|{expected_user}|{expected_user}")
+    );
+
+    let mut override_cmd = Command::new("/bin/sh");
+    override_cmd
+        .arg("-c")
+        .arg(r#"printf '%s' "$HOME""#)
+        .stdout(Stdio::piped());
+    configure_command_credentials(&mut override_cmd, Some(current_euid), None, None).unwrap();
+    override_cmd.env("HOME", "/custom/override");
+    let out2 = override_cmd.output().expect("run sh override");
+    assert_eq!(String::from_utf8_lossy(&out2.stdout), "/custom/override");
+}
+
+#[test]
+fn test_run_request_serde() {
+    use crate::commands::RunRequest;
+
+    let empty = RunRequest::from_json_str("{}").unwrap();
+    assert_eq!(empty.uid, None);
+    assert_eq!(empty.gid, None);
+    assert_eq!(empty.user, None);
+
+    let explicit_zero = RunRequest::from_json_str(r#"{"uid":0,"gid":0,"command":"id"}"#).unwrap();
+    assert_eq!(explicit_zero.uid, Some(0));
+    assert_eq!(explicit_zero.gid, Some(0));
+    assert_eq!(explicit_zero.command.as_deref(), Some("id"));
+
+    let null_fields = RunRequest::from_json_str(r#"{"uid":null,"gid":null,"user":"   "}"#).unwrap();
+    assert_eq!(null_fields.uid, None);
+    assert_eq!(null_fields.gid, None);
+    assert_eq!(null_fields.user, None);
+
+    let custom = RunRequest::from_json_str(r#"{"uid":1001,"gid":1002,"user":"cubeplex"}"#).unwrap();
+    assert_eq!(custom.uid, Some(1001));
+    assert_eq!(custom.gid, Some(1002));
+    assert_eq!(custom.user.as_deref(), Some("cubeplex"));
 }
