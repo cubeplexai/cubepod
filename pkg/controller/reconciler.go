@@ -289,9 +289,38 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 			podManifest.Labels["cubepod.io/template"] = spec.TemplateRef
 			podManifest.Labels["cubepod.io/claimed"] = "false"
 
-			podIP, _ := r.kubeClient.EnsurePod(ctx, podManifest)
+			is409 := false
+			podIP, err := r.kubeClient.EnsurePod(ctx, podManifest)
+			if err != nil {
+				errStr := strings.ToLower(err.Error())
+				if strings.Contains(errStr, "409") || strings.Contains(errStr, "already exists") || strings.Contains(errStr, "conflict") {
+					is409 = true
+				} else {
+					slog.Warn("failed to ensure warm pod", "pod", dummyStatus.PodName, "err", err)
+					continue
+				}
+			}
 			if podIP != "" {
 				dummyStatus.PodIP = podIP
+			}
+
+			// When EnsurePod returns 409 (pod already exists), check its label:
+			// if it's already claimed, do NOT add it as an unclaimed standby entry!
+			if is409 {
+				existingPods, listErr := r.kubeClient.ListPods(ctx, r.namespace, "")
+				if listErr == nil {
+					var claimedPod bool
+					for _, p := range existingPods {
+						if p.Name == dummyStatus.PodName && p.Labels != nil && p.Labels["cubepod.io/claimed"] == "true" {
+							claimedPod = true
+							break
+						}
+					}
+					if claimedPod {
+						slog.Info("pod already exists and is claimed, skipping standby adoption", "pod", dummyStatus.PodName)
+						continue
+					}
+				}
 			}
 
 			entry := &WarmPodEntry{
@@ -354,8 +383,9 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 			}
 			if err := r.kubeClient.UpsertPodWarmPool(ctx, cr); err != nil {
 				slog.Warn("failed to upsert initial PodWarmPool CR", "pool", poolName, "err", err)
+			} else {
+				pool.persisted = true
 			}
-			pool.persisted = true
 		} else {
 			err := r.kubeClient.UpdatePodWarmPoolStatus(ctx, r.namespace, poolName, *st)
 			if err != nil {
@@ -395,11 +425,8 @@ func (r *Reconciler) claimWarmPodLocked(ctx context.Context, poolName string, bo
 				if ctx == nil {
 					ctx = context.Background()
 				}
-				if err := r.kubeClient.PatchPodLabels(ctx, r.namespace, entry.PodName, map[string]string{
-					"cubepod.io/claimed":    "true",
-					"cubepod.io/claimed-by": boxName,
-				}); err != nil {
-					slog.Warn("failed to patch pod labels on claim, skipping standby pod", "pod", entry.PodName, "box", boxName, "err", err)
+				if err := r.kubeClient.ClaimPod(ctx, r.namespace, entry.PodName, boxName); err != nil {
+					slog.Warn("failed to claim standby pod via CAS patch, skipping standby pod", "pod", entry.PodName, "box", boxName, "err", err)
 					continue
 				}
 			}
@@ -585,7 +612,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		podManifest := BuildKataPod(name, tpl, spec, *status, r.volumeMode)
 		podManifest.Namespace = r.namespace
 		podIP, err := r.kubeClient.EnsurePod(ctx, podManifest)
-		if err == nil && podIP != "" {
+		if err != nil {
+			errStr := strings.ToLower(err.Error())
+			if strings.Contains(errStr, "409") || strings.Contains(errStr, "already exists") || strings.Contains(errStr, "conflict") {
+				err = nil
+			} else {
+				return nil, fmt.Errorf("failed to ensure Pod: %w", err)
+			}
+		}
+		if podIP != "" {
 			status.PodIP = podIP
 		}
 		status.PodName = podManifest.Name
@@ -748,12 +783,9 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 		if name == "" {
 			continue
 		}
-		// If box already exists in memory with a newer or modified state, don't clobber
-		if _, exists := r.boxes[name]; !exists {
-			st := box.Status
-			r.boxes[name] = &st
-			r.specs[name] = box.Spec
-		}
+		st := box.Status
+		r.boxes[name] = &st
+		r.specs[name] = box.Spec
 		if idx := parseWarmIndex(box.Status.PodName); idx > r.warmCounter {
 			r.warmCounter = idx
 		}
@@ -1029,6 +1061,20 @@ func (r *Reconciler) TouchActivity(name string, t time.Time) error {
 		return fmt.Errorf("podbox %q not found", name)
 	}
 	status.LastActivityAt = &t
+	if r.kubeClient != nil {
+		spec := r.specs[name]
+		box := v1alpha1.PodBox{
+			APIVersion: "cubepod.io/v1alpha1",
+			Kind:       "PodBox",
+			Metadata: v1alpha1.ObjectMeta{
+				Name:      name,
+				Namespace: r.namespace,
+			},
+			Spec:   spec,
+			Status: *status,
+		}
+		_ = r.kubeClient.UpsertPodBox(context.Background(), box)
+	}
 	return nil
 }
 
@@ -1041,6 +1087,20 @@ func (r *Reconciler) SetPausedAt(name string, t time.Time) error {
 		return fmt.Errorf("podbox %q not found", name)
 	}
 	status.PausedAt = &t
+	if r.kubeClient != nil {
+		spec := r.specs[name]
+		box := v1alpha1.PodBox{
+			APIVersion: "cubepod.io/v1alpha1",
+			Kind:       "PodBox",
+			Metadata: v1alpha1.ObjectMeta{
+				Name:      name,
+				Namespace: r.namespace,
+			},
+			Spec:   spec,
+			Status: *status,
+		}
+		_ = r.kubeClient.UpsertPodBox(context.Background(), box)
+	}
 	return nil
 }
 

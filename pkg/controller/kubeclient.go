@@ -24,6 +24,7 @@ type KubeClient interface {
 	DeletePod(ctx context.Context, namespace, name string) error
 	ListPods(ctx context.Context, namespace string, labelSelector string) ([]PodManifest, error)
 	PatchPodLabels(ctx context.Context, namespace, name string, labels map[string]string) error
+	ClaimPod(ctx context.Context, namespace, name, boxName string) error
 	UpsertPodBox(ctx context.Context, box v1alpha1.PodBox) error
 	GetPodBox(ctx context.Context, namespace, name string) (*v1alpha1.PodBox, error)
 	ListPodBoxes(ctx context.Context, namespace string) ([]v1alpha1.PodBox, error)
@@ -222,10 +223,19 @@ func (m *MemoryKubeClient) DeletePVC(_ context.Context, namespace, name string) 
 }
 
 // EnsurePod records the Pod manifest in memory and returns a mock Pod IP.
+// If the Pod already exists, it preserves existing labels and returns 409 Conflict.
 func (m *MemoryKubeClient) EnsurePod(_ context.Context, pod PodManifest) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := podKey(pod.Namespace, pod.Name)
+	if _, ok := m.Pods[key]; ok {
+		ip := m.IPs[key]
+		if ip == "" {
+			ip = "10.244.0.42"
+			m.IPs[key] = ip
+		}
+		return ip, fmt.Errorf("pod %s/%s already exists (409 Conflict)", pod.Namespace, pod.Name)
+	}
 	m.Pods[key] = pod
 	ip, ok := m.IPs[key]
 	if !ok {
@@ -245,8 +255,38 @@ func (m *MemoryKubeClient) DeletePod(_ context.Context, namespace, name string) 
 	return nil
 }
 
+// ClaimPod conditionally claims an unclaimed standby pod in memory.
+// Returns an error if the pod is already claimed (CAS failure).
+func (m *MemoryKubeClient) ClaimPod(_ context.Context, namespace, name, boxName string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := podKey(namespace, name)
+	pod, ok := m.Pods[key]
+	if !ok {
+		return fmt.Errorf("pod %s/%s not found", namespace, name)
+	}
+	if pod.Labels == nil {
+		pod.Labels = make(map[string]string)
+	}
+	if pod.Labels["cubepod.io/claimed"] == "true" {
+		return fmt.Errorf("pod %s/%s already claimed (409 Conflict)", namespace, name)
+	}
+	if pod.Labels["cubepod.io/claimed"] != "false" {
+		return fmt.Errorf("pod %s/%s cannot be claimed: cubepod.io/claimed is not false (got %q)", namespace, name, pod.Labels["cubepod.io/claimed"])
+	}
+	pod.Labels["cubepod.io/claimed"] = "true"
+	pod.Labels["cubepod.io/claimed-by"] = boxName
+	m.Pods[key] = pod
+	return nil
+}
+
 // PatchPodLabels merges the provided labels into the in-memory Pod manifest.
-func (m *MemoryKubeClient) PatchPodLabels(_ context.Context, namespace, name string, labels map[string]string) error {
+// If claiming a pod (cubepod.io/claimed == "true"), it enforces CAS semantics.
+func (m *MemoryKubeClient) PatchPodLabels(ctx context.Context, namespace, name string, labels map[string]string) error {
+	if labels["cubepod.io/claimed"] == "true" {
+		boxName := labels["cubepod.io/claimed-by"]
+		return m.ClaimPod(ctx, namespace, name, boxName)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := podKey(namespace, name)
@@ -814,8 +854,73 @@ func (c *RESTKubeClient) DeletePod(ctx context.Context, namespace, name string) 
 	return nil
 }
 
-// PatchPodLabels patches the labels of a Pod using strategic merge patch.
+// ClaimPod atomically claims a standby pod using RFC 6902 JSON Patch with conditional CAS.
+// It sends an HTTP PATCH with Content-Type: application/json-patch+json:
+// [
+//
+//	{"op": "test", "path": "/metadata/labels/cubepod.io~1claimed", "value": "false"},
+//	{"op": "replace", "path": "/metadata/labels/cubepod.io~1claimed", "value": "true"},
+//	{"op": "add", "path": "/metadata/labels/cubepod.io~1claimed-by", "value": boxName}
+//
+// ]
+// If another replica already claimed the pod, the Kubernetes APIServer rejects the request with 422 or 409.
+func (c *RESTKubeClient) ClaimPod(ctx context.Context, namespace, name, boxName string) error {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s", c.baseURL, ns, name)
+
+	patchOps := []map[string]any{
+		{
+			"op":    "test",
+			"path":  "/metadata/labels/cubepod.io~1claimed",
+			"value": "false",
+		},
+		{
+			"op":    "replace",
+			"path":  "/metadata/labels/cubepod.io~1claimed",
+			"value": "true",
+		},
+		{
+			"op":    "add",
+			"path":  "/metadata/labels/cubepod.io~1claimed-by",
+			"value": boxName,
+		},
+	}
+	payload, err := json.Marshal(patchOps)
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON Patch: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("ClaimPod request failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json-patch+json")
+	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("ClaimPod request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("ClaimPod failed: status %d (%s)", resp.StatusCode, string(respBody))
+	}
+	return nil
+}
+
+// PatchPodLabels patches the labels of a Pod using strategic merge patch,
+// or performs conditional CAS claim if cubepod.io/claimed is set to true.
 func (c *RESTKubeClient) PatchPodLabels(ctx context.Context, namespace, name string, labels map[string]string) error {
+	if labels["cubepod.io/claimed"] == "true" {
+		boxName := labels["cubepod.io/claimed-by"]
+		return c.ClaimPod(ctx, namespace, name, boxName)
+	}
+
 	ns := c.resolveNamespace(namespace)
 	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s", c.baseURL, ns, name)
 

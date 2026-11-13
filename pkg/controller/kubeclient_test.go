@@ -861,6 +861,67 @@ func TestWaitForRunning_Polling(t *testing.T) {
 	}
 }
 
+func TestRESTKubeClient_ClaimPod_CAS(t *testing.T) {
+	var receivedMethod string
+	var receivedPath string
+	var receivedContentType string
+	var receivedAuth string
+	var receivedBody []byte
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedMethod = r.Method
+		receivedPath = r.URL.Path
+		receivedContentType = r.Header.Get("Content-Type")
+		receivedAuth = r.Header.Get("Authorization")
+		receivedBody, _ = io.ReadAll(r.Body)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+
+	err := client.ClaimPod(context.Background(), "cubepod-workloads", "pod-xyz", "test-box")
+	if err != nil {
+		t.Fatalf("ClaimPod failed: %v", err)
+	}
+
+	if receivedMethod != http.MethodPatch {
+		t.Errorf("expected PATCH method, got %s", receivedMethod)
+	}
+	if receivedPath != "/api/v1/namespaces/cubepod-workloads/pods/pod-xyz" {
+		t.Errorf("expected path /api/v1/namespaces/cubepod-workloads/pods/pod-xyz, got %s", receivedPath)
+	}
+	if receivedContentType != "application/json-patch+json" {
+		t.Errorf("expected Content-Type application/json-patch+json, got %s", receivedContentType)
+	}
+	if receivedAuth != "Bearer test-token" {
+		t.Errorf("expected Authorization Bearer test-token, got %s", receivedAuth)
+	}
+
+	var ops []map[string]any
+	if err := json.Unmarshal(receivedBody, &ops); err != nil {
+		t.Fatalf("failed to unmarshal JSON Patch array: %v", err)
+	}
+	if len(ops) != 3 {
+		t.Fatalf("expected 3 patch ops, got %d", len(ops))
+	}
+	// Verify test op
+	if ops[0]["op"] != "test" || ops[0]["path"] != "/metadata/labels/cubepod.io~1claimed" || ops[0]["value"] != "false" {
+		t.Errorf("unexpected op 0: %+v", ops[0])
+	}
+	// Verify replace op
+	if ops[1]["op"] != "replace" || ops[1]["path"] != "/metadata/labels/cubepod.io~1claimed" || ops[1]["value"] != "true" {
+		t.Errorf("unexpected op 1: %+v", ops[1])
+	}
+	// Verify add op
+	if ops[2]["op"] != "add" || ops[2]["path"] != "/metadata/labels/cubepod.io~1claimed-by" || ops[2]["value"] != "test-box" {
+		t.Errorf("unexpected op 2: %+v", ops[2])
+	}
+}
+
 func TestRESTKubeClient_PatchPodLabels(t *testing.T) {
 	var receivedMethod string
 	var receivedPath string
@@ -883,8 +944,7 @@ func TestRESTKubeClient_PatchPodLabels(t *testing.T) {
 
 	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
 	labels := map[string]string{
-		"cubepod.io/claimed":    "true",
-		"cubepod.io/claimed-by": "test-box",
+		"app": "worker",
 	}
 
 	err := client.PatchPodLabels(context.Background(), "cubepod-workloads", "pod-xyz", labels)
@@ -913,7 +973,7 @@ func TestRESTKubeClient_PatchPodLabels(t *testing.T) {
 	if err := json.Unmarshal(receivedBody, &parsed); err != nil {
 		t.Fatalf("failed to unmarshal request body: %v", err)
 	}
-	if parsed.Metadata.Labels["cubepod.io/claimed"] != "true" || parsed.Metadata.Labels["cubepod.io/claimed-by"] != "test-box" {
+	if parsed.Metadata.Labels["app"] != "worker" {
 		t.Errorf("unexpected patched labels: %+v", parsed.Metadata.Labels)
 	}
 }

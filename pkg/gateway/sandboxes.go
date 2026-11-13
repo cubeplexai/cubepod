@@ -99,7 +99,13 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 
 	// Automatic WarmPool Claim: check if there is an available warmpool for this template if not explicitly specified
 	if spec.WarmPoolRef == "" {
-		if warmPoolName := s.reconciler.FindAvailableWarmPool(req.TemplateID); warmPoolName != "" {
+		warmPoolName := s.reconciler.FindAvailableWarmPool(req.TemplateID)
+		if warmPoolName == "" {
+			// Run a quick SyncFromKube to discover any newly added standby pods from the controller before falling back to cold start
+			_, _ = s.reconciler.SyncFromKube(r.Context())
+			warmPoolName = s.reconciler.FindAvailableWarmPool(req.TemplateID)
+		}
+		if warmPoolName != "" {
 			spec.WarmPoolRef = warmPoolName
 		}
 	}

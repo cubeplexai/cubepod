@@ -62,6 +62,11 @@ func main() {
 	}
 
 	reconciler := controller.NewReconciler(opts...)
+	if n, err := reconciler.SyncFromKube(context.Background()); err != nil {
+		slog.Warn("gateway initial SyncFromKube failed", "err", err)
+	} else {
+		slog.Info("gateway initial SyncFromKube completed", "recoveredBoxes", n)
+	}
 	gw := gateway.NewServer(reconciler)
 	if *livePodRouting {
 		gw.SetLivePodRouting(true)

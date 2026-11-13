@@ -924,6 +924,13 @@ func (f *failingPatchKubeClient) PatchPodLabels(ctx context.Context, ns, name st
 	return f.MemoryKubeClient.PatchPodLabels(ctx, ns, name, labels)
 }
 
+func (f *failingPatchKubeClient) ClaimPod(ctx context.Context, ns, name, boxName string) error {
+	if f.failPodNames[name] {
+		return fmt.Errorf("injected ClaimPod failure for %s", name)
+	}
+	return f.MemoryKubeClient.ClaimPod(ctx, ns, name, boxName)
+}
+
 func TestReconciler_ClaimWarmPod_PatchFailureSkipsPod(t *testing.T) {
 	ctx := context.Background()
 	memKube := controller.NewMemoryKubeClient()
@@ -1095,5 +1102,213 @@ func TestReconciler_SyncFromKube_RebuildsEntriesAndCounter(t *testing.T) {
 		if !strings.Contains(p.Name, "-warm-3-") && !strings.Contains(p.Name, "-warm-4-") {
 			t.Errorf("unexpected pod name created: %s", p.Name)
 		}
+	}
+}
+
+func TestMemoryKubeClient_ClaimPod_CAS(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+
+	pod := controller.PodManifest{
+		Name:      "test-standby-pod",
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"cubepod.io/warmpool": "test-pool",
+			"cubepod.io/claimed":  "false",
+		},
+	}
+	if _, err := memKube.EnsurePod(ctx, pod); err != nil {
+		t.Fatalf("EnsurePod failed: %v", err)
+	}
+
+	// 1. First claim succeeds
+	err := memKube.ClaimPod(ctx, "cubepod-workloads", "test-standby-pod", "box-1")
+	if err != nil {
+		t.Fatalf("first ClaimPod failed: %v", err)
+	}
+
+	p, ok := memKube.GetPod("cubepod-workloads", "test-standby-pod")
+	if !ok || p.Labels["cubepod.io/claimed"] != "true" || p.Labels["cubepod.io/claimed-by"] != "box-1" {
+		t.Fatalf("expected pod claimed by box-1, got: %+v", p.Labels)
+	}
+
+	// 2. Second claim fails (CAS rejection)
+	err2 := memKube.ClaimPod(ctx, "cubepod-workloads", "test-standby-pod", "box-2")
+	if err2 == nil {
+		t.Fatal("expected second ClaimPod to fail on already claimed pod")
+	}
+
+	// 3. Trying to claim pod without false label fails
+	podUnlabeled := controller.PodManifest{
+		Name:      "unlabeled-pod",
+		Namespace: "cubepod-workloads",
+		Labels:    map[string]string{},
+	}
+	_, _ = memKube.EnsurePod(ctx, podUnlabeled)
+	err3 := memKube.ClaimPod(ctx, "cubepod-workloads", "unlabeled-pod", "box-3")
+	if err3 == nil {
+		t.Fatal("expected ClaimPod to fail on pod without claimed=false label")
+	}
+}
+
+func TestReconciler_WarmPool_EnsurePodConflictClaimedNotAdopted(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+
+	// Pre-populate an existing pod that was already created and claimed
+	podName := "conflict-pool-warm-1-kata-pod"
+	existingPod := controller.PodManifest{
+		Name:      podName,
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"cubepod.io/warmpool":   "conflict-pool",
+			"cubepod.io/template":   "base-tpl",
+			"cubepod.io/claimed":    "true",
+			"cubepod.io/claimed-by": "prior-sandbox",
+		},
+	}
+	if _, err := memKube.EnsurePod(ctx, existingPod); err != nil {
+		t.Fatalf("pre-populating existing pod failed: %v", err)
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// Reconcile warm pool with 1 replica: EnsurePod will hit 409 (already exists and claimed)
+	st, err := r.ReconcileWarmPool(ctx, "conflict-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	// The claimed pod must NOT be added as an available standby entry!
+	if st.AvailableReplicas != 0 {
+		t.Fatalf("expected 0 available replicas because pod was already claimed, got %d", st.AvailableReplicas)
+	}
+}
+
+type failingUpsertKubeClient struct {
+	*controller.MemoryKubeClient
+	failUpsert bool
+}
+
+func (f *failingUpsertKubeClient) UpsertPodWarmPool(ctx context.Context, pool v1alpha1.PodWarmPool) error {
+	if f.failUpsert {
+		return fmt.Errorf("injected UpsertPodWarmPool failure")
+	}
+	return f.MemoryKubeClient.UpsertPodWarmPool(ctx, pool)
+}
+
+func TestReconciler_WarmPool_PersistedFlagOnlyOnSuccess(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	failingKube := &failingUpsertKubeClient{
+		MemoryKubeClient: memKube,
+		failUpsert:       true,
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(failingKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// 1. Upsert fails: pool should NOT be marked persisted
+	_, err := r.ReconcileWarmPool(ctx, "fail-persist-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	// In memory client, pool should NOT be in WarmPools map yet
+	if _, err := memKube.GetPodWarmPool(ctx, "cubepod-workloads", "fail-persist-pool"); err == nil {
+		t.Fatal("expected pool not to be persisted in KubeClient when upsert failed")
+	}
+
+	// 2. Clear failure: next reconcile will retry Upsert and succeed
+	failingKube.failUpsert = false
+	_, err = r.ReconcileWarmPool(ctx, "fail-persist-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	})
+	if err != nil {
+		t.Fatalf("second ReconcileWarmPool failed: %v", err)
+	}
+
+	// Now it should be persisted
+	if _, err := memKube.GetPodWarmPool(ctx, "cubepod-workloads", "fail-persist-pool"); err != nil {
+		t.Fatalf("expected pool to be persisted after successful upsert: %v", err)
+	}
+}
+
+func TestReconciler_SyncFromKube_RefreshesExistingPodBoxStatus(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// 1. Create a box in memory with Running state
+	initialSpec := v1alpha1.PodBoxSpec{
+		TemplateRef:  "ubuntu:24.04",
+		DesiredState: v1alpha1.DesiredStateRunning,
+	}
+	_, err := r.Reconcile(ctx, "refresh-box", initialSpec)
+	if err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	b, ok := r.GetBox("refresh-box")
+	if !ok || b.Phase != v1alpha1.PodBoxPhaseRunning {
+		t.Fatalf("expected initial box in Running phase, got: %+v", b)
+	}
+
+	// 2. Gateway/external agent updates PodBox in K8s to Paused
+	pausedBox := v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "refresh-box",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: v1alpha1.PodBoxSpec{
+			TemplateRef:  "ubuntu:24.04",
+			DesiredState: v1alpha1.DesiredStatePaused,
+		},
+		Status: v1alpha1.PodBoxStatus{
+			Phase:   v1alpha1.PodBoxPhasePaused,
+			PodName: "refresh-box-kata-pod",
+		},
+	}
+	if err := memKube.UpsertPodBox(ctx, pausedBox); err != nil {
+		t.Fatalf("UpsertPodBox failed: %v", err)
+	}
+
+	// 3. Controller runs SyncFromKube: MUST refresh the status in memory, not skip it!
+	recovered, err := r.SyncFromKube(ctx)
+	if err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("expected 1 recovered box, got %d", recovered)
+	}
+
+	refreshed, ok := r.GetBox("refresh-box")
+	if !ok {
+		t.Fatal("expected refresh-box to exist in memory")
+	}
+	if refreshed.Phase != v1alpha1.PodBoxPhasePaused {
+		t.Fatalf("expected refreshed phase to be Paused, got: %s", refreshed.Phase)
+	}
+	refreshedSpec, ok := r.GetBoxSpec("refresh-box")
+	if !ok || refreshedSpec.DesiredState != v1alpha1.DesiredStatePaused {
+		t.Fatalf("expected refreshed desired state Paused, got: %+v", refreshedSpec)
 	}
 }
