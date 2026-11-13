@@ -51,3 +51,14 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
+          {{- if .Values.templateBuild.enabled }}
+          volumeMounts:
+            - name: context-storage
+              mountPath: /var/lib/cubepod/context
+          {{- end }}
+      {{- if .Values.templateBuild.enabled }}
+      volumes:
+        - name: context-storage
+          persistentVolumeClaim:
+            claimName: cubepod-template-context
+      {{- end }}

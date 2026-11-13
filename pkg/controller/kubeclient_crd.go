@@ -399,3 +399,159 @@ func (c *RESTKubeClient) DeletePodWarmPool(ctx context.Context, namespace, name 
 	body, _ := io.ReadAll(resp.Body)
 	return fmt.Errorf("DeletePodWarmPool failed: status %d (%s)", resp.StatusCode, string(body))
 }
+
+// ListPodTemplates lists all PodTemplate Custom Resources in the given namespace.
+func (c *RESTKubeClient) ListPodTemplates(ctx context.Context, namespace string) ([]v1alpha1.PodTemplate, error) {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podtemplates", c.baseURL, ns)
+
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ListPodTemplates request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return []v1alpha1.PodTemplate{}, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("ListPodTemplates failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	var list v1alpha1.PodTemplateList
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("failed to decode PodTemplateList: %w", err)
+	}
+	if list.Items == nil {
+		return []v1alpha1.PodTemplate{}, nil
+	}
+	return list.Items, nil
+}
+
+// GetPodTemplate retrieves a PodTemplate Custom Resource by namespace and name.
+func (c *RESTKubeClient) GetPodTemplate(ctx context.Context, namespace, name string) (*v1alpha1.PodTemplate, error) {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podtemplates/%s", c.baseURL, ns, name)
+
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GetPodTemplate request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("podtemplate %s/%s not found", ns, name)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GetPodTemplate failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	var tpl v1alpha1.PodTemplate
+	if err := json.NewDecoder(resp.Body).Decode(&tpl); err != nil {
+		return nil, fmt.Errorf("failed to decode PodTemplate: %w", err)
+	}
+	return &tpl, nil
+}
+
+// CreatePodTemplate creates a PodTemplate Custom Resource in the Kubernetes APIServer.
+func (c *RESTKubeClient) CreatePodTemplate(ctx context.Context, template v1alpha1.PodTemplate) error {
+	ns := c.resolveNamespace(template.Metadata.Namespace)
+	template.Metadata.Namespace = ns
+	name := template.Metadata.Name
+	if name == "" {
+		return fmt.Errorf("PodTemplate metadata.name is required")
+	}
+	if template.APIVersion == "" {
+		template.APIVersion = "cubepod.io/v1alpha1"
+	}
+	if template.Kind == "" {
+		template.Kind = "PodTemplate"
+	}
+
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podtemplates", c.baseURL, ns)
+	payload, err := json.Marshal(template)
+	if err != nil {
+		return fmt.Errorf("failed to marshal PodTemplate JSON: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("CreatePodTemplate POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+
+	if resp.StatusCode == http.StatusConflict {
+		return fmt.Errorf("podtemplate %s/%s already exists: status 409", ns, name)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("CreatePodTemplate failed: status %d (%s)", resp.StatusCode, string(body))
+}
+
+// UpdatePodTemplateStatus updates the status subresource of a PodTemplate Custom Resource.
+func (c *RESTKubeClient) UpdatePodTemplateStatus(ctx context.Context, template v1alpha1.PodTemplate) error {
+	ns := c.resolveNamespace(template.Metadata.Namespace)
+	name := template.Metadata.Name
+	if name == "" {
+		return fmt.Errorf("PodTemplate metadata.name is required")
+	}
+
+	existing, err := c.GetPodTemplate(ctx, ns, name)
+	if err != nil {
+		return fmt.Errorf("failed to get existing PodTemplate for status update: %w", err)
+	}
+	template.Metadata.ResourceVersion = existing.Metadata.ResourceVersion
+	if template.APIVersion == "" {
+		template.APIVersion = "cubepod.io/v1alpha1"
+	}
+	if template.Kind == "" {
+		template.Kind = "PodTemplate"
+	}
+
+	statusURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podtemplates/%s/status", c.baseURL, ns, name)
+	payload, err := json.Marshal(template)
+	if err != nil {
+		return fmt.Errorf("failed to marshal PodTemplate status JSON: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPut, statusURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("UpdatePodTemplateStatus PUT failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("UpdatePodTemplateStatus failed: status %d (%s)", resp.StatusCode, string(body))
+}
+
+// DeletePodTemplate deletes a PodTemplate Custom Resource by namespace and name, ignoring 404 NotFound.
+func (c *RESTKubeClient) DeletePodTemplate(ctx context.Context, namespace, name string) error {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podtemplates/%s", c.baseURL, ns, name)
+
+	resp, err := c.doRequest(ctx, http.MethodDelete, url, nil)
+	if err != nil {
+		return fmt.Errorf("DeletePodTemplate request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted ||
+		resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("DeletePodTemplate failed: status %d (%s)", resp.StatusCode, string(body))
+}

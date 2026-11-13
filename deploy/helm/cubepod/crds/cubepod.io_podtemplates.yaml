@@ -18,6 +18,8 @@ spec:
     - name: v1alpha1
       served: true
       storage: true
+      subresources:
+        status: {}
       schema:
         openAPIV3Schema:
           type: object
@@ -62,13 +64,54 @@ spec:
                       type: string
                     exchangeUrl:
                       type: string
+                names:
+                  type: array
+                  items:
+                    type: string
+                cpuCount:
+                  type: integer
+                memoryMB:
+                  type: integer
+                diskSizeMB:
+                  type: integer
+                public:
+                  type: boolean
+                startCmd:
+                  type: string
+                readyCmd:
+                  type: string
+                runAsUser:
+                  type: integer
+                  format: int64
+                runAsGroup:
+                  type: integer
+                  format: int64
+                runAsUsername:
+                  type: string
+            status:
+              type: object
+              properties:
+                templateID:
+                  type: string
+                readyBuildID:
+                  type: string
+                readyImage:
+                  type: string
+                latestBuildID:
+                  type: string
+                buildStatus:
+                  type: string
+                reason:
+                  type: string
+                public:
+                  type: boolean
       additionalPrinterColumns:
         - name: Image
           type: string
-          jsonPath: .spec.image
-        - name: RuntimeClass
+          jsonPath: .status.readyImage
+        - name: Build
           type: string
-          jsonPath: .spec.runtimeClassName
+          jsonPath: .status.buildStatus
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp

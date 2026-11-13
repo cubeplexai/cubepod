@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +46,12 @@ type KubeClient interface {
 	GetPodWarmPool(ctx context.Context, namespace, name string) (*v1alpha1.PodWarmPool, error)
 	ListPodWarmPools(ctx context.Context, namespace string) ([]v1alpha1.PodWarmPool, error)
 	DeletePodWarmPool(ctx context.Context, namespace, name string) error
+
+	ListPodTemplates(ctx context.Context, namespace string) ([]v1alpha1.PodTemplate, error)
+	GetPodTemplate(ctx context.Context, namespace, name string) (*v1alpha1.PodTemplate, error)
+	CreatePodTemplate(ctx context.Context, template v1alpha1.PodTemplate) error
+	UpdatePodTemplateStatus(ctx context.Context, template v1alpha1.PodTemplate) error
+	DeletePodTemplate(ctx context.Context, namespace, name string) error
 }
 
 // MemoryKubeClient is an in-memory, thread-safe implementation of KubeClient
@@ -55,6 +63,7 @@ type MemoryKubeClient struct {
 	IPs       map[string]string
 	Boxes     map[string]v1alpha1.PodBox
 	WarmPools map[string]v1alpha1.PodWarmPool
+	Templates map[string]v1alpha1.PodTemplate
 }
 
 // NewMemoryKubeClient creates a new in-memory KubeClient.
@@ -65,6 +74,7 @@ func NewMemoryKubeClient() *MemoryKubeClient {
 		IPs:       make(map[string]string),
 		Boxes:     make(map[string]v1alpha1.PodBox),
 		WarmPools: make(map[string]v1alpha1.PodWarmPool),
+		Templates: make(map[string]v1alpha1.PodTemplate),
 	}
 }
 
@@ -87,6 +97,151 @@ func boxKey(namespace, name string) string {
 		namespace = "default"
 	}
 	return fmt.Sprintf("%s/%s", namespace, name)
+}
+
+func templateKey(namespace, name string) string {
+	if namespace == "" {
+		namespace = "default"
+	}
+	return fmt.Sprintf("%s/%s", namespace, name)
+}
+
+func persistLocalTemplate(template v1alpha1.PodTemplate) {
+	stateDir := os.Getenv("CUBEPOD_STATE")
+	if stateDir == "" {
+		return
+	}
+	tplID := template.Status.TemplateID
+	if tplID == "" {
+		tplID = template.Metadata.Name
+	}
+	if tplID == "" {
+		return
+	}
+	dir := filepath.Join(stateDir, "templates")
+	_ = os.MkdirAll(dir, 0755)
+	filePath := filepath.Join(dir, tplID+".json")
+	data, err := json.MarshalIndent(template, "", "  ")
+	if err == nil {
+		_ = os.WriteFile(filePath, data, 0644)
+	}
+}
+
+func removeLocalTemplate(template v1alpha1.PodTemplate) {
+	stateDir := os.Getenv("CUBEPOD_STATE")
+	if stateDir == "" {
+		return
+	}
+	tplID := template.Status.TemplateID
+	if tplID == "" {
+		tplID = template.Metadata.Name
+	}
+	if tplID == "" {
+		return
+	}
+	filePath := filepath.Join(stateDir, "templates", tplID+".json")
+	_ = os.Remove(filePath)
+}
+
+// CreatePodTemplate stores a PodTemplate in memory.
+func (m *MemoryKubeClient) CreatePodTemplate(_ context.Context, template v1alpha1.PodTemplate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ns := template.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	key := templateKey(ns, template.Metadata.Name)
+	if _, exists := m.Templates[key]; exists {
+		return fmt.Errorf("podtemplate %s already exists: status 409", key)
+	}
+	m.Templates[key] = template
+	persistLocalTemplate(template)
+	return nil
+}
+
+// GetPodTemplate retrieves a stored PodTemplate by namespace and name.
+func (m *MemoryKubeClient) GetPodTemplate(_ context.Context, namespace, name string) (*v1alpha1.PodTemplate, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	tpl, ok := m.Templates[templateKey(namespace, name)]
+	if !ok {
+		return nil, fmt.Errorf("podtemplate %s/%s not found", namespace, name)
+	}
+	cp := tpl
+	return &cp, nil
+}
+
+// ListPodTemplates returns all PodTemplate instances matching the namespace (or all if namespace is empty).
+func (m *MemoryKubeClient) ListPodTemplates(_ context.Context, namespace string) ([]v1alpha1.PodTemplate, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	res := make([]v1alpha1.PodTemplate, 0, len(m.Templates))
+	for _, tpl := range m.Templates {
+		tplNs := tpl.Metadata.Namespace
+		if tplNs == "" {
+			tplNs = "default"
+		}
+		if namespace == "" || tplNs == namespace {
+			res = append(res, tpl)
+		}
+	}
+	return res, nil
+}
+
+// UpdatePodTemplateStatus updates the status and spec of an existing PodTemplate in memory.
+func (m *MemoryKubeClient) UpdatePodTemplateStatus(_ context.Context, template v1alpha1.PodTemplate) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ns := template.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	key := templateKey(ns, template.Metadata.Name)
+	existing, ok := m.Templates[key]
+	if !ok {
+		return fmt.Errorf("podtemplate %s/%s not found", ns, template.Metadata.Name)
+	}
+	existing.Status = template.Status
+	if template.Spec.Image != "" {
+		existing.Spec.Image = template.Spec.Image
+	}
+	if template.Spec.StartCmd != "" {
+		existing.Spec.StartCmd = template.Spec.StartCmd
+	}
+	if template.Spec.ReadyCmd != "" {
+		existing.Spec.ReadyCmd = template.Spec.ReadyCmd
+	}
+	if template.Spec.RunAsUser != nil {
+		existing.Spec.RunAsUser = template.Spec.RunAsUser
+	}
+	if template.Spec.RunAsGroup != nil {
+		existing.Spec.RunAsGroup = template.Spec.RunAsGroup
+	}
+	if template.Spec.RunAsUsername != "" {
+		existing.Spec.RunAsUsername = template.Spec.RunAsUsername
+	}
+	m.Templates[key] = existing
+	persistLocalTemplate(existing)
+	return nil
+}
+
+// DeletePodTemplate removes a PodTemplate from memory.
+func (m *MemoryKubeClient) DeletePodTemplate(_ context.Context, namespace, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	key := templateKey(namespace, name)
+	if tpl, ok := m.Templates[key]; ok {
+		removeLocalTemplate(tpl)
+		delete(m.Templates, key)
+	}
+	return nil
 }
 
 // UpsertPodBox records or updates the PodBox in memory.

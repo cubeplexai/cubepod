@@ -281,6 +281,31 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 		}
 	}
 
+	if tpl.StartCmd != "" {
+		mainContainer.Env = append(mainContainer.Env, EnvVar{
+			Name:  "CUBEPOD_START_CMD",
+			Value: tpl.StartCmd,
+		})
+	}
+	if tpl.RunAsUser != nil {
+		mainContainer.Env = append(mainContainer.Env, EnvVar{
+			Name:  "CUBEPOD_RUN_AS_USER",
+			Value: fmt.Sprintf("%d", *tpl.RunAsUser),
+		})
+	}
+	if tpl.RunAsGroup != nil {
+		mainContainer.Env = append(mainContainer.Env, EnvVar{
+			Name:  "CUBEPOD_RUN_AS_GROUP",
+			Value: fmt.Sprintf("%d", *tpl.RunAsGroup),
+		})
+	}
+	if tpl.RunAsUsername != "" {
+		mainContainer.Env = append(mainContainer.Env, EnvVar{
+			Name:  "CUBEPOD_RUN_AS_USERNAME",
+			Value: tpl.RunAsUsername,
+		})
+	}
+
 	containers := []ContainerManifest{mainContainer}
 
 	if tpl.Egress.Enabled {
@@ -333,6 +358,11 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 		}
 	}
 
+	pullSecrets := []string{"regcred", "hub.sensedeal.vip"}
+	if len(volumeMode) > 1 && volumeMode[1] != "" {
+		pullSecrets = append(pullSecrets, volumeMode[1])
+	}
+
 	return PodManifest{
 		Name:             podName,
 		RuntimeClassName: rtClass,
@@ -340,6 +370,6 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 		InitContainers:   initContainers,
 		Containers:       containers,
 		Volumes:          volumes,
-		ImagePullSecrets: []string{"regcred", "hub.sensedeal.vip"},
+		ImagePullSecrets: pullSecrets,
 	}
 }

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 // Common runtime errors.
@@ -11,6 +12,11 @@ var (
 	ErrSandboxAlreadyRunning = errors.New("sandbox already running")
 	ErrSourceSandboxNotFound = errors.New("source sandbox not found")
 )
+
+// LocalTemplateTag formats the Docker tag for local template builds: cubepod-templates/<slug>:<buildID>.
+func LocalTemplateTag(slug, buildID string) string {
+	return fmt.Sprintf("cubepod-templates/%s:%s", slug, buildID)
+}
 
 // SandboxSpec describes the configuration and metadata for running a sandbox instance.
 type SandboxSpec struct {

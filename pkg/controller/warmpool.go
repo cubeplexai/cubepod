@@ -15,6 +15,7 @@ type WarmPodEntry struct {
 	PodName          string           `json:"podName"`
 	RootfsPVCName    string           `json:"rootfsPVCName"`
 	WorkspacePVCName string           `json:"workspacePVCName"`
+	Image            string           `json:"image"`
 	Claimed          bool             `json:"claimed"`
 	ClaimedBy        string           `json:"claimedBy,omitempty"`
 	CreatedAt        time.Time        `json:"createdAt"`
