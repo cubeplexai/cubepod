@@ -71,6 +71,8 @@ When operating as the **Controller Agent**, follow this strict multi-agent deleg
 
 ### 4.2 Orchestration Rules
 
+The primary checkout `/home/chris/cubepod` stays on `main`. Every feature, bugfix, and CEP implementation is developed in its own Git worktree. Check out feature branches only inside that worktree. Leave the primary checkout free for `main`.
+
 1. **Strict Role Separation (Controller vs. `herdr` Workers)**:
    - **Controller Agent Responsibilities**: Authoring CEPs (`docs/enhancements/NNNN-*/`), decomposing milestones into parallelizable tasks with non-overlapping file ownership, creating isolated Git worktrees, dispatching `herdr` workers (`agy --model gemini-3.8-flash-medium --mode auto --dangerously-skip-permissions`), reviewing PRs (`gh pr diff` / `gh pr comment`), merging PRs (`gh pr merge --squash`), and cutting releases.
    - **Delegate All Execution & K8s Verification Details to Workers**: Never perform low-level coding, container image builds, or interactive Kubernetes cluster (`kubectl`) debugging directly inside the Controller session. Always assign a `herdr` worker session to execute implementation details, build/push test images, deploy manifests to the Kubernetes test cluster, and run `test/k8s-e2e`.
@@ -87,11 +89,19 @@ When operating as the **Controller Agent**, follow this strict multi-agent deleg
      ```
 
 3. **Isolated Git Worktrees & Non-Overlapping File Ownership**:
-   - Always create a dedicated Git worktree per parallel worker (`/tmp/cubepod-wt-cep<N>` on branch `feat/cep-<NNNN>-<slug>`) so concurrent workers never contend on `.git/index.lock` or overwrite each other's working tree:
+   - All feature development uses a dedicated Git worktree. Do this for a single change as well as for parallel workers. Do not implement a feature by checking out its branch in `/home/chris/cubepod`.
+   - One branch per worktree, under `/tmp/cubepod-wt-<slug>`. CEP work uses `/tmp/cubepod-wt-cep<N>` on `feat/cep-<NNNN>-<slug>`. Separate worktrees keep workers off the same `.git/index.lock` and off the same working tree.
+   - New branch, created from `main` inside the worktree:
      ```bash
      git worktree add -b feat/cep-0011-example /tmp/cubepod-wt-cep11 main
      ```
-   - Partition file paths across concurrent workers so each worker owns distinct packages/directories.
+   - Existing branch: if `/home/chris/cubepod` currently has it checked out, switch that checkout back to `main`, then attach the branch to a worktree:
+     ```bash
+     git checkout main
+     git worktree add /tmp/cubepod-wt-<slug> <existing-branch>
+     ```
+   - Edit, build, test, commit, and open the pull request from the worktree. Partition paths across concurrent workers so each worker owns distinct packages and directories.
+   - After the pull request merges, remove the worktree (`git worktree remove --force /tmp/cubepod-wt-<slug> && git worktree prune`). The primary checkout remains on `main`.
 
 4. **Pull Request Review & Merge Gate**:
    - Each worker must format, lint, test, commit, push its branch, and open a GitHub Pull Request (`gh pr create`) from its worktree.
