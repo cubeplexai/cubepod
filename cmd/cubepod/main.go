@@ -4,8 +4,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -29,6 +31,11 @@ Global Flags:
 Commands:
   health                                      Check Gateway health status
   mcp                                         Start native Model Context Protocol (MCP) JSON-RPC stdio server
+  template list                               List available templates
+  template get <id-or-alias> [--alias]        Get template by ID or alias
+  template create --from-image <img> --alias <alias> [--cpu <n>] [--memory-mb <n>] [--disk-mb <n>]
+                                              Register template from existing OCI image
+  template delete <id> [--force]              Delete a template
   sandbox create [flags]                      Provision a new sandbox
   sandbox list [--template <id>]              List managed sandboxes
   sandbox get <sandbox-id>                    Get status for a sandbox
@@ -110,6 +117,13 @@ func main() {
 		if err := ServeMCP(ctx, c, os.Stdin, os.Stdout); err != nil {
 			fatal(err)
 		}
+
+	case "template":
+		if len(subArgs) == 0 {
+			printUsage()
+			os.Exit(1)
+		}
+		handleTemplate(ctx, c, subArgs, jsonOutput)
 
 	case "sandbox":
 		if len(subArgs) == 0 {
@@ -359,6 +373,209 @@ func handleSandbox(ctx context.Context, c *client.Client, args []string, jsonOut
 
 	default:
 		fatal(fmt.Errorf("unknown sandbox subcommand: %s", sub))
+	}
+}
+
+func handleTemplate(ctx context.Context, c *client.Client, args []string, jsonOutput bool) {
+	if err := runTemplate(ctx, c, args, jsonOutput, os.Stdout); err != nil {
+		fatal(err)
+	}
+}
+
+func runTemplate(ctx context.Context, c *client.Client, args []string, jsonOutput bool, out io.Writer) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: cubepod template <list|get|create|delete> [arguments...]")
+	}
+	sub := args[0]
+	rest := args[1:]
+
+	switch sub {
+	case "list":
+		list, err := c.ListTemplates(ctx)
+		if err != nil {
+			return err
+		}
+		if jsonOutput {
+			buf, err := json.MarshalIndent(list, "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(out, string(buf))
+			return nil
+		}
+		w := tabwriter.NewWriter(out, 0, 0, 3, ' ', 0)
+		fmt.Fprintln(w, "TEMPLATE ID\tALIASES\tSTATUS\tCPU\tMEMORY")
+		for _, tpl := range list {
+			id := tpl.TemplateID
+			if id == "" {
+				id = tpl.ID
+			}
+			aliases := strings.Join(tpl.Aliases, ", ")
+			if aliases == "" && len(tpl.Names) > 0 {
+				aliases = strings.Join(tpl.Names, ", ")
+			}
+			if aliases == "" && tpl.Image != "" {
+				aliases = tpl.Image
+			}
+			status := tpl.BuildStatus
+			if status == "" {
+				status = "ready"
+			}
+			memStr := "-"
+			if tpl.MemoryMB > 0 {
+				memStr = fmt.Sprintf("%d MB", tpl.MemoryMB)
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", id, aliases, status, tpl.CPUCount, memStr)
+		}
+		return w.Flush()
+
+	case "get":
+		var (
+			isAlias bool
+			target  string
+		)
+		for _, a := range rest {
+			if a == "--alias" || a == "-alias" {
+				isAlias = true
+			} else if !strings.HasPrefix(a, "-") && target == "" {
+				target = a
+			}
+		}
+		if target == "" {
+			return fmt.Errorf("usage: cubepod template get <id-or-alias> [--alias]")
+		}
+
+		var (
+			tpl *client.Template
+			err error
+		)
+		if isAlias {
+			tpl, err = c.GetTemplateByAlias(ctx, target)
+		} else {
+			tpl, err = c.GetTemplate(ctx, target)
+			if err != nil && !strings.Contains(target, "/") {
+				var apiErr *client.APIError
+				is404 := (errors.As(err, &apiErr) && apiErr.StatusCode == 404) || strings.Contains(err.Error(), "404")
+				if is404 {
+					if aliasTpl, aliasErr := c.GetTemplateByAlias(ctx, target); aliasErr == nil {
+						tpl = aliasTpl
+						err = nil
+					}
+				}
+			}
+		}
+		if err != nil {
+			return err
+		}
+
+		if jsonOutput {
+			buf, err := json.MarshalIndent(tpl, "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(out, string(buf))
+			return nil
+		}
+		fmt.Fprintf(out, "Template ID: %s\n", tpl.TemplateID)
+		if tpl.BuildID != "" {
+			fmt.Fprintf(out, "Build ID:    %s\n", tpl.BuildID)
+		}
+		if len(tpl.Aliases) > 0 {
+			fmt.Fprintf(out, "Aliases:     %s\n", strings.Join(tpl.Aliases, ", "))
+		}
+		if len(tpl.Names) > 0 {
+			fmt.Fprintf(out, "Names:       %s\n", strings.Join(tpl.Names, ", "))
+		}
+		if tpl.BuildStatus != "" {
+			fmt.Fprintf(out, "Status:      %s\n", tpl.BuildStatus)
+		}
+		if tpl.CPUCount > 0 {
+			fmt.Fprintf(out, "CPU:         %d\n", tpl.CPUCount)
+		}
+		if tpl.MemoryMB > 0 {
+			fmt.Fprintf(out, "Memory:      %d MB\n", tpl.MemoryMB)
+		}
+		if tpl.DiskSizeMB > 0 {
+			fmt.Fprintf(out, "Disk:        %d MB\n", tpl.DiskSizeMB)
+		}
+		fmt.Fprintf(out, "Public:      %t\n", tpl.Public)
+		return nil
+
+	case "create":
+		fs := flag.NewFlagSet("template create", flag.ContinueOnError)
+		fromImage := fs.String("from-image", "", "Source OCI image reference")
+		alias := fs.String("alias", "", "Template alias")
+		name := fs.String("name", "", "Template name")
+		cpu := fs.Int("cpu", 0, "CPU count")
+		memoryMB := fs.Int("memory-mb", 0, "Memory in MB")
+		diskMB := fs.Int("disk-mb", 0, "Minimum free disk in MB")
+		if err := fs.Parse(rest); err != nil {
+			return err
+		}
+		if *fromImage == "" || *alias == "" {
+			return fmt.Errorf("usage: cubepod template create --from-image <image> --alias <alias> [--cpu <n>] [--memory-mb <n>] [--disk-mb <n>]")
+		}
+
+		req := client.CreateTemplateFromImageRequest{
+			FromImage:     *fromImage,
+			Alias:         *alias,
+			Name:          *name,
+			CPUCount:      *cpu,
+			MemoryMB:      *memoryMB,
+			MinFreeDiskMB: *diskMB,
+		}
+		res, err := c.CreateTemplateFromImage(ctx, req)
+		if err != nil {
+			return err
+		}
+
+		if jsonOutput {
+			buf, err := json.MarshalIndent(res, "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(out, string(buf))
+			return nil
+		}
+		fmt.Fprintf(out, "Created template: %s (build: %s)\n", res.TemplateID, res.BuildID)
+		if len(res.Aliases) > 0 {
+			fmt.Fprintf(out, "Aliases: %s\n", strings.Join(res.Aliases, ", "))
+		}
+		return nil
+
+	case "delete":
+		var (
+			force  bool
+			target string
+		)
+		for _, a := range rest {
+			if a == "--force" || a == "-force" {
+				force = true
+			} else if !strings.HasPrefix(a, "-") && target == "" {
+				target = a
+			}
+		}
+		if target == "" {
+			return fmt.Errorf("usage: cubepod template delete <id> [--force]")
+		}
+
+		if err := c.DeleteTemplate(ctx, target, force); err != nil {
+			return err
+		}
+
+		if jsonOutput {
+			buf, err := json.MarshalIndent(map[string]string{"status": "deleted", "templateID": target}, "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(out, string(buf))
+			return nil
+		}
+		fmt.Fprintf(out, "Deleted template: %s\n", target)
+		return nil
+
+	default:
+		return fmt.Errorf("unknown template subcommand: %s", sub)
 	}
 }
 

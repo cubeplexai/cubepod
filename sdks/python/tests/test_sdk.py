@@ -423,6 +423,172 @@ class TestAsyncCubePod(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(info.sandbox_id, "cpod-retry")
             self.assertEqual(attempts, 2)
 
+    async def test_template_catalog_async(self) -> None:
+        recorded: list[dict[str, Any]] = []
+        legacy_list = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url_str = str(request.url)
+            method = request.method
+            body = None
+            if request.content:
+                try:
+                    body = json.loads(request.content)
+                except Exception:
+                    body = request.content
+            recorded.append({
+                "method": method,
+                "url": url_str,
+                "body": body,
+                "raw": request.content.decode("utf-8", errors="ignore"),
+            })
+
+            if method == "GET" and request.url.path == "/templates":
+                if legacy_list:
+                    return httpx.Response(200, json={"templates": [{"id": "cubeplex-desktop", "name": "Desktop"}]})
+                return httpx.Response(200, json=[{
+                    "templateID": "tpl_test_async",
+                    "buildID": "bld_1",
+                    "cpuCount": 2,
+                    "memoryMB": 2048,
+                    "diskSizeMB": 10240,
+                    "public": True,
+                    "aliases": ["py-async"],
+                    "names": ["py-async"],
+                    "buildStatus": "uploaded",
+                    "envdVersion": "cubepod-podd",
+                    "spawnCount": 3,
+                    "buildCount": 1,
+                }])
+
+            if method == "GET" and request.url.path == "/templates/tpl_test_async":
+                return httpx.Response(200, json={
+                    "templateID": "tpl_test_async",
+                    "buildID": "bld_1",
+                    "buildStatus": "ready",
+                })
+
+            if method == "GET" and request.url.path == "/templates/not-found":
+                return httpx.Response(404, json={"code": 404, "message": "not found"})
+
+            if method == "GET" and request.url.path == "/templates/aliases/py-async":
+                return httpx.Response(200, json={
+                    "templateID": "tpl_test_async",
+                    "aliases": ["py-async"],
+                })
+
+            if method == "POST" and request.url.path == "/v3/templates":
+                return httpx.Response(202, json={
+                    "templateID": "tpl_created_async",
+                    "buildID": "bld_created_async",
+                    "aliases": ["new-async"],
+                    "names": ["new-async"],
+                })
+
+            if method == "POST" and "/builds/" in request.url.path:
+                return httpx.Response(200, json={})
+
+            if method == "DELETE" and request.url.path.startswith("/templates/"):
+                if "conflict" in request.url.path:
+                    return httpx.Response(409, json={"code": 409, "message": "template in use"})
+                return httpx.Response(200, json={})
+
+            if method == "PATCH" and request.url.path.startswith("/templates/"):
+                return httpx.Response(200, json={"names": ["py-async"]})
+
+            return httpx.Response(404)
+
+        async with AsyncCubePod(transport=httpx.MockTransport(handler)) as client:
+            # 1. list_templates (array shape)
+            tpls = await client.list_templates()
+            self.assertEqual(len(tpls), 1)
+            self.assertEqual(tpls[0]["templateID"], "tpl_test_async")
+            self.assertEqual(tpls[0]["buildStatus"], "uploaded")
+            self.assertEqual(tpls[0]["cpuCount"], 2)
+
+            # 2. list_templates (legacy wrapper)
+            legacy_list = True
+            leg_tpls = await client.list_templates()
+            self.assertEqual(len(leg_tpls), 1)
+            self.assertEqual(leg_tpls[0]["id"], "cubeplex-desktop")
+
+            # 3. get_template
+            tpl = await client.get_template("tpl_test_async")
+            self.assertEqual(tpl["templateID"], "tpl_test_async")
+
+            with self.assertRaises(httpx.HTTPStatusError) as ctx_err:
+                await client.get_template("not-found")
+            self.assertEqual(ctx_err.exception.response.status_code, 404)
+
+            # 4. get_template_by_alias
+            alias_tpl = await client.get_template_by_alias("py-async")
+            self.assertEqual(alias_tpl["templateID"], "tpl_test_async")
+
+            # 5. create_template_from_image
+            created = await client.create_template_from_image(
+                from_image="python:3.13",
+                alias="new-async",
+                cpu_count=2,
+                memory_mb=2048,
+                min_free_disk_mb=10240,
+            )
+            self.assertEqual(created["templateID"], "tpl_created_async")
+            self.assertEqual(created["buildID"], "bld_created_async")
+            self.assertIn("new-async", created["aliases"])
+
+            # Check v3 request
+            v3_call = recorded[-2]
+            self.assertEqual(v3_call["method"], "POST")
+            self.assertTrue(v3_call["url"].endswith("/v3/templates"))
+            self.assertEqual(v3_call["body"]["alias"], "new-async")
+            self.assertEqual(v3_call["body"]["cpuCount"], 2)
+            self.assertEqual(v3_call["body"]["memoryMB"], 2048)
+            self.assertEqual(v3_call["body"]["minFreeDiskMb"], 10240)
+            self.assertNotIn("name", v3_call["body"])
+
+            # Check v2 build request
+            v2_call = recorded[-1]
+            self.assertEqual(v2_call["method"], "POST")
+            self.assertTrue("/v2/templates/tpl_created_async/builds/bld_created_async" in v2_call["url"])
+            self.assertEqual(v2_call["body"]["fromImage"], "python:3.13")
+            self.assertEqual(v2_call["body"]["steps"], [])
+            self.assertNotIn("dockerfile", v2_call["raw"].lower())
+
+            # 6. delete_template (force=False and force=True)
+            await client.delete_template("tpl_created_async", force=False)
+            self.assertEqual(recorded[-1]["method"], "DELETE")
+            self.assertNotIn("force=true", recorded[-1]["url"])
+
+            await client.delete_template("tpl_created_async", force=True)
+            self.assertIn("force=true", recorded[-1]["url"])
+
+            # 409 conflict surfaces error body
+            with self.assertRaises(httpx.HTTPStatusError) as conflict_ctx:
+                await client.delete_template("conflict-tpl")
+            self.assertEqual(conflict_ctx.exception.response.status_code, 409)
+            self.assertIn("template in use", conflict_ctx.exception.response.text)
+
+            # 7. set_template_public
+            await client.set_template_public("tpl_created_async")
+            self.assertEqual(recorded[-1]["method"], "PATCH")
+            self.assertEqual(recorded[-1]["body"], {"public": True})
+
+            # 8. build_template
+            bld_res = await client.build_template(
+                name="async-builder",
+                alias="async-bld",
+                from_image="ubuntu:24.04",
+                steps=[{"type": "RUN", "args": ["echo hi"]}],
+                start_cmd="echo start",
+                ready_cmd="true",
+                force=True,
+            )
+            self.assertEqual(bld_res["templateID"], "tpl_created_async")
+            self.assertEqual(recorded[-1]["body"]["steps"], [{"type": "RUN", "args": ["echo hi"]}])
+            self.assertEqual(recorded[-1]["body"]["startCmd"], "echo start")
+            self.assertEqual(recorded[-1]["body"]["readyCmd"], "true")
+            self.assertTrue(recorded[-1]["body"]["force"])
+
 
 class TestSyncCubePod(unittest.TestCase):
     def test_sync_client_complete(self) -> None:
@@ -553,6 +719,172 @@ class TestSyncCubePod(unittest.TestCase):
             self.assertEqual(len(tpls), 1)
 
             client.delete("cpod-sync-1")
+
+    def test_template_catalog_sync(self) -> None:
+        recorded: list[dict[str, Any]] = []
+        legacy_list = False
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            url_str = str(request.url)
+            method = request.method
+            body = None
+            if request.content:
+                try:
+                    body = json.loads(request.content)
+                except Exception:
+                    body = request.content
+            recorded.append({
+                "method": method,
+                "url": url_str,
+                "body": body,
+                "raw": request.content.decode("utf-8", errors="ignore"),
+            })
+
+            if method == "GET" and request.url.path == "/templates":
+                if legacy_list:
+                    return httpx.Response(200, json={"templates": [{"id": "cubeplex-desktop", "name": "Desktop"}]})
+                return httpx.Response(200, json=[{
+                    "templateID": "tpl_test_sync",
+                    "buildID": "bld_sync_1",
+                    "cpuCount": 4,
+                    "memoryMB": 4096,
+                    "diskSizeMB": 20480,
+                    "public": False,
+                    "aliases": ["py-sync"],
+                    "names": ["py-sync"],
+                    "buildStatus": "uploaded",
+                    "envdVersion": "cubepod-podd",
+                    "spawnCount": 1,
+                    "buildCount": 1,
+                }])
+
+            if method == "GET" and request.url.path == "/templates/tpl_test_sync":
+                return httpx.Response(200, json={
+                    "templateID": "tpl_test_sync",
+                    "buildID": "bld_sync_1",
+                    "buildStatus": "ready",
+                })
+
+            if method == "GET" and request.url.path == "/templates/not-found":
+                return httpx.Response(404, json={"code": 404, "message": "not found"})
+
+            if method == "GET" and request.url.path == "/templates/aliases/py-sync":
+                return httpx.Response(200, json={
+                    "templateID": "tpl_test_sync",
+                    "aliases": ["py-sync"],
+                })
+
+            if method == "POST" and request.url.path == "/v3/templates":
+                return httpx.Response(202, json={
+                    "templateID": "tpl_created_sync",
+                    "buildID": "bld_created_sync",
+                    "aliases": ["new-sync"],
+                    "names": ["new-sync"],
+                })
+
+            if method == "POST" and "/builds/" in request.url.path:
+                return httpx.Response(200, json={})
+
+            if method == "DELETE" and request.url.path.startswith("/templates/"):
+                if "conflict" in request.url.path:
+                    return httpx.Response(409, json={"code": 409, "message": "template in use"})
+                return httpx.Response(200, json={})
+
+            if method == "PATCH" and request.url.path.startswith("/templates/"):
+                return httpx.Response(200, json={"names": ["py-sync"]})
+
+            return httpx.Response(404)
+
+        with SyncCubePod(transport=httpx.MockTransport(handler)) as client:
+            # 1. list_templates (array shape)
+            tpls = client.list_templates()
+            self.assertEqual(len(tpls), 1)
+            self.assertEqual(tpls[0]["templateID"], "tpl_test_sync")
+            self.assertEqual(tpls[0]["buildStatus"], "uploaded")
+            self.assertEqual(tpls[0]["cpuCount"], 4)
+
+            # 2. list_templates (legacy wrapper)
+            legacy_list = True
+            leg_tpls = client.list_templates()
+            self.assertEqual(len(leg_tpls), 1)
+            self.assertEqual(leg_tpls[0]["id"], "cubeplex-desktop")
+
+            # 3. get_template
+            tpl = client.get_template("tpl_test_sync")
+            self.assertEqual(tpl["templateID"], "tpl_test_sync")
+
+            with self.assertRaises(httpx.HTTPStatusError) as ctx_err:
+                client.get_template("not-found")
+            self.assertEqual(ctx_err.exception.response.status_code, 404)
+
+            # 4. get_template_by_alias
+            alias_tpl = client.get_template_by_alias("py-sync")
+            self.assertEqual(alias_tpl["templateID"], "tpl_test_sync")
+
+            # 5. create_template_from_image
+            created = client.create_template_from_image(
+                from_image="python:3.13",
+                alias="new-sync",
+                cpu_count=4,
+                memory_mb=4096,
+                min_free_disk_mb=20480,
+            )
+            self.assertEqual(created["templateID"], "tpl_created_sync")
+            self.assertEqual(created["buildID"], "bld_created_sync")
+            self.assertIn("new-sync", created["aliases"])
+
+            # Check v3 request
+            v3_call = recorded[-2]
+            self.assertEqual(v3_call["method"], "POST")
+            self.assertTrue(v3_call["url"].endswith("/v3/templates"))
+            self.assertEqual(v3_call["body"]["alias"], "new-sync")
+            self.assertEqual(v3_call["body"]["cpuCount"], 4)
+            self.assertEqual(v3_call["body"]["memoryMB"], 4096)
+            self.assertEqual(v3_call["body"]["minFreeDiskMb"], 20480)
+            self.assertNotIn("name", v3_call["body"])
+
+            # Check v2 build request
+            v2_call = recorded[-1]
+            self.assertEqual(v2_call["method"], "POST")
+            self.assertTrue("/v2/templates/tpl_created_sync/builds/bld_created_sync" in v2_call["url"])
+            self.assertEqual(v2_call["body"]["fromImage"], "python:3.13")
+            self.assertEqual(v2_call["body"]["steps"], [])
+            self.assertNotIn("dockerfile", v2_call["raw"].lower())
+
+            # 6. delete_template (force=False and force=True)
+            client.delete_template("tpl_created_sync", force=False)
+            self.assertEqual(recorded[-1]["method"], "DELETE")
+            self.assertNotIn("force=true", recorded[-1]["url"])
+
+            client.delete_template("tpl_created_sync", force=True)
+            self.assertIn("force=true", recorded[-1]["url"])
+
+            # 409 conflict surfaces error body
+            with self.assertRaises(httpx.HTTPStatusError) as conflict_ctx:
+                client.delete_template("conflict-tpl")
+            self.assertEqual(conflict_ctx.exception.response.status_code, 409)
+            self.assertIn("template in use", conflict_ctx.exception.response.text)
+
+            # 7. set_template_public
+            client.set_template_public("tpl_created_sync")
+            self.assertEqual(recorded[-1]["method"], "PATCH")
+            self.assertEqual(recorded[-1]["body"], {"public": True})
+
+            # 8. build_template
+            bld_res = client.build_template(
+                name="sync-builder",
+                alias="sync-bld",
+                from_image="ubuntu:24.04",
+                steps=[{"type": "RUN", "args": ["echo sync"]}],
+                start_cmd="echo start",
+                ready_cmd="true",
+                force=True,
+            )
+            self.assertEqual(bld_res["templateID"], "tpl_created_sync")
+            self.assertEqual(recorded[-1]["body"]["steps"], [{"type": "RUN", "args": ["echo sync"]}])
+            self.assertEqual(recorded[-1]["body"]["startCmd"], "echo start")
+            self.assertEqual(recorded[-1]["body"]["readyCmd"], "true")
+            self.assertTrue(recorded[-1]["body"]["force"])
 
 
 if __name__ == "__main__":

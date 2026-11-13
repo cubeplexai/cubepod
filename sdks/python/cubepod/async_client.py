@@ -438,6 +438,151 @@ class AsyncCubePod:
         data = resp.json()
         return data if isinstance(data, list) else data.get("templates", [])
 
+    async def get_template(self, template_id: str) -> dict[str, Any]:
+        """Fetch status and metadata for a specific template."""
+        resp = await self._request("GET", f"/templates/{template_id}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_template_by_alias(self, alias: str) -> dict[str, Any]:
+        """Fetch template metadata by alias name or tag."""
+        resp = await self._request("GET", f"/templates/aliases/{alias}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def create_template_from_image(
+        self,
+        from_image: str,
+        alias: str | None = None,
+        name: str | None = None,
+        cpu_count: int | None = None,
+        memory_mb: int | None = None,
+        min_free_disk_mb: int | None = None,
+    ) -> dict[str, Any]:
+        """Register a template from an existing OCI image without invoking BuildKit.
+
+        Calls POST /v3/templates with only the fields provided by the caller,
+        followed by POST /v2/templates/{templateID}/builds/{buildID} with fromImage
+        and an empty steps array. Returns a dict containing templateID, buildID, aliases, names.
+        """
+        payload: dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if alias is not None:
+            payload["alias"] = alias
+        if cpu_count is not None:
+            payload["cpuCount"] = cpu_count
+        if memory_mb is not None:
+            payload["memoryMB"] = memory_mb
+        if min_free_disk_mb is not None:
+            payload["minFreeDiskMb"] = min_free_disk_mb
+
+        resp = await self._request("POST", "/v3/templates", json=payload)
+        resp.raise_for_status()
+        created = resp.json()
+
+        template_id = created.get("templateID")
+        build_id = created.get("buildID")
+
+        build_payload: dict[str, Any] = {
+            "fromImage": from_image,
+            "steps": [],
+        }
+        build_resp = await self._request(
+            "POST",
+            f"/v2/templates/{template_id}/builds/{build_id}",
+            json=build_payload,
+        )
+        build_resp.raise_for_status()
+
+        return {
+            "templateID": template_id,
+            "buildID": build_id,
+            "aliases": created.get("aliases", []),
+            "names": created.get("names", []),
+        }
+
+    async def delete_template(self, template_id: str, force: bool = False) -> None:
+        """Delete a template by templateID. If force is True, appends ?force=true."""
+        params = {"force": "true"} if force else None
+        resp = await self._request("DELETE", f"/templates/{template_id}", params=params)
+        resp.raise_for_status()
+
+    async def set_template_public(self, template_id: str) -> dict[str, Any] | None:
+        """Mark a template as public via PATCH /templates/{templateID} with {"public":true}."""
+        resp = await self._request("PATCH", f"/templates/{template_id}", json={"public": True})
+        resp.raise_for_status()
+        if resp.content:
+            return resp.json()
+        return None
+
+    async def build_template(
+        self,
+        name: str | None = None,
+        alias: str | None = None,
+        cpu_count: int | None = None,
+        memory_mb: int | None = None,
+        min_free_disk_mb: int | None = None,
+        from_image: str | None = None,
+        from_template: str | None = None,
+        steps: list[dict[str, Any]] | None = None,
+        start_cmd: str | None = None,
+        ready_cmd: str | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Thin helper for Beta template builds: registers via POST /v3/templates
+        and triggers build via POST /v2/templates/{templateID}/builds/{buildID}.
+
+        Note: uploading context files (tar archives) via PUT /templates/{templateID}/files/{hash}
+        is the caller's responsibility.
+        """
+        payload: dict[str, Any] = {}
+        if name is not None:
+            payload["name"] = name
+        if alias is not None:
+            payload["alias"] = alias
+        if cpu_count is not None:
+            payload["cpuCount"] = cpu_count
+        if memory_mb is not None:
+            payload["memoryMB"] = memory_mb
+        if min_free_disk_mb is not None:
+            payload["minFreeDiskMb"] = min_free_disk_mb
+
+        resp = await self._request("POST", "/v3/templates", json=payload)
+        resp.raise_for_status()
+        created = resp.json()
+
+        template_id = created.get("templateID")
+        build_id = created.get("buildID")
+
+        build_payload: dict[str, Any] = {
+            "steps": steps if steps is not None else [],
+        }
+        if from_image is not None:
+            build_payload["fromImage"] = from_image
+        if from_template is not None:
+            build_payload["fromTemplate"] = from_template
+        if start_cmd is not None:
+            build_payload["startCmd"] = start_cmd
+        if ready_cmd is not None:
+            build_payload["readyCmd"] = ready_cmd
+        if force:
+            build_payload["force"] = True
+
+        build_resp = await self._request(
+            "POST",
+            f"/v2/templates/{template_id}/builds/{build_id}",
+            json=build_payload,
+        )
+        build_resp.raise_for_status()
+
+        return {
+            "templateID": template_id,
+            "buildID": build_id,
+            "aliases": created.get("aliases", []),
+            "names": created.get("names", []),
+        }
+
     async def close(self) -> None:
         """Close the underlying HTTP client session."""
         await self._client.aclose()

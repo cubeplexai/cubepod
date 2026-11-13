@@ -440,6 +440,7 @@ func TestClient_ListWarmPools_WrappedResponse(t *testing.T) {
 			"totalReady":         3,
 		})
 	})
+
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
@@ -454,4 +455,376 @@ func TestClient_ListWarmPools_WrappedResponse(t *testing.T) {
 	if pools[0].Name != "wrapped-pool" || pools[0].AvailableReplicas != 3 {
 		t.Fatalf("unexpected pool data: %+v", pools[0])
 	}
+}
+
+func TestClient_Templates(t *testing.T) {
+	type recordedReq struct {
+		method  string
+		path    string
+		query   string
+		body    map[string]interface{}
+		rawBody string
+	}
+
+	var recorded []recordedReq
+	record := func(r *http.Request) recordedReq {
+		rec := recordedReq{
+			method: r.Method,
+			path:   r.URL.Path,
+			query:  r.URL.RawQuery,
+		}
+		bodyBytes, _ := io.ReadAll(r.Body)
+		rec.rawBody = string(bodyBytes)
+		if len(bodyBytes) > 0 {
+			_ = json.Unmarshal(bodyBytes, &rec.body)
+		}
+		recorded = append(recorded, rec)
+		return rec
+	}
+
+	legacyList := false
+
+	mux := http.NewServeMux()
+
+	// 1. List templates
+	mux.HandleFunc("GET /templates", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		w.Header().Set("Content-Type", "application/json")
+		if legacyList {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"templates": []map[string]interface{}{
+					{
+						"id":          "cubeplex-ubuntu24-desktop",
+						"name":        "Desktop",
+						"image":       "cubeplex-ubuntu24-desktop:latest",
+						"description": "Standard Ubuntu 24.04 desktop",
+					},
+				},
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode([]map[string]interface{}{
+			{
+				"templateID":  "tpl_abc123",
+				"buildID":     "bld_xyz789",
+				"cpuCount":    4,
+				"memoryMB":    4096,
+				"diskSizeMB":  20480,
+				"public":      true,
+				"aliases":     []string{"my-alias", "my-alias:v1"},
+				"names":       []string{"my-alias", "my-alias:v1"},
+				"buildStatus": "uploaded",
+				"envdVersion": "cubepod-podd",
+				"spawnCount":  5,
+				"buildCount":  2,
+			},
+		})
+	})
+
+	// 2. Get template by ID
+	mux.HandleFunc("GET /templates/{id}", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		id := r.PathValue("id")
+		if id == "not-found" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":404,"message":"template not found"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"templateID":  id,
+			"buildID":     "bld_get_1",
+			"cpuCount":    2,
+			"memoryMB":    2048,
+			"diskSizeMB":  10240,
+			"public":      false,
+			"aliases":     []string{"alias-get"},
+			"names":       []string{"alias-get"},
+			"buildStatus": "ready",
+			"envdVersion": "cubepod-podd",
+			"spawnCount":  1,
+			"buildCount":  1,
+		})
+	})
+
+	// 3. Get template by alias
+	mux.HandleFunc("GET /templates/aliases/{alias}", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		alias := r.PathValue("alias")
+		if alias == "unknown-alias" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":404,"message":"alias not found"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"templateID":  "tpl_by_alias",
+			"buildID":     "bld_by_alias",
+			"cpuCount":    2,
+			"memoryMB":    2048,
+			"diskSizeMB":  10240,
+			"public":      true,
+			"aliases":     []string{alias},
+			"names":       []string{alias},
+			"buildStatus": "ready",
+		})
+	})
+
+	// 4. Create template v3
+	mux.HandleFunc("POST /v3/templates", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"templateID": "tpl_new_123",
+			"buildID":    "bld_new_456",
+			"public":     false,
+			"aliases":    []string{"custom-alias"},
+			"names":      []string{"custom-alias"},
+		})
+	})
+
+	// 5. Start build v2
+	mux.HandleFunc("POST /v2/templates/{templateID}/builds/{buildID}", func(w http.ResponseWriter, r *http.Request) {
+		rec := record(r)
+		// Check for unknown step type test case
+		steps, _ := rec.body["steps"].([]interface{})
+		for _, s := range steps {
+			if sm, ok := s.(map[string]interface{}); ok {
+				if sm["type"] == "UNKNOWN_STEP" {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"code":400,"message":"unknown step type: UNKNOWN_STEP"}`))
+					return
+				}
+			}
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	})
+
+	// 6. Delete template
+	mux.HandleFunc("DELETE /templates/{id}", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		id := r.PathValue("id")
+		if id == "tpl-in-use" {
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"code":409,"message":"template is referenced by active podbox cpod-active"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// 7. Patch template public
+	mux.HandleFunc("PATCH /templates/{id}", func(w http.ResponseWriter, r *http.Request) {
+		record(r)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"names":["my-tpl"]}`))
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	c := client.New(server.URL)
+	ctx := context.Background()
+
+	// A. ListTemplates (standard shape)
+	tpls, err := c.ListTemplates(ctx)
+	if err != nil {
+		t.Fatalf("ListTemplates failed: %v", err)
+	}
+	if len(tpls) != 1 {
+		t.Fatalf("expected 1 template, got %d", len(tpls))
+	}
+	tpl0 := tpls[0]
+	if tpl0.TemplateID != "tpl_abc123" || tpl0.BuildID != "bld_xyz789" || tpl0.CPUCount != 4 || tpl0.MemoryMB != 4096 || tpl0.DiskSizeMB != 20480 || !tpl0.Public || tpl0.BuildStatus != "uploaded" || tpl0.EnvdVersion != "cubepod-podd" || tpl0.SpawnCount != 5 || tpl0.BuildCount != 2 {
+		t.Fatalf("unexpected fields preserved in template: %+v", tpl0)
+	}
+	if len(tpl0.Aliases) != 2 || tpl0.Aliases[0] != "my-alias" {
+		t.Fatalf("unexpected aliases: %v", tpl0.Aliases)
+	}
+
+	// B. ListTemplates (legacy shape)
+	legacyList = true
+	legacyTpls, err := c.ListTemplates(ctx)
+	if err != nil {
+		t.Fatalf("legacy ListTemplates failed: %v", err)
+	}
+	if len(legacyTpls) != 1 || legacyTpls[0].TemplateID != "cubeplex-ubuntu24-desktop" {
+		t.Fatalf("expected legacy template decoded, got: %+v", legacyTpls)
+	}
+
+	// C. GetTemplate
+	recBefore := len(recorded)
+	getTpl, err := c.GetTemplate(ctx, "tpl_get_123")
+	if err != nil {
+		t.Fatalf("GetTemplate failed: %v", err)
+	}
+	if getTpl.TemplateID != "tpl_get_123" || getTpl.BuildStatus != "ready" {
+		t.Fatalf("unexpected GetTemplate result: %+v", getTpl)
+	}
+	if recorded[len(recorded)-1].method != http.MethodGet || recorded[len(recorded)-1].path != "/templates/tpl_get_123" {
+		t.Fatalf("unexpected request for GetTemplate: %+v", recorded[len(recorded)-1])
+	}
+
+	// GetTemplate 404
+	_, err = c.GetTemplate(ctx, "not-found")
+	if err == nil {
+		t.Fatal("expected error on 404, got nil")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Fatalf("expected error to include status code 404, got: %v", err)
+	}
+
+	// D. GetTemplateByAlias
+	aliasTpl, err := c.GetTemplateByAlias(ctx, "my-tag:v1")
+	if err != nil {
+		t.Fatalf("GetTemplateByAlias failed: %v", err)
+	}
+	if aliasTpl.TemplateID != "tpl_by_alias" {
+		t.Fatalf("unexpected GetTemplateByAlias result: %+v", aliasTpl)
+	}
+	if recorded[len(recorded)-1].method != http.MethodGet || recorded[len(recorded)-1].path != "/templates/aliases/my-tag:v1" {
+		t.Fatalf("unexpected request for GetTemplateByAlias: %+v", recorded[len(recorded)-1])
+	}
+
+	// E. CreateTemplateFromImage
+	createReq := client.CreateTemplateFromImageRequest{
+		FromImage:     "python:3.13",
+		Alias:         "custom-alias",
+		CPUCount:      2,
+		MemoryMB:      2048,
+		MinFreeDiskMB: 10240,
+	}
+	createdRes, err := c.CreateTemplateFromImage(ctx, createReq)
+	if err != nil {
+		t.Fatalf("CreateTemplateFromImage failed: %v", err)
+	}
+	if createdRes.TemplateID != "tpl_new_123" || createdRes.BuildID != "bld_new_456" {
+		t.Fatalf("unexpected created result: %+v", createdRes)
+	}
+	if len(createdRes.Aliases) != 1 || createdRes.Aliases[0] != "custom-alias" {
+		t.Fatalf("unexpected aliases in create result: %v", createdRes.Aliases)
+	}
+	if len(createdRes.Names) != 1 || createdRes.Names[0] != "custom-alias" {
+		t.Fatalf("unexpected names in create result: %v", createdRes.Names)
+	}
+
+	// Assert v3 request:
+	v3Req := recorded[len(recorded)-2]
+	if v3Req.method != http.MethodPost || v3Req.path != "/v3/templates" {
+		t.Fatalf("expected POST /v3/templates, got: %+v", v3Req)
+	}
+	if v3Req.body["alias"] != "custom-alias" || v3Req.body["cpuCount"] != float64(2) || v3Req.body["memoryMB"] != float64(2048) || v3Req.body["minFreeDiskMb"] != float64(10240) {
+		t.Fatalf("unexpected v3 body: %+v", v3Req.body)
+	}
+	if _, exists := v3Req.body["name"]; exists {
+		t.Fatalf("expected un-set 'name' to not be in v3 body, got: %+v", v3Req.body)
+	}
+
+	// Assert v2 build request:
+	v2Req := recorded[len(recorded)-1]
+	if v2Req.method != http.MethodPost || v2Req.path != "/v2/templates/tpl_new_123/builds/bld_new_456" {
+		t.Fatalf("expected POST /v2/templates/tpl_new_123/builds/bld_new_456, got: %+v", v2Req)
+	}
+	if v2Req.body["fromImage"] != "python:3.13" {
+		t.Fatalf("expected fromImage='python:3.13', got: %+v", v2Req.body)
+	}
+	steps, ok := v2Req.body["steps"].([]interface{})
+	if !ok || len(steps) != 0 {
+		t.Fatalf("expected empty steps array [], got: %+v", v2Req.body["steps"])
+	}
+	// Assert no Dockerfile is sent
+	if strings.Contains(strings.ToLower(v2Req.rawBody), "dockerfile") {
+		t.Fatalf("expected no Dockerfile in create-from-image build body, got: %s", v2Req.rawBody)
+	}
+
+	// F. DeleteTemplate (force=true and force=false)
+	if err := c.DeleteTemplate(ctx, "tpl_to_del", true); err != nil {
+		t.Fatalf("DeleteTemplate(force=true) failed: %v", err)
+	}
+	delRec := recorded[len(recorded)-1]
+	if delRec.method != http.MethodDelete || delRec.path != "/templates/tpl_to_del" || delRec.query != "force=true" {
+		t.Fatalf("expected DELETE /templates/tpl_to_del?force=true, got: %+v", delRec)
+	}
+
+	if err := c.DeleteTemplate(ctx, "tpl_to_del_noforce", false); err != nil {
+		t.Fatalf("DeleteTemplate(force=false) failed: %v", err)
+	}
+	delNoForceRec := recorded[len(recorded)-1]
+	if delNoForceRec.query != "" {
+		t.Fatalf("expected no force query param, got: %s", delNoForceRec.query)
+	}
+
+	// Assert 409 body surfaced
+	err = c.DeleteTemplate(ctx, "tpl-in-use", false)
+	if err == nil {
+		t.Fatal("expected conflict error on 409, got nil")
+	}
+	if !strings.Contains(err.Error(), "409") {
+		t.Fatalf("expected error to include 409 status code: %v", err)
+	}
+	if !strings.Contains(err.Error(), "template is referenced by active podbox cpod-active") {
+		t.Fatalf("expected error to surface 409 response body, got: %v", err)
+	}
+
+	// G. SetTemplatePublic
+	if err := c.SetTemplatePublic(ctx, "tpl_pub_1"); err != nil {
+		t.Fatalf("SetTemplatePublic failed: %v", err)
+	}
+	patchRec := recorded[len(recorded)-1]
+	if patchRec.method != http.MethodPatch || patchRec.path != "/templates/tpl_pub_1" {
+		t.Fatalf("expected PATCH /templates/tpl_pub_1, got: %+v", patchRec)
+	}
+	if patchRec.body["public"] != true {
+		t.Fatalf("expected body public:true, got: %+v", patchRec.body)
+	}
+
+	// H. BuildTemplate
+	buildReq := client.BuildTemplateRequest{
+		Name:      "built-tpl",
+		Alias:     "built-alias",
+		FromImage: "node:20",
+		Steps: []client.BuildStep{
+			{
+				Type: "RUN",
+				Args: []string{"npm install"},
+			},
+		},
+		StartCmd: "npm start",
+		ReadyCmd: "curl -sf http://localhost:3000",
+		Force:    true,
+	}
+	bldRes, err := c.BuildTemplate(ctx, buildReq)
+	if err != nil {
+		t.Fatalf("BuildTemplate failed: %v", err)
+	}
+	if bldRes.TemplateID != "tpl_new_123" {
+		t.Fatalf("unexpected BuildTemplate result: %+v", bldRes)
+	}
+	lastBldRec := recorded[len(recorded)-1]
+	if lastBldRec.body["startCmd"] != "npm start" || lastBldRec.body["readyCmd"] != "curl -sf http://localhost:3000" || lastBldRec.body["force"] != true {
+		t.Fatalf("unexpected build body: %+v", lastBldRec.body)
+	}
+	if bldSteps, ok := lastBldRec.body["steps"].([]interface{}); !ok || len(bldSteps) != 1 {
+		t.Fatalf("expected 1 step in build request, got: %+v", lastBldRec.body["steps"])
+	}
+
+	// BuildTemplate unknown step 400 error body surfaced
+	badBuildReq := client.BuildTemplateRequest{
+		Alias:     "bad-step-tpl",
+		FromImage: "node:20",
+		Steps: []client.BuildStep{
+			{
+				Type: "UNKNOWN_STEP",
+				Args: []string{"foo"},
+			},
+		},
+	}
+	_, err = c.BuildTemplate(ctx, badBuildReq)
+	if err == nil {
+		t.Fatal("expected error for unknown step type, got nil")
+	}
+	if !strings.Contains(err.Error(), "unknown step type: UNKNOWN_STEP") {
+		t.Fatalf("expected error to surface 400 body, got: %v", err)
+	}
+	_ = recBefore
 }

@@ -105,6 +105,70 @@ type WarmPool struct {
 	AvailableReplicas int32  `json:"availableReplicas,omitempty"`
 }
 
+// Template represents an E2B-compatible template catalog entry.
+type Template struct {
+	TemplateID  string   `json:"templateID,omitempty"`
+	ID          string   `json:"id,omitempty"` // legacy compatibility
+	BuildID     string   `json:"buildID,omitempty"`
+	CPUCount    int      `json:"cpuCount,omitempty"`
+	MemoryMB    int      `json:"memoryMB,omitempty"`
+	DiskSizeMB  int      `json:"diskSizeMB,omitempty"`
+	Public      bool     `json:"public,omitempty"`
+	Aliases     []string `json:"aliases,omitempty"`
+	Names       []string `json:"names,omitempty"`
+	BuildStatus string   `json:"buildStatus,omitempty"`
+	EnvdVersion string   `json:"envdVersion,omitempty"`
+	SpawnCount  int      `json:"spawnCount,omitempty"`
+	BuildCount  int      `json:"buildCount,omitempty"`
+	CreatedAt   string   `json:"createdAt,omitempty"`
+	UpdatedAt   string   `json:"updatedAt,omitempty"`
+	Image       string   `json:"image,omitempty"`       // legacy compatibility
+	Name        string   `json:"name,omitempty"`        // legacy compatibility
+	Description string   `json:"description,omitempty"` // legacy compatibility
+}
+
+// CreateTemplateFromImageRequest parameters for registering a template from an existing OCI image.
+type CreateTemplateFromImageRequest struct {
+	Name          string `json:"name,omitempty"`
+	Alias         string `json:"alias,omitempty"`
+	FromImage     string `json:"fromImage"`
+	CPUCount      int    `json:"cpuCount,omitempty"`
+	MemoryMB      int    `json:"memoryMB,omitempty"`
+	MinFreeDiskMB int    `json:"minFreeDiskMb,omitempty"`
+}
+
+// TemplateCreateResult represents the response returned by template registration/build calls.
+type TemplateCreateResult struct {
+	TemplateID string   `json:"templateID"`
+	BuildID    string   `json:"buildID"`
+	Aliases    []string `json:"aliases"`
+	Names      []string `json:"names"`
+	Public     bool     `json:"public,omitempty"`
+}
+
+// BuildStep represents a single step in an E2B-compatible template build recipe.
+type BuildStep struct {
+	Type      string   `json:"type"`
+	Args      []string `json:"args"`
+	FilesHash string   `json:"filesHash,omitempty"`
+	Force     bool     `json:"force,omitempty"`
+}
+
+// BuildTemplateRequest parameters for building a template via rootless BuildKit.
+type BuildTemplateRequest struct {
+	Name          string      `json:"name,omitempty"`
+	Alias         string      `json:"alias,omitempty"`
+	CPUCount      int         `json:"cpuCount,omitempty"`
+	MemoryMB      int         `json:"memoryMB,omitempty"`
+	MinFreeDiskMB int         `json:"minFreeDiskMb,omitempty"`
+	FromImage     string      `json:"fromImage,omitempty"`
+	FromTemplate  string      `json:"fromTemplate,omitempty"`
+	Steps         []BuildStep `json:"steps"`
+	StartCmd      string      `json:"startCmd,omitempty"`
+	ReadyCmd      string      `json:"readyCmd,omitempty"`
+	Force         bool        `json:"force,omitempty"`
+}
+
 // Option configures a Client instance.
 type Option func(*Client)
 
@@ -129,6 +193,16 @@ func WithTimeout(timeout time.Duration) Option {
 	return func(c *Client) {
 		c.httpClient.Timeout = timeout
 	}
+}
+
+// APIError represents an HTTP error response from the CubePod API.
+type APIError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("cubepod error (HTTP %d): %s", e.StatusCode, e.Body)
 }
 
 // Client is the Go client for interacting with the CubePod Control Plane Gateway.
@@ -178,7 +252,7 @@ func (c *Client) do(req *http.Request) (*http.Response, error) {
 	if resp.StatusCode >= 400 {
 		defer resp.Body.Close()
 		bodyBytes, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("cubepod error (HTTP %d): %s", resp.StatusCode, string(bodyBytes))
+		return nil, &APIError{StatusCode: resp.StatusCode, Body: string(bodyBytes)}
 	}
 	return resp, nil
 }
@@ -713,6 +787,286 @@ func (c *Client) ListWarmPools(ctx context.Context) ([]*WarmPool, error) {
 	}
 
 	return nil, fmt.Errorf("failed to decode warmpools response: %s", string(bodyBytes))
+}
+
+// ListTemplates retrieves available sandbox templates, supporting both standard JSON array and legacy wrapper shapes.
+func (c *Client) ListTemplates(ctx context.Context) ([]*Template, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, "/templates", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	trimmed := bytes.TrimSpace(bodyBytes)
+	var list []*Template
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		if err := json.Unmarshal(trimmed, &list); err != nil {
+			return nil, err
+		}
+	} else {
+		var wrapper struct {
+			Templates []*Template `json:"templates"`
+		}
+		if err := json.Unmarshal(trimmed, &wrapper); err != nil {
+			return nil, err
+		}
+		list = wrapper.Templates
+	}
+
+	if list == nil {
+		list = []*Template{}
+	}
+	for _, tpl := range list {
+		if tpl.TemplateID == "" && tpl.ID != "" {
+			tpl.TemplateID = tpl.ID
+		}
+	}
+	return list, nil
+}
+
+// GetTemplate fetches status and metadata for a specific template by templateID.
+func (c *Client) GetTemplate(ctx context.Context, templateID string) (*Template, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("/templates/%s", url.PathEscape(templateID)), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var tpl Template
+	if err := json.NewDecoder(resp.Body).Decode(&tpl); err != nil {
+		return nil, err
+	}
+	if tpl.TemplateID == "" && tpl.ID != "" {
+		tpl.TemplateID = tpl.ID
+	}
+	return &tpl, nil
+}
+
+// GetTemplateByAlias fetches a template by its alias name or tag.
+func (c *Client) GetTemplateByAlias(ctx context.Context, alias string) (*Template, error) {
+	req, err := c.newRequest(ctx, http.MethodGet, fmt.Sprintf("/templates/aliases/%s", url.PathEscape(alias)), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var tpl Template
+	if err := json.NewDecoder(resp.Body).Decode(&tpl); err != nil {
+		return nil, err
+	}
+	if tpl.TemplateID == "" && tpl.ID != "" {
+		tpl.TemplateID = tpl.ID
+	}
+	return &tpl, nil
+}
+
+// CreateTemplateFromImage provisions a template from an existing OCI image without triggering BuildKit.
+// It sends only the caller-provided fields to POST /v3/templates, then starts the build on POST /v2/templates/{templateID}/builds/{buildID}.
+func (c *Client) CreateTemplateFromImage(ctx context.Context, req CreateTemplateFromImageRequest) (*TemplateCreateResult, error) {
+	v3Payload := make(map[string]interface{})
+	if req.Name != "" {
+		v3Payload["name"] = req.Name
+	}
+	if req.Alias != "" {
+		v3Payload["alias"] = req.Alias
+	}
+	if req.CPUCount != 0 {
+		v3Payload["cpuCount"] = req.CPUCount
+	}
+	if req.MemoryMB != 0 {
+		v3Payload["memoryMB"] = req.MemoryMB
+	}
+	if req.MinFreeDiskMB != 0 {
+		v3Payload["minFreeDiskMb"] = req.MinFreeDiskMB
+	}
+
+	bufV3, err := json.Marshal(v3Payload)
+	if err != nil {
+		return nil, err
+	}
+	reqV3, err := c.newRequest(ctx, http.MethodPost, "/v3/templates", bytes.NewReader(bufV3))
+	if err != nil {
+		return nil, err
+	}
+	reqV3.Header.Set("Content-Type", "application/json")
+	respV3, err := c.do(reqV3)
+	if err != nil {
+		return nil, err
+	}
+	defer respV3.Body.Close()
+
+	var res TemplateCreateResult
+	if err := json.NewDecoder(respV3.Body).Decode(&res); err != nil {
+		return nil, err
+	}
+
+	buildPayload := map[string]interface{}{
+		"fromImage": req.FromImage,
+		"steps":     []interface{}{},
+	}
+	bufBuild, err := json.Marshal(buildPayload)
+	if err != nil {
+		return nil, err
+	}
+	path := fmt.Sprintf("/v2/templates/%s/builds/%s", url.PathEscape(res.TemplateID), url.PathEscape(res.BuildID))
+	reqBuild, err := c.newRequest(ctx, http.MethodPost, path, bytes.NewReader(bufBuild))
+	if err != nil {
+		return nil, err
+	}
+	reqBuild.Header.Set("Content-Type", "application/json")
+	respBuild, err := c.do(reqBuild)
+	if err != nil {
+		return nil, err
+	}
+	defer respBuild.Body.Close()
+
+	if res.Aliases == nil {
+		res.Aliases = []string{}
+	}
+	if res.Names == nil {
+		res.Names = []string{}
+	}
+	return &res, nil
+}
+
+// DeleteTemplate deletes a template by templateID. If force is true, ?force=true is appended.
+func (c *Client) DeleteTemplate(ctx context.Context, templateID string, force bool) error {
+	path := fmt.Sprintf("/templates/%s", url.PathEscape(templateID))
+	if force {
+		path += "?force=true"
+	}
+	req, err := c.newRequest(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+// SetTemplatePublic marks a template as public via PATCH /templates/{templateID} with {"public":true}.
+func (c *Client) SetTemplatePublic(ctx context.Context, templateID string) error {
+	body, _ := json.Marshal(map[string]bool{"public": true})
+	req, err := c.newRequest(ctx, http.MethodPatch, fmt.Sprintf("/templates/%s", url.PathEscape(templateID)), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+// BuildTemplate is a thin helper for Beta template builds: registers via POST /v3/templates
+// and triggers the build via POST /v2/templates/{templateID}/builds/{buildID}.
+// Note: uploading context files (tar archives) via PUT /templates/{templateID}/files/{hash} is the caller's responsibility.
+func (c *Client) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (*TemplateCreateResult, error) {
+	v3Payload := make(map[string]interface{})
+	if req.Name != "" {
+		v3Payload["name"] = req.Name
+	}
+	if req.Alias != "" {
+		v3Payload["alias"] = req.Alias
+	}
+	if req.CPUCount != 0 {
+		v3Payload["cpuCount"] = req.CPUCount
+	}
+	if req.MemoryMB != 0 {
+		v3Payload["memoryMB"] = req.MemoryMB
+	}
+	if req.MinFreeDiskMB != 0 {
+		v3Payload["minFreeDiskMb"] = req.MinFreeDiskMB
+	}
+
+	bufV3, err := json.Marshal(v3Payload)
+	if err != nil {
+		return nil, err
+	}
+	reqV3, err := c.newRequest(ctx, http.MethodPost, "/v3/templates", bytes.NewReader(bufV3))
+	if err != nil {
+		return nil, err
+	}
+	reqV3.Header.Set("Content-Type", "application/json")
+	respV3, err := c.do(reqV3)
+	if err != nil {
+		return nil, err
+	}
+	defer respV3.Body.Close()
+
+	var res TemplateCreateResult
+	if err := json.NewDecoder(respV3.Body).Decode(&res); err != nil {
+		return nil, err
+	}
+
+	steps := req.Steps
+	if steps == nil {
+		steps = []BuildStep{}
+	}
+	buildPayload := map[string]interface{}{
+		"steps": steps,
+	}
+	if req.FromImage != "" {
+		buildPayload["fromImage"] = req.FromImage
+	}
+	if req.FromTemplate != "" {
+		buildPayload["fromTemplate"] = req.FromTemplate
+	}
+	if req.StartCmd != "" {
+		buildPayload["startCmd"] = req.StartCmd
+	}
+	if req.ReadyCmd != "" {
+		buildPayload["readyCmd"] = req.ReadyCmd
+	}
+	if req.Force {
+		buildPayload["force"] = true
+	}
+
+	bufBuild, err := json.Marshal(buildPayload)
+	if err != nil {
+		return nil, err
+	}
+	path := fmt.Sprintf("/v2/templates/%s/builds/%s", url.PathEscape(res.TemplateID), url.PathEscape(res.BuildID))
+	reqBuild, err := c.newRequest(ctx, http.MethodPost, path, bytes.NewReader(bufBuild))
+	if err != nil {
+		return nil, err
+	}
+	reqBuild.Header.Set("Content-Type", "application/json")
+	respBuild, err := c.do(reqBuild)
+	if err != nil {
+		return nil, err
+	}
+	defer respBuild.Body.Close()
+
+	if res.Aliases == nil {
+		res.Aliases = []string{}
+	}
+	if res.Names == nil {
+		res.Names = []string{}
+	}
+	return &res, nil
 }
 
 // FormatTime formats a time pointer or returns empty string.
