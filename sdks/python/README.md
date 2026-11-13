@@ -20,7 +20,7 @@ async def main() -> None:
     async with AsyncCubePod(base_url="http://localhost:8080", api_key="...") as client:
         box = await client.create("cubeplex-ubuntu24-desktop")
         res = await client.execute(box.sandbox_id, "python3 --version")
-        print(res.stdout)
+        print(res.output)
         await client.delete(box.sandbox_id)
 
 asyncio.run(main())
@@ -28,7 +28,7 @@ asyncio.run(main())
 # Synchronous client
 with CubePod(base_url="http://localhost:8080", api_key="...") as client:
     box = client.create("cubeplex-ubuntu24-desktop")
-    print(client.execute(box.sandbox_id, "uname -a").stdout)
+    print(client.execute(box.sandbox_id, "uname -a").output)
     client.delete(box.sandbox_id)
 ```
 
@@ -38,10 +38,10 @@ with CubePod(base_url="http://localhost:8080", api_key="...") as client:
 - **Background & Incremental Polling**:
   ```python
   cmd = await client.start_command(sandbox_id, "for i in 1 2 3; do echo $i; sleep 1; done")
-  logs = await client.poll_command(sandbox_id, cmd.command_id, cursor=0)
+  logs = await client.poll_command(sandbox_id, cmd.id, cursor=0)
   # Or stream until completion:
-  async for chunk in client.stream_command(sandbox_id, cmd.command_id):
-      print(chunk.stdout, end="")
+  async for chunk in client.stream_command(sandbox_id, cmd.id):
+      print(chunk.content, end="")
   ```
 
 ## Files & Streaming Archive Sync

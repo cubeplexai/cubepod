@@ -31,5 +31,17 @@
     "microvm",
     "ai-agents",
     "code-interpreter"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cubeplexai/cubepod.git",
+    "directory": "sdks/typescript"
+  },
+  "homepage": "https://github.com/cubeplexai/cubepod/tree/main/sdks/typescript",
+  "bugs": {
+    "url": "https://github.com/cubeplexai/cubepod/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
 }

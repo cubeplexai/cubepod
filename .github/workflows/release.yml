@@ -167,6 +167,48 @@ jobs:
         with:
           skip-existing: true
 
+  publish-npm:
+    name: Publish TypeScript SDK to npm
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Update npm for OIDC Trusted Publishing
+        run: npm install -g npm@latest
+
+      - name: Run TypeScript SDK unit tests
+        working-directory: sdks/typescript
+        run: npm test
+
+      - name: Publish to npm (OIDC Trusted Publishing or NPM_TOKEN bootstrap)
+        working-directory: sdks/typescript
+        env:
+          NPM_Bootstrap_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VER=$(node -p "require('./package.json').version")
+          if npm view "${PKG_NAME}@${PKG_VER}" version >/dev/null 2>&1; then
+            echo "${PKG_NAME}@${PKG_VER} already exists on npm, skipping."
+            exit 0
+          fi
+          if [ -n "${NPM_Bootstrap_TOKEN:-}" ]; then
+            npm config set //registry.npmjs.org/:_authToken "${NPM_Bootstrap_TOKEN}"
+          fi
+          npm publish --provenance --access public
+
   publish-images:
     name: Build & Push GHCR Images
     runs-on: ubuntu-latest
