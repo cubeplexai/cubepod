@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1077,6 +1078,86 @@ func TestWarmPoolClaim_GracefulFallbackToColdStart(t *testing.T) {
 	}
 	if box.Phase != v1alpha1.PodBoxPhaseRunning {
 		t.Fatalf("expected running phase, got %s", box.Phase)
+	}
+}
+
+func TestGateway_CreateSandbox_SyncFromKube_DiscoversWarmPool(t *testing.T) {
+	memKube := controller.NewMemoryKubeClient()
+	reconciler := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	// 1. Initially, gateway memory has NO warm pools
+	if avail := reconciler.FindAvailableWarmPool("cubeplex-ubuntu24-desktop"); avail != "" {
+		t.Fatalf("expected no available warm pool initially, got %s", avail)
+	}
+
+	// 2. Controller/Kubernetes adds a warm pool CR and a standby pod to K8s API directly
+	poolCR := v1alpha1.PodWarmPool{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodWarmPool",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "gateway-discovered-pool",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: v1alpha1.PodWarmPoolSpec{
+			TemplateRef: "cubeplex-ubuntu24-desktop",
+			Replicas:    1,
+		},
+		Status: v1alpha1.PodWarmPoolStatus{
+			ReadyReplicas:     1,
+			AvailableReplicas: 1,
+		},
+	}
+	if err := memKube.UpsertPodWarmPool(ctx, poolCR); err != nil {
+		t.Fatalf("UpsertPodWarmPool failed: %v", err)
+	}
+
+	standbyPod := controller.PodManifest{
+		Name:      "gateway-discovered-pool-warm-1-kata-pod",
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"cubepod.io/warmpool": "gateway-discovered-pool",
+			"cubepod.io/template": "cubeplex-ubuntu24-desktop",
+			"cubepod.io/claimed":  "false",
+		},
+	}
+	if _, err := memKube.EnsurePod(ctx, standbyPod); err != nil {
+		t.Fatalf("EnsurePod failed: %v", err)
+	}
+
+	// 3. POST /sandboxes: gateway sees no pool in memory, runs quick SyncFromKube, discovers it, and claims it!
+	sbReq := `{"templateID":"cubeplex-ubuntu24-desktop"}`
+	sbResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(sbReq))
+	if err != nil {
+		t.Fatalf("failed to create sandbox: %v", err)
+	}
+	defer sbResp.Body.Close()
+
+	if sbResp.StatusCode != http.StatusCreated && sbResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected sandbox creation to succeed, got status %d", sbResp.StatusCode)
+	}
+
+	var sbData struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	_ = json.NewDecoder(sbResp.Body).Decode(&sbData)
+
+	box, ok := reconciler.GetBox(sbData.SandboxID)
+	if !ok {
+		t.Fatalf("expected sandbox %s in reconciler", sbData.SandboxID)
+	}
+	if box.Reason != "WarmPoolClaimed" {
+		t.Fatalf("expected WarmPoolClaimed reason via discovered warm pool, got %s", box.Reason)
+	}
+	if box.PodName != "gateway-discovered-pool-warm-1-kata-pod" {
+		t.Fatalf("expected claimed standby pod name, got %s", box.PodName)
 	}
 }
 
