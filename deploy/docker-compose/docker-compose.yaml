@@ -5,12 +5,20 @@ services:
       dockerfile: images/gateway/Dockerfile
     ports:
       - "8080:8080"
-    command: ["/usr/local/bin/cubepod-gateway", "-addr=:8080", "--e2b-template-api=false", "--template-build=false"]
+    command:
+      - "/usr/local/bin/cubepod-gateway"
+      - "-addr=:8080"
+      - "--e2b-template-api=false"
+      - "--template-build=false"
+      - "--state-dir=/var/lib/cubepod/state"
+      - "--template-probe-timeout=120s"
     environment:
       - CUBEPOD_RUNTIME_MODE=docker-loopback
+      - CUBEPOD_STATE=/var/lib/cubepod/state
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - cubepod-volumes:/var/lib/cubepod/volumes
+      - cubepod-state:/var/lib/cubepod/state
 
   cubepod-controller:
     build:
@@ -18,7 +26,17 @@ services:
       dockerfile: images/controller/Dockerfile
     ports:
       - "8081:8081"
-    command: ["/usr/local/bin/cubepod-controller", "-addr=:8081", "--e2b-template-api=false", "--template-build=false"]
+    command:
+      - "/usr/local/bin/cubepod-controller"
+      - "-addr=:8081"
+      - "--e2b-template-api=false"
+      - "--template-build=false"
+      - "--state-dir=/var/lib/cubepod/state"
+      - "--template-probe-timeout=120s"
+    environment:
+      - CUBEPOD_STATE=/var/lib/cubepod/state
+    volumes:
+      - cubepod-state:/var/lib/cubepod/state
 
   cubepod-egress:
     build:
@@ -30,3 +48,4 @@ services:
 
 volumes:
   cubepod-volumes:
+  cubepod-state:

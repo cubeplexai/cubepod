@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import http.client
 import http.server
 import io
 import json
@@ -200,10 +201,83 @@ class LiveGatewayHandler(http.server.BaseHTTPRequestHandler):
                 sbx_id = parts[1]
         return sbx_id or "default"
 
+    @staticmethod
+    def _is_template_path(path: str) -> bool:
+        return (
+            path == "/templates"
+            or path.startswith("/templates/")
+            or path == "/v2/templates"
+            or path.startswith("/v2/templates/")
+            or path == "/v3/templates"
+            or path.startswith("/v3/templates/")
+        )
+
+    def _proxy_to_go(self, method: str, body: bytes = b"") -> None:
+        conn = http.client.HTTPConnection("127.0.0.1", self.gateway.go_port, timeout=600)
+        try:
+            fwd_host = self.headers.get("Host") or f"{self.gateway.host}:{self.gateway.port}"
+            headers: Dict[str, str] = {
+                "X-Forwarded-Host": fwd_host,
+                "X-Forwarded-Proto": "http",
+            }
+            for h in ("Content-Type", "Content-Encoding", "Idempotency-Key", "Accept", "Authorization", "X-API-Key"):
+                val = self.headers.get(h)
+                if val is not None:
+                    headers[h] = val
+            if body:
+                headers["Content-Length"] = str(len(body))
+            conn.request(method, self.path, body=body if body else None, headers=headers)
+            resp = conn.getresponse()
+            resp_body = b"" if method == "HEAD" else resp.read()
+            self.send_response(resp.status)
+            ct = resp.getheader("Content-Type")
+            if ct:
+                self.send_header("Content-Type", ct)
+            x_next = resp.getheader("X-Next-Token")
+            if x_next:
+                self.send_header("X-Next-Token", x_next)
+            if method != "HEAD":
+                self.send_header("Content-Length", str(len(resp_body)))
+            self.end_headers()
+            if method != "HEAD" and resp_body:
+                self.wfile.write(resp_body)
+        finally:
+            conn.close()
+
+    def do_HEAD(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if self._is_template_path(parsed.path):
+            self._proxy_to_go("HEAD")
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PUT(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        body = self._read_body()
+        if self._is_template_path(parsed.path):
+            self._proxy_to_go("PUT", body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def do_PATCH(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        body = self._read_body()
+        if self._is_template_path(parsed.path):
+            self._proxy_to_go("PATCH", body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
+
+        if self._is_template_path(path):
+            self._proxy_to_go("GET")
+            return
 
         # 1. Health check
         if path in ("/health", "/healthz"):
@@ -297,6 +371,10 @@ class LiveGatewayHandler(http.server.BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(parsed.query)
         body = self._read_body()
 
+        if self._is_template_path(path):
+            self._proxy_to_go("POST", body)
+            return
+
         # 1. Sandbox creation: POST /sandboxes or POST /v2/sandboxes
         if path in ("/sandboxes", "/v2/sandboxes"):
             req_data: Dict[str, Any] = {}
@@ -306,26 +384,45 @@ class LiveGatewayHandler(http.server.BaseHTTPRequestHandler):
                 except Exception:
                     req_data = {}
 
-            template_id = (
-                req_data.get("templateID")
-                or req_data.get("template_id")
-                or "base"
-            )
-            timeout = req_data.get("timeout") or 300
-            envs = req_data.get("envs") or req_data.get("env_vars") or {}
-            metadata = req_data.get("metadata") or {}
+            conn = http.client.HTTPConnection("127.0.0.1", self.gateway.go_port, timeout=60)
+            try:
+                headers = {
+                    "Content-Type": self.headers.get("Content-Type") or "application/json",
+                }
+                if body:
+                    headers["Content-Length"] = str(len(body))
+                conn.request("POST", self.path, body=body if body else b"{}", headers=headers)
+                resp = conn.getresponse()
+                resp_body = resp.read()
+                resp_ct = resp.getheader("Content-Type") or "application/json"
+            finally:
+                conn.close()
 
-            rec = self.gateway.create_sandbox(
-                template_id=template_id,
-                timeout=timeout,
-                envs=envs,
-                metadata=metadata,
-            )
+            if resp.status not in (200, 201):
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp_ct)
+                self.send_header("Content-Length", str(len(resp_body)))
+                self.end_headers()
+                if resp_body:
+                    self.wfile.write(resp_body)
+                return
 
-            self.send_response(201)
+            rec = json.loads(resp_body)
+            sbx_id = rec["sandboxID"]
+            rec.setdefault("envdAccessToken", f"envd-tok-{sbx_id}")
+            rec.setdefault("trafficAccessToken", f"traffic-tok-{sbx_id}")
+            rec.setdefault("domain", "localhost")
+            rec.setdefault("metadata", req_data.get("metadata") or {})
+            rec.setdefault("envs", req_data.get("envs") or req_data.get("env_vars") or {})
+            self.gateway.sandboxes[sbx_id] = rec
+            self.gateway.get_workspace(sbx_id)
+
+            encoded = json.dumps(rec).encode()
+            self.send_response(resp.status)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
-            self.wfile.write(json.dumps(rec).encode())
+            self.wfile.write(encoded)
             return
 
         # 2. Keepalive / Refresh / Timeout: POST /sandboxes/{id}/refreshes or /timeout
@@ -671,9 +768,20 @@ class LiveGatewayHandler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if self._is_template_path(path):
+            self._proxy_to_go("DELETE")
+            return
         if path.startswith("/sandboxes/"):
             sbx_id = path.strip("/").split("/")[1]
             self.gateway.delete_sandbox(sbx_id)
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", self.gateway.go_port, timeout=10)
+                conn.request("DELETE", self.path)
+                resp = conn.getresponse()
+                resp.read()
+                conn.close()
+            except Exception:
+                pass
             self.send_response(204)
             self.end_headers()
             return
@@ -714,10 +822,18 @@ class LiveGateway:
             f"-addr=127.0.0.1:{self.go_port}",
             "-live-pod-routing=false",
             "-namespace=cubepod-test",
+            "-e2b-template-api=true",
+            "-template-build=true",
+            f"-state-dir={self.temp_dir}",
+            "-template-probe-timeout=30s",
         ]
         gw_env = os.environ.copy()
         gw_env["TMPDIR"] = self.temp_dir
         gw_env["CUBEPOD_WORKSPACE_DIR"] = self.temp_dir
+        gw_env["CUBEPOD_STATE"] = self.temp_dir
+        gw_env["KUBECONFIG"] = os.path.join(self.temp_dir, "nonexistent-kubeconfig")
+        gw_env.pop("KUBERNETES_SERVICE_HOST", None)
+        gw_env.pop("KUBERNETES_SERVICE_PORT", None)
         self.go_proc = subprocess.Popen(
             cmd,
             env=gw_env,
@@ -729,6 +845,8 @@ class LiveGateway:
         deadline = time.time() + 5.0
         health_ok = False
         while time.time() < deadline:
+            if self.go_proc.poll() is not None:
+                break
             try:
                 req = urllib.request.urlopen(f"http://127.0.0.1:{self.go_port}/health", timeout=0.5)
                 if req.status == 200:
@@ -738,8 +856,14 @@ class LiveGateway:
                 time.sleep(0.05)
 
         if not health_ok:
+            stderr_out = ""
+            if self.go_proc and self.go_proc.stderr:
+                try:
+                    stderr_out = self.go_proc.stderr.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
             self.stop()
-            raise RuntimeError(f"Real cubepod-gateway failed to start on port {self.go_port}")
+            raise RuntimeError(f"Real cubepod-gateway failed to start on port {self.go_port}: {stderr_out}")
 
         # Start live server listener
         if self.port == 0:

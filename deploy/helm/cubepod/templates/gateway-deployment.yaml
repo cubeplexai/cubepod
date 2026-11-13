@@ -18,17 +18,18 @@ spec:
         {{- include "cubepod.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: gateway
     spec:
+      serviceAccountName: {{ include "cubepod.serviceAccountName" . }}
       containers:
         - name: gateway
           image: "{{ .Values.gateway.image.registry }}/{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}"
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy }}
           args:
             - "--addr=:{{ .Values.gateway.port }}"
+            - "--namespace={{ .Values.controller.workloadNamespace }}"
             - "--e2b-template-api={{ .Values.featureGates.e2bTemplateAPI }}"
             - "--template-build={{ .Values.templateBuild.enabled }}"
-            {{- if .Values.templateBuild.enabled }}
-            - "--buildkit-addr={{ .Values.templateBuild.buildkit.address }}"
-            {{- end }}
+            - "--template-probe-timeout={{ .Values.templateBuild.probeTimeout }}"
+            - "--controller-url=http://{{ include "cubepod.fullname" . }}-controller:{{ .Values.controller.healthzPort }}"
           env:
             {{- if .Values.gateway.panelSecret }}
             - name: CUBEPOD_PANEL_SECRET
