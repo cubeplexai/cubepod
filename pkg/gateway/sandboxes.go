@@ -17,6 +17,7 @@ import (
 type createSandboxReq struct {
 	TemplateID  string            `json:"templateID"`
 	Template_ID string            `json:"template_id,omitempty"`
+	WarmPoolRef string            `json:"warmPoolRef,omitempty"`
 	Timeout     int               `json:"timeout,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
 	EnvVars     map[string]string `json:"envVars,omitempty"`
@@ -93,11 +94,14 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		TemplateRef:      req.TemplateID,
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: 1,
+		WarmPoolRef:      req.WarmPoolRef,
 	}
 
-	// Automatic WarmPool Claim: check if there is an available warmpool for this template
-	if warmPoolName := s.reconciler.FindAvailableWarmPool(req.TemplateID); warmPoolName != "" {
-		spec.WarmPoolRef = warmPoolName
+	// Automatic WarmPool Claim: check if there is an available warmpool for this template if not explicitly specified
+	if spec.WarmPoolRef == "" {
+		if warmPoolName := s.reconciler.FindAvailableWarmPool(req.TemplateID); warmPoolName != "" {
+			spec.WarmPoolRef = warmPoolName
+		}
 	}
 
 	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
@@ -137,6 +141,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		MemoryMB:         2048,
 		DiskSizeMB:       10240,
 		State:            string(status.Phase),
+		Reason:           status.Reason,
 		EnvdPort:         49983,
 		RootfsGeneration: status.ObservedRootfsGen,
 		VolumeKey:        req.Extension.VolumeKey,
@@ -450,6 +455,7 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		MemoryMB:         2048,
 		DiskSizeMB:       10240,
 		State:            string(status.Phase),
+		Reason:           status.Reason,
 		EnvdPort:         49983,
 		RootfsGeneration: status.ObservedRootfsGen,
 		CreatedAt:        now,

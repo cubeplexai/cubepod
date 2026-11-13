@@ -50,6 +50,13 @@ func newMockCRDServer() (*mockCRDServer, *httptest.Server) {
 			return
 		}
 
+		if strings.HasPrefix(path, "/api/v1/namespaces/") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "Success"})
+			return
+		}
+
 		// Prefix: /apis/cubepod.io/v1alpha1/namespaces/{ns}/{resource}
 		const prefix = "/apis/cubepod.io/v1alpha1/namespaces/"
 		if !strings.HasPrefix(path, prefix) {

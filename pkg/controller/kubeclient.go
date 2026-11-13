@@ -21,6 +21,7 @@ type KubeClient interface {
 	DeletePVC(ctx context.Context, namespace, name string) error
 	EnsurePod(ctx context.Context, pod PodManifest) (podIP string, err error)
 	DeletePod(ctx context.Context, namespace, name string) error
+	PatchPodLabels(ctx context.Context, namespace, name string, labels map[string]string) error
 	UpsertPodBox(ctx context.Context, box v1alpha1.PodBox) error
 	GetPodBox(ctx context.Context, namespace, name string) (*v1alpha1.PodBox, error)
 	ListPodBoxes(ctx context.Context, namespace string) ([]v1alpha1.PodBox, error)
@@ -239,6 +240,25 @@ func (m *MemoryKubeClient) DeletePod(_ context.Context, namespace, name string) 
 	key := podKey(namespace, name)
 	delete(m.Pods, key)
 	delete(m.IPs, key)
+	return nil
+}
+
+// PatchPodLabels merges the provided labels into the in-memory Pod manifest.
+func (m *MemoryKubeClient) PatchPodLabels(_ context.Context, namespace, name string, labels map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := podKey(namespace, name)
+	pod, ok := m.Pods[key]
+	if !ok {
+		return fmt.Errorf("pod %s/%s not found", namespace, name)
+	}
+	if pod.Labels == nil {
+		pod.Labels = make(map[string]string)
+	}
+	for k, v := range labels {
+		pod.Labels[k] = v
+	}
+	m.Pods[key] = pod
 	return nil
 }
 
@@ -743,6 +763,44 @@ func (c *RESTKubeClient) DeletePod(ctx context.Context, namespace, name string) 
 			case <-ticker.C:
 			}
 		}
+	}
+	return nil
+}
+
+// PatchPodLabels patches the labels of a Pod using strategic merge patch.
+func (c *RESTKubeClient) PatchPodLabels(ctx context.Context, namespace, name string, labels map[string]string) error {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s", c.baseURL, ns, name)
+
+	patchData := map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"labels": labels,
+		},
+	}
+	payload, err := json.Marshal(patchData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Pod patch JSON: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, url, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("PatchPodLabels request failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/strategic-merge-patch+json")
+	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("PatchPodLabels request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("PatchPodLabels failed: status %d (%s)", resp.StatusCode, string(respBody))
 	}
 	return nil
 }

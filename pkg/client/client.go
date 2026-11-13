@@ -30,6 +30,7 @@ type SandboxRecord struct {
 	Metadata         map[string]string `json:"metadata,omitempty"`
 	CreatedAt        time.Time         `json:"createdAt,omitempty"`
 	AutoResumeCount  int               `json:"autoResumeCount,omitempty"`
+	Reason           string            `json:"reason,omitempty"`
 }
 
 // CreateSandboxRequest specifies the parameters for provisioning a sandbox.
@@ -694,11 +695,24 @@ func (c *Client) ListWarmPools(ctx context.Context) ([]*WarmPool, error) {
 	}
 	defer resp.Body.Close()
 
-	var list []*WarmPool
-	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
-		return nil, err
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
-	return list, nil
+
+	var wrapped struct {
+		WarmPools []*WarmPool `json:"warmPools"`
+	}
+	if err := json.Unmarshal(bodyBytes, &wrapped); err == nil && wrapped.WarmPools != nil {
+		return wrapped.WarmPools, nil
+	}
+
+	var direct []*WarmPool
+	if err := json.Unmarshal(bodyBytes, &direct); err == nil {
+		return direct, nil
+	}
+
+	return nil, fmt.Errorf("failed to decode warmpools response: %s", string(bodyBytes))
 }
 
 // FormatTime formats a time pointer or returns empty string.
