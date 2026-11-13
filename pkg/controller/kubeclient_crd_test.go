@@ -18,20 +18,21 @@ import (
 )
 
 type mockCRDServer struct {
-	mu           sync.RWMutex
-	podBoxes     map[string]v1alpha1.PodBox
-	podWarmPools map[string]v1alpha1.PodWarmPool
-	getCalls     int
-	postCalls    int
-	putCalls     int
-	putStatus    int
-	deleteCalls  int
-	listCalls    int
-	wpGetCalls   int
-	wpPostCalls  int
-	wpPutCalls   int
-	wpPutStatus  int
-	return404CRD bool
+	mu                 sync.RWMutex
+	podBoxes           map[string]v1alpha1.PodBox
+	podWarmPools       map[string]v1alpha1.PodWarmPool
+	getCalls           int
+	postCalls          int
+	putCalls           int
+	putStatus          int
+	deleteCalls        int
+	listCalls          int
+	wpGetCalls         int
+	wpPostCalls        int
+	wpPutCalls         int
+	wpPutStatus        int
+	return404CRD       bool
+	return404PutStatus bool
 }
 
 func newMockCRDServer() (*mockCRDServer, *httptest.Server) {
@@ -348,6 +349,10 @@ func newMockCRDServer() (*mockCRDServer, *httptest.Server) {
 		}
 
 		if len(parts) == 4 && parts[3] == "status" {
+			if m.return404PutStatus {
+				http.NotFound(w, r)
+				return
+			}
 			if r.Method == http.MethodPut {
 				m.putStatus++
 				var box v1alpha1.PodBox
@@ -504,6 +509,40 @@ func TestRESTKubeClient_PodBox_CRUD(t *testing.T) {
 	}
 	if err := client.UpsertPodBox(ctx, crdMissingBox); err != nil {
 		t.Fatalf("UpsertPodBox when CRD is missing (404) should return nil, got: %v", err)
+	}
+}
+
+func TestRESTKubeClient_UpsertPodBox_Status404ReturnsError(t *testing.T) {
+	mock, ts := newMockCRDServer()
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+	ctx := context.Background()
+
+	box := v1alpha1.PodBox{
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "box-404-status",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: v1alpha1.PodBoxSpec{
+			DesiredState: v1alpha1.DesiredStateRunning,
+		},
+	}
+	// Initial create succeeds
+	if err := client.UpsertPodBox(ctx, box); err != nil {
+		t.Fatalf("initial create failed: %v", err)
+	}
+
+	// Make PUT .../status return 404
+	mock.return404PutStatus = true
+
+	// Upsert again (triggering conflict update -> PUT status returns 404)
+	err := client.UpsertPodBox(ctx, box)
+	if err == nil {
+		t.Fatal("expected error when status update returns 404, got nil")
+	}
+	if !strings.Contains(err.Error(), "404") {
+		t.Fatalf("expected error message to mention 404, got: %v", err)
 	}
 }
 

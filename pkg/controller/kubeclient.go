@@ -22,6 +22,8 @@ var (
 	ErrPodAlreadyExists = errors.New("pod already exists")
 	// ErrCRDNotInstalled is returned when a CustomResourceDefinition is not installed on the Kubernetes APIServer (404 NotFound).
 	ErrCRDNotInstalled = errors.New("CRD not installed (404 NotFound)")
+	// ErrCASConflict is returned when a conditional CAS claim fails because the pod was already claimed or precondition failed.
+	ErrCASConflict = errors.New("CAS conflict: pod already claimed or precondition failed")
 )
 
 // KubeClient abstracts Kubernetes resource operations for PodBox workloads.
@@ -277,10 +279,10 @@ func (m *MemoryKubeClient) ClaimPod(_ context.Context, namespace, name, boxName 
 		pod.Labels = make(map[string]string)
 	}
 	if pod.Labels["cubepod.io/claimed"] == "true" {
-		return fmt.Errorf("pod %s/%s already claimed (409 Conflict)", namespace, name)
+		return fmt.Errorf("%w: pod %s already claimed", ErrCASConflict, name)
 	}
 	if pod.Labels["cubepod.io/claimed"] != "false" {
-		return fmt.Errorf("pod %s/%s cannot be claimed: cubepod.io/claimed is not false (got %q)", namespace, name, pod.Labels["cubepod.io/claimed"])
+		return fmt.Errorf("%w: pod %s cannot be claimed: cubepod.io/claimed is not false (got %q)", ErrCASConflict, name, pod.Labels["cubepod.io/claimed"])
 	}
 	pod.Labels["cubepod.io/claimed"] = "true"
 	pod.Labels["cubepod.io/claimed-by"] = boxName
@@ -915,6 +917,11 @@ func (c *RESTKubeClient) ClaimPod(ctx context.Context, namespace, name, boxName 
 		return fmt.Errorf("ClaimPod request failed: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusPreconditionFailed || resp.StatusCode == http.StatusUnprocessableEntity {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%w: status %d (%s)", ErrCASConflict, resp.StatusCode, string(respBody))
+	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		respBody, _ := io.ReadAll(resp.Body)

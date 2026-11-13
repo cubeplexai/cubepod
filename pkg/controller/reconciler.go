@@ -256,10 +256,19 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 	}
 	currentAvail := int32(len(availableEntries))
 
+	// Ensure warmCounter advances past existing indexes
+	for _, entry := range pool.entries {
+		if idx := parseWarmIndex(entry.ID); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
+		if idx := parseWarmIndex(entry.PodName); idx > r.warmCounter {
+			r.warmCounter = idx
+		}
+	}
+
 	// Scale up if needed.
 	if currentAvail < spec.Replicas {
-		toAdd := spec.Replicas - currentAvail
-		for i := int32(0); i < toAdd; i++ {
+		for attempts := 0; currentAvail < spec.Replicas && attempts < int(spec.Replicas)*3; attempts++ {
 			r.warmCounter++
 			entryID := fmt.Sprintf("%s-warm-%d", poolName, r.warmCounter)
 			warmBoxSpec := v1alpha1.PodBoxSpec{
@@ -305,22 +314,36 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				dummyStatus.PodIP = podIP
 			}
 
+			var claimedBy string
 			// When EnsurePod returns 409 (pod already exists), check its label:
 			// if it's already claimed, do NOT add it as an unclaimed standby entry!
 			if is409 {
 				existingPods, listErr := r.kubeClient.ListPods(ctx, r.namespace, "")
-				if listErr == nil {
-					var claimedPod bool
-					for _, p := range existingPods {
-						if p.Name == dummyStatus.PodName && p.Labels != nil && p.Labels["cubepod.io/claimed"] == "true" {
-							claimedPod = true
-							break
-						}
+				if listErr != nil {
+					slog.Warn("failed to list pods to verify existing warm pod", "pod", dummyStatus.PodName, "err", listErr)
+					continue
+				}
+				var foundPod *PodManifest
+				for _, p := range existingPods {
+					if p.Name == dummyStatus.PodName {
+						foundPod = &p
+						break
 					}
-					if claimedPod {
-						slog.Info("pod already exists and is claimed, skipping standby adoption", "pod", dummyStatus.PodName)
-						continue
+				}
+				if foundPod == nil {
+					slog.Warn("existing pod not found in pod list", "pod", dummyStatus.PodName)
+					continue
+				}
+				if foundPod.Labels != nil && foundPod.Labels["cubepod.io/claimed"] == "true" {
+					slog.Info("pod already exists and is claimed, skipping standby adoption", "pod", dummyStatus.PodName)
+					continue
+				}
+				// If false: copy labels and claimed-by
+				if foundPod.Labels != nil {
+					for k, v := range foundPod.Labels {
+						podManifest.Labels[k] = v
 					}
+					claimedBy = foundPod.Labels["cubepod.io/claimed-by"]
 				}
 			}
 
@@ -332,12 +355,14 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				RootfsPVCName:    rootfsPVC.Name,
 				WorkspacePVCName: wsPVC.Name,
 				Claimed:          false,
+				ClaimedBy:        claimedBy,
 				CreatedAt:        time.Now().UTC(),
 				PodManifest:      podManifest,
 				RootfsPVC:        rootfsPVC,
 				WorkspacePVC:     wsPVC,
 			}
 			pool.entries = append(pool.entries, entry)
+			currentAvail++
 		}
 	} else if currentAvail > spec.Replicas && len(availableEntries) > 0 && len(pool.entries) > 0 {
 		// Scale down excess unclaimed entries.
@@ -435,9 +460,13 @@ func (r *Reconciler) claimWarmPodLocked(ctx context.Context, poolName string, bo
 					ctx = context.Background()
 				}
 				if err := r.kubeClient.ClaimPod(ctx, r.namespace, entry.PodName, boxName); err != nil {
-					slog.Warn("failed to claim standby pod via CAS patch, marking as claimed by other replica and skipping", "pod", entry.PodName, "box", boxName, "err", err)
-					entry.Claimed = true
-					entry.ClaimedBy = "other-replica"
+					if errors.Is(err, ErrCASConflict) {
+						slog.Warn("CAS conflict claiming standby pod, marked as claimed by other replica", "pod", entry.PodName, "box", boxName, "err", err)
+						entry.Claimed = true
+						entry.ClaimedBy = "other-replica"
+					} else {
+						slog.Warn("transient/unknown error claiming standby pod, leaving unclaimed for retry", "pod", entry.PodName, "box", boxName, "err", err)
+					}
 					continue
 				}
 			}
@@ -892,7 +921,8 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 
 		for name, pool := range r.warmPools {
 			if !activePools[name] {
-				if pool.persisted && time.Since(pool.createdAt) > 10*time.Second {
+				// Either it was persisted in K8s and deleted by user, OR it failed to persist for more than 10 seconds:
+				if time.Since(pool.createdAt) > 10*time.Second {
 					for _, entry := range pool.entries {
 						if !entry.Claimed {
 							_ = r.kubeClient.DeletePod(ctx, r.namespace, entry.PodName)
@@ -968,7 +998,35 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 					// Check active lease lock.
 					leaseActive := spec.Lifecycle.LeaseExpiresAt != nil && spec.Lifecycle.LeaseExpiresAt.After(now)
 					if !leaseActive {
-						if status.PodName != "" {
+						specWithPaused := spec
+						specWithPaused.DesiredState = v1alpha1.DesiredStatePaused
+
+						statusWithPaused := *status
+						statusWithPaused.Phase = v1alpha1.PodBoxPhasePaused
+						statusWithPaused.PodName = ""
+						statusWithPaused.PodIP = ""
+						statusWithPaused.PausedAt = &now
+						statusWithPaused.Reason = "IdlePaused"
+						statusWithPaused.Message = "Paused due to idle timeout"
+
+						if r.kubeClient != nil {
+							err := r.kubeClient.UpsertPodBox(ctx, v1alpha1.PodBox{
+								APIVersion: "cubepod.io/v1alpha1",
+								Kind:       "PodBox",
+								Metadata: v1alpha1.ObjectMeta{
+									Name:      name,
+									Namespace: r.namespace,
+								},
+								Spec:   specWithPaused,
+								Status: statusWithPaused,
+							})
+							if err != nil {
+								slog.Warn("failed to persist paused state to Kubernetes; rolling back in-memory state", "name", name, "err", err)
+								continue // do not commit pause in memory, do not append to paused!
+							}
+						}
+
+						if status.PodName != "" && r.kubeClient != nil {
 							_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
 						}
 						status.Phase = v1alpha1.PodBoxPhasePaused
@@ -979,18 +1037,6 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 						status.Message = "Paused due to idle timeout"
 						spec.DesiredState = v1alpha1.DesiredStatePaused
 						r.specs[name] = spec
-						if r.kubeClient != nil {
-							_ = r.kubeClient.UpsertPodBox(ctx, v1alpha1.PodBox{
-								APIVersion: "cubepod.io/v1alpha1",
-								Kind:       "PodBox",
-								Metadata: v1alpha1.ObjectMeta{
-									Name:      name,
-									Namespace: r.namespace,
-								},
-								Spec:   r.specs[name],
-								Status: *status,
-							})
-						}
 						paused = append(paused, name)
 					}
 				}
@@ -1066,6 +1112,19 @@ func (r *Reconciler) GetWarmPoolSpecs() map[string]v1alpha1.PodWarmPoolSpec {
 		specs[name] = pool.spec
 	}
 	return specs
+}
+
+// GetWarmPoolEntries returns a copy of the warm pod entries for a pool.
+func (r *Reconciler) GetWarmPoolEntries(poolName string) []*WarmPodEntry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	pool, ok := r.warmPools[poolName]
+	if !ok {
+		return nil
+	}
+	res := make([]*WarmPodEntry, len(pool.entries))
+	copy(res, pool.entries)
+	return res
 }
 
 // GetBox returns a copy of the observed status for a PodBox.
