@@ -718,7 +718,11 @@ func TestReconciler_SyncFromKube_WarmPoolDeletionCleanup(t *testing.T) {
 	}
 
 	var unclaimedPodName, unclaimedRootfsPVC, unclaimedWorkspacePVC string
-	for _, pod := range memKube.ListPods() {
+	pods, err := memKube.ListPods(ctx, "cubepod-workloads", "")
+	if err != nil {
+		t.Fatalf("ListPods failed: %v", err)
+	}
+	for _, pod := range pods {
 		if strings.HasPrefix(pod.Name, "delete-pool-warm-") && pod.Name != claimed.PodName {
 			unclaimedPodName = pod.Name
 			break
@@ -779,18 +783,35 @@ func TestReconciler_ReconcileWarmPool_Status404_DoesNotRecreate(t *testing.T) {
 		controller.WithNamespace("cubepod-workloads"),
 	)
 
-	// Create pool in memory reconciler, but do NOT put it in memKube so UpdatePodWarmPoolStatus returns 404
 	poolSpec := v1alpha1.PodWarmPoolSpec{
 		TemplateRef: "base-tpl",
 		Replicas:    1,
 	}
 
+	// 1. Initial creation via ReconcileWarmPool: creates the CR in KubeClient and marks persisted = true
 	st, err := r.ReconcileWarmPool(ctx, "deleted-pool", poolSpec)
 	if err != nil {
 		t.Fatalf("ReconcileWarmPool failed: %v", err)
 	}
 	if st.AvailableReplicas != 1 {
 		t.Fatalf("expected 1 available replica, got %d", st.AvailableReplicas)
+	}
+	if _, err := memKube.GetPodWarmPool(ctx, "cubepod-workloads", "deleted-pool"); err != nil {
+		t.Fatalf("expected initial ReconcileWarmPool to persist CR to KubeClient: %v", err)
+	}
+
+	// 2. Simulate deletion from Kubernetes (e.g. kubectl delete podwarmpool)
+	if err := memKube.DeletePodWarmPool(ctx, "cubepod-workloads", "deleted-pool"); err != nil {
+		t.Fatalf("DeletePodWarmPool failed: %v", err)
+	}
+
+	// 3. Subsequent tick: pool.persisted is true, UpdatePodWarmPoolStatus returns 404, skips recreation!
+	st2, err := r.ReconcileWarmPool(ctx, "deleted-pool", poolSpec)
+	if err != nil {
+		t.Fatalf("subsequent ReconcileWarmPool failed: %v", err)
+	}
+	if st2.AvailableReplicas != 1 {
+		t.Fatalf("expected 1 available replica, got %d", st2.AvailableReplicas)
 	}
 
 	// Ensure memKube did NOT have UpsertPodWarmPool called (it was not recreated)
@@ -816,7 +837,10 @@ func TestReconciler_ClaimWarmPod_PatchesLabels(t *testing.T) {
 	}
 
 	// Before claim, check standby pod labels
-	pods := memKube.ListPods()
+	pods, err := memKube.ListPods(ctx, "cubepod-workloads", "")
+	if err != nil {
+		t.Fatalf("ListPods failed: %v", err)
+	}
 	if len(pods) != 1 {
 		t.Fatalf("expected 1 pod in kubeClient, got %d", len(pods))
 	}
@@ -885,5 +909,191 @@ func TestBuildKataPod_ClaimLabels(t *testing.T) {
 	}
 	if claimedPod.Labels["cubepod.io/claimed-by"] != "sandbox-claimer" {
 		t.Fatalf("expected claimed pod claimed-by=sandbox-claimer, got %s", claimedPod.Labels["cubepod.io/claimed-by"])
+	}
+}
+
+type failingPatchKubeClient struct {
+	*controller.MemoryKubeClient
+	failPodNames map[string]bool
+}
+
+func (f *failingPatchKubeClient) PatchPodLabels(ctx context.Context, ns, name string, labels map[string]string) error {
+	if f.failPodNames[name] {
+		return fmt.Errorf("injected PatchPodLabels failure for %s", name)
+	}
+	return f.MemoryKubeClient.PatchPodLabels(ctx, ns, name, labels)
+}
+
+func TestReconciler_ClaimWarmPod_PatchFailureSkipsPod(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	failingKube := &failingPatchKubeClient{
+		MemoryKubeClient: memKube,
+		failPodNames:     make(map[string]bool),
+	}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(failingKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// Create pool with 2 replicas
+	_, err := r.ReconcileWarmPool(ctx, "patch-fail-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    2,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	pods, err := memKube.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=patch-fail-pool")
+	if err != nil || len(pods) != 2 {
+		t.Fatalf("expected 2 pods in kubeClient, got %d (err: %v)", len(pods), err)
+	}
+
+	pod1 := pods[0].Name
+	pod2 := pods[1].Name
+
+	// Inject failure on pod1
+	failingKube.failPodNames[pod1] = true
+
+	// Claiming should fail on pod1, skip it, and claim pod2 successfully
+	claimedEntry, err := r.ClaimWarmPod(ctx, "patch-fail-pool", "claimer-box-1")
+	if err != nil {
+		t.Fatalf("ClaimWarmPod should have succeeded by picking pod2, got: %v", err)
+	}
+	if claimedEntry.PodName != pod2 {
+		t.Fatalf("expected claimed entry to be %s, got %s", pod2, claimedEntry.PodName)
+	}
+
+	// pod1 should remain unclaimed in memory
+	status, ok := r.GetWarmPoolStatus("patch-fail-pool")
+	if !ok || status.AvailableReplicas != 1 {
+		t.Fatalf("expected 1 available replica remaining, got %d", status.AvailableReplicas)
+	}
+
+	// Second claim should attempt pod1, fail, and return an error since no other standby pod is available
+	_, err = r.ClaimWarmPod(ctx, "patch-fail-pool", "claimer-box-2")
+	if err == nil {
+		t.Fatal("expected ClaimWarmPod to fail when all available pods fail PatchPodLabels")
+	}
+
+	// Unclaimed pod1 remains unclaimed
+	p1, _ := memKube.GetPod("cubepod-workloads", pod1)
+	if p1.Labels["cubepod.io/claimed"] != "false" {
+		t.Fatalf("expected pod1 to remain claimed=false in kubeClient, got %s", p1.Labels["cubepod.io/claimed"])
+	}
+}
+
+func TestReconciler_SyncFromKube_RebuildsEntriesAndCounter(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+
+	// 1. Pre-populate Kubernetes APIServer with a PodWarmPool CR
+	poolCR := v1alpha1.PodWarmPool{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodWarmPool",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "rebuild-pool",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: v1alpha1.PodWarmPoolSpec{
+			TemplateRef: "ubuntu:24.04",
+			Replicas:    2,
+		},
+	}
+	if err := memKube.UpsertPodWarmPool(ctx, poolCR); err != nil {
+		t.Fatalf("UpsertPodWarmPool failed: %v", err)
+	}
+
+	// 2. Pre-populate 2 pods: pod-1 is claimed, pod-2 is standby
+	pod1 := controller.PodManifest{
+		Name:      "rebuild-pool-warm-1-kata-pod",
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"cubepod.io/warmpool":   "rebuild-pool",
+			"cubepod.io/template":   "ubuntu:24.04",
+			"cubepod.io/claimed":    "true",
+			"cubepod.io/claimed-by": "existing-sandbox-1",
+		},
+	}
+	pod2 := controller.PodManifest{
+		Name:      "rebuild-pool-warm-2-kata-pod",
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"cubepod.io/warmpool": "rebuild-pool",
+			"cubepod.io/template": "ubuntu:24.04",
+			"cubepod.io/claimed":  "false",
+		},
+	}
+	if _, err := memKube.EnsurePod(ctx, pod1); err != nil {
+		t.Fatalf("EnsurePod 1 failed: %v", err)
+	}
+	if _, err := memKube.EnsurePod(ctx, pod2); err != nil {
+		t.Fatalf("EnsurePod 2 failed: %v", err)
+	}
+
+	// 3. Fresh Reconciler (simulating restart)
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// Before sync: 0 warm pools in memory
+	if _, ok := r.GetWarmPoolStatus("rebuild-pool"); ok {
+		t.Fatal("expected rebuild-pool not to exist in memory before sync")
+	}
+
+	// Recover state via SyncFromKube
+	if _, err := r.SyncFromKube(ctx); err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+
+	// Status should show 1 available replica (pod-2)
+	st, ok := r.GetWarmPoolStatus("rebuild-pool")
+	if !ok {
+		t.Fatal("expected rebuild-pool in memory after sync")
+	}
+	if st.AvailableReplicas != 1 {
+		t.Fatalf("expected 1 available replica after sync, got %d", st.AvailableReplicas)
+	}
+
+	// Claim the single available standby pod
+	claimed, err := r.ClaimWarmPod(ctx, "rebuild-pool", "new-box-alpha")
+	if err != nil {
+		t.Fatalf("ClaimWarmPod failed: %v", err)
+	}
+	if claimed.PodName != "rebuild-pool-warm-2-kata-pod" {
+		t.Fatalf("expected to claim pod 2, got %s", claimed.PodName)
+	}
+
+	// No standby replicas left
+	st, _ = r.GetWarmPoolStatus("rebuild-pool")
+	if st.AvailableReplicas != 0 {
+		t.Fatalf("expected 0 available replicas after claim, got %d", st.AvailableReplicas)
+	}
+
+	// Now reconcile the pool to replenish replicas to desired 2
+	st2, err := r.ReconcileWarmPool(ctx, "rebuild-pool", poolCR.Spec)
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool replenish failed: %v", err)
+	}
+	if st2.AvailableReplicas != 2 {
+		t.Fatalf("expected 2 available replicas after replenishment, got %d", st2.AvailableReplicas)
+	}
+
+	// Newly created pods must use index > 2 (e.g. rebuild-pool-warm-3 and 4)
+	pods, err := memKube.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=rebuild-pool")
+	if err != nil {
+		t.Fatalf("ListPods failed: %v", err)
+	}
+	for _, p := range pods {
+		if strings.Contains(p.Name, "-warm-1-") || strings.Contains(p.Name, "-warm-2-") {
+			continue
+		}
+		// Any newly created pod should have index >= 3
+		if !strings.Contains(p.Name, "-warm-3-") && !strings.Contains(p.Name, "-warm-4-") {
+			t.Errorf("unexpected pod name created: %s", p.Name)
+		}
 	}
 }

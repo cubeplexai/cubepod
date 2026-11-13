@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ type KubeClient interface {
 	DeletePVC(ctx context.Context, namespace, name string) error
 	EnsurePod(ctx context.Context, pod PodManifest) (podIP string, err error)
 	DeletePod(ctx context.Context, namespace, name string) error
+	ListPods(ctx context.Context, namespace string, labelSelector string) ([]PodManifest, error)
 	PatchPodLabels(ctx context.Context, namespace, name string, labels map[string]string) error
 	UpsertPodBox(ctx context.Context, box v1alpha1.PodBox) error
 	GetPodBox(ctx context.Context, namespace, name string) (*v1alpha1.PodBox, error)
@@ -289,15 +291,60 @@ func (m *MemoryKubeClient) ListPVCs() []BlockPVCManifest {
 	return res
 }
 
-// ListPods returns all Pod manifests recorded in memory.
-func (m *MemoryKubeClient) ListPods() []PodManifest {
+// ListPods returns Pod manifests matching the optional namespace and labelSelector.
+func (m *MemoryKubeClient) ListPods(_ context.Context, namespace string, labelSelector string) ([]PodManifest, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+
+	var selectors map[string]string
+	if labelSelector != "" {
+		selectors = make(map[string]string)
+		for _, part := range strings.Split(labelSelector, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			kv := strings.SplitN(part, "=", 2)
+			if len(kv) == 2 {
+				selectors[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+			} else {
+				selectors[part] = ""
+			}
+		}
+	}
+
 	res := make([]PodManifest, 0, len(m.Pods))
 	for _, pod := range m.Pods {
+		podNs := pod.Namespace
+		if podNs == "" {
+			podNs = "default"
+		}
+		if namespace != "" && podNs != namespace {
+			continue
+		}
+
+		if len(selectors) > 0 {
+			match := true
+			for k, v := range selectors {
+				if pod.Labels == nil || pod.Labels[k] != v {
+					match = false
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+		}
+
 		res = append(res, pod)
 	}
-	return res
+	return res, nil
+}
+
+// AllPods returns all Pod manifests recorded in memory.
+func (m *MemoryKubeClient) AllPods() []PodManifest {
+	pods, _ := m.ListPods(context.Background(), "", "")
+	return pods
 }
 
 // RESTKubeClientConfig holds configuration options for initializing RESTKubeClient.
@@ -803,4 +850,50 @@ func (c *RESTKubeClient) PatchPodLabels(ctx context.Context, namespace, name str
 		return fmt.Errorf("PatchPodLabels failed: status %d (%s)", resp.StatusCode, string(respBody))
 	}
 	return nil
+}
+
+// ListPods queries pods in the specified namespace matching the optional labelSelector.
+func (c *RESTKubeClient) ListPods(ctx context.Context, namespace string, labelSelector string) ([]PodManifest, error) {
+	ns := c.resolveNamespace(namespace)
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/pods", c.baseURL, ns)
+	if labelSelector != "" {
+		reqURL += "?labelSelector=" + url.QueryEscape(labelSelector)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ListPods request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return []PodManifest{}, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("ListPods failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	var list struct {
+		Items []coreV1Pod `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("failed to decode PodList: %w", err)
+	}
+
+	res := make([]PodManifest, 0, len(list.Items))
+	for _, p := range list.Items {
+		itemNs := p.Metadata.Namespace
+		if itemNs == "" {
+			itemNs = ns
+		}
+		res = append(res, PodManifest{
+			Name:             p.Metadata.Name,
+			Namespace:        itemNs,
+			Labels:           p.Metadata.Labels,
+			RuntimeClassName: p.Spec.RuntimeClassName,
+		})
+	}
+	return res, nil
 }

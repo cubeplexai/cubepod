@@ -74,6 +74,31 @@ func newMockK8sServer() (*mockK8sServer, *httptest.Server) {
 		if strings.HasPrefix(path, "/api/v1/namespaces/cubepod-workloads/pods") {
 			sub := strings.TrimPrefix(path, "/api/v1/namespaces/cubepod-workloads/pods")
 			if sub == "" || sub == "/" {
+				if r.Method == http.MethodGet {
+					selector := r.URL.Query().Get("labelSelector")
+					var items []map[string]any
+					for _, p := range m.pods {
+						meta, _ := p["metadata"].(map[string]any)
+						labels, _ := meta["labels"].(map[string]any)
+						if selector != "" {
+							parts := strings.Split(selector, "=")
+							if len(parts) == 2 {
+								k, v := parts[0], parts[1]
+								if labels == nil || labels[k] != v {
+									continue
+								}
+							}
+						}
+						items = append(items, p)
+					}
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"apiVersion": "v1",
+						"kind":       "PodList",
+						"items":      items,
+					})
+					return
+				}
 				if r.Method == http.MethodPost {
 					if m.conflictNext["pod"] {
 						m.conflictNext["pod"] = false
@@ -890,5 +915,136 @@ func TestRESTKubeClient_PatchPodLabels(t *testing.T) {
 	}
 	if parsed.Metadata.Labels["cubepod.io/claimed"] != "true" || parsed.Metadata.Labels["cubepod.io/claimed-by"] != "test-box" {
 		t.Errorf("unexpected patched labels: %+v", parsed.Metadata.Labels)
+	}
+}
+
+func TestMemoryKubeClient_ListPods(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+
+	pod1 := controller.PodManifest{
+		Name:      "pod-alpha",
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"app":                 "cubepod",
+			"cubepod.io/warmpool": "pool-a",
+			"cubepod.io/claimed":  "false",
+		},
+	}
+	pod2 := controller.PodManifest{
+		Name:      "pod-beta",
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"app":                 "cubepod",
+			"cubepod.io/warmpool": "pool-a",
+			"cubepod.io/claimed":  "true",
+		},
+	}
+	pod3 := controller.PodManifest{
+		Name:      "pod-gamma",
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"app":                 "cubepod",
+			"cubepod.io/warmpool": "pool-b",
+		},
+	}
+	podOtherNs := controller.PodManifest{
+		Name:      "pod-other",
+		Namespace: "other-ns",
+		Labels: map[string]string{
+			"cubepod.io/warmpool": "pool-a",
+		},
+	}
+
+	_, _ = memKube.EnsurePod(ctx, pod1)
+	_, _ = memKube.EnsurePod(ctx, pod2)
+	_, _ = memKube.EnsurePod(ctx, pod3)
+	_, _ = memKube.EnsurePod(ctx, podOtherNs)
+
+	// Filter by pool-a in cubepod-workloads
+	pods, err := memKube.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=pool-a")
+	if err != nil {
+		t.Fatalf("ListPods failed: %v", err)
+	}
+	if len(pods) != 2 {
+		t.Fatalf("expected 2 pods for pool-a, got %d", len(pods))
+	}
+
+	// Filter by pool-a unclaimed
+	pods, err = memKube.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=pool-a,cubepod.io/claimed=false")
+	if err != nil {
+		t.Fatalf("ListPods failed: %v", err)
+	}
+	if len(pods) != 1 || pods[0].Name != "pod-alpha" {
+		t.Fatalf("expected pod-alpha, got %+v", pods)
+	}
+
+	// Filter across all namespaces
+	pods, err = memKube.ListPods(ctx, "", "cubepod.io/warmpool=pool-a")
+	if err != nil {
+		t.Fatalf("ListPods failed: %v", err)
+	}
+	if len(pods) != 3 {
+		t.Fatalf("expected 3 pods across all namespaces for pool-a, got %d", len(pods))
+	}
+
+	// AllPods helper
+	all := memKube.AllPods()
+	if len(all) != 4 {
+		t.Fatalf("expected 4 pods total, got %d", len(all))
+	}
+}
+
+func TestRESTKubeClient_ListPods(t *testing.T) {
+	_, ts := newMockK8sServer()
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+	ctx := context.Background()
+
+	pod1 := controller.PodManifest{
+		Name:      "rest-pod-1",
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"cubepod.io/warmpool": "pool-x",
+			"cubepod.io/claimed":  "false",
+		},
+	}
+	pod2 := controller.PodManifest{
+		Name:      "rest-pod-2",
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"cubepod.io/warmpool": "pool-x",
+			"cubepod.io/claimed":  "true",
+		},
+	}
+	pod3 := controller.PodManifest{
+		Name:      "rest-pod-3",
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"cubepod.io/warmpool": "pool-y",
+		},
+	}
+
+	_, _ = client.EnsurePod(ctx, pod1)
+	_, _ = client.EnsurePod(ctx, pod2)
+	_, _ = client.EnsurePod(ctx, pod3)
+
+	// List with selector pool-x
+	pods, err := client.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=pool-x")
+	if err != nil {
+		t.Fatalf("ListPods failed: %v", err)
+	}
+	if len(pods) != 2 {
+		t.Fatalf("expected 2 pods matching pool-x, got %d", len(pods))
+	}
+
+	// List with empty selector (all pods in ns)
+	all, err := client.ListPods(ctx, "cubepod-workloads", "")
+	if err != nil {
+		t.Fatalf("ListPods empty selector failed: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("expected 3 pods total, got %d", len(all))
 	}
 }

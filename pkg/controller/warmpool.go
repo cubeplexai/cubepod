@@ -25,6 +25,7 @@ type WarmPodEntry struct {
 }
 
 type warmPoolState struct {
-	spec    v1alpha1.PodWarmPoolSpec
-	entries []*WarmPodEntry
+	spec      v1alpha1.PodWarmPoolSpec
+	entries   []*WarmPodEntry
+	persisted bool
 }
