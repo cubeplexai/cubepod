@@ -218,7 +218,7 @@ func (c *RESTKubeClient) UpsertPodWarmPool(ctx context.Context, pool v1alpha1.Po
 	if resp.StatusCode == http.StatusNotFound {
 		slog.Debug("CRD podwarmpools.cubepod.io not installed on APIServer; skipping PodWarmPool persistence",
 			"namespace", ns, "name", name)
-		return nil
+		return ErrCRDNotInstalled
 	}
 
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
@@ -366,7 +366,7 @@ func (c *RESTKubeClient) ListPodWarmPools(ctx context.Context, namespace string)
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return []v1alpha1.PodWarmPool{}, nil
+		return nil, ErrCRDNotInstalled
 	}
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)

@@ -1543,3 +1543,88 @@ func TestGetEndpointAndE2BRoutes(t *testing.T) {
 		t.Fatalf("expected TimeoutSeconds to be updated to 1200, got %d", updatedRec.TimeoutSeconds)
 	}
 }
+
+func TestGateway_CreateSandbox_CASFailureRefreshesFromKubeAndClaims(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	reconciler := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	// 1. Create WarmPool with 1 replica in reconciler
+	poolSpec := v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "cubeplex-ubuntu24-desktop",
+		Replicas:    1,
+	}
+	st, err := reconciler.ReconcileWarmPool(ctx, "cas-gw-pool", poolSpec)
+	if err != nil || st.AvailableReplicas != 1 {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	// Find the standby pod in memKube
+	pods, err := memKube.ListPods(ctx, "cubepod-workloads", "cubepod.io/warmpool=cas-gw-pool")
+	if err != nil || len(pods) != 1 {
+		t.Fatalf("expected 1 pod, got %d", len(pods))
+	}
+	pod1Name := pods[0].Name
+
+	// 2. Simulate another replica claiming pod1 in K8s (CAS loss)
+	pod1, _ := memKube.GetPod("cubepod-workloads", pod1Name)
+	pod1.Labels["cubepod.io/claimed"] = "true"
+	pod1.Labels["cubepod.io/claimed-by"] = "other-gateway"
+	_ = memKube.PatchPodLabels(ctx, "cubepod-workloads", pod1Name, pod1.Labels)
+
+	// 3. Controller scales up / adds a second standby pod2 in K8s
+	pod2Name := "cas-gw-pool-warm-2-kata-pod"
+	pod2 := controller.PodManifest{
+		Name:      pod2Name,
+		Namespace: "cubepod-workloads",
+		Labels: map[string]string{
+			"cubepod.io/warmpool": "cas-gw-pool",
+			"cubepod.io/template": "cubeplex-ubuntu24-desktop",
+			"cubepod.io/claimed":  "false",
+		},
+	}
+	if _, err := memKube.EnsurePod(ctx, pod2); err != nil {
+		t.Fatalf("EnsurePod 2 failed: %v", err)
+	}
+
+	// 4. Start gateway server
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 5. POST /sandboxes:
+	// - First claim attempt on pod1 fails CAS claim (claimed by other replica)
+	// - All in-memory standbys fail
+	// - Gateway triggers SyncFromKube, discovers pod2, and retries claim
+	// - Succeeded via WarmPoolClaimed on pod2!
+	sbReq := `{"templateID":"cubeplex-ubuntu24-desktop"}`
+	sbResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(sbReq))
+	if err != nil {
+		t.Fatalf("POST /sandboxes failed: %v", err)
+	}
+	defer sbResp.Body.Close()
+
+	if sbResp.StatusCode != http.StatusCreated && sbResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected status 201/200, got: %d", sbResp.StatusCode)
+	}
+
+	var sbData struct {
+		SandboxID string `json:"sandboxID"`
+		Reason    string `json:"reason"`
+	}
+	_ = json.NewDecoder(sbResp.Body).Decode(&sbData)
+
+	box, ok := reconciler.GetBox(sbData.SandboxID)
+	if !ok {
+		t.Fatalf("sandbox not found in reconciler: %s", sbData.SandboxID)
+	}
+	if box.Reason != "WarmPoolClaimed" {
+		t.Fatalf("expected WarmPoolClaimed on refreshed standby, got: %s", box.Reason)
+	}
+	if box.PodName != pod2Name {
+		t.Fatalf("expected pod2 to be claimed, got: %s", box.PodName)
+	}
+}
