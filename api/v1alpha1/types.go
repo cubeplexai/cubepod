@@ -90,6 +90,73 @@ type PodTemplateSpec struct {
 
 	// Egress defines the cluster-level egress sidecar configuration.
 	Egress EgressConfig `json:"egress,omitempty"`
+
+	// Names are the E2B aliases and tags ("my-template", "my-template:v1", "ubuntu:24.04").
+	Names []string `json:"names,omitempty"`
+
+	// CPUCount, MemoryMB, and DiskSizeMB are the E2B resource view.
+	// The controller also writes Resources and Storage.rootfsSize from them.
+	CPUCount   int32 `json:"cpuCount,omitempty"`
+	MemoryMB   int32 `json:"memoryMB,omitempty"`
+	DiskSizeMB int32 `json:"diskSizeMB,omitempty"`
+	Public     bool  `json:"public,omitempty"`
+
+	// StartCmd is launched by podd after pivot_root. It is not the container entrypoint.
+	StartCmd string `json:"startCmd,omitempty"`
+
+	// ReadyCmd is probed during the build and after each sandbox start. Empty skips the probe.
+	ReadyCmd string `json:"readyCmd,omitempty"`
+
+	// RunAsUser is the uid from a numeric USER step. Nil means unset and podd uses 1000.
+	// A pointer is required so USER 0 (root) is distinct from unset.
+	RunAsUser *int64 `json:"runAsUser,omitempty"`
+
+	// RunAsGroup is set when USER is "<uid>:<gid>" and gid is numeric.
+	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
+
+	// RunAsUsername is set when USER is not a bare integer. podd resolves it inside the image.
+	RunAsUsername string `json:"runAsUsername,omitempty"`
+}
+
+// Build status constants for PodTemplateStatus.BuildStatus
+const (
+	BuildStatusWaiting  = "waiting"
+	BuildStatusBuilding = "building"
+	BuildStatusUploaded = "uploaded"
+	BuildStatusReady    = "ready"
+	BuildStatusError    = "error"
+)
+
+// PodTemplateBuildRecord tracks an individual build attempt on a PodTemplate.
+type PodTemplateBuildRecord struct {
+	BuildID    string `json:"buildID"`
+	Status     string `json:"status"`
+	Reason     string `json:"reason,omitempty"`
+	FailedStep string `json:"failedStep,omitempty"`
+	CreatedAt  string `json:"createdAt,omitempty"`
+	UpdatedAt  string `json:"updatedAt,omitempty"`
+	CPUCount   int32  `json:"cpuCount,omitempty"`
+	MemoryMB   int32  `json:"memoryMB,omitempty"`
+}
+
+// PodTemplateStatus reports the observed state of a PodTemplate instance.
+type PodTemplateStatus struct {
+	TemplateID    string `json:"templateID,omitempty"`
+	ReadyBuildID  string `json:"readyBuildID,omitempty"`
+	ReadyImage    string `json:"readyImage,omitempty"`
+	LatestBuildID string `json:"latestBuildID,omitempty"`
+	// BuildStatus is the E2B enum for LatestBuildID:
+	// waiting, building, uploaded, ready, error.
+	BuildStatus   string                   `json:"buildStatus,omitempty"`
+	Reason        string                   `json:"reason,omitempty"`
+	FailedStep    string                   `json:"failedStep,omitempty"`
+	Public        bool                     `json:"public,omitempty"`
+	BuildCount    int64                    `json:"buildCount,omitempty"`
+	SpawnCount    int64                    `json:"spawnCount,omitempty"`
+	CreatedAt     string                   `json:"createdAt,omitempty"`
+	UpdatedAt     string                   `json:"updatedAt,omitempty"`
+	LastSpawnedAt string                   `json:"lastSpawnedAt,omitempty"`
+	Builds        []PodTemplateBuildRecord `json:"builds,omitempty"`
 }
 
 // PodWarmPoolSpec defines a pool of pre-warmed Kata MicroVMs with pre-attached thin block PVCs.
@@ -218,4 +285,21 @@ type PodWarmPoolList struct {
 	Kind       string        `json:"kind,omitempty"`
 	Metadata   ObjectMeta    `json:"metadata,omitempty"`
 	Items      []PodWarmPool `json:"items"`
+}
+
+// PodTemplate is the Custom Resource representing a reusable sandbox blueprint and template catalog entry.
+type PodTemplate struct {
+	APIVersion string            `json:"apiVersion,omitempty"`
+	Kind       string            `json:"kind,omitempty"`
+	Metadata   ObjectMeta        `json:"metadata"`
+	Spec       PodTemplateSpec   `json:"spec"`
+	Status     PodTemplateStatus `json:"status,omitempty"`
+}
+
+// PodTemplateList is a list of PodTemplate Custom Resources.
+type PodTemplateList struct {
+	APIVersion string        `json:"apiVersion,omitempty"`
+	Kind       string        `json:"kind,omitempty"`
+	Metadata   ObjectMeta    `json:"metadata,omitempty"`
+	Items      []PodTemplate `json:"items"`
 }

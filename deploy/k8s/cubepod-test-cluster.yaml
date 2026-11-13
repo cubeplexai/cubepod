@@ -59,10 +59,140 @@ spec:
     - name: v1alpha1
       served: true
       storage: true
+      subresources:
+        status: {}
       schema:
         openAPIV3Schema:
           type: object
-          x-kubernetes-preserve-unknown-fields: true
+          properties:
+            spec:
+              type: object
+              required:
+                - image
+              properties:
+                runtimeClassName:
+                  type: string
+                image:
+                  type: string
+                poddImage:
+                  type: string
+                resources:
+                  type: object
+                  properties:
+                    cpuRequest:
+                      type: string
+                    cpuLimit:
+                      type: string
+                    memoryRequest:
+                      type: string
+                    memoryLimit:
+                      type: string
+                storage:
+                  type: object
+                  properties:
+                    storageClassName:
+                      type: string
+                    rootfsSize:
+                      type: string
+                    workspaceSize:
+                      type: string
+                egress:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                    image:
+                      type: string
+                    exchangeUrl:
+                      type: string
+                names:
+                  type: array
+                  items:
+                    type: string
+                cpuCount:
+                  type: integer
+                memoryMB:
+                  type: integer
+                diskSizeMB:
+                  type: integer
+                public:
+                  type: boolean
+                startCmd:
+                  type: string
+                readyCmd:
+                  type: string
+                runAsUser:
+                  type: integer
+                  format: int64
+                runAsGroup:
+                  type: integer
+                  format: int64
+                runAsUsername:
+                  type: string
+            status:
+              type: object
+              properties:
+                templateID:
+                  type: string
+                readyBuildID:
+                  type: string
+                readyImage:
+                  type: string
+                latestBuildID:
+                  type: string
+                buildStatus:
+                  type: string
+                reason:
+                  type: string
+                failedStep:
+                  type: string
+                public:
+                  type: boolean
+                buildCount:
+                  type: integer
+                  format: int64
+                spawnCount:
+                  type: integer
+                  format: int64
+                createdAt:
+                  type: string
+                updatedAt:
+                  type: string
+                lastSpawnedAt:
+                  type: string
+                builds:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      buildID:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      failedStep:
+                        type: string
+                      createdAt:
+                        type: string
+                      updatedAt:
+                        type: string
+                      cpuCount:
+                        type: integer
+                        format: int32
+                      memoryMB:
+                        type: integer
+                        format: int32
+      additionalPrinterColumns:
+        - name: Image
+          type: string
+          jsonPath: .status.readyImage
+        - name: Build
+          type: string
+          jsonPath: .status.buildStatus
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
 
 ---
 apiVersion: apiextensions.k8s.io/v1

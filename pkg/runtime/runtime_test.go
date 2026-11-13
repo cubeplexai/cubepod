@@ -374,3 +374,15 @@ func TestPoddProcessBackend_DeleteAndInspect(t *testing.T) {
 		t.Errorf("expected sandbox directory to be deleted")
 	}
 }
+
+func TestLocalTemplateTag(t *testing.T) {
+	t.Run("local tag cubepod-templates/<slug>:<buildID>", func(t *testing.T) {
+		slug := "my-python-app"
+		buildID := "bld_12345678"
+		expected := "cubepod-templates/my-python-app:bld_12345678"
+		got := LocalTemplateTag(slug, buildID)
+		if got != expected {
+			t.Fatalf("expected tag %q, got %q", expected, got)
+		}
+	})
+}

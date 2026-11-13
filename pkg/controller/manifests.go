@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
@@ -51,6 +52,8 @@ type ContainerManifest struct {
 	Resources       v1alpha1.ResourceRequirements `json:"resources,omitempty"`
 	Env             []EnvVar                      `json:"env,omitempty"`
 	Privileged      bool                          `json:"privileged,omitempty"`
+	RunAsUser       *int64                        `json:"runAsUser,omitempty"`
+	RunAsGroup      *int64                        `json:"runAsGroup,omitempty"`
 }
 
 // VolumeManifest represents a Pod volume definition.
@@ -66,6 +69,7 @@ type PodManifest struct {
 	Name             string              `json:"name"`
 	Namespace        string              `json:"namespace,omitempty"`
 	RuntimeClassName string              `json:"runtimeClassName"`
+	RestartPolicy    string              `json:"restartPolicy,omitempty"`
 	Labels           map[string]string   `json:"labels,omitempty"`
 	InitContainers   []ContainerManifest `json:"initContainers"`
 	Containers       []ContainerManifest `json:"containers"`
@@ -281,6 +285,31 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 		}
 	}
 
+	if tpl.StartCmd != "" {
+		mainContainer.Env = append(mainContainer.Env, EnvVar{
+			Name:  "CUBEPOD_START_CMD",
+			Value: tpl.StartCmd,
+		})
+	}
+	if tpl.RunAsUser != nil {
+		mainContainer.Env = append(mainContainer.Env, EnvVar{
+			Name:  "CUBEPOD_RUN_AS_USER",
+			Value: fmt.Sprintf("%d", *tpl.RunAsUser),
+		})
+	}
+	if tpl.RunAsGroup != nil {
+		mainContainer.Env = append(mainContainer.Env, EnvVar{
+			Name:  "CUBEPOD_RUN_AS_GROUP",
+			Value: fmt.Sprintf("%d", *tpl.RunAsGroup),
+		})
+	}
+	if tpl.RunAsUsername != "" {
+		mainContainer.Env = append(mainContainer.Env, EnvVar{
+			Name:  "CUBEPOD_RUN_AS_USERNAME",
+			Value: tpl.RunAsUsername,
+		})
+	}
+
 	containers := []ContainerManifest{mainContainer}
 
 	if tpl.Egress.Enabled {
@@ -333,6 +362,13 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 		}
 	}
 
+	pullSecrets := []string{"regcred", "hub.sensedeal.vip"}
+	if len(volumeMode) > 1 && volumeMode[1] != "" && !strings.HasPrefix(volumeMode[1], "cubepod-template-src-") {
+		if !slices.Contains(pullSecrets, volumeMode[1]) {
+			pullSecrets = append(pullSecrets, volumeMode[1])
+		}
+	}
+
 	return PodManifest{
 		Name:             podName,
 		RuntimeClassName: rtClass,
@@ -340,6 +376,6 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 		InitContainers:   initContainers,
 		Containers:       containers,
 		Volumes:          volumes,
-		ImagePullSecrets: []string{"regcred", "hub.sensedeal.vip"},
+		ImagePullSecrets: pullSecrets,
 	}
 }

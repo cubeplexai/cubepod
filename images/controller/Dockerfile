@@ -1,8 +1,8 @@
 # Multi-stage Dockerfile for cubepod-controller
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
 COPY api ./api
 COPY cmd ./cmd
 COPY pkg ./pkg

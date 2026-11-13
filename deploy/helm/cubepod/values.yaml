@@ -70,3 +70,21 @@ egress:
     tag: "v0.3.0"
   port: 18080
   exchangeUrl: "https://cubeplex-backend.cubeplex.svc:8443/api/v1/internal/egress/exchange"
+
+featureGates:
+  # Turning on changes GET /templates from the wrapped stub to a JSON array
+  e2bTemplateAPI: false
+
+templateBuild:
+  enabled: false
+  buildkit:
+    image: "moby/buildkit:rootless"
+    address: "tcp://cubepod-buildkit.cubepod-system.svc:1234"
+    nodeSelector: {}
+  cacheSize: "20Gi"
+  probeTimeout: "120s"
+  registry:
+    url: ""
+    pushSecret: "cubepod-buildkit-push"
+    pullSecret: "cubepod-buildkit-pull"
+    repositoryPrefix: "cubepod-templates"

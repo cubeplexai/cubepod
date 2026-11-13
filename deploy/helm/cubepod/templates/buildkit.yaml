@@ -1,0 +1,143 @@
+{{- if .Values.templateBuild.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cubepod-buildkit-cache
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: buildkit
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.templateBuild.cacheSize }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cubepod-template-context
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cubepod-buildkit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: buildkit
+spec:
+  ports:
+    - name: buildkit
+      port: 1234
+      targetPort: 1234
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: cubepod
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: buildkit
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cubepod-buildkit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: buildkit
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cubepod
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: buildkit
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cubepod
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: buildkit
+    spec:
+      {{- with .Values.templateBuild.buildkit.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- $cacheSize := .Values.templateBuild.cacheSize | default "20Gi" | toString }}
+      {{- $cacheSizeMB := 20480 }}
+      {{- if hasSuffix "Gi" $cacheSize }}
+        {{- $cacheSizeMB = mul (trimSuffix "Gi" $cacheSize | int) 1024 }}
+      {{- else if hasSuffix "G" $cacheSize }}
+        {{- $cacheSizeMB = mul (trimSuffix "G" $cacheSize | int) 1000 }}
+      {{- else if hasSuffix "Mi" $cacheSize }}
+        {{- $cacheSizeMB = trimSuffix "Mi" $cacheSize | int }}
+      {{- else if hasSuffix "M" $cacheSize }}
+        {{- $cacheSizeMB = trimSuffix "M" $cacheSize | int }}
+      {{- else if regexMatch "^[0-9]+$" $cacheSize }}
+        {{- $cacheSizeMB = $cacheSize | int }}
+      {{- end }}
+      containers:
+        - name: buildkitd
+          image: {{ .Values.templateBuild.buildkit.image }}
+          args:
+            - "--addr=tcp://0.0.0.0:1234"
+            - "--oci-worker-no-process-sandbox"
+            - "--oci-worker-gc"
+            - "--oci-worker-gc-keepstorage={{ $cacheSizeMB }}"
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            seccompProfile:
+              type: Unconfined
+            appArmorProfile:
+              type: Unconfined
+          ports:
+            - name: buildkit
+              containerPort: 1234
+              protocol: TCP
+          volumeMounts:
+            - name: cache
+              mountPath: /home/user/.local/share/buildkit
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: cubepod-buildkit-cache
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cubepod-buildkit-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: buildkit
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: cubepod
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: buildkit
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: cubepod
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: controller
+      ports:
+        - protocol: TCP
+          port: 1234
+{{- end }}
