@@ -11,10 +11,12 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /bin/cubepod
 
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata nftables su-exec
 
 COPY --from=builder /bin/cubepod-egress /usr/local/bin/cubepod-egress
+COPY images/egress/egress-init.sh /usr/local/bin/egress-init.sh
+RUN chmod +x /usr/local/bin/egress-init.sh
 
-EXPOSE 18080
+EXPOSE 18080 18081 18443 18053 19090
 
-ENTRYPOINT ["/usr/local/bin/cubepod-egress"]
+ENTRYPOINT ["/usr/local/bin/egress-init.sh"]
