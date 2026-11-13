@@ -1,9 +1,12 @@
+from collections.abc import AsyncIterator, Iterator
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tarfile
 import unittest
+from unittest import mock
 from typing import Any
 
 # Ensure sdks/python is on sys.path
@@ -14,6 +17,8 @@ import httpx
 from cubepod import (
     AsyncCubePod,
     CubePod,
+    CubePodFileTooLargeError,
+    DesktopSession,
     SyncCubePod,
     CommandInfo,
     CommandLogs,
@@ -21,6 +26,7 @@ from cubepod import (
     FileEntry,
     PanelEndpoint,
     SandboxInfo,
+    _build_tar_gz_bytes,
 )
 
 
@@ -1052,6 +1058,372 @@ class TestSyncCubePod(unittest.TestCase):
                 )
             self.assertIn("apt-get failed", str(err_ctx.exception))
             self.assertIn("RUN apt-get", str(err_ctx.exception))
+
+
+class _TrackingAsyncStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _TrackingSyncStream(httpx.SyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        for chunk in self._chunks:
+            yield chunk
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestV04FeaturesAsync(unittest.IsolatedAsyncioTestCase):
+    async def test_url_normalization_and_trust_env_default(self) -> None:
+        with mock.patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:9", "ALL_PROXY": "http://127.0.0.1:9"}):
+            async with AsyncCubePod(base_url="gw.local:8080/") as client:
+                self.assertEqual(str(client._client.base_url), "http://gw.local:8080")
+                self.assertFalse(client._client._trust_env)
+                self.assertEqual(client._client.timeout.read, 60.0)
+
+            async with AsyncCubePod(base_url="https://gw.example.com/", timeout=15.0, trust_env=True) as client2:
+                self.assertEqual(str(client2._client.base_url), "https://gw.example.com")
+                self.assertTrue(client2._client._trust_env)
+                self.assertEqual(client2._client.timeout.read, 15.0)
+
+    async def test_create_fork_get_raw_and_sandbox_info_properties(self) -> None:
+        recorded: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content) if request.content else None
+            recorded.append({"method": request.method, "path": request.url.path, "body": body})
+            if request.method == "POST" and request.url.path == "/sandboxes":
+                return httpx.Response(
+                    201,
+                    json={
+                        "sandboxID": "sb-v04",
+                        "templateID": "tpl-1",
+                        "state": "Running",
+                        "metadata": {"tenant": "acme", "env": "prod"},
+                        "customField": "preserved",
+                    },
+                )
+            if request.method == "POST" and request.url.path == "/sandboxes/sb-v04/fork":
+                return httpx.Response(
+                    201,
+                    json={
+                        "sandboxID": "sb-v04-fork",
+                        "templateID": "tpl-1",
+                        "state": "Stopped",
+                        "metadata": {"forked": "true"},
+                    },
+                )
+            if request.method == "GET" and request.url.path == "/sandboxes/sb-v04":
+                return httpx.Response(
+                    200,
+                    json={
+                        "sandboxID": "sb-v04",
+                        "templateID": "tpl-1",
+                        "state": "Terminated",
+                        "metadata": {"tenant": "acme"},
+                        "extra": {"k": 1},
+                    },
+                )
+            return httpx.Response(404)
+
+        async with AsyncCubePod(base_url="gw.local:8080", transport=httpx.MockTransport(handler)) as client:
+            created = await client.create(
+                template_id="tpl-1",
+                volume_key="vol-1",
+                warm_pool_ref="pool-fast",
+                resource={"cpu": "4", "memory": "8Gi"},
+                timeout_seconds=900,
+                metadata={"tenant": "acme"},
+            )
+            self.assertEqual(recorded[-1]["body"]["timeoutSeconds"], 900)
+            self.assertEqual(
+                recorded[-1]["body"]["extension"],
+                {
+                    "volumeKey": "vol-1",
+                    "warmPoolRef": "pool-fast",
+                    "resource": {"cpu": "4", "memory": "8Gi"},
+                },
+            )
+            self.assertEqual(created.metadata, {"tenant": "acme", "env": "prod"})
+            self.assertEqual(created.raw["customField"], "preserved")
+            self.assertFalse(created.is_terminal)
+
+            forked = await client.fork("sb-v04", volume_key="vol-fork", metadata={"forked": "true"})
+            self.assertEqual(
+                recorded[-1]["body"],
+                {"metadata": {"forked": "true"}, "extension": {"volumeKey": "vol-fork"}},
+            )
+            self.assertTrue(forked.is_terminal)
+
+            # Bodyless fork remains supported
+            await client.fork("sb-v04")
+            self.assertIsNone(recorded[-1]["body"])
+
+            raw = await client.get_raw("sb-v04")
+            self.assertEqual(raw["extra"], {"k": 1})
+
+        for state in ("Stopped", "Terminated", "Failed", "Killed", "Succeed"):
+            self.assertTrue(SandboxInfo("id", "tpl", state).is_terminal)
+        for state in ("Running", "Paused", "Creating", "Starting"):
+            self.assertFalse(SandboxInfo("id", "tpl", state).is_terminal)
+
+    async def test_execute_and_start_command_optional_uid_gid_and_timeout(self) -> None:
+        recorded_bodies: list[dict[str, Any]] = []
+        recorded_timeouts: list[Any] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            recorded_bodies.append(json.loads(request.content))
+            recorded_timeouts.append(request.extensions.get("timeout"))
+            return httpx.Response(200, json={"id": "c1", "exit_code": 0, "output": "ok", "running": False})
+
+        async with AsyncCubePod(transport=httpx.MockTransport(handler)) as client:
+            await client.execute("sb-1", "whoami", uid=None, gid=None, timeout=12.5)
+            self.assertNotIn("uid", recorded_bodies[0])
+            self.assertNotIn("gid", recorded_bodies[0])
+            self.assertEqual(recorded_timeouts[0]["read"], 12.5)
+
+            await client.start_command("sb-1", "sleep 1", uid=None, gid=0, timeout=5.0)
+            self.assertNotIn("uid", recorded_bodies[1])
+            self.assertEqual(recorded_bodies[1]["gid"], 0)
+            self.assertEqual(recorded_timeouts[1]["read"], 5.0)
+
+    async def test_archive_sync_prebuilt_bytes_and_remove_paths(self) -> None:
+        prebuilt = _build_tar_gz_bytes({"main.py": "print(1)\n"})
+        seen: list[tuple[bytes, str | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append((request.content, request.url.params.get("remove_paths")))
+            return httpx.Response(200, json={"status": "extracted"})
+
+        async with AsyncCubePod(transport=httpx.MockTransport(handler)) as client:
+            res = await client.archive_sync(
+                "sb-1",
+                prebuilt,
+                dest="/workspace",
+                remove_paths=["stale.txt", "", "old/a.py"],
+            )
+            self.assertEqual(res["status"], "extracted")
+            self.assertEqual(seen[0][0], prebuilt)
+            self.assertEqual(seen[0][1], "stale.txt,old/a.py")
+
+    async def test_stream_file_read_text_file_and_list_files_modified_at(self) -> None:
+        streams: list[_TrackingAsyncStream] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/sandboxes/sb-1/files/list":
+                return httpx.Response(
+                    200,
+                    json={
+                        "entries": [
+                            {"name": "a.txt", "path": "/workspace/a.txt", "is_dir": False, "size": 5, "modified_at": "2026-11-13T10:00:00Z"},
+                            {"name": "b.txt", "path": "/workspace/b.txt", "is_dir": False, "size": 5, "modifiedAt": "2026-11-13T10:01:00Z"},
+                            {"name": "c.txt", "path": "/workspace/c.txt", "is_dir": False, "size": 5, "mtime": "1763028120"},
+                        ]
+                    },
+                )
+            path = request.url.params.get("path")
+            if path == "/missing":
+                err_stream = _TrackingAsyncStream([b"not found"])
+                streams.append(err_stream)
+                return httpx.Response(404, stream=err_stream)
+            if path == "/big.txt":
+                big_stream = _TrackingAsyncStream([b"12345", b"67890", b"!"])
+                streams.append(big_stream)
+                return httpx.Response(200, stream=big_stream)
+            ok_stream = _TrackingAsyncStream([b"hello ", b"world"])
+            streams.append(ok_stream)
+            return httpx.Response(200, stream=ok_stream)
+
+        async with AsyncCubePod(transport=httpx.MockTransport(handler)) as client:
+            entries = await client.list_files("sb-1", "/workspace")
+            self.assertEqual(entries[0].modified_at, "2026-11-13T10:00:00Z")
+            self.assertEqual(entries[1].modified_at, "2026-11-13T10:01:00Z")
+            self.assertEqual(entries[2].modified_at, "1763028120")
+
+            # 404 raises before returning generator and closes response
+            with self.assertRaises(httpx.HTTPStatusError) as exc_ctx:
+                await client.stream_file("sb-1", "/missing")
+            self.assertEqual(exc_ctx.exception.response.status_code, 404)
+            self.assertTrue(streams[-1].closed)
+
+            # Successful stream_file yields all chunks and closes response
+            stream = await client.stream_file("sb-1", "/ok.txt")
+            got = [chunk async for chunk in stream]
+            self.assertEqual(b"".join(got), b"hello world")
+            self.assertTrue(streams[-1].closed)
+
+            # read_text_file within max_bytes
+            text = await client.read_text_file("sb-1", "/ok.txt", max_bytes=11)
+            self.assertEqual(text, "hello world")
+            self.assertTrue(streams[-1].closed)
+
+            # read_text_file exceeding max_bytes aborts, closes stream, raises CubePodFileTooLargeError
+            with self.assertRaises(CubePodFileTooLargeError):
+                await client.read_text_file("sb-1", "/big.txt", max_bytes=8)
+            self.assertTrue(streams[-1].closed)
+
+    async def test_desktop_routes(self) -> None:
+        recorded: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content) if request.content else None
+            recorded.append({"method": request.method, "path": request.url.path, "body": body})
+            if request.url.path == "/sandboxes/sb-1/desktop/start":
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "running",
+                        "desktopUrl": "/panel/tok1/vnc.html",
+                        "terminalUrl": "/panel/tok2/",
+                        "cdpUrl": "/panel/tok3/",
+                        "expiresAt": "2026-11-13T18:00:00Z",
+                    },
+                )
+            if request.url.path == "/sandboxes/sb-1/desktop/status":
+                return httpx.Response(200, json={"status": "running", "display": ":99"})
+            if request.url.path == "/sandboxes/sb-1/desktop/stop":
+                return httpx.Response(200, json={"status": "stopped"})
+            return httpx.Response(404)
+
+        async with AsyncCubePod(transport=httpx.MockTransport(handler)) as client:
+            sess = await client.start_desktop(
+                "sb-1",
+                resolution="1920x1080x24",
+                initial_url="https://example.com",
+                expires_in_seconds=1800,
+            )
+            self.assertIsInstance(sess, DesktopSession)
+            self.assertEqual(sess.status, "running")
+            self.assertEqual(sess.desktop_url, "/panel/tok1/vnc.html")
+            self.assertEqual(sess.terminal_url, "/panel/tok2/")
+            self.assertEqual(sess.cdp_url, "/panel/tok3/")
+            self.assertEqual(sess.expires_at, "2026-11-13T18:00:00Z")
+            self.assertEqual(
+                recorded[0]["body"],
+                {
+                    "expiresInSeconds": 1800,
+                    "resolution": "1920x1080x24",
+                    "initialUrl": "https://example.com",
+                },
+            )
+
+            st = await client.get_desktop_status("sb-1")
+            self.assertEqual(st["status"], "running")
+
+            stopped = await client.stop_desktop("sb-1")
+            self.assertEqual(stopped["status"], "stopped")
+
+
+class TestV04FeaturesSync(unittest.TestCase):
+    def test_sync_v04_enhancements(self) -> None:
+        streams: list[_TrackingSyncStream] = []
+        recorded: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/sandboxes/sb-1/files/archive-sync":
+                recorded.append({
+                    "method": request.method,
+                    "path": request.url.path,
+                    "remove_paths": request.url.params.get("remove_paths"),
+                    "content": request.content,
+                })
+                return httpx.Response(200, json={"status": "extracted"})
+
+            body = json.loads(request.content) if request.content else None
+            recorded.append({"method": request.method, "path": request.url.path, "body": body})
+
+            if request.method == "POST" and request.url.path == "/sandboxes":
+                return httpx.Response(
+                    201,
+                    json={"sandboxID": "sb-1", "templateID": "tpl-1", "state": "Running", "metadata": {"k": "v"}},
+                )
+            if request.method == "GET" and request.url.path == "/sandboxes/sb-1":
+                return httpx.Response(
+                    200,
+                    json={"sandboxID": "sb-1", "templateID": "tpl-1", "state": "Stopped", "rawKey": 42},
+                )
+            if request.method == "POST" and request.url.path == "/sandboxes/sb-1/fork":
+                return httpx.Response(
+                    201,
+                    json={"sandboxID": "sb-1-fork", "templateID": "tpl-1", "state": "Running"},
+                )
+            if request.method == "POST" and request.url.path == "/sandboxes/sb-1/commands/run":
+                return httpx.Response(200, json={"id": "c1", "exit_code": 0, "output": "ok", "running": False})
+            if request.url.path == "/sandboxes/sb-1/files":
+                if request.url.params.get("path") == "/big":
+                    s = _TrackingSyncStream([b"abcdef", b"ghijkl"])
+                    streams.append(s)
+                    return httpx.Response(200, stream=s)
+                if request.url.params.get("path") == "/missing":
+                    s = _TrackingSyncStream([b"err"])
+                    streams.append(s)
+                    return httpx.Response(404, stream=s)
+                s = _TrackingSyncStream([b"sync ", b"text"])
+                streams.append(s)
+                return httpx.Response(200, stream=s)
+            if request.url.path == "/sandboxes/sb-1/desktop/start":
+                return httpx.Response(
+                    200,
+                    json={"status": "running", "desktopUrl": "/panel/d/", "terminalUrl": "/panel/t/"},
+                )
+            if request.url.path == "/sandboxes/sb-1/desktop/status":
+                return httpx.Response(200, json={"status": "running"})
+            if request.url.path == "/sandboxes/sb-1/desktop/stop":
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        with CubePod(base_url="gw.local:8080", transport=httpx.MockTransport(handler)) as client:
+            self.assertEqual(str(client._client.base_url), "http://gw.local:8080")
+            self.assertFalse(client._client._trust_env)
+
+            sb = client.create("tpl-1", warm_pool_ref="wp-1", resource={"cpu": "2"}, timeout_seconds=120)
+            self.assertEqual(sb.metadata, {"k": "v"})
+            self.assertEqual(recorded[-1]["body"]["timeoutSeconds"], 120)
+            self.assertEqual(recorded[-1]["body"]["extension"], {"warmPoolRef": "wp-1", "resource": {"cpu": "2"}})
+
+            raw = client.get_raw("sb-1")
+            self.assertEqual(raw["rawKey"], 42)
+
+            client.fork("sb-1", volume_key="vk-2", metadata={"m": "1"})
+            self.assertEqual(recorded[-1]["body"], {"metadata": {"m": "1"}, "extension": {"volumeKey": "vk-2"}})
+
+            client.execute("sb-1", "id", uid=None, gid=None, timeout=9.0)
+            self.assertNotIn("uid", recorded[-1]["body"])
+            self.assertNotIn("gid", recorded[-1]["body"])
+
+            prebuilt = _build_tar_gz_bytes({"x.txt": "hi"})
+            client.archive_sync("sb-1", prebuilt, remove_paths=["old.txt"])
+            self.assertEqual(recorded[-1]["content"], prebuilt)
+            self.assertEqual(recorded[-1]["remove_paths"], "old.txt")
+
+            with self.assertRaises(httpx.HTTPStatusError):
+                client.stream_file("sb-1", "/missing")
+            self.assertTrue(streams[-1].closed)
+
+            self.assertEqual(client.read_text_file("sb-1", "/ok", max_bytes=20), "sync text")
+            self.assertTrue(streams[-1].closed)
+
+            with self.assertRaises(CubePodFileTooLargeError):
+                client.read_text_file("sb-1", "/big", max_bytes=5)
+            self.assertTrue(streams[-1].closed)
+
+            sess = client.start_desktop("sb-1")
+            self.assertEqual(sess.desktop_url, "/panel/d/")
+            self.assertEqual(client.get_desktop_status("sb-1")["status"], "running")
+            self.assertEqual(client.stop_desktop("sb-1")["status"], "stopped")
 
 
 if __name__ == "__main__":

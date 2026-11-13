@@ -1,9 +1,13 @@
 """CubePod data models and archive serialization helpers."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import io
 import tarfile
 import time
+from typing import Any
+
+
+_TERMINAL_STATES = frozenset({"Stopped", "Terminated", "Failed", "Killed", "Succeed"})
 
 
 @dataclass
@@ -13,6 +17,13 @@ class SandboxInfo:
     state: str
     envd_port: int = 49983
     rootfs_generation: int = 1
+    metadata: dict[str, str] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_terminal(self) -> bool:
+        """Return True if the sandbox is in a terminal lifecycle state."""
+        return self.state in _TERMINAL_STATES
 
 
 @dataclass
@@ -58,6 +69,16 @@ class FileEntry:
     is_dir: bool
     size: int
     mode: str = "0644"
+    modified_at: str | None = None
+
+
+@dataclass
+class DesktopSession:
+    status: str
+    desktop_url: str
+    terminal_url: str
+    cdp_url: str | None = None
+    expires_at: str | None = None
 
 
 def _build_tar_gz_bytes(
