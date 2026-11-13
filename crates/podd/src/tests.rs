@@ -1201,3 +1201,351 @@ fn test_interpreter_zero_latency_flushing() {
     assert_eq!(line2.get("type").unwrap().as_str().unwrap(), "stdout");
     assert_eq!(line2.get("text").unwrap().as_str().unwrap(), "line two\n");
 }
+
+#[test]
+fn test_start_cmd_unset_serves_daemon_without_process_or_log() {
+    // 1. CUBEPOD_START_CMD unset: serving the daemon does not create a start process and does not require the log file.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let registry = ProcessRegistry::new();
+    let config = DaemonConfig {
+        workdir: "/tmp".to_string(),
+    };
+    let reg_clone = registry.clone();
+    std::thread::spawn(move || serve(listener, config, reg_clone));
+
+    let (status, _, body) = get(&addr.to_string(), "/health");
+    assert_eq!(status, 200);
+    let json = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    assert_eq!(json.get("status").unwrap().as_str(), Some("ok"));
+    assert_eq!(json.get("active_processes").unwrap().as_u64(), Some(0));
+
+    // Default start command log was not required or created
+    assert!(!std::path::Path::new("/var/log/cubepod/start-cmd.log").exists());
+    assert!(!std::path::Path::new("/var/log/cubepod/start-cmd.status").exists());
+}
+
+#[test]
+fn test_start_cmd_set_runs_once_outputs_logs_and_second_poll_no_op() {
+    use crate::startcmd::{
+        StartCmdConfig, StartCmdRunner, StartCmdStatus, TemplateUserCredentials,
+    };
+    use std::fs;
+
+    // 2. CUBEPOD_START_CMD set to a command that prints a marker and exits (requested uid equals the current euid):
+    // the command runs once; stdout and stderr are in the log; the exit code is in start-cmd.status;
+    // a second poll does not run it again.
+    let current_euid = unsafe { libc::geteuid() };
+    let temp_dir = std::env::temp_dir().join(format!("podd-test-marker-{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let log_path = temp_dir.join("start-cmd.log");
+    let status_path = temp_dir.join("start-cmd.status");
+
+    let stdout_marker = "MARKER_OUT_88219";
+    let stderr_marker = "MARKER_ERR_99120";
+
+    let config = StartCmdConfig {
+        command: Some(format!(
+            "echo {} && echo {} >&2",
+            stdout_marker, stderr_marker
+        )),
+        workdir: temp_dir.to_string_lossy().to_string(),
+        credentials: TemplateUserCredentials {
+            uid: Some(current_euid),
+            gid: None,
+            username: None,
+        },
+        log_path: log_path.clone(),
+        status_path: status_path.clone(),
+    };
+
+    let runner = StartCmdRunner::new(config);
+
+    // First poll starts the command
+    let first_status = runner.poll();
+    match first_status {
+        StartCmdStatus::Running { .. } => {}
+        other => panic!("expected Running status, got {:?}", other),
+    }
+
+    // Wait for the exit code to be written to start-cmd.status
+    let mut exit_found = false;
+    for _ in 0..100 {
+        if status_path.exists() {
+            if let Ok(content) = fs::read_to_string(&status_path) {
+                if !content.trim().is_empty() {
+                    assert_eq!(content.trim(), "0");
+                    exit_found = true;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(exit_found, "start-cmd.status was not written");
+
+    // Verify stdout and stderr in log
+    let log_content = fs::read_to_string(&log_path).expect("failed to read start-cmd.log");
+    assert!(
+        log_content.contains(stdout_marker),
+        "log missing stdout marker"
+    );
+    assert!(
+        log_content.contains(stderr_marker),
+        "log missing stderr marker"
+    );
+    let count_before = log_content.matches(stdout_marker).count();
+    assert_eq!(count_before, 1);
+
+    // Second poll does not run it again
+    let second_status = runner.poll();
+    assert_eq!(second_status, StartCmdStatus::AlreadyStarted);
+
+    std::thread::sleep(Duration::from_millis(50));
+    let log_content_after = fs::read_to_string(&log_path).expect("failed to read start-cmd.log");
+    let count_after = log_content_after.matches(stdout_marker).count();
+    assert_eq!(
+        count_after, 1,
+        "second poll must not execute start command again"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_child_that_exits_is_reaped_no_zombie() {
+    use crate::startcmd::{
+        ensure_subreaper, get_reaped_pids, reap_zombies, StartCmdConfig, StartCmdRunner,
+        StartCmdStatus, TemplateUserCredentials,
+    };
+    use std::fs;
+    use std::path::Path;
+
+    // 3. A child that exits is reaped. Spawn a command that forks a grandchild which exits immediately,
+    // and assert no zombie remains (check /proc or that wait collected the pid).
+    ensure_subreaper();
+
+    let temp_dir = std::env::temp_dir().join(format!("podd-test-reap-{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let log_path = temp_dir.join("start-cmd.log");
+    let status_path = temp_dir.join("start-cmd.status");
+
+    // Command forks grandchild that exits immediately, prints grandchild PID to stdout, then child exits.
+    let config = StartCmdConfig {
+        command: Some("sh -c 'sleep 0.05; exit 0' & echo $! && exit 0".to_string()),
+        workdir: temp_dir.to_string_lossy().to_string(),
+        credentials: TemplateUserCredentials::default(),
+        log_path: log_path.clone(),
+        status_path: status_path.clone(),
+    };
+
+    let runner = StartCmdRunner::new(config);
+    let child_pid = match runner.poll() {
+        StartCmdStatus::Running { pid } => pid,
+        other => panic!("expected Running status, got {:?}", other),
+    };
+
+    // Wait for the start command (direct child) to exit and write status
+    let mut exit_code_found = false;
+    for _ in 0..100 {
+        if status_path.exists() {
+            if let Ok(content) = fs::read_to_string(&status_path) {
+                if !content.trim().is_empty() {
+                    assert_eq!(content.trim(), "0");
+                    exit_code_found = true;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(exit_code_found, "start-cmd.status was not written");
+
+    // Parse grandchild PID from log
+    let mut gpid: Option<u32> = None;
+    for _ in 0..50 {
+        if let Ok(content) = fs::read_to_string(&log_path) {
+            for line in content.lines() {
+                if let Ok(p) = line.trim().parse::<u32>() {
+                    gpid = Some(p);
+                    break;
+                }
+            }
+            if gpid.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let gpid = gpid.expect("could not parse grandchild pid from start-cmd.log");
+    assert_ne!(gpid, child_pid);
+
+    // Wait for grandchild to exit and be reaped
+    let mut reaped = false;
+    for _ in 0..100 {
+        let newly = reap_zombies();
+        if newly.contains(&(gpid as libc::pid_t))
+            || get_reaped_pids().contains(&(gpid as libc::pid_t))
+        {
+            reaped = true;
+            break;
+        }
+        if !Path::new(&format!("/proc/{}", gpid)).exists() {
+            reaped = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Verify /proc/<gpid>/status if still accessible: must not be in Zombie state
+    let proc_status_path = format!("/proc/{}/status", gpid);
+    if let Ok(content) = fs::read_to_string(&proc_status_path) {
+        for line in content.lines() {
+            if line.starts_with("State:") {
+                assert!(
+                    !line.contains("Z (zombie)"),
+                    "grandchild remains as zombie: {}",
+                    line
+                );
+            }
+        }
+    }
+
+    assert!(
+        reaped || !Path::new(&format!("/proc/{}", gpid)).exists(),
+        "grandchild was not reaped"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_parsing_uid_zero_distinct_from_unset() {
+    use crate::startcmd::{
+        StartCmdConfig, StartCmdRunner, StartCmdStatus, TemplateUserCredentials,
+    };
+    use std::fs;
+
+    // 4. Parsing: value 0 is a real uid request distinct from unset.
+    // Assert the credential struct requests uid 0. Do not expect setuid(0) to succeed in this test.
+    let unset_creds = TemplateUserCredentials::from_env_getter(|_| None);
+    assert_eq!(unset_creds.uid, None);
+    assert_eq!(unset_creds.requested_uid(), None);
+
+    let zero_creds = TemplateUserCredentials::from_env_getter(|key| {
+        if key == "CUBEPOD_RUN_AS_USER" {
+            Some("0".to_string())
+        } else {
+            None
+        }
+    });
+    // Assert the credential struct requests uid 0
+    assert_eq!(zero_creds.uid, Some(0));
+    assert_eq!(zero_creds.requested_uid(), Some(0));
+
+    let temp_dir = std::env::temp_dir().join(format!("podd-test-uid0-{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let log_path = temp_dir.join("start-cmd.log");
+    let status_path = temp_dir.join("start-cmd.status");
+
+    let config = StartCmdConfig {
+        command: Some("echo should_never_run".to_string()),
+        workdir: temp_dir.to_string_lossy().to_string(),
+        credentials: zero_creds,
+        log_path: log_path.clone(),
+        status_path: status_path.clone(),
+    };
+
+    let runner = StartCmdRunner::new(config);
+    let status = runner.poll();
+
+    // Since test runs unprivileged (current euid != 0), setuid(0) fails
+    match status {
+        StartCmdStatus::CredentialSwitchFailed(msg) => {
+            assert!(msg.contains("Operation not permitted") || msg.contains("setuid"));
+        }
+        other => panic!("expected CredentialSwitchFailed, got {:?}", other),
+    }
+
+    // Verify failure logged to start-cmd.log and start-cmd.status
+    let log_content = fs::read_to_string(&log_path).expect("failed to read start-cmd.log");
+    assert!(log_content.contains("Operation not permitted") || log_content.contains("setuid"));
+    assert!(!log_content.contains("should_never_run"));
+
+    let status_content = fs::read_to_string(&status_path).expect("failed to read start-cmd.status");
+    assert_ne!(status_content.trim(), "0");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_username_nonexistent_does_not_spawn_and_writes_error_log() {
+    use crate::startcmd::{
+        StartCmdConfig, StartCmdRunner, StartCmdStatus, TemplateUserCredentials,
+    };
+    use std::fs;
+
+    // 5. Username env with a name that does not exist does not spawn and writes an error log.
+    let nonexistent = "nonexistent_cubepod_user_xyz_987654";
+    let temp_dir = std::env::temp_dir().join(format!("podd-test-baduser-{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let log_path = temp_dir.join("start-cmd.log");
+    let status_path = temp_dir.join("start-cmd.status");
+
+    let creds = TemplateUserCredentials {
+        uid: None,
+        gid: None,
+        username: Some(nonexistent.to_string()),
+    };
+
+    let config = StartCmdConfig {
+        command: Some("echo should_never_run".to_string()),
+        workdir: temp_dir.to_string_lossy().to_string(),
+        credentials: creds,
+        log_path: log_path.clone(),
+        status_path: status_path.clone(),
+    };
+
+    let runner = StartCmdRunner::new(config);
+    let status = runner.poll();
+
+    match status {
+        StartCmdStatus::UsernameResolutionFailed(msg) => {
+            assert!(msg.contains(nonexistent));
+        }
+        other => panic!("expected UsernameResolutionFailed, got {:?}", other),
+    }
+
+    // Verify error was written into start-cmd.log
+    let log_content = fs::read_to_string(&log_path).expect("failed to read start-cmd.log");
+    assert!(log_content.contains(nonexistent));
+    assert!(
+        log_content.contains("failed to resolve username")
+            || log_content.contains("user not found")
+    );
+    assert!(!log_content.contains("should_never_run"));
+
+    // Verify non-zero status written into start-cmd.status
+    let status_content = fs::read_to_string(&status_path).expect("failed to read start-cmd.status");
+    assert_ne!(status_content.trim(), "0");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_numeric_user_takes_precedence_over_username() {
+    use crate::startcmd::{resolve_credentials, TemplateUserCredentials};
+
+    let creds = TemplateUserCredentials {
+        uid: Some(1000),
+        gid: Some(1000),
+        username: Some("nonexistent_cubepod_user_xyz".to_string()),
+    };
+    let resolved = resolve_credentials(&creds).unwrap();
+    assert_eq!(resolved.uid, Some(1000));
+    assert_eq!(resolved.gid, Some(1000));
+}

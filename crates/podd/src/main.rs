@@ -14,6 +14,7 @@ pub mod files;
 pub mod http;
 pub mod interpreter;
 pub mod json;
+pub mod startcmd;
 
 #[cfg(test)]
 mod tests;
@@ -38,6 +39,12 @@ pub use interpreter::{
     handle_context_restart, handle_execute, ContextRegistry, ExecutionContext,
 };
 pub use json::{escape_json, parse_target, url_decode, JsonParser, JsonValue};
+pub use startcmd::{
+    ensure_sigchld_handler, ensure_subreaper, get_reaped_pids, lookup_reaped_exit_code,
+    maybe_spawn_start_cmd, reap_zombies, resolve_credentials, resolve_username, spawn_start_cmd,
+    ResolvedCredentials, StartCmdConfig, StartCmdCredentials, StartCmdRunner, StartCmdStatus,
+    TemplateUserCredentials,
+};
 
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -204,6 +211,7 @@ pub fn run_server(
 }
 
 pub fn serve(listener: TcpListener, config: DaemonConfig, registry: ProcessRegistry) {
+    maybe_spawn_start_cmd(&config.workdir);
     run_server(listener, config, registry, ContextRegistry::new());
 }
 
@@ -218,9 +226,13 @@ fn main() {
         workdir
     );
 
+    ensure_subreaper();
+    ensure_sigchld_handler();
+
     let config = DaemonConfig { workdir };
     let registry = ProcessRegistry::new();
     let contexts = ContextRegistry::new();
     let listener = TcpListener::bind(&addr).expect("failed to bind podd listener");
+    maybe_spawn_start_cmd(&config.workdir);
     run_server(listener, config, registry, contexts);
 }

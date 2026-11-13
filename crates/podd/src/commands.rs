@@ -271,7 +271,7 @@ pub fn handle_command_run(
                 Ok(status) => status
                     .code()
                     .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(-1)),
-                Err(_) => -1,
+                Err(_) => crate::startcmd::lookup_reaped_exit_code(pid).unwrap_or(-1),
             };
             let mut proc = entry_clone.lock().unwrap();
             proc.running = false;
@@ -300,7 +300,7 @@ pub fn handle_command_run(
             Ok(status) => status
                 .code()
                 .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(-1)),
-            Err(_) => -1,
+            Err(_) => crate::startcmd::lookup_reaped_exit_code(pid).unwrap_or(-1),
         };
         let cursor = output.len();
         let output_str = String::from_utf8_lossy(&output).to_string();
@@ -743,7 +743,7 @@ pub fn handle_connectrpc_process_start(
         Ok(status) => status
             .code()
             .unwrap_or_else(|| status.signal().map(|s| 128 + s).unwrap_or(-1)),
-        Err(_) => -1,
+        Err(_) => crate::startcmd::lookup_reaped_exit_code(pid).unwrap_or(-1),
     };
 
     {
