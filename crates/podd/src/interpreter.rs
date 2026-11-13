@@ -4,13 +4,16 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::http::{write_json, write_response, HttpRequest};
 use crate::json::{escape_json, JsonValue};
+use crate::startcmd::{
+    configure_command_credentials, exit_code_from_status, spawn_tracked, TrackedChild,
+};
 use crate::DaemonConfig;
 
 /// In-guest Python runner script passed to `python3 -u -c`.
@@ -163,7 +166,7 @@ while True:
 "#;
 
 pub struct WorkerProcess {
-    pub child: Child,
+    pub child: TrackedChild,
     pub stdin: ChildStdin,
     pub reader: BufReader<ChildStdout>,
 }
@@ -204,17 +207,18 @@ impl ExecutionContext {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        configure_command_credentials(&mut cmd, None, None, None)
+            .map_err(|e| format!("failed to configure python interpreter credentials: {e}"))?;
 
-        let mut child = cmd
-            .spawn()
+        let mut child = spawn_tracked(&mut cmd)
             .map_err(|e| format!("failed to spawn python interpreter '{py_bin}': {e}"))?;
 
         let stdin = child
-            .stdin
+            .stdin()
             .take()
             .ok_or_else(|| "failed to capture stdin".to_string())?;
         let stdout = child
-            .stdout
+            .stdout()
             .take()
             .ok_or_else(|| "failed to capture stdout".to_string())?;
         let mut reader = BufReader::new(stdout);
@@ -345,13 +349,19 @@ pub fn find_python() -> String {
         }
     }
     for candidate in &["python3", "python", "/usr/bin/python3", "/usr/bin/python"] {
-        if Command::new(candidate)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return candidate.to_string();
+        let mut cmd = Command::new(candidate);
+        cmd.arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Ok(child) = spawn_tracked(&mut cmd) {
+            if child
+                .wait_with_output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                return candidate.to_string();
+            }
         }
     }
     "python3".to_string()
@@ -575,6 +585,16 @@ fn execute_shell(
     if std::path::Path::new(&cwd).exists() {
         cmd.current_dir(&cwd);
     }
+    if let Err(e) = configure_command_credentials(&mut cmd, None, None, None) {
+        let err_msg = format!(
+            r#"{{"type":"error","name":"CredentialError","value":"{}","traceback":""}}"#,
+            escape_json(&e)
+        );
+        let exec_cnt = format!(r#"{{"type":"number_of_executions","execution_count":{count}}}"#);
+        let _ = stream.write_all(format!("{err_msg}\n{exec_cnt}\n").as_bytes());
+        let _ = stream.flush();
+        return;
+    }
     for (k, v) in env_vars {
         cmd.env(k, v);
     }
@@ -587,10 +607,10 @@ fn execute_shell(
             .unwrap_or(0)
     };
 
-    match cmd.spawn() {
+    match spawn_tracked(&mut cmd) {
         Ok(mut child) => {
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
+            let stdout = child.stdout().take();
+            let stderr = child.stderr().take();
 
             if let Some(out) = stdout {
                 let reader = BufReader::new(out);
@@ -619,7 +639,7 @@ fn execute_shell(
             }
 
             let status = child.wait();
-            let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+            let code = status.map(|s| exit_code_from_status(&s)).unwrap_or(-1);
             if code != 0 {
                 let err_msg = format!(
                     r#"{{"type":"error","name":"ProcessExitError","value":"process exited with code {}","traceback":""}}"#,

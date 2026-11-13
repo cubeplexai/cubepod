@@ -10,7 +10,31 @@ use std::process::Command;
 use crate::commands::ProcessRegistry;
 use crate::http::{write_json, write_response, HttpRequest};
 use crate::json::escape_json;
+use crate::startcmd::{lookup_passwd_by_uid, resolve_default_credentials, spawn_tracked};
 use crate::DaemonConfig;
+
+pub fn resolve_file_ownership(query_params: &HashMap<String, String>) -> (u32, u32) {
+    let req_uid = query_params.get("uid").and_then(|u| u.parse::<u32>().ok());
+    let req_gid = query_params.get("gid").and_then(|g| g.parse::<u32>().ok());
+    match (req_uid, req_gid) {
+        (Some(u), Some(g)) => (u, g),
+        (Some(u), None) => {
+            let g = lookup_passwd_by_uid(u)
+                .ok()
+                .flatten()
+                .map(|p| p.gid)
+                .unwrap_or(u);
+            (u, g)
+        }
+        (None, req_gid_opt) => {
+            let (def_uid, def_gid) = resolve_default_credentials()
+                .ok()
+                .flatten()
+                .unwrap_or((1000, 1000));
+            (def_uid, req_gid_opt.unwrap_or(def_gid))
+        }
+    }
+}
 
 pub fn handle_prepare_stop(stream: &mut TcpStream, registry: &ProcessRegistry) {
     unsafe {
@@ -69,14 +93,7 @@ pub fn handle_file_put(
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode_val));
     }
 
-    let uid = query_params
-        .get("uid")
-        .and_then(|u| u.parse().ok())
-        .unwrap_or(1000);
-    let gid = query_params
-        .get("gid")
-        .and_then(|g| g.parse().ok())
-        .unwrap_or(1000);
+    let (uid, gid) = resolve_file_ownership(query_params);
     chown_if_root(path, uid, gid);
 
     let resp = format!(
@@ -257,15 +274,15 @@ pub fn is_invalid_tar_path(path: &str) -> bool {
 
 pub fn decompress_if_gzip(data: &[u8]) -> Result<Vec<u8>, String> {
     if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-        let mut child = Command::new("gzip")
-            .arg("-dc")
+        let mut cmd = Command::new("gzip");
+        cmd.arg("-dc")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("failed to spawn gzip: {e}"))?;
+            .stderr(std::process::Stdio::piped());
+        let mut child =
+            spawn_tracked(&mut cmd).map_err(|e| format!("failed to spawn gzip: {e}"))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
+        if let Some(mut stdin) = child.stdin().take() {
             let data_vec = data.to_vec();
             std::thread::spawn(move || {
                 let _ = stdin.write_all(&data_vec);
@@ -396,14 +413,7 @@ pub fn handle_archive_sync(
         .or_else(|| query_params.get("path"))
         .map_or(config.workdir.as_str(), |s| s.as_str());
 
-    let uid = query_params
-        .get("uid")
-        .and_then(|u| u.parse().ok())
-        .unwrap_or(1000);
-    let gid = query_params
-        .get("gid")
-        .and_then(|g| g.parse().ok())
-        .unwrap_or(1000);
+    let (uid, gid) = resolve_file_ownership(query_params);
 
     let remove_paths = query_params
         .get("remove_paths")

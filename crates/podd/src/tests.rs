@@ -414,17 +414,19 @@ fn test_archive_sync_tar_gz_and_remove_paths() {
     std::fs::write(&readme, b"# Sample Archive Sync Project\n").unwrap();
 
     let tar_gz_path = test_root.join("archive.tar.gz");
-    let tar_status = Command::new("tar")
-        .args([
-            "-czf",
-            tar_gz_path.to_str().unwrap(),
-            "-C",
-            src_dir.to_str().unwrap(),
-            "src/main.py",
-            "README.md",
-        ])
-        .status()
-        .expect("failed to execute tar command");
+    let mut tar_cmd = Command::new("tar");
+    tar_cmd.args([
+        "-czf",
+        tar_gz_path.to_str().unwrap(),
+        "-C",
+        src_dir.to_str().unwrap(),
+        "src/main.py",
+        "README.md",
+    ]);
+    let tar_status = crate::startcmd::spawn_tracked(&mut tar_cmd)
+        .expect("failed to execute tar command")
+        .wait()
+        .expect("failed to wait for tar command");
     assert!(tar_status.success());
     let tar_gz_bytes = std::fs::read(&tar_gz_path).unwrap();
 
@@ -1200,4 +1202,612 @@ fn test_interpreter_zero_latency_flushing() {
     let line2 = JsonValue::parse(lines[1]).unwrap();
     assert_eq!(line2.get("type").unwrap().as_str().unwrap(), "stdout");
     assert_eq!(line2.get("text").unwrap().as_str().unwrap(), "line two\n");
+}
+
+#[test]
+fn test_start_cmd_unset_serves_daemon_without_process_or_log() {
+    // 1. CUBEPOD_START_CMD unset: serving the daemon does not create a start process and does not require the log file.
+    let log_tmp_dir =
+        std::env::temp_dir().join(format!("podd-test-unset-log-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&log_tmp_dir);
+
+    // Point CUBEPOD_START_CMD_LOG_DIR at temp directory, clear CUBEPOD_START_CMD
+    std::env::set_var("CUBEPOD_START_CMD_LOG_DIR", log_tmp_dir.to_str().unwrap());
+    std::env::remove_var("CUBEPOD_START_CMD");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let registry = ProcessRegistry::new();
+    let config = DaemonConfig {
+        workdir: "/tmp".to_string(),
+    };
+    let reg_clone = registry.clone();
+    std::thread::spawn(move || serve(listener, config, reg_clone));
+
+    let (status, _, body) = get(&addr.to_string(), "/health");
+    assert_eq!(status, 200);
+    let json = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    assert_eq!(json.get("status").unwrap().as_str(), Some("ok"));
+    assert_eq!(json.get("active_processes").unwrap().as_u64(), Some(0));
+
+    // Assert that temp directory does not gain a log or status file
+    assert!(!log_tmp_dir.join("start-cmd.log").exists());
+    assert!(!log_tmp_dir.join("start-cmd.status").exists());
+
+    std::env::remove_var("CUBEPOD_START_CMD_LOG_DIR");
+    let _ = std::fs::remove_dir_all(&log_tmp_dir);
+}
+
+#[test]
+fn test_start_cmd_set_runs_once_outputs_logs_and_second_poll_no_op() {
+    use crate::startcmd::{
+        StartCmdConfig, StartCmdRunner, StartCmdStatus, TemplateUserCredentials,
+    };
+    use std::fs;
+
+    // 2. CUBEPOD_START_CMD set to a command that prints a marker and exits (requested uid equals the current euid):
+    // the command runs once; stdout and stderr are in the log; the exit code is in start-cmd.status;
+    // a second poll does not run it again.
+    let current_euid = unsafe { libc::geteuid() };
+    let temp_dir = std::env::temp_dir().join(format!("podd-test-marker-{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let log_path = temp_dir.join("start-cmd.log");
+    let status_path = temp_dir.join("start-cmd.status");
+
+    let stdout_marker = "MARKER_OUT_88219";
+    let stderr_marker = "MARKER_ERR_99120";
+
+    let config = StartCmdConfig {
+        command: Some(format!(
+            "echo {} && echo {} >&2",
+            stdout_marker, stderr_marker
+        )),
+        workdir: temp_dir.to_string_lossy().to_string(),
+        credentials: TemplateUserCredentials {
+            uid: Some(current_euid),
+            gid: None,
+            username: None,
+        },
+        log_path: log_path.clone(),
+        status_path: status_path.clone(),
+    };
+
+    let runner = StartCmdRunner::new(config);
+
+    // First poll starts the command
+    let first_status = runner.poll();
+    match first_status {
+        StartCmdStatus::Running { .. } => {}
+        other => panic!("expected Running status, got {:?}", other),
+    }
+
+    // Wait for the exit code to be written to start-cmd.status
+    let mut exit_found = false;
+    for _ in 0..100 {
+        if status_path.exists() {
+            if let Ok(content) = fs::read_to_string(&status_path) {
+                if !content.trim().is_empty() {
+                    assert_eq!(content.trim(), "0");
+                    exit_found = true;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(exit_found, "start-cmd.status was not written");
+
+    // Verify stdout and stderr in log
+    let log_content = fs::read_to_string(&log_path).expect("failed to read start-cmd.log");
+    assert!(
+        log_content.contains(stdout_marker),
+        "log missing stdout marker"
+    );
+    assert!(
+        log_content.contains(stderr_marker),
+        "log missing stderr marker"
+    );
+    let count_before = log_content.matches(stdout_marker).count();
+    assert_eq!(count_before, 1);
+
+    // Second poll does not run it again
+    let second_status = runner.poll();
+    assert_eq!(second_status, StartCmdStatus::AlreadyStarted);
+
+    std::thread::sleep(Duration::from_millis(50));
+    let log_content_after = fs::read_to_string(&log_path).expect("failed to read start-cmd.log");
+    let count_after = log_content_after.matches(stdout_marker).count();
+    assert_eq!(
+        count_after, 1,
+        "second poll must not execute start command again"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_child_that_exits_is_reaped_no_zombie() {
+    use crate::startcmd::{
+        ensure_subreaper, install_zombie_reaper, is_pid_tracked_or_cached, reaped_orphan_count,
+        StartCmdConfig, StartCmdRunner, StartCmdStatus, TemplateUserCredentials,
+    };
+    use std::fs;
+
+    // 3. A child that exits is reaped. Spawn a command that forks an untracked grandchild
+    // which exits immediately, and assert it is reaped without leaking into TRACKED_PIDS/REAPED_STATUSES.
+    ensure_subreaper();
+    install_zombie_reaper();
+
+    let orphans_before = reaped_orphan_count();
+    let temp_dir = std::env::temp_dir().join(format!("podd-test-reap-{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let log_path = temp_dir.join("start-cmd.log");
+    let status_path = temp_dir.join("start-cmd.status");
+
+    // Command forks grandchild that exits immediately, prints grandchild PID to stdout, then child exits.
+    let config = StartCmdConfig {
+        command: Some("sh -c 'sleep 0.05; exit 0' & echo $! && exit 0".to_string()),
+        workdir: temp_dir.to_string_lossy().to_string(),
+        credentials: TemplateUserCredentials::default(),
+        log_path: log_path.clone(),
+        status_path: status_path.clone(),
+    };
+
+    let runner = StartCmdRunner::new(config);
+    let child_pid = match runner.poll() {
+        StartCmdStatus::Running { pid } => pid,
+        other => panic!("expected Running status, got {:?}", other),
+    };
+
+    // Wait for the start command (direct child) to exit and write status
+    let mut exit_code_found = false;
+    for _ in 0..100 {
+        if status_path.exists() {
+            if let Ok(content) = fs::read_to_string(&status_path) {
+                if !content.trim().is_empty() {
+                    assert_eq!(content.trim(), "0");
+                    exit_code_found = true;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(exit_code_found, "start-cmd.status was not written");
+
+    // Parse grandchild PID from log
+    let mut gpid: Option<u32> = None;
+    for _ in 0..50 {
+        if let Ok(content) = fs::read_to_string(&log_path) {
+            for line in content.lines() {
+                if let Ok(p) = line.trim().parse::<u32>() {
+                    gpid = Some(p);
+                    break;
+                }
+            }
+            if gpid.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let gpid = gpid.expect("could not parse grandchild pid from start-cmd.log");
+    assert_ne!(gpid, child_pid);
+
+    // Wait for grandchild to exit and be reaped by the SIGCHLD thread (without calling reap_zombies directly).
+    // Once reaped, kill(gpid, 0) fails with ESRCH and /proc/<gpid>/status disappears (not a zombie).
+    let mut reaped = false;
+    for _ in 0..150 {
+        let rc = unsafe { libc::kill(gpid as libc::pid_t, 0) };
+        if rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            reaped = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        reaped,
+        "grandchild pid {} was not reaped by the SIGCHLD reaper thread",
+        gpid
+    );
+    assert!(
+        reaped_orphan_count() > orphans_before,
+        "expected untracked orphan reap counter to increment"
+    );
+    assert!(
+        !is_pid_tracked_or_cached(gpid as i32),
+        "untracked grandchild pid {} must not be cached in TRACKED_PIDS/REAPED_STATUSES",
+        gpid
+    );
+
+    // Verify /proc/<gpid>/status if still accessible: must not be in Zombie state
+    let proc_status_path = format!("/proc/{}/status", gpid);
+    if let Ok(content) = fs::read_to_string(&proc_status_path) {
+        for line in content.lines() {
+            if line.starts_with("State:") {
+                assert!(
+                    !line.contains("Z (zombie)"),
+                    "grandchild remains as zombie: {}",
+                    line
+                );
+            }
+        }
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_parsing_uid_zero_distinct_from_unset() {
+    use crate::startcmd::{
+        StartCmdConfig, StartCmdRunner, StartCmdStatus, TemplateUserCredentials,
+    };
+    use std::fs;
+
+    // 4. Parsing: value 0 is a real uid request distinct from unset.
+    // Assert the credential struct requests uid 0. Do not expect setuid(0) to succeed in this test.
+    let unset_creds = TemplateUserCredentials::from_env_getter(|_| None);
+    assert_eq!(unset_creds.uid, None);
+    assert_eq!(unset_creds.requested_uid(), None);
+
+    let zero_creds = TemplateUserCredentials::from_env_getter(|key| {
+        if key == "CUBEPOD_RUN_AS_USER" {
+            Some("0".to_string())
+        } else {
+            None
+        }
+    });
+    // Assert the credential struct requests uid 0
+    assert_eq!(zero_creds.uid, Some(0));
+    assert_eq!(zero_creds.requested_uid(), Some(0));
+
+    let temp_dir = std::env::temp_dir().join(format!("podd-test-uid0-{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let log_path = temp_dir.join("start-cmd.log");
+    let status_path = temp_dir.join("start-cmd.status");
+
+    let config = StartCmdConfig {
+        command: Some("echo should_never_run".to_string()),
+        workdir: temp_dir.to_string_lossy().to_string(),
+        credentials: zero_creds,
+        log_path: log_path.clone(),
+        status_path: status_path.clone(),
+    };
+
+    let runner = StartCmdRunner::new(config);
+    let status = runner.poll();
+
+    // Since test runs unprivileged (current euid != 0), setuid(0) fails
+    match status {
+        StartCmdStatus::CredentialSwitchFailed(msg) => {
+            assert!(msg.contains("Operation not permitted") || msg.contains("setuid"));
+        }
+        other => panic!("expected CredentialSwitchFailed, got {:?}", other),
+    }
+
+    // Verify failure logged to start-cmd.log and start-cmd.status
+    let log_content = fs::read_to_string(&log_path).expect("failed to read start-cmd.log");
+    assert!(log_content.contains("Operation not permitted") || log_content.contains("setuid"));
+    assert!(!log_content.contains("should_never_run"));
+
+    let status_content = fs::read_to_string(&status_path).expect("failed to read start-cmd.status");
+    assert_ne!(status_content.trim(), "0");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_username_nonexistent_does_not_spawn_and_writes_error_log() {
+    use crate::startcmd::{
+        StartCmdConfig, StartCmdRunner, StartCmdStatus, TemplateUserCredentials,
+    };
+    use std::fs;
+
+    // 5. Username env with a name that does not exist does not spawn and writes an error log.
+    let nonexistent = "nonexistent_cubepod_user_xyz_987654";
+    let temp_dir = std::env::temp_dir().join(format!("podd-test-baduser-{}", std::process::id()));
+    let _ = fs::create_dir_all(&temp_dir);
+
+    let log_path = temp_dir.join("start-cmd.log");
+    let status_path = temp_dir.join("start-cmd.status");
+
+    let creds = TemplateUserCredentials {
+        uid: None,
+        gid: None,
+        username: Some(nonexistent.to_string()),
+    };
+
+    let config = StartCmdConfig {
+        command: Some("echo should_never_run".to_string()),
+        workdir: temp_dir.to_string_lossy().to_string(),
+        credentials: creds,
+        log_path: log_path.clone(),
+        status_path: status_path.clone(),
+    };
+
+    let runner = StartCmdRunner::new(config);
+    let status = runner.poll();
+
+    match status {
+        StartCmdStatus::UsernameResolutionFailed(msg) => {
+            assert!(msg.contains(nonexistent));
+        }
+        other => panic!("expected UsernameResolutionFailed, got {:?}", other),
+    }
+
+    // Verify error was written into start-cmd.log
+    let log_content = fs::read_to_string(&log_path).expect("failed to read start-cmd.log");
+    assert!(log_content.contains(nonexistent));
+    assert!(
+        log_content.contains("failed to resolve username")
+            || log_content.contains("user not found")
+    );
+    assert!(!log_content.contains("should_never_run"));
+
+    // Verify non-zero status written into start-cmd.status
+    let status_content = fs::read_to_string(&status_path).expect("failed to read start-cmd.status");
+    assert_ne!(status_content.trim(), "0");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_numeric_user_takes_precedence_over_username() {
+    use crate::startcmd::{resolve_credentials, TemplateUserCredentials};
+
+    let creds = TemplateUserCredentials {
+        uid: Some(1000),
+        gid: Some(1000),
+        username: Some("nonexistent_cubepod_user_xyz".to_string()),
+    };
+    let resolved = resolve_credentials(&creds).unwrap();
+    assert_eq!(resolved.uid, Some(1000));
+    assert_eq!(resolved.gid, Some(1000));
+}
+
+#[test]
+fn test_tracked_child_concurrent_gzip_and_sh_no_echild_no_leaks() {
+    use crate::files::decompress_if_gzip;
+    use crate::startcmd::{
+        ensure_subreaper, exit_code_from_status, install_zombie_reaper, is_pid_tracked_or_cached,
+        spawn_tracked,
+    };
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
+
+    ensure_subreaper();
+    install_zombie_reaper();
+
+    let payload = b"hello cubepod tracked child concurrency payload ".repeat(64);
+    let mut gz_cmd = Command::new("gzip");
+    gz_cmd
+        .arg("-c")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut gz_child = spawn_tracked(&mut gz_cmd).expect("spawn gzip -c");
+    {
+        let mut stdin = gz_child.stdin().take().expect("gzip stdin");
+        stdin.write_all(&payload).expect("write gzip stdin");
+    }
+    let gz_out = gz_child.wait_with_output().expect("wait_with_output gzip");
+    assert!(gz_out.status.success());
+    let gz_bytes = Arc::new(gz_out.stdout);
+
+    let spawned_pids = Arc::new(Mutex::new(Vec::<i32>::new()));
+    let mut handles = Vec::new();
+
+    for _ in 0..10 {
+        let gz_bytes = Arc::clone(&gz_bytes);
+        let payload = payload.clone();
+        let spawned_pids = Arc::clone(&spawned_pids);
+        handles.push(std::thread::spawn(move || {
+            for i in 0..6 {
+                let decompressed = decompress_if_gzip(&gz_bytes).expect("decompress_if_gzip");
+                assert_eq!(decompressed, payload);
+
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c").arg("exit 7");
+                let mut child = spawn_tracked(&mut cmd).expect("spawn sh exit 7");
+                let pid = child.id() as i32;
+                spawned_pids.lock().unwrap().push(pid);
+                let status = child.wait().expect("wait must not fail with ECHILD");
+                assert_eq!(exit_code_from_status(&status), 7);
+                assert!(
+                    !is_pid_tracked_or_cached(pid),
+                    "pid {pid} leaked after wait"
+                );
+
+                let mut out_cmd = Command::new("/bin/sh");
+                out_cmd
+                    .arg("-c")
+                    .arg("printf 'ok'")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let mut out_child = spawn_tracked(&mut out_cmd).expect("spawn sh printf");
+                let out_pid = out_child.id() as i32;
+                spawned_pids.lock().unwrap().push(out_pid);
+                let _ = out_child.try_wait().expect("try_wait must not ECHILD");
+                let output = out_child.wait_with_output().expect("wait_with_output");
+                assert!(output.status.success());
+                assert_eq!(output.stdout, b"ok");
+                assert!(
+                    !is_pid_tracked_or_cached(out_pid),
+                    "pid {out_pid} leaked after wait_with_output"
+                );
+
+                if i % 2 == 0 {
+                    let mut drop_cmd = Command::new("/bin/sh");
+                    drop_cmd.arg("-c").arg("exit 0");
+                    let drop_child = spawn_tracked(&mut drop_cmd).expect("spawn drop child");
+                    let drop_pid = drop_child.id() as i32;
+                    spawned_pids.lock().unwrap().push(drop_pid);
+                    drop(drop_child);
+                    assert!(
+                        !is_pid_tracked_or_cached(drop_pid),
+                        "pid {drop_pid} leaked after drop"
+                    );
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().expect("worker thread panicked");
+    }
+
+    for pid in spawned_pids.lock().unwrap().iter() {
+        assert!(
+            !is_pid_tracked_or_cached(*pid),
+            "pid {} still present in TRACKED_PIDS/REAPED_STATUSES",
+            pid
+        );
+    }
+}
+
+#[test]
+fn test_resolve_default_credentials_cases() {
+    use crate::startcmd::{
+        configure_command_credentials, lookup_passwd_by_name, lookup_passwd_by_uid,
+        resolve_default_credentials_from_getter,
+    };
+    use std::process::Stdio;
+
+    // 1. CUBEPOD_RUN_AS_USER=0 -> (0, 0) regardless of euid
+    let get_root = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USER" => Some("0".to_string()),
+        _ => None,
+    };
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_root, 0, 0).unwrap(),
+        Some((0, 0))
+    );
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_root, 1000, 1000).unwrap(),
+        Some((0, 0))
+    );
+
+    // 2. CUBEPOD_RUN_AS_USER=1001, CUBEPOD_RUN_AS_GROUP=1002 -> (1001, 1002)
+    let get_1001 = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USER" => Some("1001".to_string()),
+        "CUBEPOD_RUN_AS_GROUP" => Some("1002".to_string()),
+        _ => None,
+    };
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_1001, 0, 0).unwrap(),
+        Some((1001, 1002))
+    );
+
+    // 3. CUBEPOD_RUN_AS_USERNAME
+    let get_root_name = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USERNAME" => Some("root".to_string()),
+        _ => None,
+    };
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_root_name, 0, 0).unwrap(),
+        Some((0, 0))
+    );
+
+    let get_uid_gid_str = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USERNAME" => Some("1001:1002".to_string()),
+        _ => None,
+    };
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_uid_gid_str, 0, 0).unwrap(),
+        Some((1001, 1002))
+    );
+
+    let get_bad_name = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USERNAME" => Some("nonexistent_cubepod_user_xyz_123".to_string()),
+        _ => None,
+    };
+    assert!(resolve_default_credentials_from_getter(get_bad_name, 0, 0).is_err());
+
+    // 4. All CUBEPOD_RUN_AS_* unset:
+    //    euid == 0 -> Some((1000, 1000)); euid != 0 -> None.
+    let get_unset = |_: &str| None;
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_unset, 0, 0).unwrap(),
+        Some((1000, 1000))
+    );
+    assert_eq!(
+        resolve_default_credentials_from_getter(get_unset, 1000, 1000).unwrap(),
+        None
+    );
+
+    // 5. Reentrant getpwnam_r / getpwuid_r sanity check
+    let pw_by_name = lookup_passwd_by_name("root").unwrap().expect("root passwd");
+    assert_eq!(pw_by_name.uid, 0);
+    assert_eq!(pw_by_name.gid, 0);
+    assert_eq!(pw_by_name.username, "root");
+    assert!(!pw_by_name.home_dir.is_empty());
+
+    let pw_by_uid = lookup_passwd_by_uid(0).unwrap().expect("uid 0 passwd");
+    assert_eq!(pw_by_uid.username, "root");
+
+    // 6. configure_command_credentials sets HOME/USER/LOGNAME and allows caller envs override
+    let current_euid = unsafe { libc::geteuid() };
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(r#"printf '%s|%s|%s' "$HOME" "$USER" "$LOGNAME""#)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let resolved = configure_command_credentials(&mut cmd, Some(current_euid), None, None).unwrap();
+    let expected_home = resolved.home_dir.unwrap();
+    let expected_user = resolved.username.unwrap();
+    let out = crate::startcmd::spawn_tracked(&mut cmd)
+        .expect("spawn sh")
+        .wait_with_output()
+        .expect("wait sh");
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{expected_home}|{expected_user}|{expected_user}")
+    );
+
+    let mut override_cmd = Command::new("/bin/sh");
+    override_cmd
+        .arg("-c")
+        .arg(r#"printf '%s' "$HOME""#)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_command_credentials(&mut override_cmd, Some(current_euid), None, None).unwrap();
+    override_cmd.env("HOME", "/custom/override");
+    let out2 = crate::startcmd::spawn_tracked(&mut override_cmd)
+        .expect("spawn sh override")
+        .wait_with_output()
+        .expect("wait sh override");
+    assert!(out2.status.success());
+    assert_eq!(String::from_utf8_lossy(&out2.stdout), "/custom/override");
+}
+
+#[test]
+fn test_run_request_serde() {
+    use crate::commands::RunRequest;
+
+    let empty = RunRequest::from_json_str("{}").unwrap();
+    assert_eq!(empty.uid, None);
+    assert_eq!(empty.gid, None);
+    assert_eq!(empty.user, None);
+
+    let explicit_zero = RunRequest::from_json_str(r#"{"uid":0,"gid":0,"command":"id"}"#).unwrap();
+    assert_eq!(explicit_zero.uid, Some(0));
+    assert_eq!(explicit_zero.gid, Some(0));
+    assert_eq!(explicit_zero.command.as_deref(), Some("id"));
+
+    let null_fields = RunRequest::from_json_str(r#"{"uid":null,"gid":null,"user":"   "}"#).unwrap();
+    assert_eq!(null_fields.uid, None);
+    assert_eq!(null_fields.gid, None);
+    assert_eq!(null_fields.user, None);
+
+    let custom = RunRequest::from_json_str(r#"{"uid":1001,"gid":1002,"user":"cubeplex"}"#).unwrap();
+    assert_eq!(custom.uid, Some(1001));
+    assert_eq!(custom.gid, Some(1002));
+    assert_eq!(custom.user.as_deref(), Some("cubeplex"));
 }
