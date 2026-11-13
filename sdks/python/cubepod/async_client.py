@@ -3,23 +3,44 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+import builtins
+from collections.abc import AsyncIterator, Sequence
 import time
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
+from ._helpers import (
+    _build_archive_sync_request,
+    _build_command_payload,
+    _build_create_payload,
+    _build_desktop_start_payload,
+    _build_fork_payload,
+    _build_template_register_payload,
+    _build_template_result,
+    _format_build_error,
+    _json_dict,
+    _json_list,
+    _normalize_base_url,
+    _parse_command_info,
+    _parse_command_logs,
+    _parse_desktop_session,
+    _parse_execution_result,
+    _parse_file_entries,
+    _parse_info,
+    _parse_panel_endpoint,
+)
+from .exceptions import CubePodFileTooLargeError
 from .models import (
     CommandInfo,
     CommandLogs,
+    DesktopSession,
     ExecutionResult,
     FileEntry,
     PanelEndpoint,
     SandboxInfo,
-    _build_tar_gz_bytes,
 )
-from .sync_client import _format_build_error
 
 
 class AsyncCubePod:
@@ -31,17 +52,20 @@ class AsyncCubePod:
         api_key: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         max_retries: int = 2,
+        timeout: float = 60.0,
+        trust_env: bool = False,
     ) -> None:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self._max_retries = max_retries
         self._client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
+            base_url=_normalize_base_url(base_url),
             headers=headers,
-            timeout=60.0,
+            timeout=timeout,
+            trust_env=trust_env,
             transport=transport,
         )
 
-    async def __aenter__(self) -> "AsyncCubePod":
+    async def __aenter__(self) -> AsyncCubePod:
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
@@ -56,6 +80,7 @@ class AsyncCubePod:
         json: Any = None,
         content: bytes | None = None,
         headers: dict[str, str] | None = None,
+        timeout: float | None = None,
     ) -> httpx.Response:
         retries = 0
         while True:
@@ -66,6 +91,7 @@ class AsyncCubePod:
                 json=json,
                 content=content,
                 headers=headers,
+                timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
             )
             if resp.status_code in (502, 503, 504) and retries < self._max_retries:
                 retries += 1
@@ -80,59 +106,77 @@ class AsyncCubePod:
         volume_key: str | None = None,
         metadata: dict[str, str] | None = None,
         network_policy: dict[str, Any] | None = None,
-        secret_bindings: list[dict[str, Any]] | None = None,
+        secret_bindings: builtins.list[dict[str, Any]] | None = None,
+        timeout_seconds: int | None = None,
+        warm_pool_ref: str | None = None,
+        resource: dict[str, str] | None = None,
     ) -> SandboxInfo:
-        payload: dict[str, Any] = {"templateID": template_id, "metadata": metadata or {}}
-        if volume_key:
-            payload["extension"] = {"volumeKey": volume_key}
-        if network_policy is not None:
-            payload["networkPolicy"] = network_policy
-        if secret_bindings is not None:
-            if "networkPolicy" not in payload:
-                payload["networkPolicy"] = {}
-            payload["networkPolicy"]["secretBindings"] = secret_bindings
+        """Create a new persistent sandbox from a template."""
+        payload = _build_create_payload(
+            template_id,
+            volume_key=volume_key,
+            metadata=metadata,
+            network_policy=network_policy,
+            secret_bindings=secret_bindings,
+            timeout_seconds=timeout_seconds,
+            warm_pool_ref=warm_pool_ref,
+            resource=resource,
+        )
         resp = await self._request("POST", "/sandboxes", json=payload)
         resp.raise_for_status()
-        return self._parse_info(resp.json())
+        return _parse_info(_json_dict(resp))
 
-    async def list(self, template_id: str | None = None) -> list[SandboxInfo]:
+    async def list(self, template_id: str | None = None) -> builtins.list[SandboxInfo]:
         """List all managed sandboxes, optionally filtered by template ID."""
         params = {"templateID": template_id} if template_id else None
         resp = await self._request("GET", "/sandboxes", params=params)
         resp.raise_for_status()
-        data = resp.json()
-        items = data if isinstance(data, list) else data.get("sandboxes", [])
-        return [self._parse_info(item) for item in items]
+        return [_parse_info(item) for item in _json_list(resp, "sandboxes")]
 
     async def get(self, sandbox_id: str) -> SandboxInfo:
         """Fetch status and metadata for an existing sandbox."""
+        return _parse_info(await self.get_raw(sandbox_id))
+
+    async def get_raw(self, sandbox_id: str) -> dict[str, Any]:
+        """Fetch the raw JSON payload for an existing sandbox."""
         resp = await self._request("GET", f"/sandboxes/{sandbox_id}")
         resp.raise_for_status()
-        return self._parse_info(resp.json())
+        return _json_dict(resp)
 
     async def connect(self, sandbox_id: str) -> SandboxInfo:
         """Connect to a sandbox, automatically resuming it if Paused."""
         resp = await self._request("POST", f"/sandboxes/{sandbox_id}/connect")
         resp.raise_for_status()
-        return self._parse_info(resp.json())
+        return _parse_info(_json_dict(resp))
 
     async def pause(self, sandbox_id: str) -> SandboxInfo:
         """Suspend compute while retaining RootFS Upper and Workspace block PVCs."""
         resp = await self._request("POST", f"/sandboxes/{sandbox_id}/pause")
         resp.raise_for_status()
-        return self._parse_info(resp.json())
+        return _parse_info(_json_dict(resp))
 
     async def reset_rootfs(self, sandbox_id: str) -> SandboxInfo:
         """Reset the persistent RootFS Upper volume while preserving /workspace."""
         resp = await self._request("POST", f"/sandboxes/{sandbox_id}/reset-rootfs")
         resp.raise_for_status()
-        return self._parse_info(resp.json())
+        return _parse_info(_json_dict(resp))
 
-    async def fork(self, sandbox_id: str) -> SandboxInfo:
+    async def fork(
+        self,
+        sandbox_id: str,
+        *,
+        volume_key: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> SandboxInfo:
         """Clone both RootFS and Workspace volumes in ~1s via Copy-on-Write."""
-        resp = await self._request("POST", f"/sandboxes/{sandbox_id}/fork")
+        payload = _build_fork_payload(volume_key=volume_key, metadata=metadata)
+        resp = await self._request(
+            "POST",
+            f"/sandboxes/{sandbox_id}/fork",
+            json=payload,
+        )
         resp.raise_for_status()
-        return self._parse_info(resp.json())
+        return _parse_info(_json_dict(resp))
 
     async def delete(self, sandbox_id: str) -> None:
         """Terminate and permanently delete a sandbox."""
@@ -147,7 +191,7 @@ class AsyncCubePod:
             json={"timeoutSeconds": timeout_seconds},
         )
         resp.raise_for_status()
-        return resp.json()
+        return _json_dict(resp)
 
     async def acquire_lease(self, sandbox_id: str, lease_seconds: int = 300) -> dict[str, Any]:
         """Acquire or renew an exclusive active lease on the sandbox."""
@@ -157,7 +201,7 @@ class AsyncCubePod:
             json={"leaseSeconds": lease_seconds},
         )
         resp.raise_for_status()
-        return resp.json()
+        return _json_dict(resp)
 
     async def get_panel_endpoint(
         self,
@@ -177,12 +221,43 @@ class AsyncCubePod:
             json=payload,
         )
         resp.raise_for_status()
-        data = resp.json()
-        return PanelEndpoint(
-            url=data["url"],
-            token=data["token"],
-            expires_at=data.get("expiresAt"),
+        return _parse_panel_endpoint(_json_dict(resp))
+
+    async def start_desktop(
+        self,
+        sandbox_id: str,
+        *,
+        resolution: str | None = None,
+        initial_url: str | None = None,
+        expires_in_seconds: int = 3600,
+    ) -> DesktopSession:
+        """Start or attach to the interactive desktop stack inside the sandbox."""
+        payload = _build_desktop_start_payload(
+            resolution=resolution,
+            initial_url=initial_url,
+            expires_in_seconds=expires_in_seconds,
         )
+        resp = await self._request(
+            "POST",
+            f"/sandboxes/{sandbox_id}/desktop/start",
+            json=payload,
+        )
+        resp.raise_for_status()
+        return _parse_desktop_session(_json_dict(resp))
+
+    async def get_desktop_status(self, sandbox_id: str) -> dict[str, Any]:
+        """Fetch interactive desktop daemon status for a sandbox."""
+        resp = await self._request("GET", f"/sandboxes/{sandbox_id}/desktop/status")
+        resp.raise_for_status()
+        return _json_dict(resp)
+
+    async def stop_desktop(self, sandbox_id: str) -> dict[str, Any]:
+        """Stop the interactive desktop stack inside a sandbox."""
+        resp = await self._request("POST", f"/sandboxes/{sandbox_id}/desktop/stop")
+        resp.raise_for_status()
+        if resp.content:
+            return _json_dict(resp)
+        return {"status": "stopped"}
 
     async def execute(
         self,
@@ -191,35 +266,27 @@ class AsyncCubePod:
         *,
         workdir: str | None = None,
         envs: dict[str, str] | None = None,
-        uid: int = 1000,
-        gid: int = 1000,
+        uid: int | None = 1000,
+        gid: int | None = 1000,
+        timeout: float | None = None,
     ) -> ExecutionResult:
         """Execute a foreground command and wait for completion."""
-        payload: dict[str, Any] = {
-            "command": command,
-            "background": False,
-            "uid": uid,
-            "gid": gid,
-        }
-        if workdir is not None:
-            payload["workdir"] = workdir
-        if envs is not None:
-            payload["envs"] = envs
-
-        resp = await self._request("POST", f"/sandboxes/{sandbox_id}/commands/run", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        exit_code = data.get("exit_code") if "exit_code" in data else data.get("exitCode")
-        output = data.get("output", "") or data.get("stdout", "")
-        cmd_id = data.get("id") or data.get("cmdID", "")
-        return ExecutionResult(
-            id=cmd_id,
-            exit_code=exit_code,
-            output=output,
-            running=data.get("running", False),
-            pid=data.get("pid"),
-            cursor=data.get("cursor", 0),
+        payload = _build_command_payload(
+            command,
+            background=False,
+            workdir=workdir,
+            envs=envs,
+            uid=uid,
+            gid=gid,
         )
+        resp = await self._request(
+            "POST",
+            f"/sandboxes/{sandbox_id}/commands/run",
+            json=payload,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return _parse_execution_result(_json_dict(resp))
 
     async def start_command(
         self,
@@ -228,35 +295,27 @@ class AsyncCubePod:
         *,
         workdir: str | None = None,
         envs: dict[str, str] | None = None,
-        uid: int = 1000,
-        gid: int = 1000,
+        uid: int | None = 1000,
+        gid: int | None = 1000,
+        timeout: float | None = None,
     ) -> CommandInfo:
         """Launch an asynchronous background command."""
-        payload: dict[str, Any] = {
-            "command": command,
-            "background": True,
-            "uid": uid,
-            "gid": gid,
-        }
-        if workdir is not None:
-            payload["workdir"] = workdir
-        if envs is not None:
-            payload["envs"] = envs
-
-        resp = await self._request("POST", f"/sandboxes/{sandbox_id}/commands/run", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        cmd_id = data.get("id") or data.get("cmdID", "")
-        exit_code = data.get("exit_code") if "exit_code" in data else data.get("exitCode")
-        output = data.get("output", "") or data.get("stdout", "")
-        return CommandInfo(
-            id=cmd_id,
-            pid=data.get("pid"),
-            running=data.get("running", True),
-            exit_code=exit_code,
-            cursor=data.get("cursor", 0),
-            output=output,
+        payload = _build_command_payload(
+            command,
+            background=True,
+            workdir=workdir,
+            envs=envs,
+            uid=uid,
+            gid=gid,
         )
+        resp = await self._request(
+            "POST",
+            f"/sandboxes/{sandbox_id}/commands/run",
+            json=payload,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        return _parse_command_info(_json_dict(resp), default_running=True)
 
     async def get_command_status(
         self,
@@ -266,18 +325,7 @@ class AsyncCubePod:
         """Get the latest process status of a background command."""
         resp = await self._request("GET", f"/sandboxes/{sandbox_id}/commands/{command_id}/status")
         resp.raise_for_status()
-        data = resp.json()
-        cmd_id = data.get("id") or data.get("cmdID", command_id)
-        exit_code = data.get("exit_code") if "exit_code" in data else data.get("exitCode")
-        output = data.get("output", "") or data.get("stdout", "")
-        return CommandInfo(
-            id=cmd_id,
-            pid=data.get("pid"),
-            running=data.get("running", False),
-            exit_code=exit_code,
-            cursor=data.get("cursor", 0),
-            output=output,
-        )
+        return _parse_command_info(_json_dict(resp), default_id=command_id, default_running=False)
 
     async def poll_command(
         self,
@@ -293,16 +341,7 @@ class AsyncCubePod:
             params={"cursor": cursor},
         )
         resp.raise_for_status()
-        data = resp.json()
-        cmd_id = data.get("id") or data.get("cmdID", command_id)
-        exit_code = data.get("exit_code") if "exit_code" in data else data.get("exitCode")
-        return CommandLogs(
-            id=cmd_id,
-            content=data.get("content", ""),
-            cursor=data.get("cursor", cursor),
-            running=data.get("running", False),
-            exit_code=exit_code,
-        )
+        return _parse_command_logs(_json_dict(resp), command_id=command_id, default_cursor=cursor)
 
     async def stream_command(
         self,
@@ -325,7 +364,7 @@ class AsyncCubePod:
         """Terminate a background command process group."""
         resp = await self._request("POST", f"/sandboxes/{sandbox_id}/commands/{command_id}/kill")
         resp.raise_for_status()
-        return resp.json()
+        return _json_dict(resp)
 
     async def write_file(
         self,
@@ -352,7 +391,7 @@ class AsyncCubePod:
             headers={"Content-Type": "application/octet-stream"},
         )
         resp.raise_for_status()
-        return resp.json()
+        return _json_dict(resp)
 
     async def read_file(self, sandbox_id: str, path: str) -> bytes:
         """Read a file from inside the sandbox."""
@@ -364,6 +403,72 @@ class AsyncCubePod:
         resp.raise_for_status()
         return resp.content
 
+    async def stream_file(
+        self,
+        sandbox_id: str,
+        path: str,
+        *,
+        chunk_size: int = 65536,
+    ) -> AsyncIterator[bytes]:
+        """Stream raw bytes of a file from inside the sandbox."""
+        retries = 0
+        while True:
+            req = self._client.build_request(
+                "GET",
+                f"/sandboxes/{sandbox_id}/files",
+                params={"path": path},
+            )
+            resp = await self._client.send(req, stream=True)
+            if resp.status_code in (502, 503, 504) and retries < self._max_retries:
+                await resp.aclose()
+                retries += 1
+                await asyncio.sleep(0.01 * (2 ** (retries - 1)))
+                continue
+            break
+
+        try:
+            resp.raise_for_status()
+        except Exception:
+            await resp.aclose()
+            raise
+
+        async def _iter() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
+                    yield chunk
+            finally:
+                await resp.aclose()
+
+        return _iter()
+
+    async def read_text_file(
+        self,
+        sandbox_id: str,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+        encoding: str = "utf-8",
+    ) -> str:
+        """Stream and decode a text file, raising CubePodFileTooLargeError if max_bytes is exceeded."""
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError("max_bytes must be non-negative")
+        stream = await self.stream_file(sandbox_id, path)
+        chunks: builtins.list[bytes] = []
+        total = 0
+        aclose = getattr(stream, "aclose", None)
+        try:
+            async for chunk in stream:
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise CubePodFileTooLargeError(
+                        f"File {path!r} exceeds max_bytes limit ({total} > {max_bytes})"
+                    )
+                chunks.append(chunk)
+        finally:
+            if aclose is not None:
+                await aclose()
+        return b"".join(chunks).decode(encoding)
+
     async def delete_file(self, sandbox_id: str, path: str) -> dict[str, Any]:
         """Delete a file or directory from inside the sandbox."""
         resp = await self._request(
@@ -373,11 +478,11 @@ class AsyncCubePod:
         )
         resp.raise_for_status()
         try:
-            return resp.json()
+            return _json_dict(resp)
         except Exception:
             return {"status": "ok", "path": path}
 
-    async def list_files(self, sandbox_id: str, path: str = "/workspace") -> list[FileEntry]:
+    async def list_files(self, sandbox_id: str, path: str = "/workspace") -> builtins.list[FileEntry]:
         """List files and directories at path inside the sandbox."""
         resp = await self._request(
             "GET",
@@ -385,40 +490,26 @@ class AsyncCubePod:
             params={"path": path},
         )
         resp.raise_for_status()
-        data = resp.json()
-        entries = data if isinstance(data, list) else data.get("entries", [])
-        return [
-            FileEntry(
-                name=e.get("name", ""),
-                path=e.get("path", ""),
-                is_dir=e.get("is_dir", False),
-                size=e.get("size", 0),
-                mode=e.get("mode", "0644"),
-            )
-            for e in entries
-        ]
+        return _parse_file_entries(resp.json())
 
     async def archive_sync(
         self,
         sandbox_id: str,
-        files: dict[str, str | bytes],
+        files: dict[str, str | bytes] | bytes,
         *,
         dest: str = "/workspace",
         uid: int | None = None,
         gid: int | None = None,
+        remove_paths: Sequence[str] | None = None,
     ) -> dict[str, Any]:
-        """Pack files into an in-memory tar.gz archive and extract inside the sandbox in a single HTTP request."""
-        tar_bytes = _build_tar_gz_bytes(
+        """Upload a tar.gz archive (dict or prebuilt bytes) and extract it inside the sandbox."""
+        tar_bytes, params = _build_archive_sync_request(
             files,
-            uid=uid if uid is not None else 1000,
-            gid=gid if gid is not None else 1000,
+            dest=dest,
+            uid=uid,
+            gid=gid,
+            remove_paths=remove_paths,
         )
-        params: dict[str, str] = {"dest": dest}
-        if uid is not None:
-            params["uid"] = str(uid)
-        if gid is not None:
-            params["gid"] = str(gid)
-
         resp = await self._request(
             "POST",
             f"/sandboxes/{sandbox_id}/files/archive-sync",
@@ -427,7 +518,7 @@ class AsyncCubePod:
             headers={"Content-Type": "application/gzip"},
         )
         resp.raise_for_status()
-        return resp.json()
+        return _json_dict(resp)
 
     async def create_warmpool(
         self,
@@ -439,33 +530,31 @@ class AsyncCubePod:
         payload = {"name": name, "templateID": template_id, "replicas": replicas}
         resp = await self._request("POST", "/warmpools", json=payload)
         resp.raise_for_status()
-        return resp.json()
+        return _json_dict(resp)
 
-    async def list_warmpools(self) -> list[dict[str, Any]]:
+    async def list_warmpools(self) -> builtins.list[dict[str, Any]]:
         """List all active PodWarmPools and their standby replica counts."""
         resp = await self._request("GET", "/warmpools")
         resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, list) else data.get("warmpools", [])
+        return _json_list(resp, "warmpools")
 
-    async def list_templates(self) -> list[dict[str, Any]]:
+    async def list_templates(self) -> builtins.list[dict[str, Any]]:
         """List available sandbox templates."""
         resp = await self._request("GET", "/templates")
         resp.raise_for_status()
-        data = resp.json()
-        return data if isinstance(data, list) else data.get("templates", [])
+        return _json_list(resp, "templates")
 
     async def get_template(self, template_id: str) -> dict[str, Any]:
         """Fetch status and metadata for a specific template."""
         resp = await self._request("GET", f"/templates/{quote(template_id, safe='')}")
         resp.raise_for_status()
-        return resp.json()
+        return _json_dict(resp)
 
     async def get_template_by_alias(self, alias: str) -> dict[str, Any]:
         """Fetch template metadata by alias name or tag."""
         resp = await self._request("GET", f"/templates/aliases/{quote(alias, safe='')}")
         resp.raise_for_status()
-        return resp.json()
+        return _json_dict(resp)
 
     async def get_template_build_status(
         self,
@@ -490,7 +579,7 @@ class AsyncCubePod:
             params=params or None,
         )
         resp.raise_for_status()
-        return resp.json()
+        return _json_dict(resp)
 
     async def create_template_from_image(
         self,
@@ -500,7 +589,7 @@ class AsyncCubePod:
         cpu_count: int | None = None,
         memory_mb: int | None = None,
         min_free_disk_mb: int | None = None,
-        tags: list[str] | None = None,
+        tags: builtins.list[str] | None = None,
         from_image_registry: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         wait: bool = True,
@@ -544,7 +633,7 @@ class AsyncCubePod:
         )
         resp.raise_for_status()
         if resp.content:
-            return resp.json()
+            return _json_dict(resp)
         return None
 
     async def build_template(
@@ -556,11 +645,11 @@ class AsyncCubePod:
         min_free_disk_mb: int | None = None,
         from_image: str | None = None,
         from_template: str | None = None,
-        steps: list[dict[str, Any]] | None = None,
+        steps: builtins.list[dict[str, Any]] | None = None,
         start_cmd: str | None = None,
         ready_cmd: str | None = None,
         force: bool = False,
-        tags: list[str] | None = None,
+        tags: builtins.list[str] | None = None,
         from_image_registry: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
         wait: bool = True,
@@ -605,7 +694,7 @@ class AsyncCubePod:
         *,
         name: str | None,
         alias: str | None,
-        tags: list[str] | None,
+        tags: builtins.list[str] | None,
         cpu_count: int | None,
         memory_mb: int | None,
         min_free_disk_mb: int | None,
@@ -615,24 +704,18 @@ class AsyncCubePod:
         poll_interval: float,
         timeout: float,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        if name is not None:
-            payload["name"] = name
-        if alias is not None:
-            payload["alias"] = alias
-        if tags is not None:
-            payload["tags"] = tags
-        if cpu_count is not None:
-            payload["cpuCount"] = cpu_count
-        if memory_mb is not None:
-            payload["memoryMB"] = memory_mb
-        if min_free_disk_mb is not None:
-            payload["minFreeDiskMb"] = min_free_disk_mb
-
+        payload = _build_template_register_payload(
+            name=name,
+            alias=alias,
+            tags=tags,
+            cpu_count=cpu_count,
+            memory_mb=memory_mb,
+            min_free_disk_mb=min_free_disk_mb,
+        )
         headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
         resp = await self._request("POST", "/v3/templates", json=payload, headers=headers)
         resp.raise_for_status()
-        created = resp.json()
+        created = _json_dict(resp)
 
         template_id = str(created.get("templateID", ""))
         build_id = str(created.get("buildID", ""))
@@ -652,13 +735,7 @@ class AsyncCubePod:
                 timeout=timeout,
             )
 
-        return {
-            "templateID": template_id,
-            "buildID": build_id,
-            "aliases": created.get("aliases", []),
-            "names": created.get("names", []),
-            "tags": created.get("tags", []),
-        }
+        return _build_template_result(created)
 
     async def _wait_for_template_build(
         self,
@@ -688,10 +765,4 @@ class AsyncCubePod:
 
     @staticmethod
     def _parse_info(data: dict[str, Any]) -> SandboxInfo:
-        return SandboxInfo(
-            sandbox_id=data["sandboxID"],
-            template_id=data["templateID"],
-            state=data["state"],
-            envd_port=data.get("envdPort", 49983),
-            rootfs_generation=data.get("rootfsGeneration", 1),
-        )
+        return _parse_info(data)

@@ -1,9 +1,11 @@
 """CubePod Python SDK — Sync & Async client for persistent MicroVM agent sandboxes."""
 
 from .async_client import AsyncCubePod
+from .exceptions import CubePodFileTooLargeError
 from .models import (
     CommandInfo,
     CommandLogs,
+    DesktopSession,
     ExecutionResult,
     FileEntry,
     PanelEndpoint,
@@ -19,6 +21,8 @@ __all__ = [
     "CommandLogs",
     "PanelEndpoint",
     "FileEntry",
+    "DesktopSession",
+    "CubePodFileTooLargeError",
     "_build_tar_gz_bytes",
     "AsyncCubePod",
     "CubePod",
