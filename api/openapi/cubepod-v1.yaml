@@ -63,6 +63,26 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SandboxInfo"
+        "409":
+          description: Referenced template is not ready
+        "503":
+          description: Template ready command timed out (sandbox retained in Failed phase for log inspection)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    example: 503
+                  message:
+                    type: string
+                    example: "template ready command timed out"
+                  sandboxID:
+                    type: string
+                  logPath:
+                    type: string
+                    example: "/var/log/cubepod/start-cmd.log"
     get:
       summary: List all sandboxes with optional state and template filters
       operationId: listSandboxes
@@ -818,20 +838,488 @@ paths:
 
   /templates:
     get:
-      summary: List available sandbox templates and runtime blueprints
+      summary: List available sandbox templates (JSON array of E2BTemplate when E2BTemplateAPI gate is enabled; legacy wrapper when off)
       operationId: listTemplates
+      parameters:
+        - name: teamID
+          in: query
+          required: false
+          schema:
+            type: string
       responses:
         "200":
           description: Available sandbox templates
           content:
             application/json:
               schema:
+                oneOf:
+                  - type: array
+                    items:
+                      $ref: "#/components/schemas/E2BTemplate"
+                  - type: object
+                    properties:
+                      templates:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/TemplateInfo"
+        "400":
+          description: Template count exceeds v1 cap (5000)
+    post:
+      summary: Create or request rebuild of a template (alias of POST /v3/templates)
+      operationId: createTemplateV1
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateBuildRequestV3"
+      responses:
+        "202":
+          description: Template created or new build queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateRequestBuildResponse"
+        "409":
+          description: Build already in progress, slug collision, or idempotency mismatch
+
+  /v2/templates:
+    get:
+      summary: List templates with cursor pagination (X-Next-Token response header)
+      operationId: listTemplatesV2
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: nextToken
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated E2B templates
+          headers:
+            X-Next-Token:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/E2BTemplate"
+    post:
+      summary: Create or request rebuild of a template (v2 alias of POST /v3/templates)
+      operationId: createTemplateV2
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateBuildRequestV3"
+      responses:
+        "202":
+          description: Template created or new build queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateRequestBuildResponse"
+
+  /v3/templates:
+    post:
+      summary: Request template creation or rebuild (E2B v3)
+      operationId: requestTemplateBuildV3
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateBuildRequestV3"
+      responses:
+        "202":
+          description: Template created or new build queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateRequestBuildResponse"
+        "409":
+          description: Build already in progress, alias/slug collision, or idempotency mismatch
+
+  /templates/{templateID}:
+    get:
+      summary: Get a template along with its builds
+      operationId: getTemplate
+      parameters:
+        - name: templateID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Template with builds
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateWithBuilds"
+        "404":
+          description: Template not found
+    patch:
+      summary: Update template metadata (e.g. public visibility)
+      operationId: updateTemplate
+      parameters:
+        - name: templateID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                public:
+                  type: boolean
+      responses:
+        "200":
+          description: Template updated
+    delete:
+      summary: Delete a template (returns 409 if referenced or building unless force=true)
+      operationId: deleteTemplate
+      parameters:
+        - name: templateID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: force
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "204":
+          description: Template deleted
+        "404":
+          description: Template not found
+        "409":
+          description: Template is currently building or referenced by active PodBox/PodWarmPool
+
+  /v2/templates/{templateID}:
+    patch:
+      summary: Update template visibility and return template names
+      operationId: updateTemplateV2
+      parameters:
+        - name: templateID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                public:
+                  type: boolean
+      responses:
+        "200":
+          description: Template updated
+          content:
+            application/json:
+              schema:
                 type: object
                 properties:
-                  templates:
+                  names:
                     type: array
                     items:
-                      $ref: "#/components/schemas/TemplateInfo"
+                      type: string
+
+  /templates/aliases/{alias}:
+    get:
+      summary: Resolve a template by alias or tag
+      operationId: getTemplateByAlias
+      parameters:
+        - name: alias
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Resolved template
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/E2BTemplate"
+        "404":
+          description: Alias not found
+
+  /templates/{templateID}/files/{hash}:
+    get:
+      summary: Check build context cache presence and obtain upload URL
+      operationId: getTemplateFileUploadLink
+      parameters:
+        - name: templateID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: hash
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
+      responses:
+        "201":
+          description: Upload metadata returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildFileUpload"
+        "400":
+          description: Invalid hash format
+        "404":
+          description: Template not found
+        "501":
+          description: Template build is not enabled
+    put:
+      summary: Upload tar or gzip-compressed tar build context for filesHash
+      operationId: uploadTemplateFileContext
+      parameters:
+        - name: templateID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: hash
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
+      responses:
+        "201":
+          description: Build context stored
+        "400":
+          description: Invalid tar stream or path traversal
+        "409":
+          description: Different content already stored for hash
+        "413":
+          description: Upload exceeds configured context limit
+        "501":
+          description: Template build is not enabled
+
+  /v2/templates/{templateID}/builds/{buildID}:
+    post:
+      summary: Start an image or recipe build for a template build ID
+      operationId: startTemplateBuildV2
+      parameters:
+        - name: templateID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: buildID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateBuildStartV2"
+      responses:
+        "202":
+          description: Build accepted
+        "400":
+          description: Invalid build specification or missing context tar
+        "404":
+          description: Template or build not found
+        "409":
+          description: Build state conflict
+        "501":
+          description: Template build is not enabled
+
+  /templates/{templateID}/builds/{buildID}/status:
+    get:
+      summary: Poll build status and incremental logs
+      operationId: getTemplateBuildStatus
+      parameters:
+        - name: templateID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: buildID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: logsOffset
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            maximum: 100
+        - name: level
+          in: query
+          schema:
+            type: string
+            enum: [debug, info, warn, error]
+      responses:
+        "200":
+          description: Current build status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildInfo"
+        "404":
+          description: Template or build not found
+
+  /templates/{templateID}/builds/{buildID}/logs:
+    get:
+      summary: Read template build log entries
+      operationId: getTemplateBuildLogs
+      parameters:
+        - name: templateID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: buildID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: cursor
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            maximum: 100
+        - name: direction
+          in: query
+          schema:
+            type: string
+            enum: [forward, backward]
+        - name: level
+          in: query
+          schema:
+            type: string
+            enum: [debug, info, warn, error]
+      responses:
+        "200":
+          description: Build logs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logs:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/BuildLogEntry"
+        "501":
+          description: Template build is not enabled
+
+  /templates/tags:
+    post:
+      summary: Assign tags to a template build
+      operationId: assignTemplateTags
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [target, tags]
+              properties:
+                target:
+                  type: string
+                tags:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "201":
+          description: Tags assigned
+    delete:
+      summary: Remove tags from a template
+      operationId: deleteTemplateTags
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, tags]
+              properties:
+                name:
+                  type: string
+                tags:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        "204":
+          description: Tags deleted
+
+  /templates/{templateID}/tags:
+    get:
+      summary: List assigned tags for a template
+      operationId: getTemplateTags
+      parameters:
+        - name: templateID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Template tags
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TemplateTagInfo"
 
 components:
   schemas:
@@ -1163,4 +1651,255 @@ components:
         image:
           type: string
         description:
+          type: string
+
+    TemplateBuildRequestV3:
+      type: object
+      properties:
+        name:
+          type: string
+        alias:
+          type: string
+        tags:
+          type: array
+          items:
+            type: string
+        cpuCount:
+          type: integer
+        memoryMB:
+          type: integer
+        minFreeDiskMb:
+          type: integer
+
+    TemplateRequestBuildResponse:
+      type: object
+      required: [templateID, buildID, public, aliases, names, tags]
+      properties:
+        templateID:
+          type: string
+        buildID:
+          type: string
+        public:
+          type: boolean
+        aliases:
+          type: array
+          items:
+            type: string
+        names:
+          type: array
+          items:
+            type: string
+        tags:
+          type: array
+          items:
+            type: string
+
+    TemplateBuildStep:
+      type: object
+      required: [type, args]
+      properties:
+        type:
+          type: string
+          enum: [RUN, COPY, ADD, WORKDIR, USER, ENV]
+        args:
+          type: array
+          items:
+            type: string
+        filesHash:
+          type: string
+        force:
+          type: boolean
+
+    TemplateBuildStartV2:
+      type: object
+      properties:
+        fromImage:
+          type: string
+        fromTemplate:
+          type: string
+        fromImageRegistry:
+          type: object
+          properties:
+            type:
+              type: string
+            username:
+              type: string
+            password:
+              type: string
+        force:
+          type: boolean
+        startCmd:
+          type: string
+        readyCmd:
+          type: string
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/TemplateBuildStep"
+
+    BuildLogEntry:
+      type: object
+      required: [timestamp, level, message]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        level:
+          type: string
+          enum: [debug, info, warn, error]
+        message:
+          type: string
+
+    BuildStatusReason:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+        step:
+          type: string
+        logEntries:
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildLogEntry"
+
+    TemplateBuildInfo:
+      type: object
+      required: [templateID, buildID, status, logs, logEntries]
+      properties:
+        templateID:
+          type: string
+        buildID:
+          type: string
+        status:
+          type: string
+          enum: [waiting, building, ready, error]
+        reason:
+          $ref: "#/components/schemas/BuildStatusReason"
+        logs:
+          type: array
+          items:
+            type: string
+        logEntries:
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildLogEntry"
+
+    TemplateBuildFileUpload:
+      type: object
+      required: [present]
+      properties:
+        present:
+          type: boolean
+        url:
+          type: string
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+
+    E2BTemplateBuildSummary:
+      type: object
+      required: [buildID, status, createdAt, updatedAt, cpuCount, memoryMB]
+      properties:
+        buildID:
+          type: string
+        templateID:
+          type: string
+        status:
+          type: string
+          enum: [waiting, building, ready, error]
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        cpuCount:
+          type: integer
+        memoryMB:
+          type: integer
+        reason:
+          $ref: "#/components/schemas/BuildStatusReason"
+
+    E2BTemplate:
+      type: object
+      required:
+        - templateID
+        - buildID
+        - cpuCount
+        - memoryMB
+        - diskSizeMB
+        - public
+        - aliases
+        - names
+        - createdAt
+        - updatedAt
+        - createdBy
+        - lastSpawnedAt
+        - spawnCount
+        - buildCount
+        - envdVersion
+        - buildStatus
+      properties:
+        templateID:
+          type: string
+        buildID:
+          type: string
+        cpuCount:
+          type: integer
+        memoryMB:
+          type: integer
+        diskSizeMB:
+          type: integer
+        public:
+          type: boolean
+        aliases:
+          type: array
+          items:
+            type: string
+        names:
+          type: array
+          items:
+            type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        createdBy:
+          nullable: true
+        lastSpawnedAt:
+          type: string
+          format: date-time
+          nullable: true
+        spawnCount:
+          type: integer
+        buildCount:
+          type: integer
+        envdVersion:
+          type: string
+        buildStatus:
+          type: string
+          enum: [waiting, building, ready, error]
+
+    TemplateWithBuilds:
+      allOf:
+        - $ref: "#/components/schemas/E2BTemplate"
+        - type: object
+          required: [builds]
+          properties:
+            builds:
+              type: array
+              items:
+                $ref: "#/components/schemas/E2BTemplateBuildSummary"
+
+    TemplateTagInfo:
+      type: object
+      required: [tag, buildID]
+      properties:
+        tag:
+          type: string
+        buildID:
           type: string
