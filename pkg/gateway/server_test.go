@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/gateway"
 )
@@ -1020,6 +1022,58 @@ func TestWarmPoolRoutes(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("pool-cep12 not found in list: %+v", listData.WarmPools)
+	}
+}
+
+func TestWarmPoolClaim_GracefulFallbackToColdStart(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Create WarmPool with 1 replica
+	poolReq := `{"name":"pool-fallback","templateRef":"cubeplex-ubuntu24-desktop","replicas":1}`
+	postResp, err := http.Post(ts.URL+"/warmpools", "application/json", strings.NewReader(poolReq))
+	if err != nil || postResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create warm pool failed: status=%d err=%v", postResp.StatusCode, err)
+	}
+	_ = postResp.Body.Close()
+
+	// 2. Claim the only replica directly from reconciler to simulate race / exhaustion
+	_, err = reconciler.ClaimWarmPod(context.Background(), "pool-fallback", "race-winner")
+	if err != nil {
+		t.Fatalf("failed to claim warm pod: %v", err)
+	}
+
+	// 3. Now POST /sandboxes with template cubeplex-ubuntu24-desktop
+	sbReq := `{"templateID":"cubeplex-ubuntu24-desktop"}`
+	sbResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(sbReq))
+	if err != nil {
+		t.Fatalf("failed to create sandbox: %v", err)
+	}
+	defer sbResp.Body.Close()
+
+	if sbResp.StatusCode != http.StatusCreated && sbResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected sandbox creation to succeed via cold start fallback, got status %d", sbResp.StatusCode)
+	}
+
+	var sbData struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	_ = json.NewDecoder(sbResp.Body).Decode(&sbData)
+	if sbData.SandboxID == "" {
+		t.Fatalf("expected non-empty sandboxID")
+	}
+
+	box, ok := reconciler.GetBox(sbData.SandboxID)
+	if !ok {
+		t.Fatalf("expected sandbox %s in reconciler", sbData.SandboxID)
+	}
+	if box.Reason == "WarmPoolClaimed" {
+		t.Fatalf("expected cold start provisioned, got WarmPoolClaimed")
+	}
+	if box.Phase != v1alpha1.PodBoxPhaseRunning {
+		t.Fatalf("expected running phase, got %s", box.Phase)
 	}
 }
 

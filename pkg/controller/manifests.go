@@ -318,13 +318,20 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 		containers = append(containers, egressContainer)
 	}
 
+	labels := map[string]string{
+		"app.kubernetes.io/name": "cubepod",
+		"pod.cubeplex.ai/box":    boxName,
+	}
+	if spec.WarmPoolRef != "" {
+		labels["cubepod.io/warmpool"] = spec.WarmPoolRef
+		labels["cubepod.io/template"] = spec.TemplateRef
+		labels["cubepod.io/claimed"] = "false"
+	}
+
 	return PodManifest{
 		Name:             podName,
 		RuntimeClassName: rtClass,
-		Labels: map[string]string{
-			"app.kubernetes.io/name": "cubepod",
-			"pod.cubeplex.ai/box":    boxName,
-		},
+		Labels:           labels,
 		InitContainers:   initContainers,
 		Containers:       containers,
 		Volumes:          volumes,

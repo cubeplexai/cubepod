@@ -386,6 +386,11 @@ func TestPodWarmPool_ReconcileAndClaim(t *testing.T) {
 	if entry.ClaimedBy != "agent-box-2" || !entry.Claimed {
 		t.Fatalf("entry not properly marked claimed: %+v", entry)
 	}
+	if entry.PodManifest.Labels["cubepod.io/warmpool"] != "pool-a" ||
+		entry.PodManifest.Labels["cubepod.io/template"] != "base-tpl" ||
+		entry.PodManifest.Labels["cubepod.io/claimed"] != "true" {
+		t.Fatalf("unexpected entry podManifest labels: %+v", entry.PodManifest.Labels)
+	}
 
 	// Warm pool should now have 1 available replica
 	wpStatus3, _ := r.GetWarmPoolStatus("pool-a")
