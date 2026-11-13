@@ -1726,6 +1726,126 @@ func (r *Reconciler) SetTemplatePublic(ctx context.Context, templateID string, p
 	return nil
 }
 
+func (r *Reconciler) findTemplateLocked(nameOrID string) *v1alpha1.PodTemplate {
+	for _, obj := range r.templateObjects {
+		if obj.Status.TemplateID == nameOrID || obj.Metadata.Name == nameOrID || slices.Contains(obj.Spec.Names, nameOrID) {
+			return obj
+		}
+	}
+	if objName, ok := r.templateIndex[nameOrID]; ok {
+		return r.templateObjects[objName]
+	}
+	return nil
+}
+
+func normalizeTemplateTagEntry(primaryName, rawTag string) string {
+	t := strings.TrimSpace(rawTag)
+	if t == "" {
+		return ""
+	}
+	if strings.Contains(t, ":") {
+		return t
+	}
+	return fmt.Sprintf("%s:%s", primaryName, t)
+}
+
+// AssignTemplateTags adds tagged names (accepting "name:tag" or bare "tag") to a template's Spec.Names.
+func (r *Reconciler) AssignTemplateTags(ctx context.Context, nameOrID string, tags []string) (*v1alpha1.PodTemplate, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	tpl := r.findTemplateLocked(nameOrID)
+	if tpl == nil {
+		return nil, fmt.Errorf("%w: %s", ErrTemplateNotFound, nameOrID)
+	}
+
+	primary := primaryNameOfTemplate(tpl)
+	var normalized []string
+	for _, raw := range tags {
+		entry := normalizeTemplateTagEntry(primary, raw)
+		if entry == "" {
+			continue
+		}
+		if existing, exists := r.templateIndex[entry]; exists && existing != tpl.Metadata.Name {
+			return nil, fmt.Errorf("%w: tag %q already claimed by %q", ErrTemplateConflict, entry, existing)
+		}
+		if !slices.Contains(normalized, entry) {
+			normalized = append(normalized, entry)
+		}
+	}
+
+	for _, entry := range normalized {
+		if !slices.Contains(tpl.Spec.Names, entry) {
+			tpl.Spec.Names = append(tpl.Spec.Names, entry)
+		}
+	}
+	tpl.Status.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+
+	if err := r.kubeClient.UpdatePodTemplate(ctx, *tpl); err != nil {
+		return nil, err
+	}
+	_ = r.indexTemplateLocked(tpl)
+	r.templates[tpl.Metadata.Name] = tpl.Spec
+	r.persistLocalTemplateLocked(tpl)
+
+	cp := *tpl
+	return &cp, nil
+}
+
+// DeleteTemplateTags removes tagged names from a template's Spec.Names while preserving the primary name.
+func (r *Reconciler) DeleteTemplateTags(ctx context.Context, nameOrID string, tags []string) (*v1alpha1.PodTemplate, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	tpl := r.findTemplateLocked(nameOrID)
+	if tpl == nil {
+		return nil, fmt.Errorf("%w: %s", ErrTemplateNotFound, nameOrID)
+	}
+
+	primary := primaryNameOfTemplate(tpl)
+	toRemove := make(map[string]struct{}, len(tags))
+	for _, raw := range tags {
+		entry := normalizeTemplateTagEntry(primary, raw)
+		if entry == "" || entry == primary {
+			continue
+		}
+		toRemove[entry] = struct{}{}
+	}
+
+	kept := make([]string, 0, len(tpl.Spec.Names))
+	for _, existing := range tpl.Spec.Names {
+		if existing == primary {
+			kept = append(kept, existing)
+			continue
+		}
+		if _, rm := toRemove[existing]; rm {
+			if mapped, ok := r.templateIndex[existing]; ok && mapped == tpl.Metadata.Name {
+				delete(r.templateIndex, existing)
+			}
+			continue
+		}
+		kept = append(kept, existing)
+	}
+	tpl.Spec.Names = kept
+	tpl.Status.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+
+	if err := r.kubeClient.UpdatePodTemplate(ctx, *tpl); err != nil {
+		return nil, err
+	}
+	_ = r.indexTemplateLocked(tpl)
+	r.templates[tpl.Metadata.Name] = tpl.Spec
+	r.persistLocalTemplateLocked(tpl)
+
+	cp := *tpl
+	return &cp, nil
+}
+
 func (r *Reconciler) templateMatchesRef(tpl *v1alpha1.PodTemplate, ref string) bool {
 	if ref == tpl.Metadata.Name || ref == tpl.Status.TemplateID {
 		return true

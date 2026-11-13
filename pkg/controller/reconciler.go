@@ -279,6 +279,41 @@ func (r *Reconciler) KubeClient() KubeClient {
 	return r.kubeClient
 }
 
+// ContextStore returns the currently configured build context and log store.
+func (r *Reconciler) ContextStore() ContextStore {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.contextStore
+}
+
+// PingBuilder verifies connectivity to the configured ImageBuilder (BuildKit or Docker).
+func (r *Reconciler) PingBuilder(ctx context.Context) error {
+	r.mu.RLock()
+	builder := r.imageBuilder
+	r.mu.RUnlock()
+	if builder == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return builder.Ping(ctx)
+}
+
+// SweepTemplateContexts removes expired template build contexts (24h TTL) and logs (7d TTL).
+func (r *Reconciler) SweepTemplateContexts(now time.Time) error {
+	r.mu.RLock()
+	store := r.contextStore
+	r.mu.RUnlock()
+	if store == nil {
+		return nil
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return store.SweepExpired(now, 24*time.Hour, 7*24*time.Hour)
+}
+
 // RegisterTemplate saves or updates a reusable PodTemplateSpec.
 func (r *Reconciler) RegisterTemplate(name string, spec v1alpha1.PodTemplateSpec) {
 	r.mu.Lock()

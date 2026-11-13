@@ -1783,4 +1783,101 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 			t.Fatalf("REST DeleteSecret failed: %v", delErr)
 		}
 	})
+
+	// 38. ContextStore(), PingBuilder, SweepTemplateContexts, AssignTemplateTags & DeleteTemplateTags
+	t.Run("ContextStore PingBuilder SweepTemplateContexts AssignTemplateTags DeleteTemplateTags", func(t *testing.T) {
+		ctx := context.Background()
+		fakeBuilder := controller.NewFakeImageBuilder()
+		ctxDir := t.TempDir()
+		store := controller.NewMemoryContextStore(ctxDir)
+
+		r := controller.NewReconciler(
+			controller.WithE2BTemplateAPI(true),
+			controller.WithTemplateBuildEnabled(true),
+			controller.WithImageBuilder(fakeBuilder),
+			controller.WithContextStore(store),
+		)
+
+		if r.ContextStore() != store {
+			t.Fatalf("expected ContextStore() to return configured store")
+		}
+		if err := r.PingBuilder(ctx); err != nil {
+			t.Fatalf("PingBuilder failed: %v", err)
+		}
+		if fakeBuilder.PingCalls != 1 {
+			t.Fatalf("expected 1 Ping call, got %d", fakeBuilder.PingCalls)
+		}
+		fakeBuilder.PingErr = errors.New("builder down")
+		if err := r.PingBuilder(ctx); err == nil {
+			t.Fatalf("expected PingBuilder error")
+		}
+
+		// SweepTemplateContexts removes >24h tar contexts and >7d logs
+		var tarBuf bytes.Buffer
+		tw := tar.NewWriter(&tarBuf)
+		_ = tw.WriteHeader(&tar.Header{Name: "f.txt", Mode: 0644, Size: 1})
+		_, _ = tw.Write([]byte("x"))
+		_ = tw.Close()
+		h := strings.Repeat("9", 64)
+		if err := store.Store(h, &tarBuf); err != nil {
+			t.Fatalf("store.Store failed: %v", err)
+		}
+		_ = store.AppendLog("bld_sweep", []string{"old log"})
+		if err := r.SweepTemplateContexts(time.Now().Add(48 * time.Hour)); err != nil {
+			t.Fatalf("SweepTemplateContexts failed: %v", err)
+		}
+		if store.IsPresent(h) {
+			t.Fatalf("expected 48h sweep to expire context tar (>24h TTL)")
+		}
+		if entries, _ := store.ReadLogs("bld_sweep", 0, 10, ""); len(entries) != 1 {
+			t.Fatalf("expected logs to survive 48h sweep (<7d TTL), got %d", len(entries))
+		}
+		if err := r.SweepTemplateContexts(time.Now().Add(8 * 24 * time.Hour)); err != nil {
+			t.Fatalf("SweepTemplateContexts 8d failed: %v", err)
+		}
+		if entries, _ := store.ReadLogs("bld_sweep", 0, 10, ""); len(entries) != 0 {
+			t.Fatalf("expected logs to expire at 8d (>7d TTL), got %d", len(entries))
+		}
+
+		// AssignTemplateTags & DeleteTemplateTags
+		respA, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "tag-alpha"}, "")
+		if err != nil {
+			t.Fatalf("CreateTemplate tag-alpha failed: %v", err)
+		}
+		respB, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "tag-beta"}, "")
+		if err != nil {
+			t.Fatalf("CreateTemplate tag-beta failed: %v", err)
+		}
+
+		updated, err := r.AssignTemplateTags(ctx, respA.TemplateID, []string{"v1", "tag-alpha:prod"})
+		if err != nil {
+			t.Fatalf("AssignTemplateTags failed: %v", err)
+		}
+		if !slices.Contains(updated.Spec.Names, "tag-alpha:v1") || !slices.Contains(updated.Spec.Names, "tag-alpha:prod") {
+			t.Fatalf("expected tags in Spec.Names, got %v", updated.Spec.Names)
+		}
+		if _, ok := r.GetPodTemplate("tag-alpha:v1"); !ok {
+			t.Fatalf("expected GetPodTemplate(\"tag-alpha:v1\") to resolve")
+		}
+
+		// Tag conflict with another template -> 409
+		if _, err := r.AssignTemplateTags(ctx, respB.TemplateID, []string{"tag-alpha:v1"}); !errors.Is(err, controller.ErrTemplateConflict) {
+			t.Fatalf("expected ErrTemplateConflict on claimed tag, got %v", err)
+		}
+
+		// Delete tags preserves primary name "tag-alpha"
+		afterDel, err := r.DeleteTemplateTags(ctx, respA.TemplateID, []string{"v1", "tag-alpha"})
+		if err != nil {
+			t.Fatalf("DeleteTemplateTags failed: %v", err)
+		}
+		if slices.Contains(afterDel.Spec.Names, "tag-alpha:v1") {
+			t.Fatalf("expected tag-alpha:v1 removed, got %v", afterDel.Spec.Names)
+		}
+		if !slices.Contains(afterDel.Spec.Names, "tag-alpha") || !slices.Contains(afterDel.Spec.Names, "tag-alpha:prod") {
+			t.Fatalf("expected primary name tag-alpha and tag-alpha:prod preserved, got %v", afterDel.Spec.Names)
+		}
+		if _, ok := r.GetPodTemplate("tag-alpha:v1"); ok {
+			t.Fatalf("expected tag-alpha:v1 to no longer resolve after DeleteTemplateTags")
+		}
+	})
 }
