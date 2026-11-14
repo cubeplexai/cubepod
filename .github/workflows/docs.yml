@@ -1,0 +1,96 @@
+name: Deploy Docs
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-docs:
+    name: Build & Verify Documentation Site
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install dependencies
+        working-directory: website
+        run: npm ci
+
+      - name: Build Astro + Starlight site and llms.txt
+        working-directory: website
+        run: npm run build
+
+      - name: Verify build artifacts & internal links
+        working-directory: website
+        run: npm run verify
+
+      - name: Upload built site artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cubepod-docs-dist
+          path: website/dist
+          retention-days: 7
+
+  deploy-cloudflare:
+    name: Deploy to Cloudflare Workers Static Assets
+    runs-on: ubuntu-latest
+    needs: [build-docs]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: website/package-lock.json
+
+      - name: Download built site artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cubepod-docs-dist
+          path: website/dist
+
+      - name: Install Wrangler dependencies
+        working-directory: website
+        run: npm ci
+
+      - name: Deploy with Wrangler (if CLOUDFLARE_API_TOKEN is configured)
+        working-directory: website
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
+            echo "CLOUDFLARE_API_TOKEN secret is not configured; skipping Cloudflare deployment."
+            {
+              echo "### Cloudflare Deployment Skipped"
+              echo ""
+              echo "The documentation site built and passed all link verification checks, but \`CLOUDFLARE_API_TOKEN\` is not configured in GitHub repository secrets."
+              echo ""
+              echo "To enable automatic deployment to \`https://cubepod.cubeplex.ai\` on pushes to \`main\`:"
+              echo "1. Add \`CLOUDFLARE_API_TOKEN\` (with Workers Scripts Edit & Zone DNS/Routes permissions for \`cubeplex.ai\`) under **Settings → Secrets and variables → Actions**."
+              echo "2. Optionally add \`CLOUDFLARE_ACCOUNT_ID\` if your token spans multiple Cloudflare accounts."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          npx wrangler deploy

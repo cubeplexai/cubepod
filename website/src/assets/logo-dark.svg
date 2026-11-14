@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 40" width="180" height="40" fill="none">
+  <defs>
+    <linearGradient id="cp-cyan-dark" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <linearGradient id="cp-indigo-dark" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#818cf8"/>
+      <stop offset="100%" stop-color="#4f46e5"/>
+    </linearGradient>
+  </defs>
+  <!-- Outer Hardware MicroVM Wireframe Hexagon -->
+  <polygon points="20,3 35,11.5 35,28.5 20,37 5,28.5 5,11.5" stroke="#334155" stroke-width="1.5" fill="#0b1120"/>
+  <!-- Base Layer: Workspace Volume (Indigo) -->
+  <polygon points="20,21 31,15 31,24.5 20,30.5 9,24.5 9,15" fill="url(#cp-indigo-dark)" fill-opacity="0.28" stroke="#818cf8" stroke-width="1.2" stroke-linejoin="round"/>
+  <polyline points="9,20 20,26 31,20" stroke="#818cf8" stroke-width="1.2" stroke-linejoin="round" fill="none"/>
+  <!-- Top Layer: Persistent RootFS Overlay (Cyan) -->
+  <polygon points="20,7.5 31,13.5 20,19.5 9,13.5" fill="url(#cp-cyan-dark)" fill-opacity="0.92" stroke="#cffafe" stroke-width="1" stroke-linejoin="round"/>
+  <polyline points="20,19.5 20,30.5" stroke="#22d3ee" stroke-width="1.2" stroke-linecap="round"/>
+  <!-- Brand Wordmark -->
+  <text x="46" y="25.5" font-family="ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="19" font-weight="700" letter-spacing="-0.03em" fill="#f8fafc">Cube<tspan fill="#22d3ee">Pod</tspan></text>
+</svg>

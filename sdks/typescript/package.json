@@ -37,7 +37,7 @@
     "url": "git+https://github.com/cubeplexai/cubepod.git",
     "directory": "sdks/typescript"
   },
-  "homepage": "https://github.com/cubeplexai/cubepod/tree/main/sdks/typescript",
+  "homepage": "https://cubepod.cubeplex.ai",
   "bugs": {
     "url": "https://github.com/cubeplexai/cubepod/issues"
   },

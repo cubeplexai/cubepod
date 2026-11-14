@@ -1,0 +1,26 @@
+{
+  "name": "cubepod-website",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "predev": "node scripts/sync-sources.mjs",
+    "dev": "astro dev",
+    "prebuild": "node scripts/sync-sources.mjs",
+    "build": "astro build && node scripts/generate-llms-txt.mjs",
+    "preview": "wrangler dev",
+    "verify": "node scripts/verify-build.mjs",
+    "deploy": "npm run build && wrangler deploy"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.37.6",
+    "@scalar/api-reference": "^1.51.1",
+    "astro": "^5.18.0",
+    "mermaid": "^11.12.0",
+    "sharp": "^0.34.5"
+  },
+  "devDependencies": {
+    "wrangler": "^4.112.0",
+    "yaml": "^2.7.0"
+  }
+}

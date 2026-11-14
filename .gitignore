@@ -32,6 +32,8 @@ venv/
 node_modules/
 .pnpm-store/
 *.tsbuildinfo
+.astro/
+.wrangler/
 
 # Local development & runtime artifacts
 .env

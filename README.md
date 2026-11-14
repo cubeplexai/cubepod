@@ -2,6 +2,8 @@
 
 **Persistent Writable RootFS MicroVM Execution Platform for AI Agents**
 
+[Documentation](https://cubepod.cubeplex.ai) · [Interactive API Reference](https://cubepod.cubeplex.ai/api/) · [中文文档](https://cubepod.cubeplex.ai/zh/) · [`llms.txt`](https://cubepod.cubeplex.ai/llms.txt)
+
 CubePod is an open-source, cloud-native execution platform designed for long-lived, high-autonomy AI Agents. Together with [**CubePlex**](https://github.com/cubeplexai/cubeplex) (Agent Workspace Platform) and [**CubeLoop**](https://github.com/cubeplexai/cubeloop) (Agent Runtime), CubePod provides hardware-isolated MicroVM execution with instant hibernation/resume and full system-level persistence.
 
 ---
