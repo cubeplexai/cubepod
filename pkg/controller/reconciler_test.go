@@ -2197,3 +2197,104 @@ func TestReconcile_PodBoxStatelessAnnotations(t *testing.T) {
 		t.Fatalf("child rootfs-generation = %q; want 1", got)
 	}
 }
+
+func TestReconciler_VolumeKeyPersistenceAndWarmPoolSkip(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithVolumeMode("Filesystem"),
+	)
+
+	r.RegisterTemplate("python-312", v1alpha1.PodTemplateSpec{
+		Image: "python:3.12",
+		Storage: v1alpha1.StorageSpec{
+			StorageClassName: "local-path",
+			RootfsSize:       "5Gi",
+			WorkspaceSize:    "10Gi",
+		},
+	})
+
+	// Pre-populate a warm pool with 1 ready standby entry.
+	poolSpec := v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "python-312",
+		Replicas:    1,
+	}
+	if _, err := r.ReconcileWarmPool(ctx, "fast-pool", poolSpec); err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	// Reconcile box-1 with BOTH WarmPoolRef and VolumeKey: warmpool must be skipped
+	// and workspace PVC must be deterministic from VolumeKey.
+	volKey := "Workspace_Alpha/Agent-7"
+	spec1 := v1alpha1.PodBoxSpec{
+		TemplateRef:      "python-312",
+		WarmPoolRef:      "fast-pool",
+		VolumeKey:        volKey,
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}
+	st1, err := r.Reconcile(ctx, "cpod-vol-1", spec1)
+	if err != nil {
+		t.Fatalf("Reconcile box-1 failed: %v", err)
+	}
+	wantWSPVC := controller.WorkspacePVCName("cpod-vol-1", spec1)
+	if wantWSPVC != "workspace-alpha-agent-7-workspace-pvc" {
+		t.Fatalf("unexpected deterministic PVC name: %q", wantWSPVC)
+	}
+	if st1.WorkspacePVCName != wantWSPVC {
+		t.Fatalf("st1.WorkspacePVCName = %q; want %q", st1.WorkspacePVCName, wantWSPVC)
+	}
+	if st1.Reason == "WarmPoolClaimed" {
+		t.Fatalf("expected WarmPool claim to be skipped when VolumeKey is set, got reason=%q", st1.Reason)
+	}
+	if poolStatus, err := r.ReconcileWarmPool(ctx, "fast-pool", poolSpec); err != nil || poolStatus.AvailableReplicas != 1 {
+		t.Fatalf("expected warm pool standby to remain unclaimed (available=1), got %+v err=%v", poolStatus, err)
+	}
+
+	// Delete box-1 with deleteVolumes=false -> rootfs PVC MUST be deleted, workspace PVC MUST stay.
+	if err := r.DeleteBox(ctx, "cpod-vol-1", false); err != nil {
+		t.Fatalf("DeleteBox(false) box-1 failed: %v", err)
+	}
+	if _, ok := memKube.GetPVC("cubepod-workloads", "cpod-vol-1-rootfs-pvc"); ok {
+		t.Fatal("expected ephemeral cpod-vol-1-rootfs-pvc to be deleted on DeleteBox(..., false) for volumeKey box")
+	}
+	if _, ok := memKube.GetPVC("cubepod-workloads", wantWSPVC); !ok {
+		t.Fatalf("expected deterministic workspace PVC %q to be retained on DeleteBox(..., false)", wantWSPVC)
+	}
+
+	// Reconcile box-2 with same VolumeKey -> reattaches the same deterministic workspace PVC.
+	spec2 := spec1
+	spec2.WarmPoolRef = ""
+	st2, err := r.Reconcile(ctx, "cpod-vol-2", spec2)
+	if err != nil {
+		t.Fatalf("Reconcile box-2 failed: %v", err)
+	}
+	if st2.WorkspacePVCName != wantWSPVC {
+		t.Fatalf("st2.WorkspacePVCName = %q; want %q", st2.WorkspacePVCName, wantWSPVC)
+	}
+	pod2, ok := memKube.GetPod("cubepod-workloads", st2.PodName)
+	if !ok {
+		t.Fatalf("expected pod %q for box-2", st2.PodName)
+	}
+	attachedWS := false
+	for _, v := range pod2.Volumes {
+		if v.Name == "workspace-volume" && v.PersistentVolumeClaim == wantWSPVC {
+			attachedWS = true
+		}
+	}
+	if !attachedWS {
+		t.Fatalf("expected box-2 pod to mount retained PVC %q, got %+v", wantWSPVC, pod2.Volumes)
+	}
+
+	// Delete box-2 with deleteVolumes=true -> BOTH PVCs deleted.
+	if err := r.DeleteBox(ctx, "cpod-vol-2", true); err != nil {
+		t.Fatalf("DeleteBox(true) box-2 failed: %v", err)
+	}
+	if _, ok := memKube.GetPVC("cubepod-workloads", "cpod-vol-2-rootfs-pvc"); ok {
+		t.Fatal("expected cpod-vol-2-rootfs-pvc deleted on DeleteBox(..., true)")
+	}
+	if _, ok := memKube.GetPVC("cubepod-workloads", wantWSPVC); ok {
+		t.Fatalf("expected workspace PVC %q deleted on DeleteBox(..., true)", wantWSPVC)
+	}
+}

@@ -194,11 +194,18 @@ type SecretBinding struct {
 	AllowedHeaders []string `json:"allowedHeaders,omitempty"`
 }
 
+// NetworkEgressRule represents a single ordered allow or deny egress rule for a host or wildcard pattern.
+type NetworkEgressRule struct {
+	Action string `json:"action"`
+	Target string `json:"target"`
+}
+
 // NetworkPolicySpec configures per-sandbox DNS/nftables filtering and upstream proxy routing.
 type NetworkPolicySpec struct {
 	DefaultAction  NetworkDefaultAction `json:"defaultAction"`
 	AllowHosts     []string             `json:"allowHosts,omitempty"`
 	DenyHosts      []string             `json:"denyHosts,omitempty"`
+	Egress         []NetworkEgressRule  `json:"egress,omitempty"`
 	UpstreamProxy  string               `json:"upstreamProxy,omitempty"`
 	SecretBindings []SecretBinding      `json:"secretBindings,omitempty"`
 }
@@ -210,6 +217,10 @@ type PodBoxSpec struct {
 
 	// WarmPoolRef optionally claims a standby instance from the named PodWarmPool on initial creation.
 	WarmPoolRef string `json:"warmPoolRef,omitempty"`
+
+	// VolumeKey optionally specifies a deterministic workspace PVC prefix so workspace
+	// data persists across sandbox delete -> create cycles.
+	VolumeKey string `json:"volumeKey,omitempty"`
 
 	// DesiredState controls whether the MicroVM Pod is active ("Running") or suspended ("Paused").
 	// When Paused, the compute Pod is deleted (0 CPU/RAM) while RootFS and Workspace PVCs are retained.

@@ -54,23 +54,32 @@ func MatchHost(host, pattern string) bool {
 }
 
 // CheckEgressAllowed evaluates a NetworkPolicySpec against a target host:
-// 1. If host matches any pattern in DenyHosts, it is denied (returns false).
-// 2. If host matches any pattern in AllowHosts, it is allowed (returns true).
-// 3. Otherwise, falls back to DefaultAction ("Allow" -> true, else -> false).
+// 1. Ordered Egress rules are evaluated first (first MatchHost hit wins).
+// 2. Legacy DenyHosts are evaluated next (matches are denied).
+// 3. Legacy AllowHosts are evaluated next (matches are allowed).
+// 4. Otherwise, falls back to DefaultAction ("Allow" -> true, else -> false).
 func CheckEgressAllowed(policy v1alpha1.NetworkPolicySpec, host string) bool {
 	h := normalizeHost(host)
 	if h == "" {
 		return false
 	}
 
-	// Deny rules take strict precedence
+	// Ordered rules take precedence (first match wins)
+	for _, rule := range policy.Egress {
+		if !MatchHost(h, rule.Target) {
+			continue
+		}
+		return strings.EqualFold(strings.TrimSpace(rule.Action), string(v1alpha1.NetworkDefaultAllow))
+	}
+
+	// Legacy deny rules
 	for _, denyPattern := range policy.DenyHosts {
 		if MatchHost(h, denyPattern) {
 			return false
 		}
 	}
 
-	// Explicit allow rules
+	// Legacy explicit allow rules
 	for _, allowPattern := range policy.AllowHosts {
 		if MatchHost(h, allowPattern) {
 			return true

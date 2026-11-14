@@ -2025,3 +2025,311 @@ func TestStatelessGatewayMultiReplicaFailover(t *testing.T) {
 		t.Fatalf("expected 404 on gw2 after gw1 deleted sandbox, got %d", staleResp.StatusCode)
 	}
 }
+
+func TestVolumeKeyPersistenceAcrossDeleteAndRecreate(t *testing.T) {
+	memKube := controller.NewMemoryKubeClient()
+	reconciler := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithVolumeMode("Filesystem"),
+	)
+	srv := gateway.NewServer(reconciler)
+	srv.SetWorkspaceBaseDir(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Create sandbox 1 with deterministic volumeKey
+	createBody := []byte(`{"templateID":"cubeplex-ubuntu24-desktop","extension":{"volumeKey":"ws-persist-alpha"}}`)
+	resp1, err := http.Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader(createBody))
+	if err != nil || resp1.StatusCode != http.StatusCreated {
+		t.Fatalf("create sandbox 1 failed: resp=%v err=%v", resp1, err)
+	}
+	var rec1 gateway.SandboxRecord
+	_ = json.NewDecoder(resp1.Body).Decode(&rec1)
+	_ = resp1.Body.Close()
+
+	if rec1.VolumeKey != "ws-persist-alpha" {
+		t.Fatalf("rec1.VolumeKey = %q; want ws-persist-alpha", rec1.VolumeKey)
+	}
+	wantWSPVC := "ws-persist-alpha-workspace-pvc"
+	if _, ok := memKube.GetPVC("cubepod-workloads", wantWSPVC); !ok {
+		t.Fatalf("expected PVC %q after create", wantWSPVC)
+	}
+	if _, ok := memKube.GetPVC("cubepod-workloads", rec1.SandboxID+"-rootfs-pvc"); !ok {
+		t.Fatalf("expected ephemeral rootfs PVC %q after create", rec1.SandboxID+"-rootfs-pvc")
+	}
+
+	// 2. Write a file in /workspace
+	putReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/sandboxes/"+rec1.SandboxID+"/files?path=/workspace/project/notes.txt", strings.NewReader("persistent-hello"))
+	putResp, err := http.DefaultClient.Do(putReq)
+	if err != nil || putResp.StatusCode >= 300 {
+		t.Fatalf("put file failed: resp=%v err=%v", putResp, err)
+	}
+	_ = putResp.Body.Close()
+
+	// 3. Delete without deleteVolumes=true -> retains workspace PVC + files, deletes ephemeral rootfs PVC
+	delReq1, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+rec1.SandboxID, nil)
+	delResp1, err := http.DefaultClient.Do(delReq1)
+	if err != nil || delResp1.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete 1 failed: resp=%v err=%v", delResp1, err)
+	}
+	_ = delResp1.Body.Close()
+
+	if _, ok := memKube.GetPVC("cubepod-workloads", rec1.SandboxID+"-rootfs-pvc"); ok {
+		t.Fatalf("expected ephemeral rootfs PVC %q deleted", rec1.SandboxID+"-rootfs-pvc")
+	}
+	if _, ok := memKube.GetPVC("cubepod-workloads", wantWSPVC); !ok {
+		t.Fatalf("expected workspace PVC %q retained after delete without deleteVolumes", wantWSPVC)
+	}
+
+	// 4. Create sandbox 2 with the same volumeKey -> sees written file & same PVC
+	resp2, err := http.Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader(createBody))
+	if err != nil || resp2.StatusCode != http.StatusCreated {
+		t.Fatalf("create sandbox 2 failed: resp=%v err=%v", resp2, err)
+	}
+	var rec2 gateway.SandboxRecord
+	_ = json.NewDecoder(resp2.Body).Decode(&rec2)
+	_ = resp2.Body.Close()
+	if rec2.SandboxID == rec1.SandboxID {
+		t.Fatalf("expected fresh sandbox ID on recreate")
+	}
+
+	getResp, err := http.Get(ts.URL + "/sandboxes/" + rec2.SandboxID + "/files?path=/workspace/project/notes.txt")
+	if err != nil || getResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected persisted file in recreated sandbox, status=%v err=%v", getResp, err)
+	}
+	gotData, _ := io.ReadAll(getResp.Body)
+	_ = getResp.Body.Close()
+	if string(gotData) != "persistent-hello" {
+		t.Fatalf("persisted file content = %q; want persistent-hello", string(gotData))
+	}
+
+	// 5. Delete with deleteVolumes=true -> removes both PVCs and local workspace data
+	delReq2, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+rec2.SandboxID+"?deleteVolumes=true", nil)
+	delResp2, err := http.DefaultClient.Do(delReq2)
+	if err != nil || delResp2.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete 2 failed: resp=%v err=%v", delResp2, err)
+	}
+	_ = delResp2.Body.Close()
+
+	if _, ok := memKube.GetPVC("cubepod-workloads", rec2.SandboxID+"-rootfs-pvc"); ok {
+		t.Fatalf("expected rootfs PVC deleted with deleteVolumes=true")
+	}
+	if _, ok := memKube.GetPVC("cubepod-workloads", wantWSPVC); ok {
+		t.Fatalf("expected workspace PVC deleted with deleteVolumes=true")
+	}
+
+	resp3, err := http.Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader(createBody))
+	if err != nil || resp3.StatusCode != http.StatusCreated {
+		t.Fatalf("create sandbox 3 failed: resp=%v err=%v", resp3, err)
+	}
+	var rec3 gateway.SandboxRecord
+	_ = json.NewDecoder(resp3.Body).Decode(&rec3)
+	_ = resp3.Body.Close()
+
+	missingResp, err := http.Get(ts.URL + "/sandboxes/" + rec3.SandboxID + "/files?path=/workspace/project/notes.txt")
+	if err != nil {
+		t.Fatalf("get file on clean recreate failed: %v", err)
+	}
+	_ = missingResp.Body.Close()
+	if missingResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 after deleteVolumes=true, got %d", missingResp.StatusCode)
+	}
+}
+
+func TestNetworkPolicyPropagationAcrossLifecycleAndFailover(t *testing.T) {
+	sharedKube := controller.NewMemoryKubeClient()
+	r1 := controller.NewReconciler(controller.WithKubeClient(sharedKube), controller.WithVolumeMode("Filesystem"))
+	r2 := controller.NewReconciler(controller.WithKubeClient(sharedKube), controller.WithVolumeMode("Filesystem"))
+	gw1 := gateway.NewServer(r1)
+	gw1.SetWorkspaceBaseDir(t.TempDir())
+	gw2 := gateway.NewServer(r2)
+	gw2.SetWorkspaceBaseDir(t.TempDir())
+
+	ts1 := httptest.NewServer(gw1.Handler())
+	defer ts1.Close()
+	ts2 := httptest.NewServer(gw2.Handler())
+	defer ts2.Close()
+
+	assertPolicyOnBox := func(step, boxName string) {
+		t.Helper()
+		box, err := sharedKube.GetPodBox(t.Context(), "cubepod-workloads", boxName)
+		if err != nil || box == nil {
+			t.Fatalf("%s: GetPodBox(%s) failed: %v", step, boxName, err)
+		}
+		if box.Spec.NetworkPolicy == nil {
+			t.Fatalf("%s: expected PodBox.Spec.NetworkPolicy to be preserved, got nil", step)
+		}
+		if box.Spec.NetworkPolicy.DefaultAction != v1alpha1.NetworkDefaultDeny {
+			t.Fatalf("%s: DefaultAction = %q; want Deny", step, box.Spec.NetworkPolicy.DefaultAction)
+		}
+		if len(box.Spec.NetworkPolicy.Egress) != 2 ||
+			box.Spec.NetworkPolicy.Egress[0].Action != "allow" ||
+			box.Spec.NetworkPolicy.Egress[0].Target != "api.github.com" ||
+			box.Spec.NetworkPolicy.Egress[1].Action != "deny" ||
+			box.Spec.NetworkPolicy.Egress[1].Target != "*" {
+			t.Fatalf("%s: unexpected ordered Egress rules: %+v", step, box.Spec.NetworkPolicy.Egress)
+		}
+	}
+
+	createBody := []byte(`{
+		"templateID": "cubeplex-ubuntu24-desktop",
+		"extension": {
+			"volumeKey": "np-ws-1",
+			"networkPolicy": {
+				"defaultAction": "deny",
+				"egress": [
+					{"action": "Allow", "target": "api.github.com"},
+					{"action": "DENY", "target": "*"}
+				]
+			}
+		}
+	}`)
+	resp, err := http.Post(ts1.URL+"/sandboxes", "application/json", bytes.NewReader(createBody))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create failed: resp=%v err=%v", resp, err)
+	}
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(resp.Body).Decode(&rec)
+	_ = resp.Body.Close()
+
+	assertPolicyOnBox("create", rec.SandboxID)
+
+	// Pause -> Connect -> ResetRootfs must preserve NetworkPolicy & VolumeKey
+	for _, action := range []string{"pause", "connect", "reset-rootfs"} {
+		ar, err := http.Post(ts1.URL+"/sandboxes/"+rec.SandboxID+"/"+action, "application/json", nil)
+		if err != nil || ar.StatusCode != http.StatusOK {
+			t.Fatalf("%s failed: resp=%v err=%v", action, ar, err)
+		}
+		_ = ar.Body.Close()
+		assertPolicyOnBox(action, rec.SandboxID)
+		box, _ := sharedKube.GetPodBox(t.Context(), "cubepod-workloads", rec.SandboxID)
+		if box.Spec.VolumeKey != "np-ws-1" {
+			t.Fatalf("%s: VolumeKey = %q; want np-ws-1", action, box.Spec.VolumeKey)
+		}
+	}
+
+	// Auto-resume (ensureRunning) after pause
+	pResp, _ := http.Post(ts1.URL+"/sandboxes/"+rec.SandboxID+"/pause", "application/json", nil)
+	_ = pResp.Body.Close()
+	lsResp, err := http.Get(ts1.URL + "/sandboxes/" + rec.SandboxID + "/files/list?path=/workspace")
+	if err != nil || lsResp.StatusCode != http.StatusOK {
+		t.Fatalf("auto-resume via file list failed: resp=%v err=%v", lsResp, err)
+	}
+	_ = lsResp.Body.Close()
+	assertPolicyOnBox("ensureRunning", rec.SandboxID)
+
+	// Fork preserves NetworkPolicy on child while giving child its own VolumeKey=""
+	forkResp, err := http.Post(ts1.URL+"/sandboxes/"+rec.SandboxID+"/fork", "application/json", nil)
+	if err != nil || forkResp.StatusCode != http.StatusCreated {
+		t.Fatalf("fork failed: resp=%v err=%v", forkResp, err)
+	}
+	var child gateway.SandboxRecord
+	_ = json.NewDecoder(forkResp.Body).Decode(&child)
+	_ = forkResp.Body.Close()
+	assertPolicyOnBox("fork", child.SandboxID)
+	childBox, _ := sharedKube.GetPodBox(t.Context(), "cubepod-workloads", child.SandboxID)
+	if childBox.Spec.VolumeKey != "" {
+		t.Fatalf("fork child VolumeKey = %q; want empty so child gets its own PVC", childBox.Spec.VolumeKey)
+	}
+
+	// Second gateway replica cache-miss reconstruction via resolveSandbox preserves NetworkPolicy & VolumeKey
+	p2Resp, err := http.Post(ts2.URL+"/sandboxes/"+rec.SandboxID+"/pause", "application/json", nil)
+	if err != nil || p2Resp.StatusCode != http.StatusOK {
+		t.Fatalf("gw2 pause failed: resp=%v err=%v", p2Resp, err)
+	}
+	_ = p2Resp.Body.Close()
+	assertPolicyOnBox("gw2 resolveSandbox+pause", rec.SandboxID)
+	box2, _ := sharedKube.GetPodBox(t.Context(), "cubepod-workloads", rec.SandboxID)
+	if box2.Spec.VolumeKey != "np-ws-1" {
+		t.Fatalf("gw2 resolveSandbox+pause VolumeKey = %q; want np-ws-1", box2.Spec.VolumeKey)
+	}
+}
+
+func TestArchiveSyncEmptyBodyRemovePaths(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	srv.SetWorkspaceBaseDir(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"desktop"}`))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create failed: resp=%v err=%v", resp, err)
+	}
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(resp.Body).Decode(&rec)
+	_ = resp.Body.Close()
+
+	for _, rel := range []string{"keep.txt", "old1.txt", "old2.txt", "nested/file.txt"} {
+		req, _ := http.NewRequest(
+			http.MethodPut,
+			ts.URL+"/sandboxes/"+rec.SandboxID+"/files?path=/workspace/proj/"+rel,
+			strings.NewReader("data-"+rel),
+		)
+		pr, err := http.DefaultClient.Do(req)
+		if err != nil || pr.StatusCode >= 300 {
+			t.Fatalf("put %s failed: resp=%v err=%v", rel, pr, err)
+		}
+		_ = pr.Body.Close()
+	}
+
+	// 1. Empty body with NO remove_paths -> 400
+	rEmpty, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/files/archive-sync?dest=/workspace/proj", "application/gzip", nil)
+	if err != nil {
+		t.Fatalf("empty archive-sync request failed: %v", err)
+	}
+	_ = rEmpty.Body.Close()
+	if rEmpty.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty body without remove_paths, got %d", rEmpty.StatusCode)
+	}
+
+	// 2. Traversal in remove_paths -> 400
+	for _, bad := range []string{"../keep.txt", "/etc/passwd", "old1.txt,../../escape"} {
+		rBad, err := http.Post(
+			ts.URL+"/sandboxes/"+rec.SandboxID+"/files/archive-sync?dest=/workspace/proj&remove_paths="+url.QueryEscape(bad),
+			"application/gzip",
+			nil,
+		)
+		if err != nil {
+			t.Fatalf("bad remove_paths request failed: %v", err)
+		}
+		_ = rBad.Body.Close()
+		if rBad.StatusCode != http.StatusBadRequest {
+			t.Fatalf("expected 400 for invalid remove_paths %q, got %d", bad, rBad.StatusCode)
+		}
+	}
+
+	// 3. Empty body WITH comma-separated remove_paths -> 200 {"status":"ok","extracted":0}
+	rDel, err := http.Post(
+		ts.URL+"/sandboxes/"+rec.SandboxID+"/files/archive-sync?dest=/workspace/proj&remove_paths=old1.txt,old2.txt,nested",
+		"application/gzip",
+		nil,
+	)
+	if err != nil || rDel.StatusCode != http.StatusOK {
+		t.Fatalf("delete-only archive-sync failed: resp=%v err=%v", rDel, err)
+	}
+	var res map[string]any
+	_ = json.NewDecoder(rDel.Body).Decode(&res)
+	_ = rDel.Body.Close()
+	if res["status"] != "ok" || res["extracted"] != float64(0) {
+		t.Fatalf("unexpected archive-sync response: %+v", res)
+	}
+
+	// Verify old files/dir deleted and keep.txt untouched
+	for _, gone := range []string{"old1.txt", "old2.txt", "nested/file.txt"} {
+		gr, _ := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/files?path=/workspace/proj/" + gone)
+		_ = gr.Body.Close()
+		if gr.StatusCode != http.StatusNotFound {
+			t.Fatalf("expected %s to be deleted, got status %d", gone, gr.StatusCode)
+		}
+	}
+	kr, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/files?path=/workspace/proj/keep.txt")
+	if err != nil || kr.StatusCode != http.StatusOK {
+		t.Fatalf("expected keep.txt intact, status=%v err=%v", kr, err)
+	}
+	keepData, _ := io.ReadAll(kr.Body)
+	_ = kr.Body.Close()
+	if string(keepData) != "data-keep.txt" {
+		t.Fatalf("keep.txt mismatch: %q", string(keepData))
+	}
+}

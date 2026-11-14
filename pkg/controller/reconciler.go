@@ -946,8 +946,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	}
 
 	if !exists {
-		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set and no ForkFrom)
-		if spec.WarmPoolRef != "" && spec.ForkFrom == nil {
+		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set, no ForkFrom, and no deterministic VolumeKey)
+		if spec.WarmPoolRef != "" && spec.ForkFrom == nil && spec.VolumeKey == "" {
 			entry, err := r.claimWarmPodLocked(ctx, spec.WarmPoolRef, name)
 			if err != nil {
 				return nil, fmt.Errorf("failed to claim from warm pool %q for box %q: %w", spec.WarmPoolRef, name, err)
@@ -973,7 +973,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				Phase:             v1alpha1.PodBoxPhaseRunning,
 				PodName:           fmt.Sprintf("%s-kata-pod", name),
 				RootfsPVCName:     rootfsName,
-				WorkspacePVCName:  fmt.Sprintf("%s-workspace-pvc", name),
+				WorkspacePVCName:  WorkspacePVCName(name, spec),
 				ObservedRootfsGen: spec.RootfsGeneration,
 				LastActivityAt:    &now,
 				Reason:            "ForkCloned",
@@ -993,7 +993,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			status = &v1alpha1.PodBoxStatus{
 				Phase:             v1alpha1.PodBoxPhaseProvisioning,
 				RootfsPVCName:     rootfsName,
-				WorkspacePVCName:  fmt.Sprintf("%s-workspace-pvc", name),
+				WorkspacePVCName:  WorkspacePVCName(name, spec),
 				ObservedRootfsGen: spec.RootfsGeneration,
 				LastActivityAt:    &now,
 				Reason:            "Provisioned",
@@ -1141,6 +1141,12 @@ func (r *Reconciler) podBoxAnnotationsLocked(name, fallbackImage string) map[str
 			anns["cubepod.io/forked-from"] = spec.ForkFrom.PodBoxName
 		} else {
 			delete(anns, "cubepod.io/forked-from")
+		}
+
+		if spec.VolumeKey != "" {
+			anns["cubepod.io/volume-key"] = spec.VolumeKey
+		} else {
+			delete(anns, "cubepod.io/volume-key")
 		}
 
 		gen := spec.RootfsGeneration
@@ -1468,6 +1474,11 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 		}
 		if status.WorkspacePVCName != "" {
 			_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.WorkspacePVCName)
+		}
+	} else if spec, ok := r.specs[name]; ok && spec.VolumeKey != "" {
+		// Reclaim ephemeral rootfs PVC while retaining the deterministic volumeKey workspace PVC.
+		if status.RootfsPVCName != "" {
+			_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.RootfsPVCName)
 		}
 	}
 

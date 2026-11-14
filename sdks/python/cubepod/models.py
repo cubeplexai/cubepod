@@ -4,7 +4,21 @@ from dataclasses import dataclass, field
 import io
 import tarfile
 import time
-from typing import Any
+from typing import Any, Literal, TypedDict
+
+
+class NetworkEgressRule(TypedDict):
+    action: Literal["allow", "deny"] | str
+    target: str
+
+
+class NetworkPolicySpec(TypedDict, total=False):
+    defaultAction: Literal["allow", "deny", "Allow", "Deny"] | str
+    allowHosts: list[str]
+    denyHosts: list[str]
+    egress: list[NetworkEgressRule]
+    upstreamProxy: str
+    secretBindings: list[dict[str, Any]]
 
 
 _TERMINAL_STATES = frozenset({"Stopped", "Terminated", "Failed", "Killed", "Succeed"})

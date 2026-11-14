@@ -31,29 +31,30 @@ var subdomainHostRegex = regexp.MustCompile(`^([0-9]+)-([a-zA-Z0-9_-]+)\.(.*)$`)
 
 // SandboxRecord represents a managed sandbox exposed over the E2B-compatible API.
 type SandboxRecord struct {
-	SandboxID        string            `json:"sandboxID"`
-	TemplateID       string            `json:"templateID"`
-	State            string            `json:"state"`
-	ClientID         string            `json:"clientID"`
-	EnvdVersion      string            `json:"envdVersion"`
-	StartedAt        time.Time         `json:"startedAt"`
-	EndAt            time.Time         `json:"endAt"`
-	CPUCount         int               `json:"cpuCount"`
-	MemoryMB         int               `json:"memoryMB"`
-	DiskSizeMB       int               `json:"diskSizeMB"`
-	EnvdPort         int               `json:"envdPort"`
-	PoddURL          string            `json:"poddURL,omitempty"`
-	RootfsGeneration int64             `json:"rootfsGeneration"`
-	VolumeKey        string            `json:"volumeKey,omitempty"`
-	Metadata         map[string]string `json:"metadata,omitempty"`
-	CreatedAt        time.Time         `json:"createdAt"`
-	TimeoutSeconds   int               `json:"timeoutSeconds,omitempty"`
-	LeaseSeconds     int               `json:"leaseSeconds,omitempty"`
-	LeaseExpiresAt   *time.Time        `json:"leaseExpiresAt,omitempty"`
-	LastActivityAt   *time.Time        `json:"lastActivityAt,omitempty"`
-	AutoResumeCount  int               `json:"autoResumeCount"`
-	Reason           string            `json:"reason,omitempty"`
-	WorkspaceDir     string            `json:"-"`
+	SandboxID        string                      `json:"sandboxID"`
+	TemplateID       string                      `json:"templateID"`
+	State            string                      `json:"state"`
+	ClientID         string                      `json:"clientID"`
+	EnvdVersion      string                      `json:"envdVersion"`
+	StartedAt        time.Time                   `json:"startedAt"`
+	EndAt            time.Time                   `json:"endAt"`
+	CPUCount         int                         `json:"cpuCount"`
+	MemoryMB         int                         `json:"memoryMB"`
+	DiskSizeMB       int                         `json:"diskSizeMB"`
+	EnvdPort         int                         `json:"envdPort"`
+	PoddURL          string                      `json:"poddURL,omitempty"`
+	RootfsGeneration int64                       `json:"rootfsGeneration"`
+	VolumeKey        string                      `json:"volumeKey,omitempty"`
+	NetworkPolicy    *v1alpha1.NetworkPolicySpec `json:"networkPolicy,omitempty"`
+	Metadata         map[string]string           `json:"metadata,omitempty"`
+	CreatedAt        time.Time                   `json:"createdAt"`
+	TimeoutSeconds   int                         `json:"timeoutSeconds,omitempty"`
+	LeaseSeconds     int                         `json:"leaseSeconds,omitempty"`
+	LeaseExpiresAt   *time.Time                  `json:"leaseExpiresAt,omitempty"`
+	LastActivityAt   *time.Time                  `json:"lastActivityAt,omitempty"`
+	AutoResumeCount  int                         `json:"autoResumeCount"`
+	Reason           string                      `json:"reason,omitempty"`
+	WorkspaceDir     string                      `json:"-"`
 }
 
 type commandEntry struct {

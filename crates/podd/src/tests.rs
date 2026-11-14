@@ -490,6 +490,75 @@ fn test_archive_sync_rejects_path_traversal() {
 }
 
 #[test]
+fn test_archive_sync_empty_body_remove_paths() {
+    let test_root = std::env::temp_dir().join(format!("podd-archive-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&test_root);
+    let dest_dir = test_root.join("workspace");
+    std::fs::create_dir_all(dest_dir.join("sub")).unwrap();
+
+    let keep_file = dest_dir.join("keep.txt");
+    let file_a = dest_dir.join("old.txt");
+    let dir_b = dest_dir.join("sub");
+    let nested_b = dir_b.join("inner.txt");
+    std::fs::write(&keep_file, b"keep").unwrap();
+    std::fs::write(&file_a, b"remove me").unwrap();
+    std::fs::write(&nested_b, b"remove dir").unwrap();
+
+    let (addr, _) = start_test_server("/tmp");
+
+    // 1. Empty body + empty remove_paths still returns 400 empty_archive_body
+    let empty_url = format!("/v1/files/archive-sync?dest={}", dest_dir.to_str().unwrap());
+    let (st_empty, _, body_empty) = post_raw(&addr, &empty_url, "application/gzip", b"");
+    assert_eq!(st_empty, 400);
+    let json_empty = JsonValue::parse(std::str::from_utf8(&body_empty).unwrap()).unwrap();
+    assert_eq!(
+        json_empty.get("error").unwrap().as_str().unwrap(),
+        "empty_archive_body"
+    );
+
+    // Whitespace-only remove_paths also treats parsed list as empty
+    let ws_url = format!(
+        "/v1/files/archive-sync?dest={}&remove_paths=%20,%20",
+        dest_dir.to_str().unwrap()
+    );
+    let (st_ws, _, _) = post_raw(&addr, &ws_url, "application/gzip", b"");
+    assert_eq!(st_ws, 400);
+
+    // 2. Traversal / leading '/' in remove_paths is rejected with 400
+    for bad in ["../escape.txt", "/etc/passwd", "old.txt,../../secret"] {
+        let bad_url = format!(
+            "/v1/files/archive-sync?dest={}&remove_paths={}",
+            dest_dir.to_str().unwrap(),
+            bad
+        );
+        let (st_bad, _, body_bad) = post_raw(&addr, &bad_url, "application/gzip", b"");
+        assert_eq!(st_bad, 400, "expected 400 for bad remove_paths {bad}");
+        let json_bad = JsonValue::parse(std::str::from_utf8(&body_bad).unwrap()).unwrap();
+        assert_eq!(
+            json_bad.get("error").unwrap().as_str().unwrap(),
+            "invalid_archive_path"
+        );
+    }
+    assert!(file_a.exists(), "invalid request must not mutate disk");
+
+    // 3. Empty body + comma-separated remove_paths succeeds with extracted: 0
+    let del_url = format!(
+        "/v1/files/archive-sync?dest={}&remove_paths=old.txt,%20sub",
+        dest_dir.to_str().unwrap()
+    );
+    let (st_del, _, body_del) = post_raw(&addr, &del_url, "application/gzip", b"");
+    assert_eq!(st_del, 200);
+    let json_del = JsonValue::parse(std::str::from_utf8(&body_del).unwrap()).unwrap();
+    assert_eq!(json_del.get("status").unwrap().as_str().unwrap(), "ok");
+    assert_eq!(json_del.get("extracted").unwrap().as_u64(), Some(0));
+    assert!(!file_a.exists(), "old.txt should be deleted");
+    assert!(!dir_b.exists(), "sub directory should be deleted");
+    assert!(keep_file.exists(), "keep.txt must remain intact");
+
+    let _ = std::fs::remove_dir_all(&test_root);
+}
+
+#[test]
 fn test_file_delete_endpoint() {
     let dir = std::env::temp_dir().join(format!("podd-del-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();

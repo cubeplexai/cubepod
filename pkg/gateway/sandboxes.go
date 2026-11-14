@@ -21,16 +21,17 @@ import (
 )
 
 type createSandboxReq struct {
-	TemplateID  string            `json:"templateID"`
-	Template_ID string            `json:"template_id,omitempty"`
-	WarmPoolRef string            `json:"warmPoolRef,omitempty"`
-	Timeout     int               `json:"timeout,omitempty"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	EnvVars     map[string]string `json:"envVars,omitempty"`
-	Env_Vars    map[string]string `json:"env_vars,omitempty"`
-	AutoPause   *bool             `json:"autoPause,omitempty"`
-	AutoResume  any               `json:"autoResume,omitempty"`
-	Extension   struct {
+	TemplateID    string                      `json:"templateID"`
+	Template_ID   string                      `json:"template_id,omitempty"`
+	WarmPoolRef   string                      `json:"warmPoolRef,omitempty"`
+	Timeout       int                         `json:"timeout,omitempty"`
+	Metadata      map[string]string           `json:"metadata,omitempty"`
+	EnvVars       map[string]string           `json:"envVars,omitempty"`
+	Env_Vars      map[string]string           `json:"env_vars,omitempty"`
+	AutoPause     *bool                       `json:"autoPause,omitempty"`
+	AutoResume    any                         `json:"autoResume,omitempty"`
+	NetworkPolicy *v1alpha1.NetworkPolicySpec `json:"networkPolicy,omitempty"`
+	Extension     struct {
 		VolumeKey      string                      `json:"volumeKey,omitempty"`
 		NetworkPolicy  *v1alpha1.NetworkPolicySpec `json:"networkPolicy,omitempty"`
 		SecretBindings []struct {
@@ -40,6 +41,58 @@ type createSandboxReq struct {
 			AllowedHeaders []string `json:"allowedHeaders"`
 		} `json:"secretBindings,omitempty"`
 	} `json:"extension,omitempty"`
+}
+
+func cloneNetworkPolicy(p *v1alpha1.NetworkPolicySpec) *v1alpha1.NetworkPolicySpec {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	switch strings.ToLower(strings.TrimSpace(string(cp.DefaultAction))) {
+	case "allow":
+		cp.DefaultAction = v1alpha1.NetworkDefaultAllow
+	case "deny":
+		cp.DefaultAction = v1alpha1.NetworkDefaultDeny
+	}
+	if len(p.AllowHosts) > 0 {
+		cp.AllowHosts = append([]string(nil), p.AllowHosts...)
+	}
+	if len(p.DenyHosts) > 0 {
+		cp.DenyHosts = append([]string(nil), p.DenyHosts...)
+	}
+	if len(p.Egress) > 0 {
+		cp.Egress = make([]v1alpha1.NetworkEgressRule, len(p.Egress))
+		for i, rule := range p.Egress {
+			switch strings.ToLower(strings.TrimSpace(rule.Action)) {
+			case "allow":
+				rule.Action = "allow"
+			case "deny":
+				rule.Action = "deny"
+			}
+			cp.Egress[i] = rule
+		}
+	}
+	if len(p.SecretBindings) > 0 {
+		cp.SecretBindings = make([]v1alpha1.SecretBinding, len(p.SecretBindings))
+		for i, sb := range p.SecretBindings {
+			sbCopy := sb
+			if len(sb.AllowedHosts) > 0 {
+				sbCopy.AllowedHosts = append([]string(nil), sb.AllowedHosts...)
+			}
+			if len(sb.AllowedHeaders) > 0 {
+				sbCopy.AllowedHeaders = append([]string(nil), sb.AllowedHeaders...)
+			}
+			cp.SecretBindings[i] = sbCopy
+		}
+	}
+	return &cp
+}
+
+func (s *Server) workspaceDirForSandbox(sandboxID, volumeKey string) string {
+	if volumeKey != "" {
+		return filepath.Join(s.workspaceBaseDir, "volumes", controller.SanitizeVolumeKey(volumeKey), "workspace")
+	}
+	return filepath.Join(s.workspaceBaseDir, sandboxID, "workspace")
 }
 
 func formatPoddURL(podIP string, envdPort int) string {
@@ -106,6 +159,12 @@ func (s *Server) resolveSandbox(ctx context.Context, sandboxID string) (*Sandbox
 				s.mu.Lock()
 				rec.State = string(box.Status.Phase)
 				rec.Reason = box.Status.Reason
+				if box.Spec.VolumeKey != "" && rec.VolumeKey == "" {
+					rec.VolumeKey = box.Spec.VolumeKey
+				}
+				if box.Spec.NetworkPolicy != nil && rec.NetworkPolicy == nil {
+					rec.NetworkPolicy = cloneNetworkPolicy(box.Spec.NetworkPolicy)
+				}
 				if box.Status.ObservedRootfsGen > 0 {
 					rec.RootfsGeneration = box.Status.ObservedRootfsGen
 				}
@@ -133,7 +192,7 @@ func (s *Server) resolveSandbox(ctx context.Context, sandboxID string) (*Sandbox
 
 	templateID := box.Spec.TemplateRef
 	timeoutSecs := 1800
-	var volumeKey string
+	volumeKey := box.Spec.VolumeKey
 	var metadata map[string]string
 	if box.Metadata.Annotations != nil {
 		if templateID == "" {
@@ -144,7 +203,9 @@ func (s *Server) resolveSandbox(ctx context.Context, sandboxID string) (*Sandbox
 				timeoutSecs = parsed
 			}
 		}
-		volumeKey = box.Metadata.Annotations["cubepod.io/volume-key"]
+		if volumeKey == "" {
+			volumeKey = box.Metadata.Annotations["cubepod.io/volume-key"]
+		}
 		for k, v := range box.Metadata.Annotations {
 			if strings.HasPrefix(k, "cubepod.io/metadata-") {
 				if metadata == nil {
@@ -187,11 +248,12 @@ func (s *Server) resolveSandbox(ctx context.Context, sandboxID string) (*Sandbox
 		PoddURL:          formatPoddURL(box.Status.PodIP, 49983),
 		RootfsGeneration: rootfsGen,
 		VolumeKey:        volumeKey,
+		NetworkPolicy:    cloneNetworkPolicy(box.Spec.NetworkPolicy),
 		Metadata:         metadata,
 		CreatedAt:        createdAt,
 		LastActivityAt:   &now,
 		TimeoutSeconds:   timeoutSecs,
-		WorkspaceDir:     filepath.Join(s.workspaceBaseDir, sandboxID, "workspace"),
+		WorkspaceDir:     s.workspaceDirForSandbox(sandboxID, volumeKey),
 	}
 
 	s.mu.Lock()
@@ -296,16 +358,25 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		timeoutSecs = 1800
 	}
 
+	volumeKey := req.Extension.VolumeKey
+	netPolicy := cloneNetworkPolicy(req.Extension.NetworkPolicy)
+	if netPolicy == nil {
+		netPolicy = cloneNetworkPolicy(req.NetworkPolicy)
+	}
+
 	id := fmt.Sprintf("cpod-%d", time.Now().UnixNano())
 	spec := v1alpha1.PodBoxSpec{
 		TemplateRef:      req.TemplateID,
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: 1,
 		WarmPoolRef:      req.WarmPoolRef,
+		VolumeKey:        volumeKey,
+		NetworkPolicy:    cloneNetworkPolicy(netPolicy),
 	}
 
-	// Automatic WarmPool Claim: check if there is an available warmpool for this template if not explicitly specified
-	if spec.WarmPoolRef == "" {
+	// Automatic WarmPool Claim: skip when deterministic VolumeKey is requested
+	// because standby warm pods already mount an ephemeral workspace PVC.
+	if spec.WarmPoolRef == "" && volumeKey == "" {
 		warmPoolName := s.reconciler.FindAvailableWarmPool(req.TemplateID)
 		if warmPoolName == "" {
 			// Run a quick SyncFromKube to discover any newly added standby pods from the controller before falling back to cold start
@@ -356,7 +427,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		s.reconciler.RecordTemplateSpawn(r.Context(), req.TemplateID)
 	}
 
-	workspaceDir := filepath.Join(s.workspaceBaseDir, id, "workspace")
+	workspaceDir := s.workspaceDirForSandbox(id, volumeKey)
 	if err := os.MkdirAll(workspaceDir, 0755); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -385,7 +456,8 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		Reason:           status.Reason,
 		EnvdPort:         49983,
 		RootfsGeneration: status.ObservedRootfsGen,
-		VolumeKey:        req.Extension.VolumeKey,
+		VolumeKey:        volumeKey,
+		NetworkPolicy:    cloneNetworkPolicy(netPolicy),
 		Metadata:         req.Metadata,
 		CreatedAt:        now,
 		LastActivityAt:   &now,
@@ -506,6 +578,8 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 		TemplateRef:      rec.TemplateID,
 		DesiredState:     v1alpha1.DesiredStatePaused,
 		RootfsGeneration: rec.RootfsGeneration,
+		VolumeKey:        rec.VolumeKey,
+		NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
 	})
 	if err == nil {
 		rec.State = string(status.Phase)
@@ -534,6 +608,8 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 		TemplateRef:      rec.TemplateID,
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: rec.RootfsGeneration,
+		VolumeKey:        rec.VolumeKey,
+		NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
 	})
 	if err == nil {
 		rec.State = string(status.Phase)
@@ -673,6 +749,8 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 		TemplateRef:      rec.TemplateID,
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: rec.RootfsGeneration,
+		VolumeKey:        rec.VolumeKey,
+		NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
 	})
 	if err == nil {
 		rec.State = string(status.Phase)
@@ -704,6 +782,7 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: 1,
 		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: parentID},
+		NetworkPolicy:    cloneNetworkPolicy(parent.NetworkPolicy),
 	}
 	status, err := s.reconciler.Reconcile(r.Context(), childID, spec)
 	if err != nil {
@@ -745,6 +824,7 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		Reason:           status.Reason,
 		EnvdPort:         49983,
 		RootfsGeneration: status.ObservedRootfsGen,
+		NetworkPolicy:    cloneNetworkPolicy(parent.NetworkPolicy),
 		CreatedAt:        now,
 		LastActivityAt:   &now,
 		TimeoutSeconds:   parent.TimeoutSeconds,
@@ -762,10 +842,15 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sandboxID")
 	deleteVolumes := r.URL.Query().Get("deleteVolumes") == "true"
+
+	rec, ok := s.resolveSandbox(r.Context(), id)
 	_ = s.reconciler.DeleteBox(r.Context(), id, deleteVolumes)
 
 	s.mu.Lock()
-	rec, ok := s.sandboxes[id]
+	if cached, hasCached := s.sandboxes[id]; hasCached {
+		rec = cached
+		ok = true
+	}
 	delete(s.sandboxes, id)
 	delete(s.endpoints, id)
 	s.mu.Unlock()
@@ -773,7 +858,7 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	// Revoke secrets associated with this sandbox
 	s.vault.RevokeSandbox(id)
 
-	if ok && rec.WorkspaceDir != "" {
+	if ok && rec != nil && rec.WorkspaceDir != "" && (rec.VolumeKey == "" || deleteVolumes) {
 		_ = os.RemoveAll(filepath.Dir(rec.WorkspaceDir))
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -791,6 +876,8 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 			TemplateRef:      rec.TemplateID,
 			DesiredState:     v1alpha1.DesiredStateRunning,
 			RootfsGeneration: rec.RootfsGeneration,
+			VolumeKey:        rec.VolumeKey,
+			NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
 		})
 		if err != nil {
 			return err
