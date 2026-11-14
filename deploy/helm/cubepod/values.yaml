@@ -6,7 +6,7 @@ runtime:
   runtimeClassName: "kata-qemu"
   defaultTemplate: "cubeplex-ubuntu24-desktop"
   # Lightweight initContainer image that injects /opt/cubepod/bin/{podd-init,podd} at Pod startup
-  poddInjectorImage: "ghcr.io/cubeplexai/cubepod-podd:v0.4.0"
+  poddInjectorImage: "ghcr.io/cubeplexai/cubepod-podd:v0.4.1"
   # Default workload sandbox image (clean OS/tooling image without podd baked in)
   defaultSandboxImage: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.4.0"
 
@@ -26,7 +26,7 @@ gateway:
   image:
     registry: "ghcr.io"
     repository: "cubeplexai/cubepod-gateway"
-    tag: "v0.4.0"
+    tag: "v0.4.1"
     pullPolicy: "IfNotPresent"
   port: 8080
   service:
@@ -47,7 +47,7 @@ controller:
   image:
     registry: "ghcr.io"
     repository: "cubeplexai/cubepod-controller"
-    tag: "v0.4.0"
+    tag: "v0.4.1"
     pullPolicy: "IfNotPresent"
   healthzPort: 8081
   workloadNamespace: "cubepod-workloads"
@@ -67,7 +67,7 @@ egress:
   image:
     registry: "ghcr.io"
     repository: "cubeplexai/cubepod-egress"
-    tag: "v0.4.0"
+    tag: "v0.4.1"
   port: 18080
   exchangeUrl: "https://cubeplex-backend.cubeplex.svc:8443/api/v1/internal/egress/exchange"
 
