@@ -73,7 +73,7 @@ What `prep-node.sh` and `install.sh` configure:
 2. **Cluster preparation & Helm installation (`install.sh`)**:
    - Labels the target node `cubepod.io/longhorn-v2=true` and executes the `cubepod-longhorn-v2-prep` job (`node-prep-job.yaml`).
    - Optionally restarts `kubelet` if `CUBEPOD_RESTART_KUBELET=1` is set so kubelet recognizes hugepages immediately.
-   - Installs Helm chart `longhorn/longhorn` (`--version 1.8.2`) into namespace `longhorn-system` using `deploy/k8s/longhorn-v2/values.yaml` (`v1DataEngine: false`, `v2DataEngine: true`, `v2DataEngineCPUMask: "0x1"`, `v2DataEngineGuaranteedInstanceManagerCPU: 1000`).
+   - Installs Helm chart `longhorn/longhorn` (`--version 1.8.2`) into namespace `longhorn-system` using `deploy/k8s/longhorn-v2/values.yaml` (`v1DataEngine: false`, `v2DataEngine: true`, `v2DataEngineCPUMask: "0x2"`, `v2DataEngineGuaranteedInstanceManagerCPU: 1000`).
    - Patches `nodes.longhorn.io/<node>` with a `diskType: block` disk tagged `cubepod-v2` and applies `deploy/k8s/longhorn-v2/storageclass.yaml`:
 
 | Field | Value in `storageclass.yaml` |

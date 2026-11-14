@@ -73,7 +73,7 @@ bash deploy/k8s/longhorn-v2/install.sh
 2. **集群初始化与 Helm 安装（`install.sh`）**：
    - 为目标节点打上 `cubepod.io/longhorn-v2=true` 标签，并运行 `cubepod-longhorn-v2-prep` Job（`node-prep-job.yaml`）。
    - 若设置 `CUBEPOD_RESTART_KUBELET=1`，自动重启 `kubelet` 使其立即感知新分配的大页内存资源。
-   - 使用 `deploy/k8s/longhorn-v2/values.yaml`（`v1DataEngine: false`、`v2DataEngine: true`、`v2DataEngineCPUMask: "0x1"`、`v2DataEngineGuaranteedInstanceManagerCPU: 1000`）向 `longhorn-system` 命名空间安装 `longhorn/longhorn`（`--version 1.8.2`）。
+   - 使用 `deploy/k8s/longhorn-v2/values.yaml`（`v1DataEngine: false`、`v2DataEngine: true`、`v2DataEngineCPUMask: "0x2"`、`v2DataEngineGuaranteedInstanceManagerCPU: 1000`）向 `longhorn-system` 命名空间安装 `longhorn/longhorn`（`--version 1.8.2`）。
    - 为 `nodes.longhorn.io/<node>` 添附带 `cubepod-v2` 标签的 `diskType: block` 块磁盘，并应用 `deploy/k8s/longhorn-v2/storageclass.yaml`：
 
 | 字段 | `storageclass.yaml` 中的配置值 |
