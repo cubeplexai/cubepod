@@ -4,7 +4,7 @@
 
 [Documentation](https://cubepod.cubeplex.ai) · [Interactive API Reference](https://cubepod.cubeplex.ai/api/) · [中文文档](https://cubepod.cubeplex.ai/zh/) · [`llms.txt`](https://cubepod.cubeplex.ai/llms.txt)
 
-CubePod is an open-source, cloud-native execution platform designed for long-lived, high-autonomy AI Agents. Together with [**CubePlex**](https://github.com/cubeplexai/cubeplex) (Agent Workspace Platform) and [**CubeLoop**](https://github.com/cubeplexai/cubeloop) (Agent Runtime), CubePod provides hardware-isolated MicroVM execution with instant hibernation/resume and full system-level persistence.
+CubePod is an open-source, cloud-native execution platform designed for long-lived, high-autonomy AI Agents. **Part of the Open-Source CubePlex Agent Stack**, CubePod provides the persistent hardware-isolated execution layer powering [**CubePlex**](https://github.com/cubeplexai/cubeplex) (Team Agent Workspace) and [**CubeLoop**](https://github.com/cubeplexai/cubeloop) (Async Agent Runtime), delivering MicroVM execution with instant hibernation/resume and full system-level persistence.
 
 ---
 
@@ -271,6 +271,16 @@ make test-e2e
 # Run official E2B Python SDK & Code Interpreter compatibility test suite
 make test-e2b-compat
 ```
+
+---
+
+## Part of the Open-Source CubePlex Agent Stack
+
+Built on a **Brain-Hands Decoupling** architecture, CubePod provides the persistent hardware-isolated execution layer (**Hands**) powering [**CubePlex**](https://github.com/cubeplexai/cubeplex) (Team Agent Workspace) and [**CubeLoop**](https://github.com/cubeplexai/cubeloop) (Async Agent Runtime & Reasoning **Brain**):
+
+- [**CubePlex**](https://github.com/cubeplexai/cubeplex) — **Brain / Workspace**: Team Agent Workspace for collaborative multi-agent workflows, sessions, and governance.
+- [**CubeLoop**](https://github.com/cubeplexai/cubeloop) — **Brain / Runtime**: Async Agent Runtime orchestrating long-running, multi-model autonomous execution loops.
+- [**CubePod**](https://github.com/cubeplexai/cubepod) — **Hands / Execution**: Persistent Writable RootFS MicroVM execution substrate with Dual CSI Raw Block persistence, `<50ms` WarmPool claims, `~1s` CoW forks, and Zero-Trust `cpodref_` egress.
 
 ---
 

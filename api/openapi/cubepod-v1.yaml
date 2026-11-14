@@ -10,10 +10,29 @@ info:
       atomic `archive-sync` for Skills, zero-trust `cpodref_` egress secret bindings,
       signed HTTP/WS/WebRTC panel proxying, and pre-warmed Kata MicroVM pools (`/warmpools`).
 
+tags:
+  - name: Sandboxes
+    description: Create, list, connect, pause, fork, and manage stateful MicroVM sandboxes.
+  - name: Commands
+    description: Execute shell commands and Python code inside sandboxes and stream logs.
+  - name: Files
+    description: Read, write, list, delete, and archive-sync files in the sandbox workspace.
+  - name: Desktop & Panels
+    description: Start interactive desktop/browser stacks and mint signed endpoint proxy URLs.
+  - name: Templates
+    description: Build, manage, and tag sandbox rootfs and image templates.
+  - name: WarmPools
+    description: Register and inspect pre-warmed standby MicroVM pools.
+  - name: System
+    description: Health checks, OpenAPI schema discovery, and internal zero-trust egress exchange.
+
 paths:
   /health:
     get:
-      summary: Health check of the Gateway and cluster state
+      tags:
+        - System
+      summary: Health check
+      description: Health check of the Gateway and cluster state
       operationId: getHealth
       responses:
         "200":
@@ -36,7 +55,10 @@ paths:
 
   /openapi.yaml:
     get:
-      summary: Retrieve the OpenAPI 3.1 specification for CubePod
+      tags:
+        - System
+      summary: Get OpenAPI spec
+      description: Retrieve the OpenAPI 3.1 specification for CubePod
       operationId: getOpenAPISpec
       responses:
         "200":
@@ -48,7 +70,10 @@ paths:
 
   /sandboxes:
     post:
-      summary: Create or claim a CubePod sandbox (E2B compatible + CubePod extensions)
+      tags:
+        - Sandboxes
+      summary: Create sandbox
+      description: Create or claim a CubePod sandbox (E2B compatible + CubePod extensions)
       operationId: createSandbox
       requestBody:
         required: true
@@ -84,7 +109,10 @@ paths:
                     type: string
                     example: "/var/log/cubepod/start-cmd.log"
     get:
-      summary: List all sandboxes with optional state and template filters
+      tags:
+        - Sandboxes
+      summary: List sandboxes
+      description: List all sandboxes with optional state and template filters
       operationId: listSandboxes
       parameters:
         - name: state
@@ -110,7 +138,10 @@ paths:
 
   /sandboxes/{sandboxID}:
     get:
-      summary: Get sandbox status and endpoints
+      tags:
+        - Sandboxes
+      summary: Get sandbox
+      description: Get sandbox status and endpoints
       operationId: getSandbox
       parameters:
         - name: sandboxID
@@ -128,7 +159,10 @@ paths:
         "404":
           description: Sandbox not found
     delete:
-      summary: Kill and delete sandbox
+      tags:
+        - Sandboxes
+      summary: Delete sandbox
+      description: Kill and delete sandbox
       operationId: deleteSandbox
       parameters:
         - name: sandboxID
@@ -148,7 +182,10 @@ paths:
 
   /sandboxes/{sandboxID}/pause:
     post:
-      summary: Suspend sandbox (flush filesystem, delete MicroVM pod, retain RootFS & Workspace Block PVCs)
+      tags:
+        - Sandboxes
+      summary: Pause sandbox
+      description: "Suspend sandbox (flush filesystem, delete MicroVM pod, retain RootFS & Workspace Block PVCs)"
       operationId: pauseSandbox
       parameters:
         - name: sandboxID
@@ -166,7 +203,10 @@ paths:
 
   /sandboxes/{sandboxID}/connect:
     post:
-      summary: Connect to sandbox, automatically resuming from Paused state if needed (E2B compatible)
+      tags:
+        - Sandboxes
+      summary: Connect sandbox
+      description: Connect to sandbox, automatically resuming from Paused state if needed (E2B compatible)
       operationId: connectSandbox
       parameters:
         - name: sandboxID
@@ -184,7 +224,10 @@ paths:
 
   /sandboxes/{sandboxID}/timeout:
     post:
-      summary: Set sandbox idle timeout
+      tags:
+        - Sandboxes
+      summary: Set sandbox timeout
+      description: Set sandbox idle timeout
       operationId: setTimeoutSandbox
       parameters:
         - name: sandboxID
@@ -211,7 +254,10 @@ paths:
 
   /sandboxes/{sandboxID}/refreshes:
     post:
-      summary: Refresh sandbox idle timeout and keepalive lease (E2B standard)
+      tags:
+        - Sandboxes
+      summary: Refresh sandbox
+      description: Refresh sandbox idle timeout and keepalive lease (E2B standard)
       operationId: refreshSandbox
       parameters:
         - name: sandboxID
@@ -239,7 +285,10 @@ paths:
 
   /sandboxes/{sandboxID}/lease:
     post:
-      summary: Acquire or renew lease protection against automatic idle pausing
+      tags:
+        - Sandboxes
+      summary: Acquire lease
+      description: Acquire or renew lease protection against automatic idle pausing
       operationId: setLeaseSandbox
       parameters:
         - name: sandboxID
@@ -266,7 +315,10 @@ paths:
 
   /sandboxes/{sandboxID}/reset-rootfs:
     post:
-      summary: Reset the persistent RootFS Upper PVC to a clean Base Image state while preserving /workspace
+      tags:
+        - Sandboxes
+      summary: Reset RootFS
+      description: Reset the persistent RootFS Upper PVC to a clean Base Image state while preserving /workspace
       operationId: resetRootfs
       parameters:
         - name: sandboxID
@@ -284,7 +336,10 @@ paths:
 
   /sandboxes/{sandboxID}/fork:
     post:
-      summary: Clone an existing sandbox in ~1s via CSI Copy-on-Write block snapshots
+      tags:
+        - Sandboxes
+      summary: Fork sandbox
+      description: Clone an existing sandbox in ~1s via CSI Copy-on-Write block snapshots
       operationId: forkSandbox
       parameters:
         - name: sandboxID
@@ -314,7 +369,10 @@ paths:
 
   /sandboxes/{sandboxID}/commands:
     post:
-      summary: Execute command in sandbox (E2B standard route alias for /commands/run)
+      tags:
+        - Commands
+      summary: Run command (E2B)
+      description: Execute command in sandbox (E2B standard route alias for /commands/run)
       operationId: runCommandStandard
       parameters:
         - name: sandboxID
@@ -338,7 +396,10 @@ paths:
 
   /sandboxes/{sandboxID}/commands/run:
     post:
-      summary: Execute command in sandbox (foreground synchronous or background asynchronous)
+      tags:
+        - Commands
+      summary: Run command
+      description: Execute command in sandbox (foreground synchronous or background asynchronous)
       operationId: runCommand
       parameters:
         - name: sandboxID
@@ -362,7 +423,10 @@ paths:
 
   /sandboxes/{sandboxID}/code/execute:
     post:
-      summary: Execute Python code via in-guest Jupyter code interpreter on port 49999 (e2b-code-interpreter)
+      tags:
+        - Commands
+      summary: Execute code
+      description: Execute Python code via in-guest Jupyter code interpreter on port 49999 (e2b-code-interpreter)
       operationId: executeCode
       parameters:
         - name: sandboxID
@@ -391,7 +455,10 @@ paths:
 
   /sandboxes/{sandboxID}/commands/{cmdID}/logs:
     get:
-      summary: Read incremental command logs via stateless byte-offset cursor
+      tags:
+        - Commands
+      summary: Get command logs
+      description: Read incremental command logs via stateless byte-offset cursor
       operationId: getCommandLogs
       parameters:
         - name: sandboxID
@@ -420,7 +487,10 @@ paths:
 
   /sandboxes/{sandboxID}/commands/{cmdID}/status:
     get:
-      summary: Inspect background command process status, PID, exit code, and log cursor
+      tags:
+        - Commands
+      summary: Get command status
+      description: Inspect background command process status, PID, exit code, and log cursor
       operationId: getCommandStatus
       parameters:
         - name: sandboxID
@@ -445,7 +515,10 @@ paths:
 
   /sandboxes/{sandboxID}/commands/{cmdID}/stream:
     get:
-      summary: Stream incremental command logs over Server-Sent Events (SSE text/event-stream) until completion
+      tags:
+        - Commands
+      summary: Stream command logs
+      description: Stream incremental command logs over Server-Sent Events (SSE text/event-stream) until completion
       operationId: streamCommandLogs
       parameters:
         - name: sandboxID
@@ -469,7 +542,10 @@ paths:
 
   /sandboxes/{sandboxID}/commands/{cmdID}/kill:
     post:
-      summary: Send SIGKILL to the command process group (-pgid)
+      tags:
+        - Commands
+      summary: Kill command
+      description: Send SIGKILL to the command process group (-pgid)
       operationId: killCommand
       parameters:
         - name: sandboxID
@@ -497,7 +573,10 @@ paths:
 
   /sandboxes/{sandboxID}/files:
     get:
-      summary: Read file content from sandbox
+      tags:
+        - Files
+      summary: Read file
+      description: Read file content from sandbox
       operationId: getFile
       parameters:
         - name: sandboxID
@@ -537,7 +616,10 @@ paths:
         "404":
           description: File not found
     put:
-      summary: Upload file to sandbox with optional UID/GID and mode settings
+      tags:
+        - Files
+      summary: Upload file
+      description: Upload file to sandbox with optional UID/GID and mode settings
       operationId: putFile
       parameters:
         - name: sandboxID
@@ -598,7 +680,10 @@ paths:
                   size:
                     type: integer
     delete:
-      summary: Delete file or directory from sandbox workspace
+      tags:
+        - Files
+      summary: Delete file
+      description: Delete file or directory from sandbox workspace
       operationId: deleteFile
       parameters:
         - name: sandboxID
@@ -628,7 +713,10 @@ paths:
 
   /sandboxes/{sandboxID}/files/list:
     get:
-      summary: List files and directories in sandbox workspace
+      tags:
+        - Files
+      summary: List files
+      description: List files and directories in sandbox workspace
       operationId: listFiles
       parameters:
         - name: sandboxID
@@ -654,7 +742,10 @@ paths:
 
   /sandboxes/{sandboxID}/files/archive-sync:
     post:
-      summary: Synchronize skill archives (tar.gz) into sandbox memory/filesystem
+      tags:
+        - Files
+      summary: Sync archive
+      description: Synchronize skill archives (tar.gz) into sandbox memory/filesystem
       operationId: archiveSync
       parameters:
         - name: sandboxID
@@ -694,7 +785,10 @@ paths:
 
   /sandboxes/{sandboxID}/desktop/start:
     post:
-      summary: Lazily start interactive desktop, browser (CDP), and web terminal stack (CEP-0021)
+      tags:
+        - Desktop & Panels
+      summary: Start desktop
+      description: Lazily start interactive desktop, browser (CDP), and web terminal stack (CEP-0021)
       operationId: startDesktop
       parameters:
         - name: sandboxID
@@ -728,7 +822,10 @@ paths:
 
   /sandboxes/{sandboxID}/desktop/status:
     get:
-      summary: Query interactive desktop stack status and daemon PIDs (CEP-0021)
+      tags:
+        - Desktop & Panels
+      summary: Get desktop status
+      description: Query interactive desktop stack status and daemon PIDs (CEP-0021)
       operationId: getDesktopStatus
       parameters:
         - name: sandboxID
@@ -754,7 +851,10 @@ paths:
 
   /sandboxes/{sandboxID}/desktop/stop:
     post:
-      summary: Stop interactive desktop, browser, and web terminal daemons (CEP-0021)
+      tags:
+        - Desktop & Panels
+      summary: Stop desktop
+      description: Stop interactive desktop, browser, and web terminal daemons (CEP-0021)
       operationId: stopDesktop
       parameters:
         - name: sandboxID
@@ -780,7 +880,10 @@ paths:
 
   /sandboxes/{sandboxID}/endpoints/{port}:
     get:
-      summary: Get public ingress host/URL for sandbox port (E2B get_host compatible)
+      tags:
+        - Desktop & Panels
+      summary: Get endpoint host
+      description: Get public ingress host/URL for sandbox port (E2B get_host compatible)
       operationId: getEndpointHost
       parameters:
         - name: sandboxID
@@ -814,7 +917,10 @@ paths:
                   sandboxID:
                     type: string
     post:
-      summary: Mint HMAC-SHA256 signed panel proxy token for interactive web/VNC/HTTP ports
+      tags:
+        - Desktop & Panels
+      summary: Mint panel token
+      description: Mint HMAC-SHA256 signed panel proxy token for interactive web/VNC/HTTP ports
       operationId: mintEndpointToken
       parameters:
         - name: sandboxID
@@ -856,7 +962,10 @@ paths:
 
   /panel/{token}:
     get:
-      summary: Reverse-proxy HTTP/WebSocket/WebRTC traffic into sandbox port using signed token
+      tags:
+        - Desktop & Panels
+      summary: Proxy panel traffic
+      description: Reverse-proxy HTTP/WebSocket/WebRTC traffic into sandbox port using signed token
       operationId: proxyPanel
       parameters:
         - name: token
@@ -870,7 +979,10 @@ paths:
 
   /internal/v1/egress/exchange:
     post:
-      summary: Swap zero-trust cpodref_ reference tokens for real external API credentials
+      tags:
+        - System
+      summary: Exchange egress secret
+      description: Swap zero-trust cpodref_ reference tokens for real external API credentials
       operationId: egressExchange
       requestBody:
         required: true
@@ -896,7 +1008,10 @@ paths:
 
   /warmpools:
     post:
-      summary: Register and scale a pre-warmed Kata MicroVM standby pool
+      tags:
+        - WarmPools
+      summary: Create warm pool
+      description: Register and scale a pre-warmed Kata MicroVM standby pool
       operationId: createWarmPool
       requestBody:
         required: true
@@ -912,7 +1027,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/WarmPoolInfo"
     get:
-      summary: List all active warm standby pools and total ready count
+      tags:
+        - WarmPools
+      summary: List warm pools
+      description: List all active warm standby pools and total ready count
       operationId: listWarmPools
       responses:
         "200":
@@ -924,7 +1042,10 @@ paths:
 
   /templates:
     get:
-      summary: List available sandbox templates (JSON array of E2BTemplate when E2BTemplateAPI gate is enabled; legacy wrapper when off)
+      tags:
+        - Templates
+      summary: List templates
+      description: List available sandbox templates (JSON array of E2BTemplate when E2BTemplateAPI gate is enabled; legacy wrapper when off)
       operationId: listTemplates
       parameters:
         - name: teamID
@@ -951,7 +1072,10 @@ paths:
         "400":
           description: Template count exceeds v1 cap (5000)
     post:
-      summary: Create or request rebuild of a template (alias of POST /v3/templates)
+      tags:
+        - Templates
+      summary: Create template (v1)
+      description: Create or request rebuild of a template (alias of POST /v3/templates)
       operationId: createTemplateV1
       parameters:
         - name: Idempotency-Key
@@ -977,7 +1101,10 @@ paths:
 
   /v2/templates:
     get:
-      summary: List templates with cursor pagination (X-Next-Token response header)
+      tags:
+        - Templates
+      summary: List templates (v2)
+      description: List templates with cursor pagination (X-Next-Token response header)
       operationId: listTemplatesV2
       parameters:
         - name: limit
@@ -1003,7 +1130,10 @@ paths:
                 items:
                   $ref: "#/components/schemas/E2BTemplate"
     post:
-      summary: Create or request rebuild of a template (v2 alias of POST /v3/templates)
+      tags:
+        - Templates
+      summary: Create template (v2)
+      description: Create or request rebuild of a template (v2 alias of POST /v3/templates)
       operationId: createTemplateV2
       parameters:
         - name: Idempotency-Key
@@ -1027,7 +1157,10 @@ paths:
 
   /v3/templates:
     post:
-      summary: Request template creation or rebuild (E2B v3)
+      tags:
+        - Templates
+      summary: Create template build
+      description: Request template creation or rebuild (E2B v3)
       operationId: requestTemplateBuildV3
       parameters:
         - name: Idempotency-Key
@@ -1053,7 +1186,10 @@ paths:
 
   /templates/{templateID}:
     get:
-      summary: Get a template along with its builds
+      tags:
+        - Templates
+      summary: Get template
+      description: Get a template along with its builds
       operationId: getTemplate
       parameters:
         - name: templateID
@@ -1071,7 +1207,10 @@ paths:
         "404":
           description: Template not found
     patch:
-      summary: Update template metadata (e.g. public visibility)
+      tags:
+        - Templates
+      summary: Update template
+      description: Update template metadata (e.g. public visibility)
       operationId: updateTemplate
       parameters:
         - name: templateID
@@ -1092,7 +1231,10 @@ paths:
         "200":
           description: Template updated
     delete:
-      summary: Delete a template (returns 409 if referenced or building unless force=true)
+      tags:
+        - Templates
+      summary: Delete template
+      description: Delete a template (returns 409 if referenced or building unless force=true)
       operationId: deleteTemplate
       parameters:
         - name: templateID
@@ -1115,7 +1257,10 @@ paths:
 
   /v2/templates/{templateID}:
     patch:
-      summary: Update template visibility and return template names
+      tags:
+        - Templates
+      summary: Update template (v2)
+      description: Update template visibility and return template names
       operationId: updateTemplateV2
       parameters:
         - name: templateID
@@ -1147,7 +1292,10 @@ paths:
 
   /templates/aliases/{alias}:
     get:
-      summary: Resolve a template by alias or tag
+      tags:
+        - Templates
+      summary: Resolve template alias
+      description: Resolve a template by alias or tag
       operationId: getTemplateByAlias
       parameters:
         - name: alias
@@ -1167,7 +1315,10 @@ paths:
 
   /templates/{templateID}/files/{hash}:
     get:
-      summary: Check build context cache presence and obtain upload URL
+      tags:
+        - Templates
+      summary: Get upload link
+      description: Check build context cache presence and obtain upload URL
       operationId: getTemplateFileUploadLink
       parameters:
         - name: templateID
@@ -1195,7 +1346,10 @@ paths:
         "501":
           description: Template build is not enabled
     put:
-      summary: Upload tar or gzip-compressed tar build context for filesHash
+      tags:
+        - Templates
+      summary: Upload build context
+      description: Upload tar or gzip-compressed tar build context for filesHash
       operationId: uploadTemplateFileContext
       parameters:
         - name: templateID
@@ -1223,7 +1377,10 @@ paths:
 
   /v2/templates/{templateID}/builds/{buildID}:
     post:
-      summary: Start an image or recipe build for a template build ID
+      tags:
+        - Templates
+      summary: Start template build
+      description: Start an image or recipe build for a template build ID
       operationId: startTemplateBuildV2
       parameters:
         - name: templateID
@@ -1256,7 +1413,10 @@ paths:
 
   /templates/{templateID}/builds/{buildID}/status:
     get:
-      summary: Poll build status and incremental logs
+      tags:
+        - Templates
+      summary: Get build status
+      description: Poll build status and incremental logs
       operationId: getTemplateBuildStatus
       parameters:
         - name: templateID
@@ -1297,7 +1457,10 @@ paths:
 
   /templates/{templateID}/builds/{buildID}/logs:
     get:
-      summary: Read template build log entries
+      tags:
+        - Templates
+      summary: Get build logs
+      description: Read template build log entries
       operationId: getTemplateBuildLogs
       parameters:
         - name: templateID
@@ -1347,7 +1510,10 @@ paths:
 
   /templates/tags:
     post:
-      summary: Assign tags to a template build
+      tags:
+        - Templates
+      summary: Assign template tags
+      description: Assign tags to a template build
       operationId: assignTemplateTags
       requestBody:
         required: true
@@ -1367,7 +1533,10 @@ paths:
         "201":
           description: Tags assigned
     delete:
-      summary: Remove tags from a template
+      tags:
+        - Templates
+      summary: Delete template tags
+      description: Remove tags from a template
       operationId: deleteTemplateTags
       requestBody:
         required: true
@@ -1389,7 +1558,10 @@ paths:
 
   /templates/{templateID}/tags:
     get:
-      summary: List assigned tags for a template
+      tags:
+        - Templates
+      summary: List template tags
+      description: List assigned tags for a template
       operationId: getTemplateTags
       parameters:
         - name: templateID

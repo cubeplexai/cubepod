@@ -3,6 +3,15 @@ import Default from '@astrojs/starlight/components/Head.astro';
 ---
 
 <Default {...Astro.props}><slot /></Default>
+
+<script is:inline>
+  // Clear any legacy preview palette override so Starlight's Dark (Oxide Copper) / Light (Option A) cleanly applies
+  try {
+    localStorage.removeItem('cp-palette');
+    delete document.documentElement.dataset.cpPalette;
+  } catch (e) {}
+</script>
+
 <script>
   import mermaid from 'mermaid';
 
@@ -15,28 +24,26 @@ import Default from '@astrojs/starlight/components/Head.astro';
     if (nodes.length === 0) return;
 
     const isLight = getTheme() === 'default';
+    const styles = getComputedStyle(document.documentElement);
+    const primary = styles.getPropertyValue('--cp-primary').trim() || (isLight ? '#ea580c' : '#f97316');
+    const bg = styles.getPropertyValue('--cp-canvas').trim() || (isLight ? '#f8f7f4' : '#0e0e0d');
+    const surface = styles.getPropertyValue('--cp-surface').trim() || (isLight ? '#ffffff' : '#161614');
+    const text = styles.getPropertyValue('--cp-heading').trim() || (isLight ? '#111214' : '#f2f0ea');
+    const line = styles.getPropertyValue('--cp-muted').trim() || (isLight ? '#52525b' : '#a8a49c');
+
     mermaid.initialize({
       startOnLoad: false,
       theme: isLight ? 'default' : 'dark',
       securityLevel: 'loose',
-      themeVariables: isLight
-        ? {
-            primaryColor: '#e0f2fe',
-            primaryTextColor: '#0f172a',
-            primaryBorderColor: '#0891b2',
-            lineColor: '#334155',
-            secondaryColor: '#eef2ff',
-            tertiaryColor: '#f8fafc',
-          }
-        : {
-            primaryColor: '#0f172a',
-            primaryTextColor: '#e2e8f0',
-            primaryBorderColor: '#22d3ee',
-            lineColor: '#38bdf8',
-            secondaryColor: '#1e1b4b',
-            tertiaryColor: '#0b1220',
-            background: '#070b14',
-          },
+      themeVariables: {
+        primaryColor: surface,
+        primaryTextColor: text,
+        primaryBorderColor: primary,
+        lineColor: line,
+        secondaryColor: surface,
+        tertiaryColor: bg,
+        background: bg,
+      },
     });
 
     for (const el of nodes) {
@@ -49,12 +56,14 @@ import Default from '@astrojs/starlight/components/Head.astro';
     await mermaid.run({ nodes });
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-      renderMermaidBlocks().catch(console.error);
-    });
-  } else {
+  function init() {
     renderMermaidBlocks().catch(console.error);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
   }
 
   const observer = new MutationObserver((mutations) => {

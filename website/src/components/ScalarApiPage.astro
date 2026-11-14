@@ -1,4 +1,7 @@
 ---
+import logoDark from '../assets/logo-dark.svg';
+import logoLight from '../assets/logo-light.svg';
+
 interface Props {
   locale: 'en' | 'zh';
 }
@@ -8,10 +11,16 @@ const homeHref = isZh ? '/zh/' : '/';
 const docsHref = isZh ? '/zh/getting-started/introduction/' : '/getting-started/introduction/';
 const switchHref = isZh ? '/api/' : '/zh/api/';
 const switchLabel = isZh ? 'English' : '简体中文';
+const scalarConfig = {
+  theme: 'default',
+  hideDarkModeToggle: true,
+  showSidebar: true,
+  defaultHttpClient: { targetKey: 'python', clientKey: 'httpx' },
+};
 ---
 
 <!doctype html>
-<html lang={isZh ? 'zh-CN' : 'en'}>
+<html lang={isZh ? 'zh-CN' : 'en'} data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -19,108 +28,362 @@ const switchLabel = isZh ? 'English' : '简体中文';
     <meta
       name="description"
       content={isZh
-        ? 'CubePod v0.4.0 统一控制面与数据面 OpenAPI 3.1 交互式调试控制台。'
-        : 'Interactive OpenAPI 3.1 explorer for the CubePod v0.4.0 E2B-compatible superset Control and Data Plane API.'}
+        ? 'CubePod v0.4.1 统一控制面与数据面 OpenAPI 3.1 交互式调试控制台。'
+        : 'Interactive OpenAPI 3.1 explorer for the CubePod v0.4.1 E2B-compatible superset Control and Data Plane API.'}
     />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <style>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
+    />
+    <script is:inline>
+      (function () {
+        var stored = null;
+        try {
+          stored = localStorage.getItem('starlight-theme');
+        } catch (e) {}
+        var theme = stored === 'light' || stored === 'dark'
+          ? stored
+          : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+        document.documentElement.dataset.theme = theme;
+        window.__cpInitialTheme = theme;
+      })();
+    </script>
+    <style is:global>
       :root {
-        color-scheme: dark;
+        --cp-header-h: 54px;
+        --cp-font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans SC', sans-serif;
+        --cp-font-display: 'Plus Jakarta Sans', 'Inter', ui-sans-serif, system-ui, 'Noto Sans SC', sans-serif;
+        --cp-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       }
+
+      /* DARK MODE — Oxide Copper */
+      html[data-theme='dark'],
+      body.dark-mode {
+        color-scheme: dark;
+        --cp-bg: #0e0e0d;
+        --cp-surface: #161614;
+        --cp-surface-high: #1f1e1b;
+        --cp-well: #080807;
+        --cp-border: #2a2926;
+        --cp-border-active: #44423c;
+        --cp-heading: #f2f0ea;
+        --cp-body: #e5e2da;
+        --cp-muted: #a8a49c;
+        --cp-primary: #f97316;
+        --cp-primary-hover: #fb923c;
+        --cp-primary-ink: #0e0e0d;
+        --cp-primary-soft: rgba(249, 115, 22, 0.11);
+        --cp-primary-border: rgba(249, 115, 22, 0.36);
+
+        --scalar-font: var(--cp-font-sans);
+        --scalar-font-code: var(--cp-font-mono);
+        --scalar-custom-header-height: var(--cp-header-h);
+        --scalar-header-height: var(--cp-header-h);
+        --scalar-radius: 4px;
+        --scalar-radius-lg: 6px;
+        --scalar-radius-xl: 8px;
+
+        --scalar-background-1: #0e0e0d;
+        --scalar-background-2: #161614;
+        --scalar-background-3: #1f1e1b;
+        --scalar-background-4: #262521;
+        --scalar-background-card: #161614;
+        --scalar-background-accent: rgba(249, 115, 22, 0.11);
+        --scalar-border-color: #2a2926;
+
+        --scalar-color-1: #f2f0ea;
+        --scalar-color-2: #e5e2da;
+        --scalar-color-3: #a8a49c;
+        --scalar-color-accent: #f97316;
+        --scalar-link-color: #fb923c;
+        --scalar-link-color-hover: #fdba74;
+
+        --scalar-button-1: #f97316;
+        --scalar-button-1-hover: #fb923c;
+        --scalar-button-1-color: #0e0e0d;
+
+        --scalar-color-green: #34d399;
+        --scalar-color-blue: #38bdf8;
+        --scalar-color-orange: #f97316;
+        --scalar-color-yellow: #fbbf24;
+        --scalar-color-red: #f87171;
+
+        --scalar-sidebar-background-1: #121210;
+        --scalar-sidebar-border-color: #2a2926;
+        --scalar-sidebar-color-1: #e5e2da;
+        --scalar-sidebar-color-2: #a8a49c;
+        --scalar-sidebar-color-active: #fb923c;
+        --scalar-sidebar-item-active-background: rgba(249, 115, 22, 0.11);
+        --scalar-sidebar-item-hover-background: #1f1e1b;
+        --scalar-sidebar-item-hover-color: #f2f0ea;
+        --scalar-sidebar-search-background: #080807;
+        --scalar-sidebar-search-border-color: #2a2926;
+        --scalar-sidebar-search-color: #a8a49c;
+      }
+
+      /* LIGHT MODE — Option A: Swiss Hardware Blueprint */
+      html[data-theme='light'],
+      body.light-mode {
+        color-scheme: light;
+        --cp-bg: #f8f7f4;
+        --cp-surface: #ffffff;
+        --cp-surface-high: #eceae3;
+        --cp-well: #f1f0eb;
+        --cp-border: #d4d4cc;
+        --cp-border-active: #a3a399;
+        --cp-heading: #111214;
+        --cp-body: #27272a;
+        --cp-muted: #52525b;
+        --cp-primary: #ea580c;
+        --cp-primary-hover: #c2410c;
+        --cp-primary-ink: #ffffff;
+        --cp-primary-soft: rgba(234, 88, 12, 0.09);
+        --cp-primary-border: rgba(234, 88, 12, 0.35);
+
+        --scalar-font: var(--cp-font-sans);
+        --scalar-font-code: var(--cp-font-mono);
+        --scalar-custom-header-height: var(--cp-header-h);
+        --scalar-header-height: var(--cp-header-h);
+        --scalar-radius: 4px;
+        --scalar-radius-lg: 6px;
+        --scalar-radius-xl: 8px;
+
+        --scalar-background-1: #f8f7f4;
+        --scalar-background-2: #ffffff;
+        --scalar-background-3: #eceae3;
+        --scalar-background-4: #e4e3dc;
+        --scalar-background-card: #ffffff;
+        --scalar-background-accent: rgba(234, 88, 12, 0.09);
+        --scalar-border-color: #d4d4cc;
+
+        --scalar-color-1: #111214;
+        --scalar-color-2: #27272a;
+        --scalar-color-3: #52525b;
+        --scalar-color-accent: #ea580c;
+        --scalar-link-color: #c2410c;
+        --scalar-link-color-hover: #9a3412;
+
+        --scalar-button-1: #ea580c;
+        --scalar-button-1-hover: #c2410c;
+        --scalar-button-1-color: #ffffff;
+
+        --scalar-color-green: #059669;
+        --scalar-color-blue: #1d4ed8;
+        --scalar-color-orange: #ea580c;
+        --scalar-color-yellow: #d97706;
+        --scalar-color-red: #dc2626;
+
+        --scalar-sidebar-background-1: #f2f1ec;
+        --scalar-sidebar-border-color: #d4d4cc;
+        --scalar-sidebar-color-1: #27272a;
+        --scalar-sidebar-color-2: #52525b;
+        --scalar-sidebar-color-active: #c2410c;
+        --scalar-sidebar-item-active-background: rgba(234, 88, 12, 0.09);
+        --scalar-sidebar-item-hover-background: #eceae3;
+        --scalar-sidebar-item-hover-color: #111214;
+        --scalar-sidebar-search-background: #ffffff;
+        --scalar-sidebar-search-border-color: #d4d4cc;
+        --scalar-sidebar-search-color: #52525b;
+      }
+
       html,
       body {
         margin: 0;
         padding: 0;
-        background: #070b14;
-        color: #f8fafc;
-        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans SC', sans-serif;
+        background: var(--cp-bg);
+        color: var(--cp-body);
+        font-family: var(--cp-font-sans);
       }
+
       .cp-api-topbar {
         position: sticky;
         top: 0;
         z-index: 1000;
+        min-height: var(--cp-header-h);
+        box-sizing: border-box;
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
         justify-content: space-between;
-        gap: 1rem;
-        padding: 0.65rem 1.25rem;
-        background: rgba(7, 11, 20, 0.92);
+        gap: 0.75rem 1rem;
+        padding: 0.5rem 1.25rem;
+        background: color-mix(in srgb, var(--cp-bg) 90%, transparent);
         backdrop-filter: blur(12px);
-        border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+        -webkit-backdrop-filter: blur(12px);
+        border-bottom: 1px solid var(--cp-border);
       }
-      .cp-api-brand {
+
+      .cp-api-brand-row {
         display: flex;
         align-items: center;
         gap: 0.75rem;
+      }
+
+      .cp-api-brand {
+        display: inline-flex;
+        align-items: center;
         text-decoration: none;
-        color: #f8fafc;
-        font-weight: 700;
       }
+
+      .cp-api-brand img {
+        height: 30px;
+        width: auto;
+        display: block;
+      }
+
+      .cp-logo-light {
+        display: none !important;
+      }
+
+      html[data-theme='light'] .cp-logo-dark {
+        display: none !important;
+      }
+
+      html[data-theme='light'] .cp-logo-light {
+        display: block !important;
+      }
+
       .cp-api-badge {
-        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-        font-size: 0.75rem;
-        padding: 0.2rem 0.55rem;
-        border-radius: 999px;
-        background: rgba(34, 211, 238, 0.12);
-        color: #22d3ee;
-        border: 1px solid rgba(34, 211, 238, 0.35);
+        font-family: var(--cp-font-mono);
+        font-size: 0.71rem;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        padding: 0.22rem 0.55rem;
+        border-radius: 0.25rem;
+        background: var(--cp-primary-soft);
+        color: var(--cp-primary);
+        border: 1px solid var(--cp-primary-border);
       }
+
       .cp-api-nav {
         display: flex;
         flex-wrap: wrap;
         align-items: center;
-        gap: 0.85rem;
-        font-size: 0.88rem;
+        gap: 0.35rem;
+        font-family: var(--cp-font-mono);
+        font-size: 0.78rem;
       }
-      .cp-api-nav a {
-        color: #cbd5e1;
+
+      .cp-api-nav a,
+      .cp-theme-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.38rem;
+        min-height: 1.85rem;
+        box-sizing: border-box;
+        color: var(--cp-muted);
         text-decoration: none;
-        padding: 0.32rem 0.65rem;
-        border-radius: 0.45rem;
+        padding: 0.28rem 0.62rem;
+        border-radius: 0.25rem;
         border: 1px solid transparent;
+        background: transparent;
+        font-family: var(--cp-font-mono);
+        font-size: 0.78rem;
+        line-height: 1;
+        cursor: pointer;
+        transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
       }
-      .cp-api-nav a:hover {
-        color: #22d3ee;
-        border-color: rgba(34, 211, 238, 0.3);
-        background: rgba(34, 211, 238, 0.08);
+
+      .cp-api-nav a:hover,
+      .cp-theme-toggle:hover {
+        color: var(--cp-primary);
+        border-color: var(--cp-border);
+        background: var(--cp-surface);
       }
-      /* Align Scalar theme variables with CubePod dark aesthetic */
-      .dark-mode {
-        --scalar-background-1: #070b14;
-        --scalar-background-2: #0a101e;
-        --scalar-background-3: #0f172a;
-        --scalar-color-accent: #22d3ee;
+
+      .cp-theme-toggle {
+        border-color: var(--cp-border);
+        background: var(--cp-surface);
+        color: var(--cp-heading);
+      }
+
+      .cp-theme-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 9999px;
+        background: var(--cp-primary);
+      }
+
+      /* Ensure Scalar headings match site display font cleanly */
+      .scalar-api-reference h1,
+      .scalar-api-reference h2,
+      .scalar-api-reference h3,
+      .scalar-api-reference .section-header-title {
+        font-family: var(--cp-font-display) !important;
+        letter-spacing: -0.02em;
       }
     </style>
   </head>
   <body class="dark-mode">
     <header class="cp-api-topbar">
-      <a href={homeHref} class="cp-api-brand">
-        <img src="/favicon.svg" alt="CubePod" width="24" height="24" />
-        <span>CubePod</span>
-        <span class="cp-api-badge">OpenAPI 3.1 · v0.4.0</span>
-      </a>
+      <div class="cp-api-brand-row">
+        <a href={homeHref} class="cp-api-brand" aria-label="CubePod Home">
+          <img src={logoDark.src} alt="CubePod" class="cp-logo-dark" width="124" height="30" />
+          <img src={logoLight.src} alt="CubePod" class="cp-logo-light" width="124" height="30" />
+        </a>
+        <span class="cp-api-badge">OpenAPI 3.1 · v0.4.1</span>
+      </div>
       <nav class="cp-api-nav">
         <a href={docsHref}>{isZh ? '返回文档' : 'Back to Docs'}</a>
         <a href="/openapi.yaml" target="_blank" rel="noopener noreferrer">openapi.yaml</a>
         <a href="/llms.txt" target="_blank" rel="noopener noreferrer">llms.txt</a>
         <a href={switchHref}>{switchLabel}</a>
         <a href="https://github.com/cubeplexai/cubepod" target="_blank" rel="noopener noreferrer">GitHub</a>
+        <button
+          type="button"
+          class="cp-theme-toggle"
+          id="cp-api-theme-btn"
+          aria-label={isZh ? '切换亮暗主题' : 'Toggle light or dark theme'}
+        >
+          <span class="cp-theme-dot" aria-hidden="true"></span>
+          <span id="cp-api-theme-label">Dark</span>
+        </button>
       </nav>
     </header>
 
     <script
       id="api-reference"
       data-url="/openapi.yaml"
-      data-configuration={JSON.stringify({
-        theme: 'kepler',
-        darkMode: true,
-        forceDarkModeState: 'dark',
-        hideDarkModeToggle: false,
-        showSidebar: true,
-        defaultHttpClient: { targetKey: 'python', clientKey: 'httpx' },
-      })}
+      data-configuration={JSON.stringify(scalarConfig)}
     ></script>
+    <script is:inline>
+      (function () {
+        var theme = window.__cpInitialTheme === 'light' ? 'light' : 'dark';
+        var refEl = document.getElementById('api-reference');
+        if (refEl) {
+          try {
+            var cfg = JSON.parse(refEl.getAttribute('data-configuration') || '{}');
+            cfg.darkMode = theme === 'dark';
+            cfg.forceDarkModeState = theme;
+            refEl.setAttribute('data-configuration', JSON.stringify(cfg));
+          } catch (e) {}
+        }
+
+        function syncBodyTheme(t) {
+          document.documentElement.dataset.theme = t;
+          document.body.classList.toggle('dark-mode', t === 'dark');
+          document.body.classList.toggle('light-mode', t === 'light');
+          var lbl = document.getElementById('cp-api-theme-label');
+          if (lbl) lbl.textContent = t === 'light' ? 'Light' : 'Dark';
+        }
+
+        syncBodyTheme(theme);
+
+        var btn = document.getElementById('cp-api-theme-btn');
+        if (btn) {
+          btn.addEventListener('click', function () {
+            var next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+            try {
+              localStorage.setItem('starlight-theme', next);
+            } catch (e) {}
+            syncBodyTheme(next);
+          });
+        }
+      })();
+    </script>
     <script src="/vendor/scalar-api-reference.js" is:inline></script>
   </body>
 </html>

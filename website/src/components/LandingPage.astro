@@ -9,471 +9,1317 @@ const prefix = isZh ? '/zh' : '';
 
 const copy = isZh
   ? {
-      badge: 'v0.4.0 开源发布 · Apache 2.0 · 100% E2B 协议兼容',
-      h1Prefix: '面向高自治 AI Agent 的',
-      h1Accent: '持久化可写 RootFS 微虚拟机平台',
+      badge: 'v0.4.1 · Apache 2.0 · 100% E2B 协议兼容',
+      h1Rest: '专为长生命周期自主 Agent',
+      h1Accent: '打造的持久微虚拟机沙箱',
+      heroSubhead: 'Persistent Writable RootFS MicroVM Execution Platform · 持久化可写 RootFS 微虚拟机执行平台',
       subtitle:
-        '通过双块卷 CSI Raw Block 持久化、Kata Containers 硬件级隔离、零导出 0 资源休眠秒级恢复与零信任出站凭据代理，让每个 AI Agent 拥有“永不丢失系统环境与项目文件”的云原生操作系统。',
+        '基于 Kata Containers 硬件隔离与双 CSI Raw Block 持久化。支持 Zero-Export 0 CPU 休眠、~1s 跨节点唤醒与 1s CoW 克隆，让系统环境与工作区永不丢失。',
       ctaPrimary: '5 分钟快速上手',
-      ctaSecondary: '交互式 API 控制台',
-      ctaGithub: 'GitHub 仓库',
+      ctaSecondary: 'API 控制台',
+      ctaGithub: 'GitHub',
+      copyLabel: '复制',
+      copiedLabel: '已复制',
+      simTitle: 'MicroVM 生命周期演示',
+      simAuto: '自动轮播',
+      simStates: [
+        {
+          id: 'running',
+          label: 'Running',
+          pill: 'node-01 · 42ms 领用',
+          computeTitle: 'Kata MicroVM 计算实例',
+          computeMeta: '2 vCPU · 4 GiB · 运行中',
+          rootTitle: 'OverlayFS (/)',
+          rootMeta: 'RW · podd :49983',
+          rootfsState: 'RW · 持久 upperdir',
+          rootfsNote: 'apt / pip / npm 修改实时落盘',
+          wsState: 'RW · /workspace',
+          wsNote: 'volumeKey: agent-ws · 1000:1000',
+          banner: '双块卷已挂载，系统软件与工作区数据协同读写。',
+        },
+        {
+          id: 'suspend',
+          label: 'Suspend',
+          pill: 'Zero-Export · 0 CPU',
+          computeTitle: 'Kata Pod 已销毁',
+          computeMeta: '0 vCPU · 0 MB RAM',
+          rootTitle: '计算资源已释放',
+          rootMeta: 'sync + fsfreeze 完成',
+          rootfsState: '保留 · CSI 块卷落盘',
+          rootfsNote: '已安装的系统包完整留存在块设备',
+          wsState: '保留 · CSI 块卷落盘',
+          wsNote: '代码与产出静默留存，零计算计费',
+          banner: '无需导出 GB 级内存镜像，直接销毁 Pod 将算力降为 0。',
+        },
+        {
+          id: 'resume',
+          label: 'Resume ~1s',
+          pill: 'node-01 → node-02 · ~1.0s',
+          computeTitle: '跨节点重建 Kata MicroVM',
+          computeMeta: '自动调度至 node-02',
+          rootTitle: 'OverlayFS 重挂载 (/)',
+          rootMeta: 'podd-init pivot_root',
+          rootfsState: '恢复 · ext4 挂载就绪',
+          rootfsNote: '之前安装的 pip / apt 依赖即刻可用',
+          wsState: '恢复 · /workspace 就绪',
+          wsNote: '项目文件字节级无损重连',
+          banner: '来流自动拦截唤醒：任意节点 1 秒重挂载双块卷恢复运行。',
+        },
+        {
+          id: 'fork',
+          label: 'CoW Fork',
+          pill: 'CSI Snapshot · <1s',
+          computeTitle: '并行分支 sandbox-fork-02',
+          computeMeta: 'POST /sandboxes/{id}/fork',
+          rootTitle: '独立 OverlayFS 分支 (/)',
+          rootMeta: '写时复制 · 零全量拷贝',
+          rootfsState: 'CoW 克隆 · 独立系统层',
+          rootfsNote: '子 Agent 可独立尝试新依赖安装',
+          wsState: 'CoW 克隆 · 独立工作区',
+          wsNote: '多线程探索不同修复方案互不干扰',
+          banner: '基于 CSI VolumeSnapshot 瞬间拉起并行分支沙箱。',
+        },
+        {
+          id: 'reset',
+          label: 'OS Reset',
+          pill: 'rootfsGeneration: 3 → 4',
+          computeTitle: 'Kata MicroVM 重置 OS',
+          computeMeta: '仅重建 RootFS Upper',
+          rootTitle: '纯净系统层已重置',
+          rootMeta: '基础镜像 + 空白 upperdir',
+          rootfsState: '已重建 · 清除异常包状态',
+          rootfsNote: '受损的 apt / pip 环境瞬间恢复干净',
+          wsState: '已锁定保护 · 毫发无损',
+          wsNote: 'volumeKey 工作区 100% 保留未受影响',
+          banner: '递增 rootfsGeneration 瞬间清洗系统盘，/workspace 零损伤。',
+        },
+      ],
       metrics: [
-        { value: '< 50ms', label: 'PodWarmPool 预热池秒领' },
-        { value: '~1s', label: 'CoW 克隆与跨节点唤醒' },
-        { value: '0 CPU / RAM', label: 'Zero-Export 休眠计算开销' },
-        { value: '100%', label: 'RootFS + /workspace 双卷持久化' },
+        { kpi: 'CLAIM LATENCY', value: '< 50ms', title: 'PodWarmPool 冷启动', desc: '预热微虚拟机毫秒级领用', tone: 'primary' },
+        { kpi: 'RESUME & FORK', value: '~1s', title: 'CoW 克隆与跨节点唤醒', desc: 'CSI 块卷重挂载与快照分支', tone: 'secondary' },
+        { kpi: 'IDLE OVERHEAD', value: '0 CPU', title: 'Zero-Export 零开销休眠', desc: '0 内存占用 · 无需镜像导出', tone: 'ok' },
+        { kpi: 'PERSISTENCE', value: '100%', title: 'RootFS + /workspace', desc: '双卷彻底解耦持久保留', tone: 'neutral' },
       ],
-      sdkTitle: '一行配置零改造迁移，或原生调用企业级超集 SDK',
-      sdkSubtitle: '直接把 E2B_DOMAIN 指向 cubepod-gateway，即可无缝接入 LangChain / AutoGen / OpenHands；或使用 CubePod 原生 Python / TypeScript SDK 与 MCP Server 解锁 1s CoW Fork 与零信任出站。',
+      sdkEyebrow: 'DEVELOPER EXPERIENCE',
+      sdkTitle: '一行配置兼容 E2B，或原生调用超集 SDK',
+      sdkSubtitle: '切换标签或点击重放，实时观察 SDK 调用与沙箱内 podd 守护进程的执行遥测流。',
+      replayLabel: '重放演示',
+      logHeader: 'podd-daemon · /var/log/cubepod.stream',
+      logStatus: 'STREAMING',
       tabs: [
-        { id: 'e2b', label: 'E2B 零改造接入' },
-        { id: 'python', label: 'Python SDK (cubepod)' },
-        { id: 'ts', label: 'TypeScript SDK' },
-        { id: 'cli', label: 'CLI & MCP Server' },
+        { id: 'e2b', label: 'E2B Drop-in', file: 'agent_runner.py' },
+        { id: 'python', label: 'Python SDK', file: 'cubepod_session.py' },
+        { id: 'ts', label: 'TypeScript', file: 'sandbox_session.ts' },
+        { id: 'cli', label: 'CLI & MCP', file: 'terminal' },
       ],
-      archTitle: '四层云原生架构设计',
-      archSubtitle: '将易变的系统层（RootFS Upper）与珍贵的用户数据（/workspace）彻底解耦，构建零宿主机侵入的 Kata 微虚拟机执行底座。',
+      archEyebrow: 'SYSTEM INTERNALS',
+      archTitle: '四层云原生架构栈',
+      archSubtitle: '将易变 OS 依赖与用户工作区彻底解耦，零宿主机 Kubelet / containerd 侵入。',
       layers: [
         {
           num: '01',
-          name: '接入与协议层 (Access Layer)',
-          color: 'cyan',
-          items: ['CubePlex 平台 / CubeLoop 运行时', '官方 E2B SDK (Python / JS / Code Interpreter)', 'CubePod SDK (Python / TS / Go)', 'Native MCP stdio Server (cubepod mcp)'],
+          tone: 'primary',
+          name: '接入与协议层',
+          tag: 'Access Layer',
+          desc: '官方 E2B SDK 无缝迁移、原生 Python / TS / Go SDK 与 MCP Server。',
+          chips: ['E2B Drop-in', 'cubepod mcp', 'Signed /panel/{jwt}/'],
         },
         {
           num: '02',
-          name: '无状态控制与网关面 (Control & Gateway Plane)',
-          color: 'indigo',
-          items: ['cubepod-gateway (Go): E2B REST/SSE 路由 & Auto-Resume 自动唤醒拦截', 'Signed /panel/{jwt}/ Proxy: HTTP / WebSocket / WebRTC 桌面与终端转发', 'cubepod-controller (Go): 双卷 PVC、PodWarmPool、CoW Fork 与每 Pod mTLS 签发'],
+          tone: 'secondary',
+          name: '无状态控制与网关面',
+          tag: 'Control Plane',
+          desc: 'Auto-Resume 流量拦截唤醒、PodWarmPool 调度与每 Pod mTLS 签发。',
+          chips: ['cubepod-gateway', 'cubepod-controller', 'PodWarmPool'],
         },
         {
           num: '03',
-          name: '硬件隔离数据面 (Kata MicroVM Data Plane)',
-          color: 'cyan',
-          items: ['podd-init (Rust PID 1): ext4 校验修复 + OverlayFS 组装 + pivot_root（零镜象侵入）', 'podd (Rust :49983): 前后台执行、磁盘环形日志 Cursor、流式 tar.gz archive-sync', 'cubepod-egress (Go): nftables 透明流量劫持 + SNI 白名单 + cpodref_ mTLS 凭据替换', 'Lazy Desktop Stack: Xorg + Chromium CDP (:9222) + Neko WebRTC (:8080) + ttyd (:7681)'],
+          tone: 'ok',
+          name: 'Kata 微虚拟机数据面',
+          tag: 'Hardware Isolation',
+          desc: '独立 Guest 内核中运行 Rust PID 1 podd-init、podd 与零信任出站代理。',
+          chips: ['podd-init (Rust)', 'podd :49983', 'cubepod-egress', 'Lazy Desktop'],
         },
         {
           num: '04',
-          name: '持久块存储面 (CSI Raw Block Storage Plane)',
-          color: 'indigo',
-          items: ['Base OCI Image (RO, virtio-fs / EROFS): 纯净基础镜像，无基础设施二进制污染', 'rootfs-pvc (volumeMode: Block -> ext4): 持久化 /usr /etc /var 增删，可独立重置', 'workspace-pvc (volumeMode: Block -> /workspace): 原生 NVMe-oF 速度，独立生命周期保护'],
+          tone: 'primary',
+          name: 'CSI 持久块存储面',
+          tag: 'Raw Block CoW',
+          desc: '只读 Base OCI 叠加独立 rootfs-pvc 与 workspace-pvc 双块卷。',
+          chips: ['Longhorn V2 SPDK', 'OpenEBS LVM', 'Dual Raw Block'],
         },
       ],
-      bentoTitle: '专为长周期高自治 Agent 打造的企业级超集能力',
+      bentoEyebrow: 'CORE CAPABILITIES',
+      bentoTitle: '专为长周期 AI Agent 打造',
+      bentoSubtitle: '点击任意能力卡片，深入对应架构规范文档。',
       features: [
         {
-          tag: 'Dual-Volume',
-          title: '双卷解耦与无损系统重置',
-          desc: 'RootFS Upper 与 /workspace 各自绑定独立 Raw Block PVC。递增 rootfsGeneration 即可瞬间重置受损的 apt/pip 环境，同时 100% 保留 /workspace 代码与数据。',
+          icon: 'storage',
+          tone: 'primary',
+          title: '双卷持久化与 OS 重置',
+          tag: 'RootFS + volumeKey',
+          desc: '递增 rootfsGeneration 即可清洗受损系统环境，同时通过 volumeKey 保留工作区。',
+          foot: '查看双卷持久化文档',
           href: `${prefix}/concepts/dual-volume-persistence/`,
         },
         {
-          tag: 'Zero-Export',
-          title: '0 CPU 休眠与 ~1s 跨节点恢复',
-          desc: '休眠时通过 sync + fsfreeze 落盘后直接销毁 Kata Pod，计算资源归零；来流时 Gateway 自动拦截并在集群任意节点 1 秒重挂载块卷恢复。',
+          icon: 'pause',
+          tone: 'secondary',
+          title: 'Zero-Export 零开销休眠',
+          tag: '0 CPU / 0 RAM',
+          desc: '落盘后销毁 Pod 使算力归零；来流时自动在集群任意节点 ~1s 恢复。',
+          foot: '查看生命周期与预热池',
           href: `${prefix}/concepts/lifecycle-warmpool-fork/`,
         },
         {
-          tag: 'CoW Fork',
-          title: '< 1 秒写时复制沙箱分支',
-          desc: '基于 CSI VolumeSnapshot 同步克隆运行中沙箱的 RootFS 与 Workspace 双卷，让多子 Agent 并行探索不同修复方案而互不干扰。',
+          icon: 'fork',
+          tone: 'neutral',
+          title: '< 1 秒 CoW 沙箱分支',
+          tag: 'Instant Branch',
+          desc: '通过 CSI VolumeSnapshot 同步克隆双卷，支持多子 Agent 并行探索。',
+          foot: 'POST /sandboxes/{id}/fork',
           href: `${prefix}/concepts/lifecycle-warmpool-fork/`,
         },
         {
+          icon: 'shield',
+          tone: 'ok',
+          title: 'cpodref_ 零信任出站',
           tag: 'Zero-Trust',
-          title: 'cpodref_ 零信任出站凭据库',
-          desc: '真实 API Key 永不进入沙箱内存或环境变量。沙箱内仅持有占位符，出站流量经 nftables 重定向至 cubepod-egress 通过单 Pod mTLS 动态换取真实凭据。',
+          desc: '真实密钥永不入沙箱；按序 allow/deny 规则与 mTLS 在出站边界动态换取。',
+          foot: '查看零信任出站设计',
           href: `${prefix}/concepts/zero-trust-egress/`,
         },
         {
-          tag: 'GUI & Panel',
-          title: '懒加载桌面与签名 Panel 代理',
-          desc: '按需拉起 Xorg + Chromium CDP + Neko WebRTC + ttyd，通过 HMAC-SHA256 签名路径 /panel/{token}/ 安全暴露浏览器与交互终端，彻底告别端口冲突。',
+          icon: 'desktop',
+          tone: 'neutral',
+          title: '懒加载桌面与 Panel 代理',
+          tag: 'WebRTC / CDP',
+          desc: '按需拉起 Xorg、Chromium CDP 与 Neko WebRTC，经签名路径暴露零冲突。',
+          foot: '查看桌面与代理架构',
           href: `${prefix}/concepts/desktop-and-panel-proxy/`,
         },
         {
-          tag: 'MCP & Code',
-          title: '6 语言内核与原生 MCP Server',
-          desc: '内置 Python / JS / TS / R / Java / Bash 6 大流式代码内核与图表捕获，同时提供开箱即用的 cubepod mcp 工具集接入 Claude / Cursor。',
+          icon: 'hub',
+          tone: 'primary',
+          title: '6 语言内核与原生 MCP',
+          tag: 'Polyglot + MCP',
+          desc: '支持 Python / JS / TS / R / Java / Bash 流式内核及 cubepod mcp 接入。',
+          foot: '查看 MCP Server 集成',
           href: `${prefix}/sdks/mcp-server/`,
         },
       ],
-      compareTitle: 'CubePod vs. 上游 E2B Cloud vs. 传统容器沙箱',
-      compareHeaders: ['核心维度', '传统容器 / 上游 E2B', 'CubePod v0.4.0 开源平台'],
+      compareEyebrow: 'COMPARISON',
+      compareTitle: 'CubePod vs. 上游 E2B vs. 传统容器',
+      compareHeaders: ['对比维度', 'CubePod v0.4.1', '上游 E2B Cloud', '传统容器沙箱'],
       compareRows: [
-        ['系统盘持久化', 'RootFS 临时易失；休眠后 apt/pip 依赖全部丢失', 'RootFS + /workspace 双卷持久化；系统软件跨休眠永久保留'],
-        ['存储性能模型', 'NFS/CephFS 小文件 RPC 瓶颈或容器 overlay', '双 CSI Raw Block (Longhorn V2 SPDK / OpenEBS LVM) 原生 NVMe-oF 速度'],
-        ['OS 与数据耦合度', '重置环境往往连带清理工作区', '完全解耦：递增 rootfsGeneration 仅重装 OS，/workspace 毫发无损'],
-        ['休眠与冷启动', '千兆级内存镜像导出耗时且绑定 CPU 架构', 'Zero-Export (0 CPU/RAM) + ~1s 跨节点块卷挂载 + <50ms WarmPool 领用'],
-        ['多分支并行探索', '不支持或需全量磁盘拷贝', '< 1s 写时复制克隆 (POST /sandboxes/{id}/fork)'],
-        ['密钥与出站安全', '明文环境变量注入，存在 LLM 越狱泄露风险', '仅注入 cpodref_ 占位符 + nftables + mTLS 边界动态注入'],
-        ['协议与部署自由', '专有 SaaS 绑定', '100% E2B 协议超集 · 自托管 K8s (Kata) 或单机 Docker Compose'],
+        ['系统盘持久化', 'RootFS + /workspace 双持久', '仅临时 RootFS', '重启即丢失'],
+        ['存储性能模型', 'Dual CSI Raw Block (NVMe-oF)', '临时 overlay / 共享 FS', 'OverlayFS / NFS'],
+        ['OS 与数据耦合', '完全解耦（独立重置 OS）', '状态耦合', '全局重置丢失'],
+        ['休眠与唤醒', '0 CPU/RAM · ~1s 块卷恢复', '导出内存镜像 / 冷启', '持续占内存'],
+        ['沙箱分支克隆', '< 1s CoW 双卷快照', '不支持 / 全量拷贝', '不支持'],
+        ['凭据安全隔离', 'cpodref_ + mTLS 边界替换', '明文环境变量', '明文 ENV + 共享内核'],
+        ['部署自由度', '100% E2B 超集 · 自托管开源', '专有 SaaS', '需自行拼装'],
       ],
-      ecoTitle: 'CubePlex 开源 Agent 基础设施生态',
-      ecoDesc: 'CubePod 专注底层硬件隔离与持久化执行底座，与 CubePlex（团队协同工作空间）及 CubeLoop（异步多模型 Agent 运行时）原生协同。',
+      ecoEyebrow: 'CUBEPLEX OPEN-SOURCE STACK · 脑手解耦架构',
+      ecoTitle: '开源 CubePlex Agent 技术栈的核心执行层',
       ecoExplore: '阅读架构文档',
       ecoApi: '打开 API 控制台',
-      ecoLlms: '查看 llms.txt',
+      ecoLlms: 'llms.txt',
+      footerDesc: '持久化可写 RootFS 微虚拟机执行平台。基于 Kata Containers、双 CSI Raw Block 与零信任出站隔离构建。',
+      footerCols: [
+        {
+          title: '生态',
+          links: [
+            { label: 'CubePod 平台简介', href: `${prefix}/getting-started/introduction/` },
+            { label: 'CubePlex', href: 'https://github.com/cubeplexai/cubeplex', ext: true },
+            { label: 'CubeLoop', href: 'https://github.com/cubeplexai/cubeloop', ext: true },
+          ],
+        },
+        {
+          title: '文档',
+          links: [
+            { label: '快速上手', href: `${prefix}/getting-started/quickstart/` },
+            { label: '系统架构', href: `${prefix}/concepts/architecture/` },
+            { label: 'OpenAPI 控制台', href: `${prefix}/api/` },
+            { label: 'llms.txt', href: '/llms.txt' },
+          ],
+        },
+        {
+          title: '规范',
+          links: [
+            { label: '零信任出站', href: `${prefix}/concepts/zero-trust-egress/` },
+            { label: 'CEPs 提案', href: `${prefix}/ceps/` },
+            { label: 'CRDs 字典', href: `${prefix}/reference/crds/` },
+            { label: 'v0.4.1 日志', href: `${prefix}/changelog/0.4.1/` },
+          ],
+        },
+      ],
+      copyright: 'Apache 2.0 · CubePlex AI Infrastructure',
+      statusNominal: 'v0.4.1 Docs & OpenAPI Synced',
     }
   : {
-      badge: 'v0.4.0 Open Source · Apache 2.0 · 100% E2B Compatible',
-      h1Prefix: 'Persistent Writable RootFS',
-      h1Accent: 'MicroVM Execution Platform for AI Agents',
+      badge: 'v0.4.1 · Apache 2.0 · 100% E2B Compatible',
+      h1Rest: 'Sandbox Built for',
+      h1Accent: 'Long-Lived Autonomous Agents',
+      heroSubhead: 'Persistent Writable RootFS MicroVM Execution Platform',
       subtitle:
-        'Hardware-isolated Kata MicroVMs with Dual CSI Raw Block persistence, Zero-Export 0-CPU hibernation with ~1s cross-node resume, <50ms PodWarmPool claims, 1s CoW forks, and a Zero-Trust cpodref_ egress vault.',
+        'Hardware-isolated Kata MicroVMs backed by Dual CSI Raw Block volumes. Sleep at 0 CPU/RAM, resume on any node in ~1s, and keep OS packages intact.',
       ctaPrimary: '5-Minute Quickstart',
-      ctaSecondary: 'Interactive API Explorer',
-      ctaGithub: 'View on GitHub',
+      ctaSecondary: 'API Explorer',
+      ctaGithub: 'GitHub',
+      copyLabel: 'Copy',
+      copiedLabel: 'Copied',
+      simTitle: 'MicroVM Lifecycle Demo',
+      simAuto: 'Auto-Play',
+      simStates: [
+        {
+          id: 'running',
+          label: 'Running',
+          pill: 'node-01 · 42ms claim',
+          computeTitle: 'Kata MicroVM Compute',
+          computeMeta: '2 vCPU · 4 GiB · Active',
+          rootTitle: 'OverlayFS Root (/)',
+          rootMeta: 'RW · podd :49983',
+          rootfsState: 'RW · Persistent upperdir',
+          rootfsNote: 'apt, pip & npm survive sleep',
+          wsState: 'RW · /workspace',
+          wsNote: 'volumeKey: agent-ws · 1000:1000',
+          banner: 'Both CSI block volumes attached; OS deltas and workspace data stay decoupled.',
+        },
+        {
+          id: 'suspend',
+          label: 'Suspend',
+          pill: 'Zero-Export · 0 CPU',
+          computeTitle: 'Kata Pod Deleted',
+          computeMeta: '0 vCPU · 0 MB RAM',
+          rootTitle: 'Compute Released',
+          rootMeta: 'sync + fsfreeze flushed',
+          rootfsState: 'Retained · CSI Block',
+          rootfsNote: 'Installed OS packages stay on disk',
+          wsState: 'Retained · CSI Block',
+          wsNote: 'Project artifacts preserved at zero cost',
+          banner: 'Zero multi-GB memory dumps—compute drops to zero while block state remains.',
+        },
+        {
+          id: 'resume',
+          label: 'Resume ~1s',
+          pill: 'node-01 → node-02 · ~1.0s',
+          computeTitle: 'Fresh MicroVM on node-02',
+          computeMeta: 'Auto-Resumed by Gateway',
+          rootTitle: 'OverlayFS Remounted (/)',
+          rootMeta: 'podd-init pivot_root',
+          rootfsState: 'Attached · ext4 Ready',
+          rootfsNote: 'Prior pip / apt toolchains ready immediately',
+          wsState: 'Attached · /workspace Ready',
+          wsNote: 'Byte-exact workspace restored',
+          banner: 'Incoming requests auto-schedule a fresh Pod and re-attach both volumes in ~1s.',
+        },
+        {
+          id: 'fork',
+          label: 'CoW Fork',
+          pill: 'CSI Snapshot · <1s',
+          computeTitle: 'Branch sandbox-fork-02',
+          computeMeta: 'POST /sandboxes/{id}/fork',
+          rootTitle: 'Isolated OverlayFS (/)',
+          rootMeta: 'Copy-on-Write · Zero Copy',
+          rootfsState: 'CoW Clone · Independent OS',
+          rootfsNote: 'Test new packages without polluting parent',
+          wsState: 'CoW Clone · Independent WS',
+          wsNote: 'Sub-agents explore parallel trajectories',
+          banner: 'Clone both RootFS and /workspace simultaneously via CSI VolumeSnapshots.',
+        },
+        {
+          id: 'reset',
+          label: 'OS Reset',
+          pill: 'rootfsGeneration: 3 → 4',
+          computeTitle: 'MicroVM RootFS Reset',
+          computeMeta: 'OS Re-imaged · Data Safe',
+          rootTitle: 'Clean Base RootFS (/)',
+          rootMeta: 'Fresh upperdir mounted',
+          rootfsState: 'Re-imaged · Clean OS',
+          rootfsNote: 'Corrupted apt/pip state wiped cleanly',
+          wsState: 'Locked Safe · Untouched',
+          wsNote: 'volumeKey workspace 100% preserved',
+          banner: 'Increment rootfsGeneration to wipe OS state while /workspace stays intact.',
+        },
+      ],
       metrics: [
-        { value: '< 50ms', label: 'PodWarmPool Cold Start' },
-        { value: '~1s', label: 'CoW Fork & Cross-Node Resume' },
-        { value: '0 CPU / RAM', label: 'Zero-Export Suspend Overhead' },
-        { value: '100%', label: 'RootFS + /workspace Persistence' },
+        { kpi: 'CLAIM LATENCY', value: '< 50ms', title: 'PodWarmPool Claim', desc: 'Pre-formatted standby MicroVMs', tone: 'primary' },
+        { kpi: 'RESUME & FORK', value: '~1s', title: 'CoW Fork & Resume', desc: 'Cross-node CSI block re-attach', tone: 'secondary' },
+        { kpi: 'IDLE OVERHEAD', value: '0 CPU', title: 'Zero-Export Suspend', desc: '0 RAM · no memory snapshots', tone: 'ok' },
+        { kpi: 'PERSISTENCE', value: '100%', title: 'RootFS + /workspace', desc: 'Decoupled dual block PVCs', tone: 'neutral' },
       ],
-      sdkTitle: 'Drop-in E2B Compatibility or Enterprise Superset SDKs',
-      sdkSubtitle:
-        'Point E2B_DOMAIN to cubepod-gateway with zero code changes, or adopt the native CubePod Python, TypeScript, Go, and MCP toolchains to unlock RootFS resets, 1s CoW forks, and cpodref_ secret bindings.',
+      sdkEyebrow: 'DEVELOPER EXPERIENCE',
+      sdkTitle: 'Drop-in E2B Compatibility or Superset SDKs',
+      sdkSubtitle: 'Switch tabs or click Replay to watch the live podd daemon execution stream.',
+      replayLabel: 'Replay',
+      logHeader: 'podd-daemon · /var/log/cubepod.stream',
+      logStatus: 'STREAMING',
       tabs: [
-        { id: 'e2b', label: 'E2B Drop-in' },
-        { id: 'python', label: 'Python SDK' },
-        { id: 'ts', label: 'TypeScript SDK' },
-        { id: 'cli', label: 'CLI & MCP' },
+        { id: 'e2b', label: 'E2B Drop-in', file: 'agent_runner.py' },
+        { id: 'python', label: 'Python SDK', file: 'cubepod_session.py' },
+        { id: 'ts', label: 'TypeScript', file: 'sandbox_session.ts' },
+        { id: 'cli', label: 'CLI & MCP', file: 'terminal' },
       ],
-      archTitle: 'Four-Layer Cloud-Native Architecture',
-      archSubtitle:
-        'Decouples ephemeral base OCI images from persistent RootFS deltas and user workspaces—with zero host-level kubelet/containerd patches.',
+      archEyebrow: 'SYSTEM INTERNALS',
+      archTitle: 'Four-Layer Architecture Stack',
+      archSubtitle: 'Decouples ephemeral OCI images from persistent RootFS deltas with zero host kubelet patches.',
       layers: [
         {
           num: '01',
-          name: 'Access Layer: Agent Platforms & SDKs',
-          color: 'cyan',
-          items: ['CubePlex Platform & CubeLoop Runtime', 'Official E2B SDKs (e2b / e2b-code-interpreter)', 'CubePod SDKs (Python / TypeScript / Go)', 'Native MCP stdio Server (cubepod mcp)'],
+          tone: 'primary',
+          name: 'Access & Ingress Layer',
+          tag: 'Client Interfaces',
+          desc: 'Drop-in E2B SDKs, native CubePod SDKs (Python/TS/Go), CLI, and MCP stdio Server.',
+          chips: ['E2B Drop-in', 'cubepod mcp', 'Signed /panel/{jwt}/'],
         },
         {
           num: '02',
-          name: 'Control & Gateway Plane (Stateless HA)',
-          color: 'indigo',
-          items: ['cubepod-gateway (Go): E2B REST/SSE router & Auto-Resume traffic interceptor', 'Signed /panel/{jwt}/ Reverse Proxy: HTTP / WebSocket / WebRTC GUI streaming', 'cubepod-controller (Go): Dual Block PVC, PodWarmPool, CoW Fork & per-pod mTLS CA'],
+          tone: 'secondary',
+          name: 'Control & Gateway Plane',
+          tag: 'Kubernetes',
+          desc: 'Auto-Resume traffic interceptor, PodWarmPool reconciler, and per-pod mTLS CA.',
+          chips: ['cubepod-gateway', 'cubepod-controller', 'PodWarmPool'],
         },
         {
           num: '03',
-          name: 'Data Plane: Hardware-Isolated Kata MicroVM',
-          color: 'cyan',
-          items: ['podd-init (Rust PID 1): e2fsck/mkfs.ext4 + OverlayFS assembly + pivot_root', 'podd (Rust :49983): Exec, disk ring-buffer cursor logs & streaming tar.gz archive-sync', 'cubepod-egress (Go): nftables redirection + TLS SNI policy + cpodref_ mTLS swap', 'Lazy Desktop Stack: Xorg + Chromium CDP (:9222) + Neko WebRTC (:8080) + ttyd (:7681)'],
+          tone: 'ok',
+          name: 'Kata MicroVM Data Plane',
+          tag: 'Hardware Isolation',
+          desc: 'Dedicated guest kernel running Rust PID 1 podd-init, podd, and zero-trust egress.',
+          chips: ['podd-init (Rust)', 'podd :49983', 'cubepod-egress', 'Lazy Desktop'],
         },
         {
           num: '04',
-          name: 'Persistent Storage Plane (CSI Raw Block)',
-          color: 'indigo',
-          items: ['Base OCI Image (RO, virtio-fs / EROFS): Stock upstream images kept 100% clean', 'rootfs-pvc (volumeMode: Block -> ext4): Persists /usr, /etc, /var across suspends', 'workspace-pvc (volumeMode: Block -> /workspace): Native NVMe-oF speed & independent lifecycle'],
+          tone: 'primary',
+          name: 'CSI Raw Block Storage Plane',
+          tag: 'Zero-Copy CoW',
+          desc: 'Read-only Base OCI image over independent rootfs-pvc and workspace-pvc block devices.',
+          chips: ['Longhorn V2 SPDK', 'OpenEBS LVM', 'Dual Raw Block'],
         },
       ],
-      bentoTitle: 'Enterprise Superset Capabilities Built for Long-Lived Agents',
+      bentoEyebrow: 'CORE CAPABILITIES',
+      bentoTitle: 'Built for Long-Lived Autonomous Agents',
+      bentoSubtitle: 'Select any capability to open its architecture reference.',
       features: [
         {
-          tag: 'Dual-Volume',
-          title: 'Decoupled RootFS Reset',
-          desc: 'RootFS Upper and /workspace reside on independent Raw Block PVCs. Increment rootfsGeneration to wipe a broken OS package state while keeping /workspace 100% intact.',
+          icon: 'storage',
+          tone: 'primary',
+          title: 'Dual-Volume & OS Reset',
+          tag: 'RootFS + volumeKey',
+          desc: 'Increment rootfsGeneration to reset a broken OS while keeping volumeKey workspaces intact.',
+          foot: 'Dual-volume docs',
           href: `${prefix}/concepts/dual-volume-persistence/`,
         },
         {
-          tag: 'Zero-Export',
-          title: '0-CPU Suspend & ~1s Resume',
-          desc: 'Quiesce filesystems with sync + fsfreeze and delete the Pod to drop compute cost to zero. Any incoming request auto-schedules a MicroVM on any node in ~1s.',
+          icon: 'pause',
+          tone: 'secondary',
+          title: 'Zero-Export Suspend',
+          tag: '0 CPU / 0 RAM',
+          desc: 'Flush with sync + fsfreeze and delete the Pod; auto-resume on any node in ~1s.',
+          foot: 'Lifecycle & WarmPool',
           href: `${prefix}/concepts/lifecycle-warmpool-fork/`,
         },
         {
-          tag: 'CoW Fork',
-          title: '< 1s Copy-on-Write Sandbox Fork',
-          desc: 'Clone an active sandbox and both its RootFS and Workspace volumes via CSI snapshots so sub-agents can branch speculative trajectories concurrently.',
+          icon: 'fork',
+          tone: 'neutral',
+          title: '< 1s CoW Sandbox Fork',
+          tag: 'Instant Branch',
+          desc: 'Snapshot both RootFS and Workspace volumes simultaneously for parallel agent branching.',
+          foot: 'POST /sandboxes/{id}/fork',
           href: `${prefix}/concepts/lifecycle-warmpool-fork/`,
         },
         {
-          tag: 'Zero-Trust',
-          title: 'cpodref_ Secret Vault & Egress',
-          desc: 'Real API keys never enter sandbox memory or env vars. Outbound requests carry opaque placeholders exchanged by cubepod-egress over per-sandbox mTLS.',
+          icon: 'shield',
+          tone: 'ok',
+          title: 'Zero-Trust cpodref_ Vault',
+          tag: 'mTLS Egress',
+          desc: 'Real keys never enter guest memory; ordered egress rules swap placeholders at the proxy.',
+          foot: 'Zero-Trust egress',
           href: `${prefix}/concepts/zero-trust-egress/`,
         },
         {
-          tag: 'GUI & Panel',
-          title: 'Lazy Desktop & Signed Panel Proxy',
-          desc: 'Activate Xorg, Chromium CDP, Neko WebRTC, and ttyd on demand—exposed safely via HMAC-SHA256 /panel/{token}/ URLs with zero port collisions.',
+          icon: 'desktop',
+          tone: 'neutral',
+          title: 'Lazy Desktop & Panel',
+          tag: 'WebRTC / CDP',
+          desc: 'Launch Xorg, Chromium CDP, Neko WebRTC, and ttyd on demand over signed /panel/ URLs.',
+          foot: 'Desktop & Panel proxy',
           href: `${prefix}/concepts/desktop-and-panel-proxy/`,
         },
         {
-          tag: 'MCP & Kernels',
-          title: '6 Code Kernels & Native MCP',
-          desc: 'Stream NDJSON outputs and charts across Python, JS, TS, R, Java, and Bash, or expose sandboxes directly to Claude & Cursor via cubepod mcp.',
+          icon: 'hub',
+          tone: 'primary',
+          title: '6 Code Kernels & MCP',
+          tag: 'Polyglot + MCP',
+          desc: 'Stream outputs across Python, JS, TS, R, Java, and Bash, or connect Claude via cubepod mcp.',
+          foot: 'MCP Server docs',
           href: `${prefix}/sdks/mcp-server/`,
         },
       ],
-      compareTitle: 'CubePod vs. Upstream E2B & Standard Sandboxes',
-      compareHeaders: ['Capability', 'Upstream E2B / Standard Containers', 'CubePod v0.4.0 Open-Source'],
+      compareEyebrow: 'COMPARISON',
+      compareTitle: 'CubePod vs. Upstream E2B & Containers',
+      compareHeaders: ['Dimension', 'CubePod v0.4.1', 'Upstream E2B', 'Containers'],
       compareRows: [
-        ['System Persistence', 'Ephemeral RootFS; apt/pip installs lost on sleep', 'Full RootFS + /workspace dual block persistence across suspends'],
-        ['Storage Performance', 'Container overlay or slow shared NFS/CephFS RPCs', 'Dual CSI Raw Block (Longhorn V2 SPDK / OpenEBS LVM) at NVMe-oF speed'],
-        ['OS / Data Coupling', 'Resetting environment wipes workspace or vice versa', 'Fully decoupled: increment rootfsGeneration without touching /workspace'],
-        ['Suspend & Cold Start', 'Multi-GB VM memory snapshots or cold boots', 'Zero-Export (0 CPU/RAM) + ~1s block re-attach + <50ms WarmPool claims'],
-        ['Sandbox Forking', 'Unsupported or full volume copies', '< 1s Copy-on-Write volume clone (POST /sandboxes/{id}/fork)'],
-        ['Secret Isolation', 'Plaintext API keys in environment variables', 'Opaque cpodref_ placeholders + nftables + mTLS egress swap'],
-        ['Deployment Freedom', 'Proprietary SaaS vendor lock-in', '100% E2B superset · Self-host on K8s (Kata) or Docker Compose'],
+        ['System Persistence', 'RootFS + /workspace persistent', 'Ephemeral RootFS', 'Lost on restart'],
+        ['Storage Engine', 'Dual CSI Raw Block (NVMe-oF)', 'Ephemeral overlay', 'Overlay / NFS'],
+        ['OS / Data Coupling', 'Decoupled (rootfsGeneration)', 'Coupled state', 'Full wipe on reset'],
+        ['Suspend & Wake', '0 CPU/RAM · ~1s block attach', 'Memory dump / cold boot', 'Always billed RAM'],
+        ['Sandbox Forking', '< 1s CoW dual-volume clone', 'Full copy / N/A', 'Not supported'],
+        ['Secret Isolation', 'cpodref_ + mTLS proxy swap', 'Plaintext env vars', 'Plaintext ENV'],
+        ['Deployment', '100% E2B Superset · Self-Host', 'Proprietary SaaS', 'DIY plumbing'],
       ],
+      ecoEyebrow: 'CUBEPLEX OPEN-SOURCE STACK · BRAIN-HANDS DECOUPLING',
       ecoTitle: 'Part of the Open-Source CubePlex Agent Stack',
-      ecoDesc: 'CubePod provides the persistent hardware-isolated execution layer powering CubePlex (Team Agent Workspace) and CubeLoop (Async Agent Runtime).',
       ecoExplore: 'Explore Architecture',
-      ecoApi: 'Open API Reference',
-      ecoLlms: 'Read llms.txt',
+      ecoApi: 'API Reference',
+      ecoLlms: 'llms.txt',
+      footerDesc: 'Persistent Writable RootFS MicroVM Execution Platform for AI Agents. Built with Kata Containers, Dual CSI Raw Block, and Zero-Trust egress.',
+      footerCols: [
+        {
+          title: 'ECOSYSTEM',
+          links: [
+            { label: 'CubePod Intro', href: `${prefix}/getting-started/introduction/` },
+            { label: 'CubePlex', href: 'https://github.com/cubeplexai/cubeplex', ext: true },
+            { label: 'CubeLoop', href: 'https://github.com/cubeplexai/cubeloop', ext: true },
+          ],
+        },
+        {
+          title: 'DOCS',
+          links: [
+            { label: 'Quickstart', href: `${prefix}/getting-started/quickstart/` },
+            { label: 'Architecture', href: `${prefix}/concepts/architecture/` },
+            { label: 'API Explorer', href: `${prefix}/api/` },
+            { label: 'llms.txt', href: '/llms.txt' },
+          ],
+        },
+        {
+          title: 'SPECS',
+          links: [
+            { label: 'Zero-Trust Egress', href: `${prefix}/concepts/zero-trust-egress/` },
+            { label: 'CEPs Index', href: `${prefix}/ceps/` },
+            { label: 'CRDs Reference', href: `${prefix}/reference/crds/` },
+            { label: 'Release v0.4.1', href: `${prefix}/changelog/0.4.1/` },
+          ],
+        },
+      ],
+      copyright: 'Apache 2.0 · CubePlex AI Infrastructure',
+      statusNominal: 'v0.4.1 Docs & OpenAPI Synced',
     };
----
 
-<div class="cp-landing">
-  <!-- Ambient Background Grid & Glow -->
-  <div class="cp-bg-grid" aria-hidden="true"></div>
-
-  <!-- HERO -->
-  <section class="cp-hero">
-    <div class="cp-hero-copy">
-      <div class="cp-badge">
-        <span class="cp-dot"></span>
-        <span>{copy.badge}</span>
-      </div>
-      <h1 class="cp-h1">
-        {copy.h1Prefix}
-        <span class="cp-gradient-text">{copy.h1Accent}</span>
-      </h1>
-      <p class="cp-subtitle">{copy.subtitle}</p>
-      <div class="cp-actions">
-        <a href={`${prefix}/getting-started/quickstart/`} class="cp-btn cp-btn-primary">
-          {copy.ctaPrimary}
-          <span aria-hidden="true">→</span>
-        </a>
-        <a href={`${prefix}/api/`} class="cp-btn cp-btn-secondary">
-          {copy.ctaSecondary}
-        </a>
-        <a href="https://github.com/cubeplexai/cubepod" target="_blank" rel="noopener noreferrer" class="cp-btn cp-btn-ghost">
-          {copy.ctaGithub}
-        </a>
-      </div>
-    </div>
-
-    <div class="cp-hero-visual" aria-hidden="true">
-      <div class="cp-vm-card">
-        <div class="cp-vm-header">
-          <span class="cp-vm-pill">Kata MicroVM · virtio-blk</span>
-          <span class="cp-vm-status"><span class="cp-dot-green"></span> Running · 42ms claim</span>
-        </div>
-        <div class="cp-vm-stack">
-          <div class="cp-layer-box cp-layer-merged">
-            <div class="cp-layer-title">OverlayFS Merged Root (<code>/</code>)</div>
-            <div class="cp-layer-sub"><code>podd :49983</code> · <code>cubepod-egress</code> · Lazy Desktop</div>
-          </div>
-          <div class="cp-layer-split">
-            <div class="cp-layer-box cp-layer-rootfs">
-              <div class="cp-layer-title"><code>/dev/cubepod-rootfs</code></div>
-              <div class="cp-layer-sub">Persistent <code>upperdir</code> (ext4)<br/><code>apt</code> / <code>pip</code> / <code>npm</code> survive sleep</div>
-            </div>
-            <div class="cp-layer-box cp-layer-ws">
-              <div class="cp-layer-title"><code>/dev/cubepod-workspace</code></div>
-              <div class="cp-layer-sub">Mounted at <code>/workspace</code> (1000:1000)<br/>Preserved across <code>rootfsGeneration</code></div>
-            </div>
-          </div>
-          <div class="cp-layer-box cp-layer-base">
-            <div class="cp-layer-title">Base OCI Image (Read-Only <code>lowerdir</code>)</div>
-            <div class="cp-layer-sub">Stock Ubuntu / Python / Desktop image — zero injected binaries</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- METRICS STRIP -->
-  <section class="cp-metrics">
-    {copy.metrics.map((m) => (
-      <div class="cp-metric-card">
-        <div class="cp-metric-val">{m.value}</div>
-        <div class="cp-metric-label">{m.label}</div>
-      </div>
-    ))}
-  </section>
-
-  <!-- INTERACTIVE SDK SWITCHER -->
-  <section class="cp-section">
-    <div class="cp-section-head">
-      <h2>{copy.sdkTitle}</h2>
-      <p>{copy.sdkSubtitle}</p>
-    </div>
-
-    <div class="cp-code-switcher" data-cp-switcher>
-      <div class="cp-tabs" role="tablist">
-        {copy.tabs.map((tab, idx) => (
-          <button
-            type="button"
-            role="tab"
-            class={`cp-tab ${idx === 0 ? 'is-active' : ''}`}
-            aria-selected={idx === 0 ? 'true' : 'false'}
-            data-tab-target={tab.id}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
-
-      <div class="cp-panels">
-        <div class="cp-panel is-active" data-tab-panel="e2b">
-          <pre><code>{`export E2B_DOMAIN="localhost:8080"
+const snippets = {
+  e2b: `export E2B_DOMAIN="127.0.0.1:8080"
 export E2B_API_KEY="cpod_live_secret"
 
 from e2b_code_interpreter import Sandbox
 
-with Sandbox.create() as sandbox:
-    # Install system packages once — persisted in rootfs-pvc across suspends
-    sandbox.commands.run("pip install pandas matplotlib")
-    exec_res = sandbox.run_code("import pandas as pd; pd.DataFrame({'a': [1, 2, 3]})")
-    print(exec_res.results[0].html)`}</code></pre>
-        </div>
+with Sandbox.create() as sbx:
+    sbx.commands.run("pip install pandas matplotlib")
+    res = sbx.run_code("import pandas as pd; pd.DataFrame({'a':[1,2,3]})")
+    print(res.results[0].html)`,
+  python: `from cubepod import AsyncCubePod
 
-        <div class="cp-panel" data-tab-panel="python">
-          <pre><code>{`import asyncio
-from cubepod import AsyncCubePod
+async with AsyncCubePod(base_url="http://127.0.0.1:8080") as cp:
+    box = await cp.create(
+        "cubeplex-ubuntu24-desktop",
+        volume_key="agent-ws-042",
+        secret_bindings=[{
+            "env_name": "GITHUB_TOKEN",
+            "placeholder": "cpodref_gh_readonly_01",
+            "allowed_hosts": ["api.github.com"],
+        }],
+    )
+    forked = await cp.fork(box.sandbox_id)
+    await cp.reset_rootfs(box.sandbox_id)
+    await cp.pause(box.sandbox_id)`,
+  ts: `import { Sandbox } from 'cubepod';
 
-async def main() -> None:
-    async with AsyncCubePod(base_url="http://localhost:8080") as client:
-        box = await client.create(
-            "cubeplex-ubuntu24-desktop",
-            secret_bindings=[{
-                "env_name": "GITHUB_TOKEN",
-                "placeholder": "cpodref_gh_readonly_01",
-                "allowed_hosts": ["api.github.com"],
-            }],
-        )
-        forked = await client.fork(box.sandbox_id)   # <1s CoW clone of both volumes
-        await client.reset_rootfs(box.sandbox_id)    # Reset OS, keep /workspace intact
-        await client.pause(box.sandbox_id)           # 0 CPU/RAM suspend`}</code></pre>
-        </div>
-
-        <div class="cp-panel" data-tab-panel="ts">
-          <pre><code>{`import { Sandbox } from 'cubepod';
-
-const sandbox = await Sandbox.create({
-  baseUrl: 'http://localhost:8080',
+const sbx = await Sandbox.create({
+  baseUrl: 'http://127.0.0.1:8080',
   templateId: 'cubeplex-ubuntu24-desktop',
-  timeout: 1800,
+  volumeKey: 'agent-ws-042',
 });
 
-// Atomic tar.gz sync + streaming Code Interpreter + signed WebRTC/CDP panel URL
-await sandbox.files.archiveSync({ 'app/main.py': 'print("ready")\\n' }, { dest: '/workspace' });
-const panel = await sandbox.createEndpoint(8080, { expiresInSeconds: 3600 });
-console.log('Interactive GUI Panel:', panel.url);
+await sbx.files.archiveSync({ 'app/main.py': 'print("ok")\\n' }, { dest: '/workspace' });
+const panel = await sbx.createEndpoint(8080, { expiresInSeconds: 3600 });
+console.log('GUI Panel:', panel.url);
+await sbx.pause();`,
+  cli: `cubepod health
+cubepod sandbox create --template cubeplex-ubuntu24-desktop
+cubepod sandbox exec <id> "apt-get update && apt-get install -y ripgrep"
+cubepod sandbox fork <id>
+cubepod sandbox reset-rootfs <id>
+cubepod sandbox pause <id>
 
-await sandbox.pause();`}</code></pre>
+# Expose sandbox tools via Model Context Protocol
+cubepod mcp`,
+};
+
+const daemonLogs = {
+  e2b: [
+    { t: '0.038s', tag: 'WARMPOOL', msg: 'Claimed standby Kata MicroVM pod-wp-84a1 (<50ms)' },
+    { t: '0.094s', tag: 'CSI-BLK ', msg: 'Attached /dev/cubepod-rootfs (ext4) + /dev/cubepod-workspace' },
+    { t: '0.412s', tag: 'OVERLAY ', msg: 'pip install pandas matplotlib committed to RootFS upperdir' },
+    { t: '0.680s', tag: 'KERNEL  ', msg: 'python3 kernel executed cell · 1 HTML table artifact captured' },
+    { t: '0.715s', tag: 'READY   ', msg: 'State persisted on block PVC across suspend & wake' },
+  ],
+  python: [
+    { t: '0.044s', tag: 'VOLUME  ', msg: 'Bound deterministic volumeKey="agent-ws-042" -> /workspace' },
+    { t: '0.118s', tag: 'EGRESS  ', msg: 'Injected cpodref_gh_readonly_01 · mTLS vault armed (api.github.com)' },
+    { t: '0.842s', tag: 'COW-FORK', msg: 'CSI VolumeSnapshot cloned both PVCs -> child sandbox ready' },
+    { t: '1.190s', tag: 'RESET-OS', msg: 'rootfsGeneration bumped -> clean OS; /workspace untouched' },
+    { t: '1.310s', tag: 'SUSPEND ', msg: 'sync + fsfreeze complete -> Pod deleted (0 CPU / 0 RAM)' },
+  ],
+  ts: [
+    { t: '0.041s', tag: 'WARMPOOL', msg: 'MicroVM ready · volumeKey="agent-ws-042" attached (1000:1000)' },
+    { t: '0.165s', tag: 'ARCHIVE ', msg: 'POST /files/archive-sync unpacked app/main.py -> /workspace' },
+    { t: '0.290s', tag: 'PANEL   ', msg: 'Lazy Desktop Neko WebRTC (:8080) signed -> /panel/{jwt}/' },
+    { t: '0.420s', tag: 'SUSPEND ', msg: 'Zero-Export suspend complete · host memory reclaimed' },
+  ],
+  cli: [
+    { t: '0.012s', tag: 'HEALTH  ', msg: 'cubepod-gateway :8080 OK · controller :8081 OK · egress OK' },
+    { t: '0.046s', tag: 'CREATE  ', msg: 'Claimed Kata MicroVM from PodWarmPool in 46ms' },
+    { t: '0.860s', tag: 'FORK    ', msg: 'CoW clone created via CSI VolumeSnapshot in 860ms' },
+    { t: '1.020s', tag: 'MCP     ', msg: 'JSON-RPC stdio server listening (exec, files, fork, panel)' },
+  ],
+};
+
+const installCmds = {
+  helm: {
+    label: isZh ? 'Helm (GHCR OCI · K8s)' : 'Helm (GHCR OCI · K8s)',
+    cmd: 'helm install cubepod oci://ghcr.io/cubeplexai/charts/cubepod -n cubepod-system --create-namespace',
+  },
+  compose: {
+    label: isZh ? 'Docker Compose (本地)' : 'Docker Compose (Local)',
+    cmd: 'docker compose -f deploy/docker-compose/docker-compose.yaml up -d --build',
+  },
+};
+---
+
+<div class="cp-otel not-content">
+  <!-- ======================================================================= -->
+  <!-- 1. HERO SPLIT + INTERACTIVE MICROVM LIFECYCLE SIMULATOR                 -->
+  <!-- ======================================================================= -->
+  <section class="cp-band cp-hero-band">
+    <div class="cp-wrap cp-hero-grid">
+      <div class="cp-hero-copy">
+        <div class="cp-status-pill">
+          <span class="cp-beacon" aria-hidden="true">
+            <span class="cp-beacon-ping"></span>
+            <span class="cp-beacon-dot"></span>
+          </span>
+          <span class="cp-caps">{copy.badge}</span>
         </div>
 
-        <div class="cp-panel" data-tab-panel="cli">
-          <pre><code>{`# Provision from WarmPool or template, inspect, fork, and expose MCP tools
-cubepod health
-cubepod sandbox create --template cubeplex-ubuntu24-desktop
-cubepod sandbox exec <sandbox-id> "apt-get update && apt-get install -y ripgrep"
-cubepod sandbox pause <sandbox-id>
-cubepod sandbox fork <sandbox-id>
-cubepod sandbox reset-rootfs <sandbox-id>
+        <h1 class="cp-h1">
+          <span class="cp-h1-rest">{copy.h1Rest}</span>
+          <span class="cp-h1-accent">{copy.h1Accent}</span>
+        </h1>
 
-# Start native Model Context Protocol (MCP) JSON-RPC stdio server
-cubepod mcp`}</code></pre>
+        <p class="cp-hero-subhead">{copy.heroSubhead}</p>
+
+        <p class="cp-lead">{copy.subtitle}</p>
+
+        <div class="cp-actions">
+          <a href={`${prefix}/getting-started/quickstart/`} class="cp-btn cp-btn-primary">
+            <span>{copy.ctaPrimary}</span>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>
+            </svg>
+          </a>
+          <a href={`${prefix}/api/`} class="cp-btn cp-btn-secondary">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--cp-primary)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polyline points="4 17 10 11 4 5"/><line x1="12" x2="20" y1="19" y2="19"/>
+            </svg>
+            <span>{copy.ctaSecondary}</span>
+          </a>
+          <a href="https://github.com/cubeplexai/cubepod" target="_blank" rel="noopener noreferrer" class="cp-btn cp-btn-ghost">
+            <span>{copy.ctaGithub} ↗</span>
+          </a>
+        </div>
+
+        <div class="cp-cmd-wrap" data-cp-cmd-wrap>
+          <div class="cp-cmd-modes" role="tablist" aria-label={isZh ? '选择部署命令' : 'Select install command'}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected="true"
+              class="cp-cmd-mode is-active"
+              data-cmd-value={installCmds.helm.cmd}
+            >
+              {installCmds.helm.label}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected="false"
+              class="cp-cmd-mode"
+              data-cmd-value={installCmds.compose.cmd}
+            >
+              {installCmds.compose.label}
+            </button>
+          </div>
+          <div class="cp-cmd-bar">
+            <span class="cp-cmd-prompt">$</span>
+            <input
+              type="text"
+              readonly
+              value={installCmds.helm.cmd}
+              aria-label="Quickstart install command"
+              class="cp-cmd-input"
+              data-cmd-input
+            />
+            <button
+              type="button"
+              class="cp-cmd-copy"
+              data-copy-text={installCmds.helm.cmd}
+              data-label-default={copy.copyLabel}
+              data-label-done={copy.copiedLabel}
+            >
+              <span>{copy.copyLabel}</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Right: Interactive Lifecycle Simulator -->
+      <div class="cp-sim-card" data-cp-sim data-state="running">
+        <div class="cp-sim-head">
+          <div class="cp-sim-title">
+            <span class="cp-sim-led"></span>
+            <span class="cp-caps">{copy.simTitle}</span>
+          </div>
+          <div class="cp-sim-head-right">
+            <span class="cp-chip cp-sim-pill" data-sim-pill>{copy.simStates[0].pill}</span>
+            <button type="button" class="cp-sim-auto is-playing" data-sim-auto aria-pressed="true">
+              <span class="cp-sim-auto-dot"></span>
+              <span>{copy.simAuto}</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Lifecycle Stage Tabs -->
+        <div class="cp-sim-tabs" role="tablist">
+          {copy.simStates.map((st, idx) => (
+            <button
+              type="button"
+              role="tab"
+              class={`cp-sim-tab ${idx === 0 ? 'is-active' : ''}`}
+              aria-selected={idx === 0 ? 'true' : 'false'}
+              data-sim-target={st.id}
+            >
+              {st.label}
+            </button>
+          ))}
+        </div>
+
+        <!-- Animated Compute + OverlayFS + Dual Block Layers -->
+        <div class="cp-sim-stage">
+          <!-- Compute / Kata Pod Layer -->
+          <div class="cp-sim-compute">
+            <div class="cp-sim-row">
+              <span class="cp-sim-compute-title" data-sim-compute-title>{copy.simStates[0].computeTitle}</span>
+              <span class="cp-caps cp-sim-compute-meta" data-sim-compute-meta>{copy.simStates[0].computeMeta}</span>
+            </div>
+            <div class="cp-sim-overlay">
+              <span class="cp-mono-primary" data-sim-root-title>{copy.simStates[0].rootTitle}</span>
+              <span class="cp-caps cp-text-muted" data-sim-root-meta>{copy.simStates[0].rootMeta}</span>
+            </div>
+          </div>
+
+          <!-- Animated I/O Bus Lines -->
+          <div class="cp-sim-bus" aria-hidden="true">
+            <div class="cp-bus-lane"><span class="cp-bus-pulse"></span></div>
+            <div class="cp-bus-lane cp-bus-lane-sec"><span class="cp-bus-pulse"></span></div>
+          </div>
+
+          <!-- Persistent Dual CSI Raw Block PVCs -->
+          <div class="cp-sim-vols">
+            <div class="cp-sim-vol cp-sim-vol-rootfs">
+              <div class="cp-sim-vol-scan" aria-hidden="true"></div>
+              <div class="cp-sim-vol-head">
+                <code>/dev/cubepod-rootfs</code>
+                <span class="cp-caps cp-text-primary" data-sim-rootfs-state>{copy.simStates[0].rootfsState}</span>
+              </div>
+              <p data-sim-rootfs-note>{copy.simStates[0].rootfsNote}</p>
+            </div>
+
+            <div class="cp-sim-vol cp-sim-vol-ws">
+              <div class="cp-sim-vol-head">
+                <code>/dev/cubepod-workspace</code>
+                <span class="cp-caps cp-text-secondary" data-sim-ws-state>{copy.simStates[0].wsState}</span>
+              </div>
+              <p data-sim-ws-note>{copy.simStates[0].wsNote}</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="cp-sim-banner" data-sim-banner>
+          {copy.simStates[0].banner}
         </div>
       </div>
     </div>
   </section>
 
-  <!-- 4-LAYER SYSTEM ARCHITECTURE -->
-  <section class="cp-section">
-    <div class="cp-section-head">
-      <h2>{copy.archTitle}</h2>
-      <p>{copy.archSubtitle}</p>
-    </div>
-    <div class="cp-arch-grid">
-      {copy.layers.map((layer) => (
-        <div class={`cp-arch-layer cp-arch-${layer.color}`}>
-          <div class="cp-arch-num">{layer.num}</div>
-          <div class="cp-arch-body">
-            <h3>{layer.name}</h3>
-            <ul>
-              {layer.items.map((item) => <li>{item}</li>)}
-            </ul>
+  <!-- ======================================================================= -->
+  <!-- 2. WIREFRAME METRICS STRIP (Clean & Breathable)                         -->
+  <!-- ======================================================================= -->
+  <section class="cp-band cp-metrics-band">
+    <div class="cp-wrap cp-metrics-grid">
+      {copy.metrics.map((m, i) => (
+        <div class={`cp-metric-cell cp-tone-${m.tone} cp-reveal`} style={`--delay:${i * 70}ms`}>
+          <div class="cp-metric-top">
+            <span class="cp-caps cp-metric-kpi">{m.kpi}</span>
+            <span class="cp-metric-dot" aria-hidden="true"></span>
           </div>
+          <div class="cp-metric-val">{m.value}</div>
+          <div class="cp-metric-title">{m.title}</div>
+          <p class="cp-metric-desc">{m.desc}</p>
         </div>
       ))}
     </div>
   </section>
 
-  <!-- 6-CARD ENTERPRISE CAPABILITY BENTO -->
-  <section class="cp-section">
-    <div class="cp-section-head">
-      <h2>{copy.bentoTitle}</h2>
-    </div>
-    <div class="cp-bento">
-      {copy.features.map((f) => (
-        <a href={f.href} class="cp-bento-card">
-          <span class="cp-bento-tag">{f.tag}</span>
-          <h3>{f.title}</h3>
-          <p>{f.desc}</p>
-        </a>
-      ))}
-    </div>
-  </section>
-
-  <!-- COMPARISON MATRIX -->
-  <section class="cp-section">
-    <div class="cp-section-head">
-      <h2>{copy.compareTitle}</h2>
-    </div>
-    <div class="cp-table-wrap">
-      <table class="cp-compare-table">
-        <thead>
-          <tr>
-            {copy.compareHeaders.map((h) => <th>{h}</th>)}
-          </tr>
-        </thead>
-        <tbody>
-          {copy.compareRows.map((row) => (
-            <tr>
-              <td class="cp-td-dim">{row[0]}</td>
-              <td class="cp-td-old">{row[1]}</td>
-              <td class="cp-td-new">{row[2]}</td>
-            </tr>
+  <!-- ======================================================================= -->
+  <!-- 3. SDK CODE + STREAMING PODD DAEMON LOG CONSOLE                         -->
+  <!-- ======================================================================= -->
+  <section class="cp-band cp-surface-band" id="quickstart">
+    <div class="cp-wrap">
+      <div class="cp-head-split">
+        <div>
+          <div class="cp-eyebrow">{copy.sdkEyebrow}</div>
+          <h2 class="cp-h2">{copy.sdkTitle}</h2>
+          <p class="cp-sub">{copy.sdkSubtitle}</p>
+        </div>
+        <div class="cp-seg-tabs" role="tablist" data-cp-tabs>
+          {copy.tabs.map((tab, idx) => (
+            <button
+              type="button"
+              role="tab"
+              class={`cp-seg-tab ${idx === 0 ? 'is-active' : ''}`}
+              aria-selected={idx === 0 ? 'true' : 'false'}
+              data-tab-target={tab.id}
+              data-tab-file={tab.file}
+            >
+              {tab.label}
+            </button>
           ))}
-        </tbody>
-      </table>
+        </div>
+      </div>
+
+      <div class="cp-ide-split cp-reveal" data-cp-terminal>
+        <!-- Left: Code Pane -->
+        <div class="cp-ide-code">
+          <div class="cp-term-bar">
+            <div class="cp-term-dots">
+              <span class="cp-tdot"></span>
+              <span class="cp-tdot"></span>
+              <span class="cp-tdot"></span>
+              <span class="cp-term-file" data-term-file>{copy.tabs[0].file}</span>
+            </div>
+            <div class="cp-term-meta">
+              <button type="button" class="cp-term-btn" data-term-replay>▶ {copy.replayLabel}</button>
+              <button
+                type="button"
+                class="cp-term-btn"
+                data-term-copy
+                data-label-default={copy.copyLabel}
+                data-label-done={copy.copiedLabel}
+              >
+                {copy.copyLabel}
+              </button>
+            </div>
+          </div>
+
+          <div class="cp-term-body">
+            {Object.entries(snippets).map(([id, code], idx) => {
+              const lines = code.split('\n');
+              return (
+                <div class={`cp-code-pane ${idx === 0 ? 'is-active' : ''}`} data-tab-panel={id}>
+                  <div class="cp-gutter" aria-hidden="true">
+                    {lines.map((_, i) => (
+                      <span>{String(i + 1).padStart(2, '0')}</span>
+                    ))}
+                  </div>
+                  <pre class="cp-pre"><code>{code}</code></pre>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <!-- Right: Streaming Daemon Output -->
+        <div class="cp-ide-logs">
+          <div class="cp-term-bar">
+            <span class="cp-term-file">{copy.logHeader}</span>
+            <span class="cp-log-badge">
+              <span class="cp-dot-ok"></span>
+              <span class="cp-caps">{copy.logStatus}</span>
+            </span>
+          </div>
+          <div class="cp-log-body" data-log-body aria-live="polite">
+            {daemonLogs.e2b.map((line) => (
+              <div class="cp-log-line is-visible">
+                <span class="cp-log-t">[{line.t}]</span>
+                <span class="cp-log-tag">{line.tag}</span>
+                <span class="cp-log-msg">{line.msg}</span>
+              </div>
+            ))}
+          </div>
+          <div class="cp-log-cursor">
+            <span class="cp-cursor-block">_</span>
+          </div>
+        </div>
+      </div>
     </div>
   </section>
 
-  <!-- ECOSYSTEM FOOTER CTA -->
-  <section class="cp-footer-cta">
-    <div>
-      <h2>{copy.ecoTitle}</h2>
-      <p>{copy.ecoDesc}</p>
-    </div>
-    <div class="cp-actions">
-      <a href={`${prefix}/concepts/architecture/`} class="cp-btn cp-btn-primary">{copy.ecoExplore}</a>
-      <a href={`${prefix}/api/`} class="cp-btn cp-btn-secondary">{copy.ecoApi}</a>
-      <a href="/llms.txt" class="cp-btn cp-btn-ghost">{copy.ecoLlms}</a>
-    </div>
-    <div class="cp-eco-links">
-      <a href="https://github.com/cubeplexai/cubeplex" target="_blank" rel="noopener noreferrer">CubePlex</a>
-      <span>·</span>
-      <a href="https://github.com/cubeplexai/cubeloop" target="_blank" rel="noopener noreferrer">CubeLoop</a>
-      <span>·</span>
-      <a href="https://github.com/cubeplexai/cubepod" target="_blank" rel="noopener noreferrer">CubePod (Apache 2.0)</a>
+  <!-- ======================================================================= -->
+  <!-- 4. FOUR-LAYER ARCHITECTURE STACK (Crisp Scannable Bands)                -->
+  <!-- ======================================================================= -->
+  <section class="cp-band" id="architecture">
+    <div class="cp-wrap">
+      <div class="cp-head-block">
+        <div class="cp-eyebrow">{copy.archEyebrow}</div>
+        <h2 class="cp-h2">{copy.archTitle}</h2>
+        <p class="cp-sub">{copy.archSubtitle}</p>
+      </div>
+
+      <div class="cp-arch-stack">
+        {copy.layers.map((layer, i) => (
+          <div class={`cp-arch-band cp-arch-${layer.tone} cp-reveal`} style={`--delay:${i * 75}ms`}>
+            <div class="cp-arch-left">
+              <span class="cp-arch-num">{layer.num}</span>
+              <div>
+                <div class="cp-arch-title-row">
+                  <h3>{layer.name}</h3>
+                  <span class={`cp-tag cp-tag-${layer.tone}`}>{layer.tag}</span>
+                </div>
+                <p>{layer.desc}</p>
+              </div>
+            </div>
+            <div class="cp-arch-chips">
+              {layer.chips.map((c) => (
+                <span class="cp-chip">{c}</span>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   </section>
+
+  <!-- ======================================================================= -->
+  <!-- 5. SIX-CARD BENTO GRID (Generous Whitespace, Concise Copy)              -->
+  <!-- ======================================================================= -->
+  <section class="cp-band cp-surface-band" id="features">
+    <div class="cp-wrap">
+      <div class="cp-head-center">
+        <div class="cp-eyebrow">{copy.bentoEyebrow}</div>
+        <h2 class="cp-h2">{copy.bentoTitle}</h2>
+        <p class="cp-sub">{copy.bentoSubtitle}</p>
+      </div>
+
+      <div class="cp-bento-grid">
+        {copy.features.map((f, i) => (
+          <a href={f.href} class={`cp-bento-card cp-bento-${f.tone} cp-reveal`} style={`--delay:${i * 60}ms`}>
+            <div>
+              <div class="cp-bento-icon-row">
+                <div class="cp-bento-icon" aria-hidden="true">
+                  {f.icon === 'storage' && (
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>
+                  )}
+                  {f.icon === 'pause' && (
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="10" x2="10" y1="15" y2="9"/><line x1="14" x2="14" y1="15" y2="9"/></svg>
+                  )}
+                  {f.icon === 'fork' && (
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><path d="M18 9v2c0 .6-.4 1-1 1H7c-.6 0-1-.4-1-1V9"/><path d="M12 12v3"/></svg>
+                  )}
+                  {f.icon === 'shield' && (
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></svg>
+                  )}
+                  {f.icon === 'desktop' && (
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>
+                  )}
+                  {f.icon === 'hub' && (
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4"/><path d="m16.2 7.8 2.9-2.9"/><path d="M18 12h4"/><path d="m16.2 16.2 2.9 2.9"/><path d="M12 18v4"/><path d="m4.9 19.1 2.9-2.9"/><path d="M2 12h4"/><path d="m4.9 4.9 2.9 2.9"/><circle cx="12" cy="12" r="3"/></svg>
+                  )}
+                </div>
+                <span class="cp-tag">{f.tag}</span>
+              </div>
+              <h3>{f.title}</h3>
+              <p>{f.desc}</p>
+            </div>
+            <div class="cp-bento-foot">
+              <span>{f.foot}</span>
+              <span aria-hidden="true">→</span>
+            </div>
+          </a>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================================= -->
+  <!-- 6. CONCISE COMPARISON MATRIX                                            -->
+  <!-- ======================================================================= -->
+  <section class="cp-band">
+    <div class="cp-wrap">
+      <div class="cp-head-block">
+        <div class="cp-eyebrow">{copy.compareEyebrow}</div>
+        <h2 class="cp-h2">{copy.compareTitle}</h2>
+      </div>
+
+      <div class="cp-matrix-wrap cp-reveal">
+        <table class="cp-matrix">
+          <colgroup>
+            <col style="width: 19%;" />
+            <col style="width: 31%;" />
+            <col style="width: 25%;" />
+            <col style="width: 25%;" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th>{copy.compareHeaders[0]}</th>
+              <th class="cp-col-highlight">{copy.compareHeaders[1]}</th>
+              <th>{copy.compareHeaders[2]}</th>
+              <th>{copy.compareHeaders[3]}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {copy.compareRows.map((row) => (
+              <tr>
+                <td class="cp-cell-dim">{row[0]}</td>
+                <td class="cp-cell-highlight">{row[1]}</td>
+                <td class="cp-cell-muted">{row[2]}</td>
+                <td class="cp-cell-muted">{row[3]}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======================================================================= -->
+  <!-- 7. ECOSYSTEM CTA BANNER & FOOTER                                        -->
+  <!-- ======================================================================= -->
+  <section class="cp-band cp-surface-band">
+    <div class="cp-wrap">
+      <div class="cp-cta-panel cp-reveal">
+        <div class="cp-cta-body">
+          <div class="cp-eyebrow">{copy.ecoEyebrow}</div>
+          <h2 class="cp-h2">{copy.ecoTitle}</h2>
+          <p class="cp-sub">
+            {isZh ? (
+              <>
+                采用<strong>脑手解耦（Brain-Hands Decoupling）</strong>架构：上层「脑」由{' '}
+                <a href="https://github.com/cubeplexai/cubeplex" class="cp-eco-link" target="_blank" rel="noopener noreferrer">
+                  CubePlex
+                </a>
+                （团队 Agent 工作空间）与{' '}
+                <a href="https://github.com/cubeplexai/cubeloop" class="cp-eco-link" target="_blank" rel="noopener noreferrer">
+                  CubeLoop
+                </a>
+                （异步 Agent 运行时）负责规划决策，底层「手」由 CubePod 提供持久化硬件隔离执行底座。
+              </>
+            ) : (
+              <>
+                Built on a <strong>Brain-Hands Decoupling</strong> architecture:{' '}
+                <a href="https://github.com/cubeplexai/cubeplex" class="cp-eco-link" target="_blank" rel="noopener noreferrer">
+                  CubePlex
+                </a>{' '}
+                (Team Agent Workspace) and{' '}
+                <a href="https://github.com/cubeplexai/cubeloop" class="cp-eco-link" target="_blank" rel="noopener noreferrer">
+                  CubeLoop
+                </a>{' '}
+                (Async Agent Runtime) act as the reasoning Brain, while CubePod provides the persistent hardware-isolated execution Hands.
+              </>
+            )}
+          </p>
+          <div class="cp-actions">
+            <a href={`${prefix}/concepts/architecture/`} class="cp-btn cp-btn-primary">{copy.ecoExplore}</a>
+            <a href={`${prefix}/api/`} class="cp-btn cp-btn-secondary">{copy.ecoApi}</a>
+            <a href="/llms.txt" class="cp-btn cp-btn-ghost">{copy.ecoLlms}</a>
+          </div>
+        </div>
+        <pre class="cp-cta-ascii" aria-hidden="true">{`[ BRAIN · Planning & Orchestration ]
++--------------------------------------------+
+|  CubePlex        Team Agent Workspace      |
+|  Collaborative UI · Threads · Sessions     |
++--------------------------------------------+
+                     |  orchestrates
+                     v
++--------------------------------------------+
+|  CubeLoop        Async Agent Runtime       |
+|  Long-Lived Loops · Tool Calls · State     |
++--------------------------------------------+
+                     |
+====== Brain-Hands Decoupling (REST/MCP) =====
+                     |  executes in
+                     v
+`}<span class="cp-ascii-accent">{`[ HANDS · Hardware-Isolated Execution ]
++--------------------------------------------+
+|  CubePod         MicroVM Execution Layer   |
+|  Persistent RootFS · /workspace · Zero-CPU |
++--------------------------------------------+`}</span></pre>
+      </div>
+    </div>
+  </section>
+
+  <footer class="cp-footer">
+    <div class="cp-wrap">
+      <div class="cp-footer-grid">
+        <div class="cp-footer-brand">
+          <div class="cp-footer-logo">
+            <img src="/favicon.svg" alt="CubePod" width="22" height="22" />
+            <span>CubePod</span>
+            <span class="cp-chip cp-chip-primary">v0.4.1</span>
+          </div>
+          <p>{copy.footerDesc}</p>
+        </div>
+
+        {copy.footerCols.map((col) => (
+          <div class="cp-footer-col">
+            <div class="cp-caps cp-footer-col-title">{col.title}</div>
+            <ul>
+              {col.links.map((l) => (
+                <li>
+                  <a
+                    href={l.href}
+                    target={l.ext ? '_blank' : undefined}
+                    rel={l.ext ? 'noopener noreferrer' : undefined}
+                  >
+                    {l.label}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+
+      <div class="cp-footer-bottom">
+        <span>{copy.copyright}</span>
+        <span class="cp-text-ok">● {copy.statusNominal}</span>
+      </div>
+    </div>
+  </footer>
 </div>
 
-<script is:inline>
-  document.querySelectorAll('[data-cp-switcher]').forEach((root) => {
-    const tabs = root.querySelectorAll('[data-tab-target]');
-    const panels = root.querySelectorAll('[data-tab-panel]');
+<script is:inline define:vars={{ simStates: copy.simStates, daemonLogs }}>
+  function copyTextToClipboard(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise((resolve, reject) => {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (ok) resolve();
+        else reject(new Error('copy failed'));
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  // 1. Install mode switcher + Copy command button
+  const cmdWrap = document.querySelector('[data-cp-cmd-wrap]');
+  if (cmdWrap) {
+    const cmdInput = cmdWrap.querySelector('[data-cmd-input]');
+    const cmdCopy = cmdWrap.querySelector('[data-copy-text]');
+    const cmdModes = cmdWrap.querySelectorAll('[data-cmd-value]');
+    cmdModes.forEach((modeBtn) => {
+      modeBtn.addEventListener('click', () => {
+        const val = modeBtn.getAttribute('data-cmd-value') || '';
+        cmdModes.forEach((m) => {
+          const active = m === modeBtn;
+          m.classList.toggle('is-active', active);
+          m.setAttribute('aria-selected', active ? 'true' : 'false');
+        });
+        if (cmdInput) cmdInput.value = val;
+        if (cmdCopy) cmdCopy.setAttribute('data-copy-text', val);
+      });
+    });
+  }
+
+  document.querySelectorAll('[data-copy-text]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const text = btn.getAttribute('data-copy-text') || '';
+      const span = btn.querySelector('span');
+      const def = btn.getAttribute('data-label-default') || 'Copy';
+      const done = btn.getAttribute('data-label-done') || 'Copied';
+      copyTextToClipboard(text).then(() => {
+        if (span) span.textContent = done;
+        setTimeout(() => {
+          if (span) span.textContent = def;
+        }, 1600);
+      });
+    });
+  });
+
+  // 2. Hero Interactive MicroVM Lifecycle Simulator
+  const simCard = document.querySelector('[data-cp-sim]');
+  if (simCard && Array.isArray(simStates)) {
+    const simTabs = Array.from(simCard.querySelectorAll('[data-sim-target]'));
+    const autoBtn = simCard.querySelector('[data-sim-auto]');
+    const elPill = simCard.querySelector('[data-sim-pill]');
+    const elComputeTitle = simCard.querySelector('[data-sim-compute-title]');
+    const elComputeMeta = simCard.querySelector('[data-sim-compute-meta]');
+    const elRootTitle = simCard.querySelector('[data-sim-root-title]');
+    const elRootMeta = simCard.querySelector('[data-sim-root-meta]');
+    const elRootfsState = simCard.querySelector('[data-sim-rootfs-state]');
+    const elRootfsNote = simCard.querySelector('[data-sim-rootfs-note]');
+    const elWsState = simCard.querySelector('[data-sim-ws-state]');
+    const elWsNote = simCard.querySelector('[data-sim-ws-note]');
+    const elBanner = simCard.querySelector('[data-sim-banner]');
+
+    let currentIdx = 0;
+    let autoPlay = !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    let timer = null;
+
+    function applySimState(idx) {
+      currentIdx = idx;
+      const st = simStates[idx];
+      if (!st) return;
+      simCard.setAttribute('data-state', st.id);
+      simTabs.forEach((t, i) => {
+        const active = i === idx;
+        t.classList.toggle('is-active', active);
+        t.setAttribute('aria-selected', active ? 'true' : 'false');
+      });
+      if (elPill) elPill.textContent = st.pill;
+      if (elComputeTitle) elComputeTitle.textContent = st.computeTitle;
+      if (elComputeMeta) elComputeMeta.textContent = st.computeMeta;
+      if (elRootTitle) elRootTitle.textContent = st.rootTitle;
+      if (elRootMeta) elRootMeta.textContent = st.rootMeta;
+      if (elRootfsState) elRootfsState.textContent = st.rootfsState;
+      if (elRootfsNote) elRootfsNote.textContent = st.rootfsNote;
+      if (elWsState) elWsState.textContent = st.wsState;
+      if (elWsNote) elWsNote.textContent = st.wsNote;
+      if (elBanner) elBanner.textContent = st.banner;
+    }
+
+    function stopAuto() {
+      autoPlay = false;
+      if (timer) clearInterval(timer);
+      timer = null;
+      if (autoBtn) {
+        autoBtn.classList.remove('is-playing');
+        autoBtn.setAttribute('aria-pressed', 'false');
+      }
+    }
+
+    function startAuto() {
+      if (timer) clearInterval(timer);
+      autoPlay = true;
+      if (autoBtn) {
+        autoBtn.classList.add('is-playing');
+        autoBtn.setAttribute('aria-pressed', 'true');
+      }
+      timer = setInterval(() => {
+        applySimState((currentIdx + 1) % simStates.length);
+      }, 3800);
+    }
+
+    simTabs.forEach((btn, idx) => {
+      btn.addEventListener('click', () => {
+        stopAuto();
+        applySimState(idx);
+      });
+    });
+
+    if (autoBtn) {
+      autoBtn.addEventListener('click', () => {
+        if (autoPlay) stopAuto();
+        else startAuto();
+      });
+    }
+
+    if (autoPlay) startAuto();
+    else stopAuto();
+  }
+
+  // 3. SDK Switcher + Streaming Daemon Log Replay
+  const tabWrap = document.querySelector('[data-cp-tabs]');
+  const termWrap = document.querySelector('[data-cp-terminal]');
+  if (tabWrap && termWrap) {
+    const tabs = tabWrap.querySelectorAll('[data-tab-target]');
+    const panels = termWrap.querySelectorAll('[data-tab-panel]');
+    const fileEl = termWrap.querySelector('[data-term-file]');
+    const copyBtn = termWrap.querySelector('[data-term-copy]');
+    const replayBtn = termWrap.querySelector('[data-term-replay]');
+    const logBody = termWrap.querySelector('[data-log-body]');
+    let currentTab = 'e2b';
+    let logTimers = [];
+
+    function streamLogs(tabId) {
+      if (!logBody) return;
+      logTimers.forEach((id) => clearTimeout(id));
+      logTimers = [];
+      const entries = daemonLogs[tabId] || [];
+      logBody.innerHTML = '';
+
+      const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+      if (replayBtn) {
+        replayBtn.classList.toggle('is-replaying', !reduced && entries.length > 0);
+      }
+
+      entries.forEach((entry, idx) => {
+        const delay = reduced ? 0 : 90 + idx * 280;
+        const tid = setTimeout(() => {
+          const row = document.createElement('div');
+          row.className = 'cp-log-line';
+
+          const tSpan = document.createElement('span');
+          tSpan.className = 'cp-log-t';
+          tSpan.textContent = `[${entry.t}]`;
+
+          const tagSpan = document.createElement('span');
+          tagSpan.className = 'cp-log-tag';
+          tagSpan.textContent = entry.tag;
+
+          const msgSpan = document.createElement('span');
+          msgSpan.className = 'cp-log-msg';
+          msgSpan.textContent = entry.msg;
+
+          row.append(tSpan, tagSpan, msgSpan);
+          logBody.appendChild(row);
+
+          if (reduced) {
+            row.classList.add('is-visible');
+          } else {
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                row.classList.add('is-visible');
+              });
+            });
+          }
+
+          if (idx === entries.length - 1 && replayBtn) {
+            const doneTid = setTimeout(() => {
+              replayBtn.classList.remove('is-replaying');
+            }, 300);
+            logTimers.push(doneTid);
+          }
+        }, delay);
+        logTimers.push(tid);
+      });
+    }
+
     tabs.forEach((btn) => {
       btn.addEventListener('click', () => {
-        const target = btn.getAttribute('data-tab-target');
+        const target = btn.getAttribute('data-tab-target') || 'e2b';
+        const file = btn.getAttribute('data-tab-file');
+        currentTab = target;
         tabs.forEach((t) => {
           const active = t === btn;
           t.classList.toggle('is-active', active);
@@ -482,109 +1328,208 @@ cubepod mcp`}</code></pre>
         panels.forEach((p) => {
           p.classList.toggle('is-active', p.getAttribute('data-tab-panel') === target);
         });
+        if (fileEl && file) fileEl.textContent = file;
+        streamLogs(target);
       });
     });
-  });
+
+    if (replayBtn) {
+      replayBtn.addEventListener('click', () => streamLogs(currentTab));
+    }
+
+    if (copyBtn) {
+      copyBtn.addEventListener('click', () => {
+        const activeCode = termWrap.querySelector('.cp-code-pane.is-active code');
+        if (!activeCode) return;
+        const def = copyBtn.getAttribute('data-label-default') || 'Copy';
+        const done = copyBtn.getAttribute('data-label-done') || 'Copied';
+        copyTextToClipboard(activeCode.textContent || '').then(() => {
+          copyBtn.textContent = done;
+          setTimeout(() => {
+            copyBtn.textContent = def;
+          }, 1600);
+        });
+      });
+    }
+  }
+
+  // 4. Scroll Reveal Observer
+  const reveals = document.querySelectorAll('.cp-reveal');
+  if ('IntersectionObserver' in window && !window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+    const io = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add('is-in');
+            io.unobserve(entry.target);
+          }
+        });
+      },
+      { threshold: 0.12, rootMargin: '0px 0px -30px 0px' }
+    );
+    reveals.forEach((el) => io.observe(el));
+  } else {
+    reveals.forEach((el) => el.classList.add('is-in'));
+  }
 </script>
 
 <style>
-  .cp-landing {
-    position: relative;
+  .cp-otel {
     display: flex;
     flex-direction: column;
-    gap: 4.5rem;
-    padding: 1.5rem 0 3rem;
+    color: var(--cp-body);
   }
 
-  .cp-bg-grid {
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    z-index: -1;
+  .cp-wrap {
+    max-width: 1280px;
+    margin-inline: auto;
+    padding-inline: clamp(1.25rem, 3vw, 2.5rem);
+  }
+
+  .cp-band {
+    padding-block: clamp(3.75rem, 6vw, 5.5rem);
+    border-bottom: 1px solid var(--cp-border);
+    background: var(--cp-canvas);
+  }
+
+  .cp-surface-band {
+    background: var(--cp-surface-solid);
+  }
+
+  .cp-hero-band {
+    padding-top: clamp(1.5rem, 2.8vw, 2.35rem);
+    padding-bottom: clamp(2.75rem, 4.5vw, 3.75rem);
     background-image:
-      radial-gradient(circle at 18% 12%, rgba(34, 211, 238, 0.14), transparent 42%),
-      radial-gradient(circle at 82% 28%, rgba(129, 140, 248, 0.14), transparent 44%),
-      linear-gradient(to right, rgba(148, 163, 184, 0.05) 1px, transparent 1px),
-      linear-gradient(to bottom, rgba(148, 163, 184, 0.05) 1px, transparent 1px);
-    background-size: 100% 100%, 100% 100%, 48px 48px, 48px 48px;
+      radial-gradient(circle at 18% 15%, var(--cp-glow-primary), transparent 46%),
+      linear-gradient(to right, var(--cp-grid-line) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--cp-grid-line) 1px, transparent 1px);
+    background-size: 100% 100%, 36px 36px, 36px 36px;
   }
 
-  .cp-hero {
+  .cp-hero-grid {
     display: grid;
-    grid-template-columns: 1.15fr 0.95fr;
-    gap: 2.5rem;
-    align-items: center;
-    padding-top: 1.25rem;
+    grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr);
+    gap: clamp(2rem, 4vw, 3.25rem);
+    align-items: start;
   }
 
-  @media (max-width: 960px) {
-    .cp-hero {
+  @media (max-width: 1024px) {
+    .cp-hero-grid {
       grid-template-columns: 1fr;
     }
   }
 
-  .cp-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.55rem;
-    padding: 0.35rem 0.9rem;
-    border-radius: 999px;
-    border: 1px solid var(--cp-border-accent);
-    background: rgba(34, 211, 238, 0.08);
-    color: var(--cp-cyan);
+  .cp-caps {
     font-family: var(--sl-font-mono);
-    font-size: 0.8rem;
-    margin-bottom: 1.25rem;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
   }
 
-  .cp-dot {
-    width: 0.5rem;
-    height: 0.5rem;
-    border-radius: 50%;
-    background: var(--cp-cyan);
-    box-shadow: 0 0 10px var(--cp-cyan);
+  .cp-eyebrow {
+    font-family: var(--sl-font-mono);
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--cp-primary);
+    margin-bottom: 0.65rem;
+  }
+
+  .cp-status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.35rem 0.75rem;
+    border-radius: 0.25rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-surface);
+    color: var(--cp-muted);
+    margin-bottom: 1.35rem;
+  }
+
+  .cp-beacon {
+    position: relative;
+    display: inline-flex;
+    width: 8px;
+    height: 8px;
+  }
+
+  .cp-beacon-ping {
+    position: absolute;
+    inset: 0;
+    border-radius: 9999px;
+    background: var(--cp-primary);
+    opacity: 0.65;
+    animation: cp-ping 2.2s cubic-bezier(0, 0, 0.2, 1) infinite;
+  }
+
+  .cp-beacon-dot {
+    position: relative;
+    width: 8px;
+    height: 8px;
+    border-radius: 9999px;
+    background: var(--cp-primary);
+  }
+
+  @keyframes cp-ping {
+    75%, 100% { transform: scale(2.1); opacity: 0; }
   }
 
   .cp-h1 {
-    font-size: clamp(2.15rem, 4vw, 3.35rem);
-    line-height: 1.12;
+    font-family: var(--cp-font-display);
+    font-size: clamp(2.05rem, 3.45vw, 2.95rem);
     font-weight: 800;
+    line-height: 1.12;
     letter-spacing: -0.03em;
     color: var(--cp-heading);
-    margin: 0 0 1.25rem;
+    margin: 0 0 0.75rem;
   }
 
-  .cp-gradient-text {
+  .cp-h1-accent {
     display: block;
-    background: linear-gradient(120deg, #22d3ee 0%, #38bdf8 48%, #818cf8 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+    color: var(--cp-primary);
   }
 
-  .cp-subtitle {
-    font-size: 1.08rem;
+  .cp-h1-rest {
+    display: block;
+  }
+
+  .cp-hero-subhead {
+    font-family: var(--cp-font-display);
+    font-size: clamp(0.98rem, 1.25vw, 1.12rem);
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--cp-heading);
+    margin: 0 0 0.85rem;
+  }
+
+  .cp-lead {
+    font-size: 0.98rem;
     line-height: 1.7;
     color: var(--cp-muted);
-    margin: 0 0 1.85rem;
-    max-width: 60ch;
+    max-width: 52ch;
+    margin: 0 0 1.65rem;
   }
 
   .cp-actions {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.85rem;
+    gap: 0.75rem;
   }
 
   .cp-btn {
     display: inline-flex;
     align-items: center;
     gap: 0.5rem;
-    padding: 0.72rem 1.25rem;
-    border-radius: 0.6rem;
+    padding: 0.68rem 1.2rem;
+    border-radius: 0.25rem;
+    font-family: var(--cp-font-display);
     font-weight: 600;
     font-size: 0.94rem;
     text-decoration: none !important;
-    transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
   }
 
   .cp-btn:hover {
@@ -592,419 +1537,1279 @@ cubepod mcp`}</code></pre>
   }
 
   .cp-btn-primary {
-    background: linear-gradient(135deg, #22d3ee, #06b6d4);
-    color: #04131c !important;
-    box-shadow: 0 8px 24px -6px rgba(34, 211, 238, 0.45);
+    background: var(--cp-primary);
+    color: var(--cp-primary-ink) !important;
+    border: 1px solid var(--cp-primary);
+  }
+
+  .cp-btn-primary:hover {
+    background: var(--cp-primary-hover);
+    border-color: var(--cp-primary-hover);
   }
 
   .cp-btn-secondary {
     background: var(--cp-surface);
     color: var(--cp-heading) !important;
-    border: 1px solid var(--cp-border-accent);
+    border: 1px solid var(--cp-border-active);
+  }
+
+  .cp-btn-secondary:hover {
+    background: var(--cp-surface-high);
+    border-color: var(--cp-primary-border);
   }
 
   .cp-btn-ghost {
     background: transparent;
     color: var(--cp-muted) !important;
-    border: 1px solid var(--cp-border);
+    border: 1px solid transparent;
   }
 
-  .cp-vm-card {
-    background: var(--cp-surface);
-    border: 1px solid var(--cp-border);
-    border-radius: 1rem;
-    padding: 1.25rem;
-    box-shadow: 0 24px 50px -18px rgba(2, 6, 23, 0.7);
+  .cp-btn-ghost:hover {
+    color: var(--cp-heading) !important;
+    border-color: var(--cp-border);
   }
 
-  .cp-vm-header {
+  .cp-cmd-wrap {
+    margin-top: 1.4rem;
+    max-width: 39rem;
+    border: 1px solid var(--cp-border);
+    border-radius: 0.25rem;
+    background: var(--cp-well);
+    overflow: hidden;
+  }
+
+  .cp-cmd-modes {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    gap: 0.75rem;
-    margin-bottom: 1rem;
+    gap: 0.25rem;
+    padding: 0.35rem 0.5rem;
+    background: var(--cp-surface);
+    border-bottom: 1px solid var(--cp-border);
+  }
+
+  .cp-cmd-mode {
+    appearance: none;
+    margin: 0;
+    padding: 0.22rem 0.55rem;
+    border: 1px solid transparent;
+    border-radius: 0.2rem;
+    background: transparent;
+    color: var(--cp-muted);
+    font-family: var(--sl-font-mono);
+    font-size: 0.69rem;
+    font-weight: 500;
+    line-height: 1.2;
+    cursor: pointer;
+    transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+  }
+
+  .cp-cmd-mode:hover {
+    color: var(--cp-heading);
+  }
+
+  .cp-cmd-mode.is-active {
+    background: var(--cp-primary-soft);
+    border-color: var(--cp-primary-border);
+    color: var(--cp-primary);
+    font-weight: 600;
+  }
+
+  .cp-cmd-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 0.75rem;
+  }
+
+  .cp-cmd-prompt {
+    font-family: var(--sl-font-mono);
+    font-size: 0.8125rem;
+    color: var(--cp-primary);
+    user-select: none;
+  }
+
+  .cp-cmd-input {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: 0;
+    outline: none;
+    color: var(--cp-heading);
     font-family: var(--sl-font-mono);
     font-size: 0.78rem;
   }
 
-  .cp-vm-pill {
-    padding: 0.25rem 0.65rem;
-    border-radius: 0.4rem;
-    background: rgba(129, 140, 248, 0.14);
-    color: var(--cp-indigo);
-    border: 1px solid rgba(129, 140, 248, 0.3);
+  .cp-cmd-copy {
+    appearance: none;
+    background: transparent;
+    border: 0;
+    border-left: 1px solid var(--cp-border);
+    padding: 0.15rem 0.2rem 0.15rem 0.65rem;
+    color: var(--cp-muted);
+    font-family: var(--sl-font-mono);
+    font-size: 0.74rem;
+    cursor: pointer;
   }
 
-  .cp-vm-status {
+  .cp-cmd-copy:hover {
+    color: var(--cp-primary);
+  }
+
+  /* ===================================================================== */
+  /* HERO INTERACTIVE LIFECYCLE SIMULATOR                                  */
+  /* ===================================================================== */
+  .cp-sim-card {
+    background: var(--cp-surface);
+    border: 1px solid var(--cp-border);
+    border-radius: 0.375rem;
+    padding: 1.15rem;
+  }
+
+  .cp-sim-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    padding-bottom: 0.85rem;
+    border-bottom: 1px solid var(--cp-border);
+  }
+
+  .cp-sim-title {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--cp-heading);
+  }
+
+  .cp-sim-led {
+    width: 8px;
+    height: 8px;
+    border-radius: 9999px;
+    background: var(--cp-ok);
+    transition: background 0.25s ease;
+  }
+
+  .cp-sim-card[data-state='suspend'] .cp-sim-led {
+    background: var(--cp-subtle);
+  }
+
+  .cp-sim-card[data-state='reset'] .cp-sim-led {
+    background: var(--cp-primary);
+  }
+
+  .cp-sim-head-right {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+  }
+
+  .cp-chip {
     display: inline-flex;
     align-items: center;
-    gap: 0.4rem;
-    color: var(--cp-emerald);
+    font-family: var(--sl-font-mono);
+    font-size: 0.72rem;
+    line-height: 1;
+    min-height: 1.7rem;
+    padding: 0.25rem 0.55rem;
+    border-radius: 0.25rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-surface-high);
+    color: var(--cp-body);
+    margin: 0;
   }
 
-  .cp-dot-green {
-    width: 0.45rem;
-    height: 0.45rem;
-    border-radius: 50%;
-    background: var(--cp-emerald);
+  .cp-chip-primary {
+    color: var(--cp-primary);
+    border-color: var(--cp-primary-border);
+    background: var(--cp-primary-soft);
   }
 
-  .cp-vm-stack {
+  .cp-sim-auto {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-height: 1.7rem;
+    line-height: 1;
+    padding: 0.25rem 0.6rem;
+    margin: 0;
+    border-radius: 0.25rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-well);
+    color: var(--cp-muted);
+    font-family: var(--sl-font-mono);
+    font-size: 0.68rem;
+    cursor: pointer;
+  }
+
+  .cp-sim-auto-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background: var(--cp-subtle);
+  }
+
+  .cp-sim-auto.is-playing {
+    color: var(--cp-primary);
+    border-color: var(--cp-primary-border);
+  }
+
+  .cp-sim-auto.is-playing .cp-sim-auto-dot {
+    background: var(--cp-primary);
+    animation: cp-ping 1.8s infinite;
+  }
+
+  .cp-sim-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 0.3rem;
+    margin: 0.85rem 0;
+  }
+
+  .cp-sim-tab {
+    appearance: none;
+    flex: 1 1 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0;
+    min-height: 2rem;
+    line-height: 1.2;
+    padding: 0.4rem 0.5rem;
+    border-radius: 0.25rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-well);
+    color: var(--cp-muted);
+    font-family: var(--sl-font-mono);
+    font-size: 0.72rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+  }
+
+  .cp-sim-tab:hover {
+    color: var(--cp-heading);
+    border-color: var(--cp-border-active);
+  }
+
+  .cp-sim-tab.is-active {
+    background: var(--cp-primary-soft);
+    color: var(--cp-primary);
+    border-color: var(--cp-primary-border);
+    font-weight: 600;
+  }
+
+  .cp-sim-stage {
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
+    gap: 0.5rem;
   }
 
-  .cp-layer-split {
+  .cp-sim-compute {
+    padding: 0.8rem 0.9rem;
+    border-radius: 0.25rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-surface-solid);
+    transition: opacity 0.3s ease, border-color 0.3s ease, transform 0.3s ease;
+  }
+
+  .cp-sim-card[data-state='suspend'] .cp-sim-compute {
+    opacity: 0.48;
+    border-style: dashed;
+  }
+
+  .cp-sim-card[data-state='fork'] .cp-sim-compute {
+    border-color: var(--cp-primary-border);
+    box-shadow: 4px 4px 0 -1px var(--cp-canvas), 4px 4px 0 0 var(--cp-primary-border);
+  }
+
+  .cp-sim-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .cp-sim-compute-title {
+    font-family: var(--cp-font-display);
+    font-size: 0.86rem;
+    font-weight: 600;
+    color: var(--cp-heading);
+  }
+
+  .cp-sim-compute-meta {
+    color: var(--cp-ok);
+  }
+
+  .cp-sim-card[data-state='suspend'] .cp-sim-compute-meta {
+    color: var(--cp-muted);
+  }
+
+  .cp-sim-overlay {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0.5rem 0.7rem;
+    border-radius: 0.25rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-well);
+  }
+
+  .cp-mono-primary {
+    font-family: var(--sl-font-mono);
+    font-size: 0.76rem;
+    font-weight: 600;
+    color: var(--cp-primary);
+  }
+
+  /* Animated I/O Bus */
+  .cp-sim-bus {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 0.75rem;
+    gap: 0.65rem;
+    height: 18px;
+    padding-inline: 22%;
   }
 
-  @media (max-width: 560px) {
-    .cp-layer-split {
+  .cp-bus-lane {
+    position: relative;
+    width: 2px;
+    height: 100%;
+    margin-inline: auto;
+    background: var(--cp-border);
+    overflow: hidden;
+  }
+
+  .cp-bus-pulse {
+    position: absolute;
+    left: 0;
+    width: 2px;
+    height: 8px;
+    background: var(--cp-primary);
+    animation: cp-bus-flow 1.3s linear infinite;
+  }
+
+  .cp-bus-lane-sec .cp-bus-pulse {
+    background: var(--cp-secondary);
+    animation-delay: 0.45s;
+  }
+
+  .cp-sim-card[data-state='suspend'] .cp-bus-pulse {
+    animation-play-state: paused;
+    opacity: 0;
+  }
+
+  @keyframes cp-bus-flow {
+    0% { top: -8px; opacity: 0; }
+    30% { opacity: 1; }
+    100% { top: 18px; opacity: 0; }
+  }
+
+  /* Persistent Volume Cards */
+  .cp-sim-vols {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: stretch;
+    gap: 0.65rem;
+  }
+
+  @media (max-width: 540px) {
+    .cp-sim-vols {
       grid-template-columns: 1fr;
     }
   }
 
-  .cp-layer-box {
-    padding: 0.85rem 1rem;
-    border-radius: 0.65rem;
-    border: 1px solid var(--cp-border);
-    background: rgba(15, 23, 42, 0.55);
+  .cp-sim-vol {
+    position: relative;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    margin: 0;
+    padding: 0.85rem;
+    border-radius: 0.25rem;
+    transition: border-color 0.25s ease, background 0.25s ease;
   }
 
-  :root[data-theme='light'] .cp-layer-box {
-    background: rgba(241, 245, 249, 0.9);
+  .cp-sim-vol-rootfs {
+    border: 1px solid var(--cp-primary-border);
+    background: var(--cp-primary-soft);
   }
 
-  .cp-layer-merged {
-    border-color: rgba(34, 211, 238, 0.38);
+  .cp-sim-vol-ws {
+    border: 1px solid var(--cp-secondary-border);
+    background: var(--cp-secondary-soft);
   }
 
-  .cp-layer-rootfs {
-    border-color: rgba(34, 211, 238, 0.35);
-    background: rgba(8, 51, 68, 0.25);
+  .cp-sim-vol-scan {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, var(--cp-primary-soft), transparent);
+    transform: translateX(-100%);
+    pointer-events: none;
   }
 
-  .cp-layer-ws {
-    border-color: rgba(129, 140, 248, 0.38);
-    background: rgba(49, 46, 129, 0.25);
+  .cp-sim-card[data-state='reset'] .cp-sim-vol-scan {
+    animation: cp-scan 1.4s ease-in-out infinite;
   }
 
-  .cp-layer-title {
-    font-weight: 700;
-    font-size: 0.88rem;
+  @keyframes cp-scan {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(100%); }
+  }
+
+  .cp-sim-card[data-state='reset'] .cp-sim-vol-ws {
+    border-color: var(--cp-ok-border);
+    background: var(--cp-ok-soft);
+  }
+
+  .cp-sim-vol-head {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 0.45rem;
+  }
+
+  .cp-sim-vol-head code {
+    font-family: var(--sl-font-mono);
+    font-size: 0.74rem;
+    font-weight: 600;
     color: var(--cp-heading);
-    margin-bottom: 0.28rem;
+    background: transparent;
+    padding: 0;
   }
 
-  .cp-layer-sub {
-    font-size: 0.78rem;
+  .cp-sim-vol p {
+    margin: 0;
+    font-size: 0.76rem;
     line-height: 1.5;
     color: var(--cp-muted);
   }
 
-  .cp-metrics {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 1rem;
+  .cp-sim-banner {
+    margin-top: 0.85rem;
+    padding: 0.6rem 0.8rem;
+    border-radius: 0.25rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-well);
+    font-family: var(--sl-font-mono);
+    font-size: 0.74rem;
+    line-height: 1.5;
+    color: var(--cp-body);
   }
 
-  @media (max-width: 820px) {
-    .cp-metrics {
-      grid-template-columns: repeat(2, 1fr);
+  .cp-text-primary { color: var(--cp-primary); }
+  .cp-text-secondary { color: var(--cp-secondary); }
+  .cp-text-ok { color: var(--cp-ok); }
+  .cp-text-muted { color: var(--cp-muted); }
+
+  /* ===================================================================== */
+  /* METRICS STRIP                                                         */
+  /* ===================================================================== */
+  .cp-metrics-band {
+    padding-block: 0;
+  }
+
+  .cp-metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    padding-inline: 0;
+  }
+
+  @media (max-width: 960px) {
+    .cp-metrics-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
     }
   }
 
-  .cp-metric-card {
-    padding: 1.25rem;
-    border-radius: 0.85rem;
-    border: 1px solid var(--cp-border);
+  @media (max-width: 560px) {
+    .cp-metrics-grid {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .cp-metric-cell {
+    padding: 1.75rem 1.75rem;
+    border-right: 1px solid var(--cp-border);
+    border-bottom: 1px solid var(--cp-border);
+    transition: background 0.15s ease;
+  }
+
+  @media (min-width: 961px) {
+    .cp-metric-cell { border-bottom: 0; }
+    .cp-metric-cell:last-child { border-right: 0; }
+  }
+
+  .cp-metric-cell:hover {
     background: var(--cp-surface);
   }
 
+  .cp-metric-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 0.85rem;
+  }
+
+  .cp-metric-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 9999px;
+    background: var(--cp-muted);
+  }
+
+  .cp-tone-primary .cp-metric-kpi,
+  .cp-tone-primary .cp-metric-val { color: var(--cp-primary); }
+  .cp-tone-primary .cp-metric-dot { background: var(--cp-primary); }
+
+  .cp-tone-secondary .cp-metric-kpi,
+  .cp-tone-secondary .cp-metric-val { color: var(--cp-secondary); }
+  .cp-tone-secondary .cp-metric-dot { background: var(--cp-secondary); }
+
+  .cp-tone-ok .cp-metric-kpi,
+  .cp-tone-ok .cp-metric-val { color: var(--cp-ok); }
+  .cp-tone-ok .cp-metric-dot { background: var(--cp-ok); }
+
+  .cp-tone-neutral .cp-metric-kpi,
+  .cp-tone-neutral .cp-metric-val { color: var(--cp-heading); }
+
   .cp-metric-val {
     font-family: var(--sl-font-mono);
-    font-size: 1.65rem;
-    font-weight: 800;
-    color: var(--cp-cyan);
-    margin-bottom: 0.3rem;
-  }
-
-  .cp-metric-label {
-    font-size: 0.88rem;
-    color: var(--cp-muted);
-  }
-
-  .cp-section-head {
-    margin-bottom: 1.5rem;
-  }
-
-  .cp-section-head h2 {
-    font-size: 1.75rem;
-    font-weight: 800;
+    font-size: 1.8rem;
+    font-weight: 700;
     letter-spacing: -0.02em;
-    color: var(--cp-heading);
-    margin: 0 0 0.5rem;
+    line-height: 1.1;
   }
 
-  .cp-section-head p {
+  .cp-metric-title {
+    font-family: var(--cp-font-display);
+    font-size: 0.98rem;
+    font-weight: 600;
+    color: var(--cp-heading);
+    margin-top: 0.5rem;
+  }
+
+  .cp-metric-desc {
+    margin: 0.3rem 0 0;
+    font-size: 0.82rem;
+    line-height: 1.5;
     color: var(--cp-muted);
-    max-width: 72ch;
+  }
+
+  /* ===================================================================== */
+  /* SECTION HEADS                                                         */
+  /* ===================================================================== */
+  .cp-head-split {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 1.5rem;
+    margin-bottom: 2rem;
+  }
+
+  .cp-head-block {
+    max-width: 44rem;
+    margin-bottom: 2.25rem;
+  }
+
+  .cp-head-center {
+    max-width: 40rem;
+    margin-inline: auto;
+    text-align: center;
+    margin-bottom: 2.5rem;
+  }
+
+  .cp-h2 {
+    font-family: var(--cp-font-display);
+    font-size: clamp(1.55rem, 2.6vw, 2.05rem);
+    font-weight: 700;
+    letter-spacing: -0.025em;
+    color: var(--cp-heading);
     margin: 0;
   }
 
-  /* Code switcher */
-  .cp-code-switcher {
-    border: 1px solid var(--cp-border);
-    border-radius: 0.9rem;
-    background: var(--cp-surface-solid);
-    overflow: hidden;
+  .cp-sub {
+    margin: 0.65rem 0 0;
+    font-size: 0.96rem;
+    line-height: 1.65;
+    color: var(--cp-muted);
   }
 
-  .cp-tabs {
-    display: flex;
+  /* ===================================================================== */
+  /* SPLIT SDK IDE + STREAMING DAEMON LOG CONSOLE                          */
+  /* ===================================================================== */
+  .cp-seg-tabs {
+    display: inline-flex;
     flex-wrap: wrap;
+    align-items: stretch;
     gap: 0.25rem;
-    padding: 0.6rem 0.75rem;
-    border-bottom: 1px solid var(--cp-border);
-    background: rgba(15, 23, 42, 0.45);
+    padding: 0.25rem;
+    background: var(--cp-well);
+    border: 1px solid var(--cp-border);
+    border-radius: 0.25rem;
   }
 
-  :root[data-theme='light'] .cp-tabs {
-    background: #f1f5f9;
-  }
-
-  .cp-tab {
+  .cp-seg-tab {
     appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0;
+    min-height: 2.1rem;
+    line-height: 1.2;
     border: 1px solid transparent;
     background: transparent;
     color: var(--cp-muted);
     font-family: var(--sl-font-mono);
-    font-size: 0.83rem;
-    padding: 0.45rem 0.85rem;
-    border-radius: 0.45rem;
+    font-size: 0.78rem;
+    font-weight: 500;
+    padding: 0.44rem 0.85rem;
+    border-radius: 0.25rem;
+    cursor: pointer;
+    transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+  }
+
+  .cp-seg-tab:hover {
+    color: var(--cp-heading);
+  }
+
+  .cp-seg-tab.is-active {
+    background: var(--cp-primary-soft);
+    color: var(--cp-primary);
+    border-color: var(--cp-primary-border);
+    font-weight: 600;
+  }
+
+  .cp-ide-split {
+    display: grid;
+    grid-template-columns: 1.25fr 0.95fr;
+    border: 1px solid var(--cp-border);
+    border-radius: 0.375rem;
+    background: var(--cp-well);
+    overflow: hidden;
+  }
+
+  @media (max-width: 960px) {
+    .cp-ide-split {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .cp-ide-code {
+    border-right: 1px solid var(--cp-border);
+    min-width: 0;
+  }
+
+  @media (max-width: 960px) {
+    .cp-ide-code {
+      border-right: 0;
+      border-bottom: 1px solid var(--cp-border);
+    }
+  }
+
+  .cp-term-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    min-height: 2.95rem;
+    padding: 0.5rem 1rem;
+    background: var(--cp-surface);
+    border-bottom: 1px solid var(--cp-border);
+    box-sizing: border-box;
+  }
+
+  .cp-term-dots {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .cp-tdot {
+    width: 9px;
+    height: 9px;
+    border-radius: 9999px;
+    border: 1px solid var(--cp-border-active);
+    background: var(--cp-surface-high);
+  }
+
+  .cp-term-file {
+    margin-left: 0.45rem;
+    font-family: var(--sl-font-mono);
+    font-size: 0.76rem;
+    color: var(--cp-muted);
+  }
+
+  .cp-term-meta {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+  }
+
+  .cp-term-btn {
+    appearance: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0;
+    min-height: 1.7rem;
+    line-height: 1;
+    background: var(--cp-surface-high);
+    border: 1px solid var(--cp-border);
+    color: var(--cp-body);
+    font-family: var(--sl-font-mono);
+    font-size: 0.72rem;
+    padding: 0.25rem 0.6rem;
+    border-radius: 0.25rem;
     cursor: pointer;
   }
 
-  .cp-tab.is-active {
-    color: var(--cp-cyan);
-    background: rgba(34, 211, 238, 0.1);
-    border-color: var(--cp-border-accent);
+  .cp-term-btn:hover,
+  .cp-term-btn.is-replaying {
+    border-color: var(--cp-primary-border);
+    color: var(--cp-primary);
   }
 
-  .cp-panel {
-    display: none;
-  }
-
-  .cp-panel.is-active {
-    display: block;
-  }
-
-  .cp-panel pre {
-    margin: 0;
-    padding: 1.25rem 1.4rem;
+  .cp-term-body {
+    padding: 1.35rem;
     overflow-x: auto;
-    font-family: var(--sl-font-mono);
-    font-size: 0.86rem;
-    line-height: 1.6;
-    background: transparent;
-    border: none;
   }
 
-  /* Architecture 4-layer */
-  .cp-arch-grid {
+  .cp-code-pane {
+    display: none;
+    gap: 1.15rem;
+    font-family: var(--sl-font-mono);
+    font-size: 0.81rem;
+    line-height: 1.65;
+  }
+
+  .cp-code-pane.is-active {
+    display: flex;
+  }
+
+  .cp-gutter {
     display: flex;
     flex-direction: column;
-    gap: 0.9rem;
+    text-align: right;
+    user-select: none;
+    color: var(--cp-subtle);
   }
 
-  .cp-arch-layer {
-    display: grid;
-    grid-template-columns: 3.5rem 1fr;
+  .cp-pre {
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--cp-body);
+    font-family: var(--sl-font-mono);
+    font-size: 0.81rem;
+    line-height: 1.65;
+    flex: 1;
+  }
+
+  .cp-ide-logs {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    background: var(--cp-well);
+  }
+
+  .cp-ide-logs .cp-term-file {
+    margin-left: 0;
+  }
+
+  .cp-log-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 1.7rem;
+    gap: 0.4rem;
+    color: var(--cp-ok);
+  }
+
+  .cp-dot-ok {
+    width: 6px;
+    height: 6px;
+    border-radius: 9999px;
+    background: var(--cp-ok);
+  }
+
+  .cp-log-body {
+    padding: 1.35rem 1.2rem 0.6rem;
+    min-height: 11.5rem;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+    font-family: var(--sl-font-mono);
+    font-size: 0.76rem;
+    line-height: 1.55;
+  }
+
+  .cp-log-body :global(.cp-log-line) {
+    display: flex;
+    align-items: baseline;
+    gap: 0.55rem;
+    opacity: 0;
+    transform: translateY(4px);
+    transition: opacity 0.25s ease, transform 0.25s ease;
+  }
+
+  .cp-log-body :global(.cp-log-line.is-visible) {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  .cp-log-body :global(.cp-log-t) {
+    color: var(--cp-subtle);
+    flex-shrink: 0;
+  }
+
+  .cp-log-body :global(.cp-log-tag) {
+    color: var(--cp-primary);
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+
+  .cp-log-body :global(.cp-log-msg) {
+    color: var(--cp-body);
+  }
+
+  .cp-log-cursor {
+    padding: 0.35rem 1.2rem 1.25rem;
+    font-family: var(--sl-font-mono);
+    color: var(--cp-primary);
+  }
+
+  .cp-cursor-block {
+    display: inline-block;
+    animation: cp-blink 1s step-end infinite;
+  }
+
+  @keyframes cp-blink {
+    50% { opacity: 0; }
+  }
+
+  /* ===================================================================== */
+  /* 4-LAYER ARCHITECTURE STACK                                            */
+  /* ===================================================================== */
+  .cp-arch-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .cp-arch-band {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
     gap: 1.25rem;
-    align-items: start;
-    padding: 1.2rem 1.35rem;
-    border-radius: 0.85rem;
-    border: 1px solid var(--cp-border);
+    padding: 1.35rem 1.5rem;
     background: var(--cp-surface);
+    border: 1px solid var(--cp-border);
+    border-left-width: 4px;
+    border-radius: 0.25rem;
+    transition: background 0.15s ease, border-color 0.15s ease;
   }
 
-  .cp-arch-cyan {
-    border-left: 3px solid var(--cp-cyan);
+  .cp-arch-band:hover {
+    background: var(--cp-surface-high);
   }
 
-  .cp-arch-indigo {
-    border-left: 3px solid var(--cp-indigo);
+  .cp-arch-primary { border-left-color: var(--cp-primary); }
+  .cp-arch-secondary { border-left-color: var(--cp-secondary); }
+  .cp-arch-ok { border-left-color: var(--cp-ok); }
+
+  .cp-arch-left {
+    display: flex;
+    align-items: center;
+    gap: 1.15rem;
+    flex: 1 1 28rem;
   }
 
   .cp-arch-num {
     font-family: var(--sl-font-mono);
-    font-size: 1.25rem;
-    font-weight: 800;
-    color: var(--cp-cyan);
+    font-size: 1.35rem;
+    font-weight: 700;
   }
 
-  .cp-arch-indigo .cp-arch-num {
-    color: var(--cp-indigo);
+  .cp-arch-primary .cp-arch-num { color: var(--cp-primary); }
+  .cp-arch-secondary .cp-arch-num { color: var(--cp-secondary); }
+  .cp-arch-ok .cp-arch-num { color: var(--cp-ok); }
+
+  .cp-arch-title-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.3rem;
   }
 
-  .cp-arch-body h3 {
-    margin: 0 0 0.5rem;
-    font-size: 1.05rem;
+  .cp-arch-title-row h3 {
+    margin: 0;
+    font-size: 1.04rem;
+    font-weight: 600;
     color: var(--cp-heading);
   }
 
-  .cp-arch-body ul {
+  .cp-arch-left p {
     margin: 0;
-    padding-left: 1.15rem;
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
-    gap: 0.35rem 1.5rem;
+    font-size: 0.88rem;
+    line-height: 1.55;
     color: var(--cp-muted);
-    font-size: 0.9rem;
   }
 
-  /* Bento */
-  .cp-bento {
+  .cp-tag {
+    font-family: var(--sl-font-mono);
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    padding: 0.15rem 0.45rem;
+    border-radius: 0.25rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-surface-high);
+    color: var(--cp-muted);
+  }
+
+  .cp-tag-primary {
+    color: var(--cp-primary);
+    border-color: var(--cp-primary-border);
+    background: var(--cp-primary-soft);
+  }
+
+  .cp-tag-secondary {
+    color: var(--cp-secondary);
+    border-color: var(--cp-secondary-border);
+    background: var(--cp-secondary-soft);
+  }
+
+  .cp-tag-ok {
+    color: var(--cp-ok);
+    border-color: var(--cp-ok-border);
+    background: var(--cp-ok-soft);
+  }
+
+  .cp-arch-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+  }
+
+  /* ===================================================================== */
+  /* BENTO GRID                                                            */
+  /* ===================================================================== */
+  .cp-bento-grid {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 1.1rem;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1.25rem;
   }
 
-  @media (max-width: 960px) {
-    .cp-bento {
-      grid-template-columns: repeat(2, 1fr);
-    }
+  @media (max-width: 1024px) {
+    .cp-bento-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
 
-  @media (max-width: 620px) {
-    .cp-bento {
-      grid-template-columns: 1fr;
-    }
+  @media (max-width: 640px) {
+    .cp-bento-grid { grid-template-columns: 1fr; }
   }
 
   .cp-bento-card {
     display: flex;
     flex-direction: column;
-    gap: 0.55rem;
-    padding: 1.35rem;
-    border-radius: 0.9rem;
+    justify-content: space-between;
+    gap: 1.35rem;
+    padding: 1.65rem;
+    border-radius: 0.25rem;
     border: 1px solid var(--cp-border);
     background: var(--cp-surface);
     text-decoration: none !important;
-    transition: border-color 0.15s ease, transform 0.15s ease;
+    transition: border-color 0.18s ease, background 0.18s ease, transform 0.18s ease;
   }
 
   .cp-bento-card:hover {
-    border-color: var(--cp-border-accent);
+    border-color: var(--cp-primary-border);
+    background: var(--cp-surface-high);
     transform: translateY(-2px);
   }
 
-  .cp-bento-tag {
-    align-self: flex-start;
-    font-family: var(--sl-font-mono);
-    font-size: 0.72rem;
-    padding: 0.2rem 0.55rem;
-    border-radius: 0.35rem;
-    background: rgba(34, 211, 238, 0.1);
-    color: var(--cp-cyan);
-    border: 1px solid rgba(34, 211, 238, 0.25);
+  .cp-bento-icon-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 1rem;
   }
 
+  .cp-bento-icon {
+    width: 36px;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 0.25rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-surface-high);
+    color: var(--cp-primary);
+  }
+
+  .cp-bento-secondary .cp-bento-icon { color: var(--cp-secondary); }
+  .cp-bento-ok .cp-bento-icon { color: var(--cp-ok); }
+  .cp-bento-neutral .cp-bento-icon { color: var(--cp-heading); }
+
   .cp-bento-card h3 {
-    margin: 0.15rem 0 0;
-    font-size: 1.08rem;
+    margin: 0 0 0.5rem;
+    font-size: 1.06rem;
+    font-weight: 600;
     color: var(--cp-heading);
   }
 
   .cp-bento-card p {
     margin: 0;
-    font-size: 0.9rem;
-    line-height: 1.6;
+    font-size: 0.88rem;
+    line-height: 1.65;
     color: var(--cp-muted);
   }
 
-  /* Comparison table */
-  .cp-table-wrap {
+  .cp-bento-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-top: 0.9rem;
+    border-top: 1px solid var(--cp-border);
+    font-family: var(--sl-font-mono);
+    font-size: 0.74rem;
+    color: var(--cp-primary);
+  }
+
+  .cp-bento-secondary .cp-bento-foot { color: var(--cp-secondary); }
+  .cp-bento-ok .cp-bento-foot { color: var(--cp-ok); }
+  .cp-bento-neutral .cp-bento-foot { color: var(--cp-muted); }
+
+  /* ===================================================================== */
+  /* COMPARISON MATRIX                                                     */
+  /* ===================================================================== */
+  .cp-matrix-wrap {
     border: 1px solid var(--cp-border);
-    border-radius: 0.9rem;
+    border-radius: 0.25rem;
     overflow-x: auto;
     background: var(--cp-surface);
   }
 
-  .cp-compare-table {
+  .cp-matrix {
+    display: table;
     width: 100%;
+    min-width: 720px;
+    table-layout: fixed;
     border-collapse: collapse;
-    font-size: 0.92rem;
+    text-align: left;
+    font-size: 0.88rem;
   }
 
-  .cp-compare-table th,
-  .cp-compare-table td {
-    padding: 0.9rem 1.1rem;
-    text-align: left;
+  .cp-matrix th,
+  .cp-matrix td {
+    padding: 1rem 1.15rem;
     border-bottom: 1px solid var(--cp-border);
   }
 
-  .cp-compare-table th {
-    color: var(--cp-heading);
-    font-weight: 700;
-    background: rgba(15, 23, 42, 0.45);
+  .cp-matrix tbody tr:last-child td {
+    border-bottom: 0;
   }
 
-  :root[data-theme='light'] .cp-compare-table th {
-    background: #f1f5f9;
+  .cp-matrix thead th {
+    font-family: var(--sl-font-mono);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--cp-muted);
+    background: var(--cp-surface-solid);
   }
 
-  .cp-td-dim {
+  .cp-col-highlight {
+    background: var(--cp-primary-soft) !important;
+    color: var(--cp-primary) !important;
+    border-left: 1px solid var(--cp-primary-border);
+    border-right: 1px solid var(--cp-primary-border);
+  }
+
+  .cp-cell-dim {
     font-weight: 600;
     color: var(--cp-heading);
-    white-space: nowrap;
   }
 
-  .cp-td-old {
+  .cp-cell-highlight {
+    background: var(--cp-primary-soft);
+    border-left: 1px solid var(--cp-primary-border);
+    border-right: 1px solid var(--cp-primary-border);
+    font-family: var(--sl-font-mono);
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--cp-primary);
+  }
+
+  .cp-cell-muted {
+    font-family: var(--sl-font-mono);
+    font-size: 0.8rem;
     color: var(--cp-muted);
   }
 
-  .cp-td-new {
-    color: var(--cp-cyan);
-    font-weight: 500;
-  }
-
-  /* Footer CTA */
-  .cp-footer-cta {
-    display: flex;
-    flex-direction: column;
-    gap: 1.25rem;
-    padding: 2rem;
-    border-radius: 1rem;
-    border: 1px solid var(--cp-border-accent);
-    background: linear-gradient(135deg, rgba(34, 211, 238, 0.08), rgba(129, 140, 248, 0.08));
-  }
-
-  .cp-footer-cta h2 {
-    margin: 0 0 0.4rem;
-    font-size: 1.5rem;
-    color: var(--cp-heading);
-  }
-
-  .cp-footer-cta p {
-    margin: 0;
-    color: var(--cp-muted);
-  }
-
-  .cp-eco-links {
+  /* ===================================================================== */
+  /* CTA & FOOTER                                                          */
+  /* ===================================================================== */
+  .cp-cta-panel {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.65rem;
+    align-items: center;
+    justify-content: space-between;
+    gap: 2rem;
+    padding: clamp(1.75rem, 3.5vw, 2.75rem);
+    border: 1px solid var(--cp-border);
+    border-radius: 0.375rem;
+    background: var(--cp-surface);
+  }
+
+  .cp-cta-body {
+    max-width: 38rem;
+  }
+
+  .cp-cta-body .cp-actions {
+    margin-top: 1.5rem;
+  }
+
+  .cp-eco-link {
+    color: var(--cp-primary);
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    font-weight: 600;
+  }
+
+  .cp-eco-link:hover {
+    opacity: 0.85;
+  }
+
+  .cp-cta-ascii {
+    margin: 0;
+    padding: 1rem 1.25rem;
+    border: 1px solid var(--cp-border);
+    border-radius: 0.25rem;
+    background: var(--cp-well);
     font-family: var(--sl-font-mono);
-    font-size: 0.85rem;
+    font-size: 0.74rem;
+    line-height: 1.5;
     color: var(--cp-muted);
   }
 
-  .cp-eco-links a {
-    color: var(--cp-cyan);
+  .cp-ascii-accent {
+    color: var(--cp-primary);
+    font-weight: 600;
+  }
+
+  @media (max-width: 960px) {
+    .cp-cta-ascii { display: none; }
+  }
+
+  .cp-footer {
+    padding-block: 3.25rem 2.25rem;
+    background: var(--cp-well);
+  }
+
+  .cp-footer-grid {
+    display: grid;
+    grid-template-columns: 2fr repeat(3, 1fr);
+    gap: 2rem;
+    padding-bottom: 2.25rem;
+    border-bottom: 1px solid var(--cp-border);
+  }
+
+  @media (max-width: 900px) {
+    .cp-footer-grid { grid-template-columns: repeat(2, 1fr); }
+    .cp-footer-brand { grid-column: 1 / -1; }
+  }
+
+  .cp-footer-logo {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    font-family: var(--cp-font-display);
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--cp-heading);
+    margin-bottom: 0.75rem;
+  }
+
+  .cp-footer-brand p {
+    margin: 0;
+    max-width: 36ch;
+    font-size: 0.84rem;
+    line-height: 1.65;
+    color: var(--cp-muted);
+  }
+
+  .cp-footer-col-title {
+    color: var(--cp-heading);
+    margin-bottom: 0.85rem;
+  }
+
+  .cp-footer-col ul {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+  }
+
+  .cp-footer-col a {
+    font-family: var(--sl-font-mono);
+    font-size: 0.8rem;
+    color: var(--cp-muted);
     text-decoration: none;
+  }
+
+  .cp-footer-col a:hover {
+    color: var(--cp-primary);
+  }
+
+  .cp-footer-bottom {
+    padding-top: 1.5rem;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    font-family: var(--sl-font-mono);
+    font-size: 0.76rem;
+    color: var(--cp-subtle);
+  }
+
+  /* Scroll Reveal */
+  .cp-reveal {
+    opacity: 0;
+    transform: translateY(14px);
+    transition: opacity 0.55s cubic-bezier(0.16, 1, 0.3, 1), transform 0.55s cubic-bezier(0.16, 1, 0.3, 1);
+    transition-delay: var(--delay, 0ms);
+  }
+
+  .cp-reveal.is-in {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .cp-reveal {
+      opacity: 1;
+      transform: none;
+      transition: none;
+    }
+    .cp-beacon-ping,
+    .cp-bus-pulse,
+    .cp-sim-vol-scan,
+    .cp-cursor-block,
+    .cp-sim-auto-dot {
+      animation: none !important;
+    }
   }
 </style>

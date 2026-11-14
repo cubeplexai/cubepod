@@ -14,7 +14,16 @@ For the exhaustive key-by-key schema generated directly from `deploy/helm/cubepo
 
 ## Quick Install
 
-Install the chart from your local checkout into a control-plane namespace such as `cubepod-system`:
+Install directly from the published GHCR OCI registry into a control-plane namespace such as `cubepod-system` (no repository clone required):
+
+```bash
+helm install cubepod oci://ghcr.io/cubeplexai/charts/cubepod \
+  --version 0.4.1 \
+  --namespace cubepod-system \
+  --create-namespace
+```
+
+Or install from a local repository checkout:
 
 ```bash
 helm install cubepod ./deploy/helm/cubepod \

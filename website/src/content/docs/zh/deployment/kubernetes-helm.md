@@ -14,7 +14,16 @@ description: 使用 Helm Chart 在 Kubernetes 集群中部署 CubePod Operator�
 
 ## 快速安装
 
-从本地仓库检出目录将 Chart 安装到控制面命名空间（例如 `cubepod-system`）：
+可直接从已发布的 GHCR OCI 仓库一键安装到控制面命名空间（无需先克隆源码仓库）：
+
+```bash
+helm install cubepod oci://ghcr.io/cubeplexai/charts/cubepod \
+  --version 0.4.1 \
+  --namespace cubepod-system \
+  --create-namespace
+```
+
+如需基于本地仓库源码目录安装，可执行：
 
 ```bash
 helm install cubepod ./deploy/helm/cubepod \

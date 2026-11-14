@@ -3,7 +3,7 @@ title: Introduction
 description: Learn what CubePod is, why long-running AI agents need persistent writable RootFS MicroVMs, and how CubePod unifies E2B compatibility with Kubernetes-native isolation.
 ---
 
-**CubePod** is an open-source, cloud-native **Persistent Writable RootFS MicroVM Execution Platform for AI Agents**, built to power **CubePlex** and the broader **E2B / MCP** open-source ecosystem.
+**CubePod** is an open-source, cloud-native **Persistent Writable RootFS MicroVM Execution Platform for AI Agents**. Following a **Brain-Hands Decoupling** architecture as part of the open-source CubePlex Agent Stack, CubePod provides the persistent hardware-isolated execution layer (**Hands**) powering [**CubePlex**](https://github.com/cubeplexai/cubeplex) (Team Agent Workspace) and [**CubeLoop**](https://github.com/cubeplexai/cubeloop) (Async Agent Runtime & Reasoning **Brain**), alongside the broader **E2B / MCP** open-source ecosystem.
 
 Unlike stateless container runners or ephemeral sandboxes that discard installed dependencies, browser state, and system configuration whenever a session pauses or restarts, CubePod gives every AI agent a hardware-isolated sandbox whose **entire OS filesystem (`/`, `/usr`, `/etc`, `/var/lib`) and user project directory (`/workspace`) both persist independently**.
 

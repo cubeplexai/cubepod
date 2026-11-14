@@ -1,90 +1,237 @@
-/* CubePod AI Infra Dark-First Design System */
+/* CubePod Dual-Theme Infrastructure Design System
+ * Light Mode: Option A — Swiss Hardware Blueprint (#f8f7f4 + #ea580c + #1d4ed8)
+ * Dark Mode:  Oxide Copper — Bare-Metal Charcoal & Copper (#0e0e0d + #f97316 + #d6d3cd)
+ */
 
 :root {
-  --sl-font: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans SC', 'PingFang SC', sans-serif;
+  --sl-font: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans SC', 'PingFang SC', sans-serif;
+  --cp-font-display: 'Plus Jakarta Sans', 'Inter', ui-sans-serif, system-ui, 'Noto Sans SC', 'PingFang SC', sans-serif;
   --sl-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
-:root[data-theme='dark'],
-:root:not([data-theme='light']) {
-  --sl-color-bg: #070b14;
-  --sl-color-bg-nav: rgba(7, 11, 20, 0.86);
-  --sl-color-bg-sidebar: #0a101e;
-  --sl-color-bg-inline-code: #0f172a;
-  --sl-color-hairline-light: rgba(148, 163, 184, 0.14);
-  --sl-color-hairline: rgba(148, 163, 184, 0.18);
-  --sl-color-hairline-shade: rgba(15, 23, 42, 0.9);
-  --sl-color-accent-low: #083344;
-  --sl-color-accent: #22d3ee;
-  --sl-color-accent-high: #cffafe;
-  --sl-color-white: #f8fafc;
-  --sl-color-gray-1: #e2e8f0;
-  --sl-color-gray-2: #cbd5e1;
-  --sl-color-gray-3: #94a3b8;
-  --sl-color-gray-4: #64748b;
-  --sl-color-gray-5: #1e293b;
-  --sl-color-gray-6: #0f172a;
-  --sl-color-black: #020617;
-  --cp-surface: rgba(15, 23, 42, 0.65);
-  --cp-surface-solid: #0b1222;
-  --cp-border: rgba(148, 163, 184, 0.16);
-  --cp-border-accent: rgba(34, 211, 238, 0.35);
-  --cp-muted: #94a3b8;
-  --cp-heading: #f8fafc;
-  --cp-cyan: #22d3ee;
-  --cp-indigo: #818cf8;
-  --cp-emerald: #34d399;
+/* DARK MODE — Oxide Copper: Bare-Metal Charcoal & Copper */
+html[data-theme='dark'],
+html:not([data-theme='light']) {
+  --sl-color-bg: #0e0e0d;
+  --sl-color-bg-nav: rgba(14, 14, 13, 0.92);
+  --sl-color-bg-sidebar: #121210;
+  --sl-color-bg-inline-code: #1c1b19;
+  --sl-color-hairline-light: #2a2926;
+  --sl-color-hairline: #2a2926;
+  --sl-color-hairline-shade: #080807;
+  --sl-color-accent-low: #2b1507;
+  --sl-color-accent: #f97316;
+  --sl-color-accent-high: #fb923c;
+  --sl-color-text-accent: #fb923c;
+  --sl-color-text-invert: #0e0e0d;
+  --sl-color-white: #f2f0ea;
+  --sl-color-gray-1: #e5e2da;
+  --sl-color-gray-2: #d6d3cd;
+  --sl-color-gray-3: #a8a49c;
+  --sl-color-gray-4: #78746c;
+  --sl-color-gray-5: #2a2926;
+  --sl-color-gray-6: #1a1917;
+  --sl-color-black: #080807;
+
+  --cp-well: #080807;
+  --cp-canvas: #0e0e0d;
+  --cp-surface: #161614;
+  --cp-surface-solid: #121210;
+  --cp-surface-high: #1f1e1b;
+  --cp-border: #2a2926;
+  --cp-border-active: #44423c;
+  --cp-heading: #f2f0ea;
+  --cp-body: #e5e2da;
+  --cp-muted: #a8a49c;
+  --cp-subtle: #78746c;
+
+  --cp-primary: #f97316;
+  --cp-primary-hover: #fb923c;
+  --cp-primary-ink: #0e0e0d;
+  --cp-primary-soft: rgba(249, 115, 22, 0.1);
+  --cp-primary-border: rgba(249, 115, 22, 0.36);
+
+  --cp-secondary: #d6d3cd;
+  --cp-secondary-soft: rgba(214, 211, 205, 0.07);
+  --cp-secondary-border: rgba(214, 211, 205, 0.25);
+
+  --cp-ok: #34d399;
+  --cp-ok-soft: rgba(52, 211, 153, 0.09);
+  --cp-ok-border: rgba(52, 211, 153, 0.32);
+
+  --cp-grid-line: rgba(68, 66, 60, 0.28);
+  --cp-glow-primary: rgba(249, 115, 22, 0.055);
 }
 
-:root[data-theme='light'] {
-  --sl-color-bg: #f8fafc;
-  --sl-color-bg-nav: rgba(248, 250, 252, 0.88);
-  --sl-color-bg-sidebar: #f1f5f9;
-  --sl-color-accent-low: #cffafe;
-  --sl-color-accent: #0891b2;
-  --sl-color-accent-high: #164e63;
-  --cp-surface: rgba(255, 255, 255, 0.9);
-  --cp-surface-solid: #ffffff;
-  --cp-border: rgba(15, 23, 42, 0.11);
-  --cp-border-accent: rgba(8, 145, 178, 0.35);
-  --cp-muted: #475569;
-  --cp-heading: #0f172a;
-  --cp-cyan: #0891b2;
-  --cp-indigo: #4f46e5;
-  --cp-emerald: #059669;
+/* LIGHT MODE — Option A: Swiss Hardware Blueprint */
+html[data-theme='light'] {
+  --sl-color-bg: #f8f7f4;
+  --sl-color-bg-nav: rgba(248, 247, 244, 0.92);
+  --sl-color-bg-sidebar: #f2f1ec;
+  --sl-color-bg-inline-code: #eceae3;
+  --sl-color-hairline-light: #e4e3dc;
+  --sl-color-hairline: #d4d4cc;
+  --sl-color-hairline-shade: #b8b8ae;
+  --sl-color-accent-low: #ffedd5;
+  --sl-color-accent: #ea580c;
+  --sl-color-accent-high: #9a3412;
+  --sl-color-text-accent: #c2410c;
+  --sl-color-text-invert: #ffffff;
+  --sl-color-white: #111214;
+  --sl-color-gray-1: #27272a;
+  --sl-color-gray-2: #3f3f46;
+  --sl-color-gray-3: #52525b;
+  --sl-color-gray-4: #71717a;
+  --sl-color-gray-5: #e4e4e7;
+  --sl-color-gray-6: #f4f4f0;
+  --sl-color-black: #ffffff;
+
+  --cp-well: #f1f0eb;
+  --cp-canvas: #f8f7f4;
+  --cp-surface: #ffffff;
+  --cp-surface-solid: #f4f3ee;
+  --cp-surface-high: #eceae3;
+  --cp-border: #d4d4cc;
+  --cp-border-active: #a3a399;
+  --cp-heading: #111214;
+  --cp-body: #27272a;
+  --cp-muted: #52525b;
+  --cp-subtle: #71717a;
+
+  --cp-primary: #ea580c;
+  --cp-primary-hover: #c2410c;
+  --cp-primary-ink: #ffffff;
+  --cp-primary-soft: rgba(234, 88, 12, 0.08);
+  --cp-primary-border: rgba(234, 88, 12, 0.35);
+
+  --cp-secondary: #1d4ed8;
+  --cp-secondary-soft: rgba(29, 78, 216, 0.07);
+  --cp-secondary-border: rgba(29, 78, 216, 0.3);
+
+  --cp-ok: #059669;
+  --cp-ok-soft: rgba(5, 150, 105, 0.08);
+  --cp-ok-border: rgba(5, 150, 105, 0.3);
+
+  --cp-grid-line: rgba(163, 163, 153, 0.28);
+  --cp-glow-primary: rgba(234, 88, 12, 0.04);
 }
 
-/* Header blur */
+/* Global typography & mechanical wireframe styling */
+h1, h2, h3, h4, .cp-display {
+  font-family: var(--cp-font-display);
+}
+
+/* Header bar */
 header.header {
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  border-bottom: 1px solid var(--sl-color-hairline);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--cp-border);
+  box-shadow: none !important;
 }
 
-/* Clean Splash Page layout for Landing Page */
+/* Starlight Sidebar & Right TOC refinements */
+.sidebar-pane {
+  border-inline-end: 1px solid var(--cp-border) !important;
+}
+
+.right-sidebar {
+  border-inline-start: 1px solid var(--cp-border) !important;
+}
+
+starlight-toc h2,
+.sidebar-content summary span.large {
+  font-family: var(--sl-font-mono);
+  font-size: 0.72rem !important;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.sidebar-content a[aria-current='page'],
+.sidebar-content a[aria-current='page']:hover,
+.sidebar-content a[aria-current='page']:focus {
+  background-color: var(--cp-primary-soft) !important;
+  color: var(--cp-primary) !important;
+  border-radius: 0.25rem;
+  font-weight: 600;
+  border-inline-start: 2px solid var(--cp-primary);
+}
+
+starlight-toc a[aria-current='true'],
+starlight-toc a[aria-current='true']:hover {
+  color: var(--cp-primary) !important;
+  font-weight: 600;
+}
+
+/* Splash Landing Page full-bleed wireframe container */
+main:has(.cp-otel) > .content-panel:first-child {
+  display: none;
+}
+
+main:has(.cp-otel) .main-pane,
 [data-has-hero] .main-pane,
 .sl-splash .main-pane {
   width: 100%;
 }
 
+main:has(.cp-otel) .content-panel,
 .sl-splash .content-panel {
   border-top: none !important;
-  padding-top: 0 !important;
-  padding-bottom: 2rem !important;
+  padding: 0 !important;
 }
 
+main:has(.cp-otel) .sl-container,
 .sl-splash .sl-container {
-  max-width: 1280px !important;
+  max-width: 100% !important;
   margin-inline: auto;
+}
+
+/* Docs content typography & blocks */
+.sl-markdown-content h1 {
+  font-family: var(--cp-font-display);
+  letter-spacing: -0.025em;
+}
+
+.sl-markdown-content blockquote {
+  border-inline-start: 3px solid var(--cp-primary);
+  background: var(--cp-surface);
+  border-top: 1px solid var(--cp-border);
+  border-right: 1px solid var(--cp-border);
+  border-bottom: 1px solid var(--cp-border);
+  border-radius: 0.25rem;
+  padding: 0.9rem 1.15rem;
+}
+
+.sl-markdown-content .expressive-code .frame {
+  border-radius: 0.25rem !important;
+  border: 1px solid var(--cp-border) !important;
+  box-shadow: none !important;
+}
+
+.sl-markdown-content .starlight-aside {
+  border-radius: 0.25rem;
+  border: 1px solid var(--cp-border);
+  border-inline-start-width: 3px;
+}
+
+.pagination-links a {
+  border-radius: 0.25rem !important;
+  border: 1px solid var(--cp-border) !important;
+  background: var(--cp-surface) !important;
+  box-shadow: none !important;
+}
+
+.pagination-links a:hover {
+  border-color: var(--cp-primary-border) !important;
+  background: var(--cp-surface-high) !important;
 }
 
 /* Mermaid diagrams */
 .cp-mermaid-wrap {
   margin: 1.5rem 0;
   padding: 1.25rem;
-  border-radius: 0.75rem;
+  border-radius: 0.25rem;
   border: 1px solid var(--cp-border);
-  background: var(--cp-surface);
+  background: var(--cp-well);
   overflow-x: auto;
 }
 
@@ -102,19 +249,40 @@ header.header {
   height: auto;
 }
 
-/* Tables & code ergonomics */
-.sl-markdown-content table {
+/* Tables & code ergonomics (keep custom .not-content tables as native full-width tables) */
+.sl-markdown-content table:not(.not-content table) {
   display: block;
   overflow-x: auto;
+  width: fit-content;
+  max-width: 100%;
   border-collapse: collapse;
-  width: 100%;
+  border: 1px solid var(--cp-border);
+  border-radius: 0.25rem;
+  background: var(--cp-canvas);
 }
 
-.sl-markdown-content th {
-  font-size: 0.85rem;
+.sl-markdown-content :is(th, td):not(:where(.not-content *)),
+.sl-markdown-content :is(th:first-child, td:first-child):not(:where(.not-content *)),
+.sl-markdown-content :is(th:last-child, td:last-child):not(:where(.not-content *)) {
+  padding: 0.72rem 1rem !important;
+  border-bottom: 1px solid var(--cp-border);
+}
+
+.sl-markdown-content th:not(:where(.not-content *)) {
+  font-family: var(--sl-font-mono);
+  font-size: 0.72rem;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.06em;
   color: var(--cp-muted);
+  background: var(--cp-surface);
+}
+
+.sl-markdown-content tbody tr:last-child td:not(:where(.not-content *)) {
+  border-bottom: 0;
+}
+
+.sl-markdown-content tr:hover td:not(:where(.not-content *)) {
+  background: var(--cp-surface);
 }
 
 .sl-markdown-content code {

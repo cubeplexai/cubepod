@@ -3,7 +3,7 @@ title: 简介
 description: 了解 CubePod 的核心定位、为什么长周期 AI Agent 需要持久化可写 RootFS MicroVM，以及 CubePod 如何融合 E2B 兼容性与云原生隔离。
 ---
 
-**CubePod** 是一个开源、云原生的 **AI Agent 持久化可写 RootFS MicroVM 执行平台（Persistent Writable RootFS MicroVM Execution Platform for AI Agents）**，为 **CubePlex** 以及更广泛的 **E2B / MCP** 开源 Agent 生态提供底层算力与沙箱底座。
+**CubePod** 是一个开源、云原生的 **AI Agent 持久化可写 RootFS MicroVM 执行平台（Persistent Writable RootFS MicroVM Execution Platform for AI Agents）**。作为开源 CubePlex Agent 技术栈的重要组成部分，整套系统采用 **脑手解耦（Brain-Hands Decoupling）** 架构——由 [**CubePlex**](https://github.com/cubeplexai/cubeplex)（团队 Agent 工作空间）与 [**CubeLoop**](https://github.com/cubeplexai/cubeloop)（异步 Agent 运行时）承担上层规划编排之「**脑**」，**CubePod** 与更广泛的 **E2B / MCP** 生态协同承担底层持久化硬件隔离执行之「**手**」。
 
 与在会话暂停或重启后即丢弃已安装依赖、浏览器状态与系统配置的无状态容器或瞬态沙箱不同，CubePod 为每个 AI Agent 提供具备硬件级隔离的沙箱，确保 **完整操作系统根目录（`/`、`/usr`、`/etc`、`/var/lib`）与用户工作区（`/workspace`）双双独立持久化**。
 
