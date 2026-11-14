@@ -1093,6 +1093,30 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			} else {
 				if createdCold {
 					r.rollbackColdCreateLocked(ctx, name, spec, status, podManifest.Name)
+				} else {
+					// Persist in-progress state transitions (e.g. rootfsGeneration bump + new PVC)
+					// even when waiting for the replacement Pod fails or times out.
+					status.Phase = v1alpha1.PodBoxPhaseProvisioning
+					status.PodName = podManifest.Name
+					status.PodIP = ""
+					status.LastActivityAt = &now
+					r.specs[name] = spec
+					cpErr := *status
+					annsErr := r.podBoxAnnotationsLocked(name, effectiveImage)
+					if annsErr != nil {
+						r.boxAnnotations[name] = maps.Clone(annsErr)
+					}
+					_ = r.kubeClient.UpsertPodBox(context.WithoutCancel(ctx), v1alpha1.PodBox{
+						APIVersion: "cubepod.io/v1alpha1",
+						Kind:       "PodBox",
+						Metadata: v1alpha1.ObjectMeta{
+							Name:        name,
+							Namespace:   r.namespace,
+							Annotations: annsErr,
+						},
+						Spec:   spec,
+						Status: cpErr,
+					})
 				}
 				return nil, fmt.Errorf("failed to ensure Pod: %w", err)
 			}

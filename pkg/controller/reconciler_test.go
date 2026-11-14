@@ -2462,3 +2462,58 @@ func TestReconciler_WithEgressUpstreamCA(t *testing.T) {
 		t.Fatalf("upstream-ca.crt = %q; want %q", string(sec.Data["upstream-ca.crt"]), string(upstreamCA))
 	}
 }
+
+type failOnSecondEnsurePodKubeClient struct {
+	*controller.MemoryKubeClient
+	ensureCalls int
+}
+
+func (f *failOnSecondEnsurePodKubeClient) EnsurePod(ctx context.Context, pod controller.PodManifest) (string, error) {
+	f.ensureCalls++
+	if f.ensureCalls >= 2 {
+		return "", fmt.Errorf("injected EnsurePod timeout")
+	}
+	return f.MemoryKubeClient.EnsurePod(ctx, pod)
+}
+
+func TestReconciler_ResetRootFS_EnsurePodFailure_PersistsNewGenInPodBox(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	fk := &failOnSecondEnsurePodKubeClient{MemoryKubeClient: memKube}
+	r := controller.NewReconciler(
+		controller.WithKubeClient(fk),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	r.RegisterTemplate("base-tpl", sampleTemplate())
+
+	spec1 := v1alpha1.PodBoxSpec{
+		TemplateRef:      "base-tpl",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		VolumeKey:        "ws-key-1",
+	}
+	if _, err := r.Reconcile(ctx, "reset-persist-box", spec1); err != nil {
+		t.Fatalf("initial Reconcile failed: %v", err)
+	}
+
+	spec2 := spec1
+	spec2.RootfsGeneration = 2
+	if _, err := r.Reconcile(ctx, "reset-persist-box", spec2); err == nil {
+		t.Fatal("expected Reconcile error on injected EnsurePod failure")
+	}
+
+	box, err := memKube.GetPodBox(ctx, "cubepod-workloads", "reset-persist-box")
+	if err != nil {
+		t.Fatalf("GetPodBox failed: %v", err)
+	}
+	if box.Spec.RootfsGeneration != 2 || box.Status.ObservedRootfsGen != 2 {
+		t.Fatalf("expected generation=2 persisted in PodBox, got spec=%d status=%d", box.Spec.RootfsGeneration, box.Status.ObservedRootfsGen)
+	}
+	wantPVC := "reset-persist-box-rootfs-gen2-pvc"
+	if box.Status.RootfsPVCName != wantPVC {
+		t.Fatalf("RootfsPVCName = %q; want %q", box.Status.RootfsPVCName, wantPVC)
+	}
+	if box.Status.Phase != v1alpha1.PodBoxPhaseProvisioning {
+		t.Fatalf("Phase = %q; want %q", box.Status.Phase, v1alpha1.PodBoxPhaseProvisioning)
+	}
+}

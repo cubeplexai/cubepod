@@ -63,6 +63,79 @@ EOF
 systemctl daemon-reload
 systemctl enable cubepod-longhorn-loop.service
 
+install -d /usr/local/sbin
+cat > /usr/local/sbin/cubepod-spdk-sched-idle <<'EOF'
+#!/bin/bash
+set -euo pipefail
+
+# Longhorn V2 runs spdk_tgt with v2-data-engine-guaranteed-instance-manager-cpu >= 1000
+# in a burstable cgroup. Under Linux EEVDF hierarchical scheduling, a 100%-polling
+# SCHED_OTHER reactor prevents root-cgroup per-CPU kworker threads from flushing work
+# (for example during dmsetup/nvme teardown). Mark reactor_* threads SCHED_IDLE and keep
+# a 95% per-reactor cpu.max floor on the spdk_tgt container cgroup.
+for pid_dir in /proc/[0-9]*; do
+  [[ -r "$pid_dir/comm" ]] || continue
+  comm="$(cat "$pid_dir/comm" 2>/dev/null || true)"
+  [[ "$comm" == "spdk_tgt" ]] || continue
+  pid="${pid_dir#/proc/}"
+
+  reactors=0
+  for task_dir in "/proc/$pid/task/"*; do
+    [[ -r "$task_dir/comm" && -r "$task_dir/stat" ]] || continue
+    tcomm="$(cat "$task_dir/comm" 2>/dev/null || true)"
+    case "$tcomm" in
+      reactor_*)
+        reactors=$((reactors + 1))
+        tid="${task_dir##*/}"
+        policy="$(awk '{print $41}' "$task_dir/stat" 2>/dev/null || true)"
+        if [[ "$policy" != "5" ]]; then
+          /usr/bin/chrt -i -p 0 "$tid" >/dev/null 2>&1 || true
+        fi
+        ;;
+    esac
+  done
+
+  if [[ "$reactors" -gt 0 && -r "/proc/$pid/cgroup" ]]; then
+    cg_rel="$(awk -F: '$1 == "0" {print $3}' "/proc/$pid/cgroup" 2>/dev/null || true)"
+    cpu_max_file="/sys/fs/cgroup${cg_rel}/cpu.max"
+    if [[ -n "$cg_rel" && -w "$cpu_max_file" ]]; then
+      want="$((reactors * 95000)) 100000"
+      cur="$(cat "$cpu_max_file" 2>/dev/null || true)"
+      if [[ "$cur" != "$want" ]]; then
+        printf '%s\n' "$want" > "$cpu_max_file" || true
+      fi
+    fi
+  fi
+done
+EOF
+chmod 0755 /usr/local/sbin/cubepod-spdk-sched-idle
+
+cat > /etc/systemd/system/cubepod-spdk-sched-idle.service <<'EOF'
+[Unit]
+Description=Set SCHED_IDLE and cpu.max guard on Longhorn V2 SPDK reactor threads
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cubepod-spdk-sched-idle
+EOF
+
+cat > /etc/systemd/system/cubepod-spdk-sched-idle.timer <<'EOF'
+[Unit]
+Description=Periodically ensure SCHED_IDLE and cpu.max on Longhorn V2 SPDK reactors
+
+[Timer]
+OnBootSec=5s
+OnUnitActiveSec=5s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now cubepod-spdk-sched-idle.timer
+/usr/local/sbin/cubepod-spdk-sched-idle
+
 if [[ "${RESTART_KUBELET:-0}" == "1" ]]; then
   systemctl restart kubelet
 fi
