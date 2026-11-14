@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cubepod-docs",
+  "compatibility_date": "2026-11-01",
+  "routes": [
+    {
+      "pattern": "cubepod.cubeplex.ai",
+      "custom_domain": true
+    }
+  ],
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "404-page",
+    "html_handling": "auto-trailing-slash"
+  }
+}

@@ -22,7 +22,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/cubeplexai/cubepod"
+Homepage = "https://cubepod.cubeplex.ai"
+Documentation = "https://cubepod.cubeplex.ai/getting-started/introduction/"
 Repository = "https://github.com/cubeplexai/cubepod"
 Issues = "https://github.com/cubeplexai/cubepod/issues"
 

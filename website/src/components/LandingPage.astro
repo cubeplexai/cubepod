@@ -1,0 +1,1010 @@
+---
+interface Props {
+  locale: 'en' | 'zh';
+}
+
+const { locale } = Astro.props;
+const isZh = locale === 'zh';
+const prefix = isZh ? '/zh' : '';
+
+const copy = isZh
+  ? {
+      badge: 'v0.4.0 开源发布 · Apache 2.0 · 100% E2B 协议兼容',
+      h1Prefix: '面向高自治 AI Agent 的',
+      h1Accent: '持久化可写 RootFS 微虚拟机平台',
+      subtitle:
+        '通过双块卷 CSI Raw Block 持久化、Kata Containers 硬件级隔离、零导出 0 资源休眠秒级恢复与零信任出站凭据代理，让每个 AI Agent 拥有“永不丢失系统环境与项目文件”的云原生操作系统。',
+      ctaPrimary: '5 分钟快速上手',
+      ctaSecondary: '交互式 API 控制台',
+      ctaGithub: 'GitHub 仓库',
+      metrics: [
+        { value: '< 50ms', label: 'PodWarmPool 预热池秒领' },
+        { value: '~1s', label: 'CoW 克隆与跨节点唤醒' },
+        { value: '0 CPU / RAM', label: 'Zero-Export 休眠计算开销' },
+        { value: '100%', label: 'RootFS + /workspace 双卷持久化' },
+      ],
+      sdkTitle: '一行配置零改造迁移，或原生调用企业级超集 SDK',
+      sdkSubtitle: '直接把 E2B_DOMAIN 指向 cubepod-gateway，即可无缝接入 LangChain / AutoGen / OpenHands；或使用 CubePod 原生 Python / TypeScript SDK 与 MCP Server 解锁 1s CoW Fork 与零信任出站。',
+      tabs: [
+        { id: 'e2b', label: 'E2B 零改造接入' },
+        { id: 'python', label: 'Python SDK (cubepod)' },
+        { id: 'ts', label: 'TypeScript SDK' },
+        { id: 'cli', label: 'CLI & MCP Server' },
+      ],
+      archTitle: '四层云原生架构设计',
+      archSubtitle: '将易变的系统层（RootFS Upper）与珍贵的用户数据（/workspace）彻底解耦，构建零宿主机侵入的 Kata 微虚拟机执行底座。',
+      layers: [
+        {
+          num: '01',
+          name: '接入与协议层 (Access Layer)',
+          color: 'cyan',
+          items: ['CubePlex 平台 / CubeLoop 运行时', '官方 E2B SDK (Python / JS / Code Interpreter)', 'CubePod SDK (Python / TS / Go)', 'Native MCP stdio Server (cubepod mcp)'],
+        },
+        {
+          num: '02',
+          name: '无状态控制与网关面 (Control & Gateway Plane)',
+          color: 'indigo',
+          items: ['cubepod-gateway (Go): E2B REST/SSE 路由 & Auto-Resume 自动唤醒拦截', 'Signed /panel/{jwt}/ Proxy: HTTP / WebSocket / WebRTC 桌面与终端转发', 'cubepod-controller (Go): 双卷 PVC、PodWarmPool、CoW Fork 与每 Pod mTLS 签发'],
+        },
+        {
+          num: '03',
+          name: '硬件隔离数据面 (Kata MicroVM Data Plane)',
+          color: 'cyan',
+          items: ['podd-init (Rust PID 1): ext4 校验修复 + OverlayFS 组装 + pivot_root（零镜象侵入）', 'podd (Rust :49983): 前后台执行、磁盘环形日志 Cursor、流式 tar.gz archive-sync', 'cubepod-egress (Go): nftables 透明流量劫持 + SNI 白名单 + cpodref_ mTLS 凭据替换', 'Lazy Desktop Stack: Xorg + Chromium CDP (:9222) + Neko WebRTC (:8080) + ttyd (:7681)'],
+        },
+        {
+          num: '04',
+          name: '持久块存储面 (CSI Raw Block Storage Plane)',
+          color: 'indigo',
+          items: ['Base OCI Image (RO, virtio-fs / EROFS): 纯净基础镜像，无基础设施二进制污染', 'rootfs-pvc (volumeMode: Block -> ext4): 持久化 /usr /etc /var 增删，可独立重置', 'workspace-pvc (volumeMode: Block -> /workspace): 原生 NVMe-oF 速度，独立生命周期保护'],
+        },
+      ],
+      bentoTitle: '专为长周期高自治 Agent 打造的企业级超集能力',
+      features: [
+        {
+          tag: 'Dual-Volume',
+          title: '双卷解耦与无损系统重置',
+          desc: 'RootFS Upper 与 /workspace 各自绑定独立 Raw Block PVC。递增 rootfsGeneration 即可瞬间重置受损的 apt/pip 环境，同时 100% 保留 /workspace 代码与数据。',
+          href: `${prefix}/concepts/dual-volume-persistence/`,
+        },
+        {
+          tag: 'Zero-Export',
+          title: '0 CPU 休眠与 ~1s 跨节点恢复',
+          desc: '休眠时通过 sync + fsfreeze 落盘后直接销毁 Kata Pod，计算资源归零；来流时 Gateway 自动拦截并在集群任意节点 1 秒重挂载块卷恢复。',
+          href: `${prefix}/concepts/lifecycle-warmpool-fork/`,
+        },
+        {
+          tag: 'CoW Fork',
+          title: '< 1 秒写时复制沙箱分支',
+          desc: '基于 CSI VolumeSnapshot 同步克隆运行中沙箱的 RootFS 与 Workspace 双卷，让多子 Agent 并行探索不同修复方案而互不干扰。',
+          href: `${prefix}/concepts/lifecycle-warmpool-fork/`,
+        },
+        {
+          tag: 'Zero-Trust',
+          title: 'cpodref_ 零信任出站凭据库',
+          desc: '真实 API Key 永不进入沙箱内存或环境变量。沙箱内仅持有占位符，出站流量经 nftables 重定向至 cubepod-egress 通过单 Pod mTLS 动态换取真实凭据。',
+          href: `${prefix}/concepts/zero-trust-egress/`,
+        },
+        {
+          tag: 'GUI & Panel',
+          title: '懒加载桌面与签名 Panel 代理',
+          desc: '按需拉起 Xorg + Chromium CDP + Neko WebRTC + ttyd，通过 HMAC-SHA256 签名路径 /panel/{token}/ 安全暴露浏览器与交互终端，彻底告别端口冲突。',
+          href: `${prefix}/concepts/desktop-and-panel-proxy/`,
+        },
+        {
+          tag: 'MCP & Code',
+          title: '6 语言内核与原生 MCP Server',
+          desc: '内置 Python / JS / TS / R / Java / Bash 6 大流式代码内核与图表捕获，同时提供开箱即用的 cubepod mcp 工具集接入 Claude / Cursor。',
+          href: `${prefix}/sdks/mcp-server/`,
+        },
+      ],
+      compareTitle: 'CubePod vs. 上游 E2B Cloud vs. 传统容器沙箱',
+      compareHeaders: ['核心维度', '传统容器 / 上游 E2B', 'CubePod v0.4.0 开源平台'],
+      compareRows: [
+        ['系统盘持久化', 'RootFS 临时易失；休眠后 apt/pip 依赖全部丢失', 'RootFS + /workspace 双卷持久化；系统软件跨休眠永久保留'],
+        ['存储性能模型', 'NFS/CephFS 小文件 RPC 瓶颈或容器 overlay', '双 CSI Raw Block (Longhorn V2 SPDK / OpenEBS LVM) 原生 NVMe-oF 速度'],
+        ['OS 与数据耦合度', '重置环境往往连带清理工作区', '完全解耦：递增 rootfsGeneration 仅重装 OS，/workspace 毫发无损'],
+        ['休眠与冷启动', '千兆级内存镜像导出耗时且绑定 CPU 架构', 'Zero-Export (0 CPU/RAM) + ~1s 跨节点块卷挂载 + <50ms WarmPool 领用'],
+        ['多分支并行探索', '不支持或需全量磁盘拷贝', '< 1s 写时复制克隆 (POST /sandboxes/{id}/fork)'],
+        ['密钥与出站安全', '明文环境变量注入，存在 LLM 越狱泄露风险', '仅注入 cpodref_ 占位符 + nftables + mTLS 边界动态注入'],
+        ['协议与部署自由', '专有 SaaS 绑定', '100% E2B 协议超集 · 自托管 K8s (Kata) 或单机 Docker Compose'],
+      ],
+      ecoTitle: 'CubePlex 开源 Agent 基础设施生态',
+      ecoDesc: 'CubePod 专注底层硬件隔离与持久化执行底座，与 CubePlex（团队协同工作空间）及 CubeLoop（异步多模型 Agent 运行时）原生协同。',
+      ecoExplore: '阅读架构文档',
+      ecoApi: '打开 API 控制台',
+      ecoLlms: '查看 llms.txt',
+    }
+  : {
+      badge: 'v0.4.0 Open Source · Apache 2.0 · 100% E2B Compatible',
+      h1Prefix: 'Persistent Writable RootFS',
+      h1Accent: 'MicroVM Execution Platform for AI Agents',
+      subtitle:
+        'Hardware-isolated Kata MicroVMs with Dual CSI Raw Block persistence, Zero-Export 0-CPU hibernation with ~1s cross-node resume, <50ms PodWarmPool claims, 1s CoW forks, and a Zero-Trust cpodref_ egress vault.',
+      ctaPrimary: '5-Minute Quickstart',
+      ctaSecondary: 'Interactive API Explorer',
+      ctaGithub: 'View on GitHub',
+      metrics: [
+        { value: '< 50ms', label: 'PodWarmPool Cold Start' },
+        { value: '~1s', label: 'CoW Fork & Cross-Node Resume' },
+        { value: '0 CPU / RAM', label: 'Zero-Export Suspend Overhead' },
+        { value: '100%', label: 'RootFS + /workspace Persistence' },
+      ],
+      sdkTitle: 'Drop-in E2B Compatibility or Enterprise Superset SDKs',
+      sdkSubtitle:
+        'Point E2B_DOMAIN to cubepod-gateway with zero code changes, or adopt the native CubePod Python, TypeScript, Go, and MCP toolchains to unlock RootFS resets, 1s CoW forks, and cpodref_ secret bindings.',
+      tabs: [
+        { id: 'e2b', label: 'E2B Drop-in' },
+        { id: 'python', label: 'Python SDK' },
+        { id: 'ts', label: 'TypeScript SDK' },
+        { id: 'cli', label: 'CLI & MCP' },
+      ],
+      archTitle: 'Four-Layer Cloud-Native Architecture',
+      archSubtitle:
+        'Decouples ephemeral base OCI images from persistent RootFS deltas and user workspaces—with zero host-level kubelet/containerd patches.',
+      layers: [
+        {
+          num: '01',
+          name: 'Access Layer: Agent Platforms & SDKs',
+          color: 'cyan',
+          items: ['CubePlex Platform & CubeLoop Runtime', 'Official E2B SDKs (e2b / e2b-code-interpreter)', 'CubePod SDKs (Python / TypeScript / Go)', 'Native MCP stdio Server (cubepod mcp)'],
+        },
+        {
+          num: '02',
+          name: 'Control & Gateway Plane (Stateless HA)',
+          color: 'indigo',
+          items: ['cubepod-gateway (Go): E2B REST/SSE router & Auto-Resume traffic interceptor', 'Signed /panel/{jwt}/ Reverse Proxy: HTTP / WebSocket / WebRTC GUI streaming', 'cubepod-controller (Go): Dual Block PVC, PodWarmPool, CoW Fork & per-pod mTLS CA'],
+        },
+        {
+          num: '03',
+          name: 'Data Plane: Hardware-Isolated Kata MicroVM',
+          color: 'cyan',
+          items: ['podd-init (Rust PID 1): e2fsck/mkfs.ext4 + OverlayFS assembly + pivot_root', 'podd (Rust :49983): Exec, disk ring-buffer cursor logs & streaming tar.gz archive-sync', 'cubepod-egress (Go): nftables redirection + TLS SNI policy + cpodref_ mTLS swap', 'Lazy Desktop Stack: Xorg + Chromium CDP (:9222) + Neko WebRTC (:8080) + ttyd (:7681)'],
+        },
+        {
+          num: '04',
+          name: 'Persistent Storage Plane (CSI Raw Block)',
+          color: 'indigo',
+          items: ['Base OCI Image (RO, virtio-fs / EROFS): Stock upstream images kept 100% clean', 'rootfs-pvc (volumeMode: Block -> ext4): Persists /usr, /etc, /var across suspends', 'workspace-pvc (volumeMode: Block -> /workspace): Native NVMe-oF speed & independent lifecycle'],
+        },
+      ],
+      bentoTitle: 'Enterprise Superset Capabilities Built for Long-Lived Agents',
+      features: [
+        {
+          tag: 'Dual-Volume',
+          title: 'Decoupled RootFS Reset',
+          desc: 'RootFS Upper and /workspace reside on independent Raw Block PVCs. Increment rootfsGeneration to wipe a broken OS package state while keeping /workspace 100% intact.',
+          href: `${prefix}/concepts/dual-volume-persistence/`,
+        },
+        {
+          tag: 'Zero-Export',
+          title: '0-CPU Suspend & ~1s Resume',
+          desc: 'Quiesce filesystems with sync + fsfreeze and delete the Pod to drop compute cost to zero. Any incoming request auto-schedules a MicroVM on any node in ~1s.',
+          href: `${prefix}/concepts/lifecycle-warmpool-fork/`,
+        },
+        {
+          tag: 'CoW Fork',
+          title: '< 1s Copy-on-Write Sandbox Fork',
+          desc: 'Clone an active sandbox and both its RootFS and Workspace volumes via CSI snapshots so sub-agents can branch speculative trajectories concurrently.',
+          href: `${prefix}/concepts/lifecycle-warmpool-fork/`,
+        },
+        {
+          tag: 'Zero-Trust',
+          title: 'cpodref_ Secret Vault & Egress',
+          desc: 'Real API keys never enter sandbox memory or env vars. Outbound requests carry opaque placeholders exchanged by cubepod-egress over per-sandbox mTLS.',
+          href: `${prefix}/concepts/zero-trust-egress/`,
+        },
+        {
+          tag: 'GUI & Panel',
+          title: 'Lazy Desktop & Signed Panel Proxy',
+          desc: 'Activate Xorg, Chromium CDP, Neko WebRTC, and ttyd on demand—exposed safely via HMAC-SHA256 /panel/{token}/ URLs with zero port collisions.',
+          href: `${prefix}/concepts/desktop-and-panel-proxy/`,
+        },
+        {
+          tag: 'MCP & Kernels',
+          title: '6 Code Kernels & Native MCP',
+          desc: 'Stream NDJSON outputs and charts across Python, JS, TS, R, Java, and Bash, or expose sandboxes directly to Claude & Cursor via cubepod mcp.',
+          href: `${prefix}/sdks/mcp-server/`,
+        },
+      ],
+      compareTitle: 'CubePod vs. Upstream E2B & Standard Sandboxes',
+      compareHeaders: ['Capability', 'Upstream E2B / Standard Containers', 'CubePod v0.4.0 Open-Source'],
+      compareRows: [
+        ['System Persistence', 'Ephemeral RootFS; apt/pip installs lost on sleep', 'Full RootFS + /workspace dual block persistence across suspends'],
+        ['Storage Performance', 'Container overlay or slow shared NFS/CephFS RPCs', 'Dual CSI Raw Block (Longhorn V2 SPDK / OpenEBS LVM) at NVMe-oF speed'],
+        ['OS / Data Coupling', 'Resetting environment wipes workspace or vice versa', 'Fully decoupled: increment rootfsGeneration without touching /workspace'],
+        ['Suspend & Cold Start', 'Multi-GB VM memory snapshots or cold boots', 'Zero-Export (0 CPU/RAM) + ~1s block re-attach + <50ms WarmPool claims'],
+        ['Sandbox Forking', 'Unsupported or full volume copies', '< 1s Copy-on-Write volume clone (POST /sandboxes/{id}/fork)'],
+        ['Secret Isolation', 'Plaintext API keys in environment variables', 'Opaque cpodref_ placeholders + nftables + mTLS egress swap'],
+        ['Deployment Freedom', 'Proprietary SaaS vendor lock-in', '100% E2B superset · Self-host on K8s (Kata) or Docker Compose'],
+      ],
+      ecoTitle: 'Part of the Open-Source CubePlex Agent Stack',
+      ecoDesc: 'CubePod provides the persistent hardware-isolated execution layer powering CubePlex (Team Agent Workspace) and CubeLoop (Async Agent Runtime).',
+      ecoExplore: 'Explore Architecture',
+      ecoApi: 'Open API Reference',
+      ecoLlms: 'Read llms.txt',
+    };
+---
+
+<div class="cp-landing">
+  <!-- Ambient Background Grid & Glow -->
+  <div class="cp-bg-grid" aria-hidden="true"></div>
+
+  <!-- HERO -->
+  <section class="cp-hero">
+    <div class="cp-hero-copy">
+      <div class="cp-badge">
+        <span class="cp-dot"></span>
+        <span>{copy.badge}</span>
+      </div>
+      <h1 class="cp-h1">
+        {copy.h1Prefix}
+        <span class="cp-gradient-text">{copy.h1Accent}</span>
+      </h1>
+      <p class="cp-subtitle">{copy.subtitle}</p>
+      <div class="cp-actions">
+        <a href={`${prefix}/getting-started/quickstart/`} class="cp-btn cp-btn-primary">
+          {copy.ctaPrimary}
+          <span aria-hidden="true">→</span>
+        </a>
+        <a href={`${prefix}/api/`} class="cp-btn cp-btn-secondary">
+          {copy.ctaSecondary}
+        </a>
+        <a href="https://github.com/cubeplexai/cubepod" target="_blank" rel="noopener noreferrer" class="cp-btn cp-btn-ghost">
+          {copy.ctaGithub}
+        </a>
+      </div>
+    </div>
+
+    <div class="cp-hero-visual" aria-hidden="true">
+      <div class="cp-vm-card">
+        <div class="cp-vm-header">
+          <span class="cp-vm-pill">Kata MicroVM · virtio-blk</span>
+          <span class="cp-vm-status"><span class="cp-dot-green"></span> Running · 42ms claim</span>
+        </div>
+        <div class="cp-vm-stack">
+          <div class="cp-layer-box cp-layer-merged">
+            <div class="cp-layer-title">OverlayFS Merged Root (<code>/</code>)</div>
+            <div class="cp-layer-sub"><code>podd :49983</code> · <code>cubepod-egress</code> · Lazy Desktop</div>
+          </div>
+          <div class="cp-layer-split">
+            <div class="cp-layer-box cp-layer-rootfs">
+              <div class="cp-layer-title"><code>/dev/cubepod-rootfs</code></div>
+              <div class="cp-layer-sub">Persistent <code>upperdir</code> (ext4)<br/><code>apt</code> / <code>pip</code> / <code>npm</code> survive sleep</div>
+            </div>
+            <div class="cp-layer-box cp-layer-ws">
+              <div class="cp-layer-title"><code>/dev/cubepod-workspace</code></div>
+              <div class="cp-layer-sub">Mounted at <code>/workspace</code> (1000:1000)<br/>Preserved across <code>rootfsGeneration</code></div>
+            </div>
+          </div>
+          <div class="cp-layer-box cp-layer-base">
+            <div class="cp-layer-title">Base OCI Image (Read-Only <code>lowerdir</code>)</div>
+            <div class="cp-layer-sub">Stock Ubuntu / Python / Desktop image — zero injected binaries</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- METRICS STRIP -->
+  <section class="cp-metrics">
+    {copy.metrics.map((m) => (
+      <div class="cp-metric-card">
+        <div class="cp-metric-val">{m.value}</div>
+        <div class="cp-metric-label">{m.label}</div>
+      </div>
+    ))}
+  </section>
+
+  <!-- INTERACTIVE SDK SWITCHER -->
+  <section class="cp-section">
+    <div class="cp-section-head">
+      <h2>{copy.sdkTitle}</h2>
+      <p>{copy.sdkSubtitle}</p>
+    </div>
+
+    <div class="cp-code-switcher" data-cp-switcher>
+      <div class="cp-tabs" role="tablist">
+        {copy.tabs.map((tab, idx) => (
+          <button
+            type="button"
+            role="tab"
+            class={`cp-tab ${idx === 0 ? 'is-active' : ''}`}
+            aria-selected={idx === 0 ? 'true' : 'false'}
+            data-tab-target={tab.id}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      <div class="cp-panels">
+        <div class="cp-panel is-active" data-tab-panel="e2b">
+          <pre><code>{`export E2B_DOMAIN="localhost:8080"
+export E2B_API_KEY="cpod_live_secret"
+
+from e2b_code_interpreter import Sandbox
+
+with Sandbox.create() as sandbox:
+    # Install system packages once — persisted in rootfs-pvc across suspends
+    sandbox.commands.run("pip install pandas matplotlib")
+    exec_res = sandbox.run_code("import pandas as pd; pd.DataFrame({'a': [1, 2, 3]})")
+    print(exec_res.results[0].html)`}</code></pre>
+        </div>
+
+        <div class="cp-panel" data-tab-panel="python">
+          <pre><code>{`import asyncio
+from cubepod import AsyncCubePod
+
+async def main() -> None:
+    async with AsyncCubePod(base_url="http://localhost:8080") as client:
+        box = await client.create(
+            "cubeplex-ubuntu24-desktop",
+            secret_bindings=[{
+                "env_name": "GITHUB_TOKEN",
+                "placeholder": "cpodref_gh_readonly_01",
+                "allowed_hosts": ["api.github.com"],
+            }],
+        )
+        forked = await client.fork(box.sandbox_id)   # <1s CoW clone of both volumes
+        await client.reset_rootfs(box.sandbox_id)    # Reset OS, keep /workspace intact
+        await client.pause(box.sandbox_id)           # 0 CPU/RAM suspend`}</code></pre>
+        </div>
+
+        <div class="cp-panel" data-tab-panel="ts">
+          <pre><code>{`import { Sandbox } from 'cubepod';
+
+const sandbox = await Sandbox.create({
+  baseUrl: 'http://localhost:8080',
+  templateId: 'cubeplex-ubuntu24-desktop',
+  timeout: 1800,
+});
+
+// Atomic tar.gz sync + streaming Code Interpreter + signed WebRTC/CDP panel URL
+await sandbox.files.archiveSync({ 'app/main.py': 'print("ready")\\n' }, { dest: '/workspace' });
+const panel = await sandbox.createEndpoint(8080, { expiresInSeconds: 3600 });
+console.log('Interactive GUI Panel:', panel.url);
+
+await sandbox.pause();`}</code></pre>
+        </div>
+
+        <div class="cp-panel" data-tab-panel="cli">
+          <pre><code>{`# Provision from WarmPool or template, inspect, fork, and expose MCP tools
+cubepod health
+cubepod sandbox create --template cubeplex-ubuntu24-desktop
+cubepod sandbox exec <sandbox-id> "apt-get update && apt-get install -y ripgrep"
+cubepod sandbox pause <sandbox-id>
+cubepod sandbox fork <sandbox-id>
+cubepod sandbox reset-rootfs <sandbox-id>
+
+# Start native Model Context Protocol (MCP) JSON-RPC stdio server
+cubepod mcp`}</code></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4-LAYER SYSTEM ARCHITECTURE -->
+  <section class="cp-section">
+    <div class="cp-section-head">
+      <h2>{copy.archTitle}</h2>
+      <p>{copy.archSubtitle}</p>
+    </div>
+    <div class="cp-arch-grid">
+      {copy.layers.map((layer) => (
+        <div class={`cp-arch-layer cp-arch-${layer.color}`}>
+          <div class="cp-arch-num">{layer.num}</div>
+          <div class="cp-arch-body">
+            <h3>{layer.name}</h3>
+            <ul>
+              {layer.items.map((item) => <li>{item}</li>)}
+            </ul>
+          </div>
+        </div>
+      ))}
+    </div>
+  </section>
+
+  <!-- 6-CARD ENTERPRISE CAPABILITY BENTO -->
+  <section class="cp-section">
+    <div class="cp-section-head">
+      <h2>{copy.bentoTitle}</h2>
+    </div>
+    <div class="cp-bento">
+      {copy.features.map((f) => (
+        <a href={f.href} class="cp-bento-card">
+          <span class="cp-bento-tag">{f.tag}</span>
+          <h3>{f.title}</h3>
+          <p>{f.desc}</p>
+        </a>
+      ))}
+    </div>
+  </section>
+
+  <!-- COMPARISON MATRIX -->
+  <section class="cp-section">
+    <div class="cp-section-head">
+      <h2>{copy.compareTitle}</h2>
+    </div>
+    <div class="cp-table-wrap">
+      <table class="cp-compare-table">
+        <thead>
+          <tr>
+            {copy.compareHeaders.map((h) => <th>{h}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {copy.compareRows.map((row) => (
+            <tr>
+              <td class="cp-td-dim">{row[0]}</td>
+              <td class="cp-td-old">{row[1]}</td>
+              <td class="cp-td-new">{row[2]}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ECOSYSTEM FOOTER CTA -->
+  <section class="cp-footer-cta">
+    <div>
+      <h2>{copy.ecoTitle}</h2>
+      <p>{copy.ecoDesc}</p>
+    </div>
+    <div class="cp-actions">
+      <a href={`${prefix}/concepts/architecture/`} class="cp-btn cp-btn-primary">{copy.ecoExplore}</a>
+      <a href={`${prefix}/api/`} class="cp-btn cp-btn-secondary">{copy.ecoApi}</a>
+      <a href="/llms.txt" class="cp-btn cp-btn-ghost">{copy.ecoLlms}</a>
+    </div>
+    <div class="cp-eco-links">
+      <a href="https://github.com/cubeplexai/cubeplex" target="_blank" rel="noopener noreferrer">CubePlex</a>
+      <span>·</span>
+      <a href="https://github.com/cubeplexai/cubeloop" target="_blank" rel="noopener noreferrer">CubeLoop</a>
+      <span>·</span>
+      <a href="https://github.com/cubeplexai/cubepod" target="_blank" rel="noopener noreferrer">CubePod (Apache 2.0)</a>
+    </div>
+  </section>
+</div>
+
+<script is:inline>
+  document.querySelectorAll('[data-cp-switcher]').forEach((root) => {
+    const tabs = root.querySelectorAll('[data-tab-target]');
+    const panels = root.querySelectorAll('[data-tab-panel]');
+    tabs.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const target = btn.getAttribute('data-tab-target');
+        tabs.forEach((t) => {
+          const active = t === btn;
+          t.classList.toggle('is-active', active);
+          t.setAttribute('aria-selected', active ? 'true' : 'false');
+        });
+        panels.forEach((p) => {
+          p.classList.toggle('is-active', p.getAttribute('data-tab-panel') === target);
+        });
+      });
+    });
+  });
+</script>
+
+<style>
+  .cp-landing {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 4.5rem;
+    padding: 1.5rem 0 3rem;
+  }
+
+  .cp-bg-grid {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: -1;
+    background-image:
+      radial-gradient(circle at 18% 12%, rgba(34, 211, 238, 0.14), transparent 42%),
+      radial-gradient(circle at 82% 28%, rgba(129, 140, 248, 0.14), transparent 44%),
+      linear-gradient(to right, rgba(148, 163, 184, 0.05) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(148, 163, 184, 0.05) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 48px 48px, 48px 48px;
+  }
+
+  .cp-hero {
+    display: grid;
+    grid-template-columns: 1.15fr 0.95fr;
+    gap: 2.5rem;
+    align-items: center;
+    padding-top: 1.25rem;
+  }
+
+  @media (max-width: 960px) {
+    .cp-hero {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .cp-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.35rem 0.9rem;
+    border-radius: 999px;
+    border: 1px solid var(--cp-border-accent);
+    background: rgba(34, 211, 238, 0.08);
+    color: var(--cp-cyan);
+    font-family: var(--sl-font-mono);
+    font-size: 0.8rem;
+    margin-bottom: 1.25rem;
+  }
+
+  .cp-dot {
+    width: 0.5rem;
+    height: 0.5rem;
+    border-radius: 50%;
+    background: var(--cp-cyan);
+    box-shadow: 0 0 10px var(--cp-cyan);
+  }
+
+  .cp-h1 {
+    font-size: clamp(2.15rem, 4vw, 3.35rem);
+    line-height: 1.12;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    color: var(--cp-heading);
+    margin: 0 0 1.25rem;
+  }
+
+  .cp-gradient-text {
+    display: block;
+    background: linear-gradient(120deg, #22d3ee 0%, #38bdf8 48%, #818cf8 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .cp-subtitle {
+    font-size: 1.08rem;
+    line-height: 1.7;
+    color: var(--cp-muted);
+    margin: 0 0 1.85rem;
+    max-width: 60ch;
+  }
+
+  .cp-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.85rem;
+  }
+
+  .cp-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.72rem 1.25rem;
+    border-radius: 0.6rem;
+    font-weight: 600;
+    font-size: 0.94rem;
+    text-decoration: none !important;
+    transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+  }
+
+  .cp-btn:hover {
+    transform: translateY(-1px);
+  }
+
+  .cp-btn-primary {
+    background: linear-gradient(135deg, #22d3ee, #06b6d4);
+    color: #04131c !important;
+    box-shadow: 0 8px 24px -6px rgba(34, 211, 238, 0.45);
+  }
+
+  .cp-btn-secondary {
+    background: var(--cp-surface);
+    color: var(--cp-heading) !important;
+    border: 1px solid var(--cp-border-accent);
+  }
+
+  .cp-btn-ghost {
+    background: transparent;
+    color: var(--cp-muted) !important;
+    border: 1px solid var(--cp-border);
+  }
+
+  .cp-vm-card {
+    background: var(--cp-surface);
+    border: 1px solid var(--cp-border);
+    border-radius: 1rem;
+    padding: 1.25rem;
+    box-shadow: 0 24px 50px -18px rgba(2, 6, 23, 0.7);
+  }
+
+  .cp-vm-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    font-family: var(--sl-font-mono);
+    font-size: 0.78rem;
+  }
+
+  .cp-vm-pill {
+    padding: 0.25rem 0.65rem;
+    border-radius: 0.4rem;
+    background: rgba(129, 140, 248, 0.14);
+    color: var(--cp-indigo);
+    border: 1px solid rgba(129, 140, 248, 0.3);
+  }
+
+  .cp-vm-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--cp-emerald);
+  }
+
+  .cp-dot-green {
+    width: 0.45rem;
+    height: 0.45rem;
+    border-radius: 50%;
+    background: var(--cp-emerald);
+  }
+
+  .cp-vm-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .cp-layer-split {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }
+
+  @media (max-width: 560px) {
+    .cp-layer-split {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .cp-layer-box {
+    padding: 0.85rem 1rem;
+    border-radius: 0.65rem;
+    border: 1px solid var(--cp-border);
+    background: rgba(15, 23, 42, 0.55);
+  }
+
+  :root[data-theme='light'] .cp-layer-box {
+    background: rgba(241, 245, 249, 0.9);
+  }
+
+  .cp-layer-merged {
+    border-color: rgba(34, 211, 238, 0.38);
+  }
+
+  .cp-layer-rootfs {
+    border-color: rgba(34, 211, 238, 0.35);
+    background: rgba(8, 51, 68, 0.25);
+  }
+
+  .cp-layer-ws {
+    border-color: rgba(129, 140, 248, 0.38);
+    background: rgba(49, 46, 129, 0.25);
+  }
+
+  .cp-layer-title {
+    font-weight: 700;
+    font-size: 0.88rem;
+    color: var(--cp-heading);
+    margin-bottom: 0.28rem;
+  }
+
+  .cp-layer-sub {
+    font-size: 0.78rem;
+    line-height: 1.5;
+    color: var(--cp-muted);
+  }
+
+  .cp-metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1rem;
+  }
+
+  @media (max-width: 820px) {
+    .cp-metrics {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+
+  .cp-metric-card {
+    padding: 1.25rem;
+    border-radius: 0.85rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-surface);
+  }
+
+  .cp-metric-val {
+    font-family: var(--sl-font-mono);
+    font-size: 1.65rem;
+    font-weight: 800;
+    color: var(--cp-cyan);
+    margin-bottom: 0.3rem;
+  }
+
+  .cp-metric-label {
+    font-size: 0.88rem;
+    color: var(--cp-muted);
+  }
+
+  .cp-section-head {
+    margin-bottom: 1.5rem;
+  }
+
+  .cp-section-head h2 {
+    font-size: 1.75rem;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: var(--cp-heading);
+    margin: 0 0 0.5rem;
+  }
+
+  .cp-section-head p {
+    color: var(--cp-muted);
+    max-width: 72ch;
+    margin: 0;
+  }
+
+  /* Code switcher */
+  .cp-code-switcher {
+    border: 1px solid var(--cp-border);
+    border-radius: 0.9rem;
+    background: var(--cp-surface-solid);
+    overflow: hidden;
+  }
+
+  .cp-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    padding: 0.6rem 0.75rem;
+    border-bottom: 1px solid var(--cp-border);
+    background: rgba(15, 23, 42, 0.45);
+  }
+
+  :root[data-theme='light'] .cp-tabs {
+    background: #f1f5f9;
+  }
+
+  .cp-tab {
+    appearance: none;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--cp-muted);
+    font-family: var(--sl-font-mono);
+    font-size: 0.83rem;
+    padding: 0.45rem 0.85rem;
+    border-radius: 0.45rem;
+    cursor: pointer;
+  }
+
+  .cp-tab.is-active {
+    color: var(--cp-cyan);
+    background: rgba(34, 211, 238, 0.1);
+    border-color: var(--cp-border-accent);
+  }
+
+  .cp-panel {
+    display: none;
+  }
+
+  .cp-panel.is-active {
+    display: block;
+  }
+
+  .cp-panel pre {
+    margin: 0;
+    padding: 1.25rem 1.4rem;
+    overflow-x: auto;
+    font-family: var(--sl-font-mono);
+    font-size: 0.86rem;
+    line-height: 1.6;
+    background: transparent;
+    border: none;
+  }
+
+  /* Architecture 4-layer */
+  .cp-arch-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+  }
+
+  .cp-arch-layer {
+    display: grid;
+    grid-template-columns: 3.5rem 1fr;
+    gap: 1.25rem;
+    align-items: start;
+    padding: 1.2rem 1.35rem;
+    border-radius: 0.85rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-surface);
+  }
+
+  .cp-arch-cyan {
+    border-left: 3px solid var(--cp-cyan);
+  }
+
+  .cp-arch-indigo {
+    border-left: 3px solid var(--cp-indigo);
+  }
+
+  .cp-arch-num {
+    font-family: var(--sl-font-mono);
+    font-size: 1.25rem;
+    font-weight: 800;
+    color: var(--cp-cyan);
+  }
+
+  .cp-arch-indigo .cp-arch-num {
+    color: var(--cp-indigo);
+  }
+
+  .cp-arch-body h3 {
+    margin: 0 0 0.5rem;
+    font-size: 1.05rem;
+    color: var(--cp-heading);
+  }
+
+  .cp-arch-body ul {
+    margin: 0;
+    padding-left: 1.15rem;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+    gap: 0.35rem 1.5rem;
+    color: var(--cp-muted);
+    font-size: 0.9rem;
+  }
+
+  /* Bento */
+  .cp-bento {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.1rem;
+  }
+
+  @media (max-width: 960px) {
+    .cp-bento {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+
+  @media (max-width: 620px) {
+    .cp-bento {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .cp-bento-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.55rem;
+    padding: 1.35rem;
+    border-radius: 0.9rem;
+    border: 1px solid var(--cp-border);
+    background: var(--cp-surface);
+    text-decoration: none !important;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+  }
+
+  .cp-bento-card:hover {
+    border-color: var(--cp-border-accent);
+    transform: translateY(-2px);
+  }
+
+  .cp-bento-tag {
+    align-self: flex-start;
+    font-family: var(--sl-font-mono);
+    font-size: 0.72rem;
+    padding: 0.2rem 0.55rem;
+    border-radius: 0.35rem;
+    background: rgba(34, 211, 238, 0.1);
+    color: var(--cp-cyan);
+    border: 1px solid rgba(34, 211, 238, 0.25);
+  }
+
+  .cp-bento-card h3 {
+    margin: 0.15rem 0 0;
+    font-size: 1.08rem;
+    color: var(--cp-heading);
+  }
+
+  .cp-bento-card p {
+    margin: 0;
+    font-size: 0.9rem;
+    line-height: 1.6;
+    color: var(--cp-muted);
+  }
+
+  /* Comparison table */
+  .cp-table-wrap {
+    border: 1px solid var(--cp-border);
+    border-radius: 0.9rem;
+    overflow-x: auto;
+    background: var(--cp-surface);
+  }
+
+  .cp-compare-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.92rem;
+  }
+
+  .cp-compare-table th,
+  .cp-compare-table td {
+    padding: 0.9rem 1.1rem;
+    text-align: left;
+    border-bottom: 1px solid var(--cp-border);
+  }
+
+  .cp-compare-table th {
+    color: var(--cp-heading);
+    font-weight: 700;
+    background: rgba(15, 23, 42, 0.45);
+  }
+
+  :root[data-theme='light'] .cp-compare-table th {
+    background: #f1f5f9;
+  }
+
+  .cp-td-dim {
+    font-weight: 600;
+    color: var(--cp-heading);
+    white-space: nowrap;
+  }
+
+  .cp-td-old {
+    color: var(--cp-muted);
+  }
+
+  .cp-td-new {
+    color: var(--cp-cyan);
+    font-weight: 500;
+  }
+
+  /* Footer CTA */
+  .cp-footer-cta {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+    padding: 2rem;
+    border-radius: 1rem;
+    border: 1px solid var(--cp-border-accent);
+    background: linear-gradient(135deg, rgba(34, 211, 238, 0.08), rgba(129, 140, 248, 0.08));
+  }
+
+  .cp-footer-cta h2 {
+    margin: 0 0 0.4rem;
+    font-size: 1.5rem;
+    color: var(--cp-heading);
+  }
+
+  .cp-footer-cta p {
+    margin: 0;
+    color: var(--cp-muted);
+  }
+
+  .cp-eco-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.65rem;
+    font-family: var(--sl-font-mono);
+    font-size: 0.85rem;
+    color: var(--cp-muted);
+  }
+
+  .cp-eco-links a {
+    color: var(--cp-cyan);
+    text-decoration: none;
+  }
+</style>

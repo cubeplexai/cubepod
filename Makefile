@@ -1,4 +1,4 @@
-.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress build-cli test test-rust test-go test-e2e test-e2b-compat test-k8s-e2e test-k8s-block test-k8s-longhorn-v2 fmt vet clean
+.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress build-cli test test-rust test-go test-e2e test-e2b-compat test-k8s-e2e test-k8s-block test-k8s-longhorn-v2 fmt vet clean docs-dev docs-build
 
 GO ?= go
 CARGO ?= $(shell which cargo 2>/dev/null || echo "$(HOME)/.cargo/bin/cargo")
@@ -86,3 +86,9 @@ vet:
 
 clean:
 	rm -rf $(BINDIR) target
+
+docs-dev:
+	cd website && npm run dev
+
+docs-build:
+	cd website && npm run build && npm run verify

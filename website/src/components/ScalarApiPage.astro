@@ -1,0 +1,126 @@
+---
+interface Props {
+  locale: 'en' | 'zh';
+}
+const { locale } = Astro.props;
+const isZh = locale === 'zh';
+const homeHref = isZh ? '/zh/' : '/';
+const docsHref = isZh ? '/zh/getting-started/introduction/' : '/getting-started/introduction/';
+const switchHref = isZh ? '/api/' : '/zh/api/';
+const switchLabel = isZh ? 'English' : '简体中文';
+---
+
+<!doctype html>
+<html lang={isZh ? 'zh-CN' : 'en'}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{isZh ? 'CubePod API 交互式控制台 (OpenAPI 3.1)' : 'CubePod Interactive API Reference (OpenAPI 3.1)'}</title>
+    <meta
+      name="description"
+      content={isZh
+        ? 'CubePod v0.4.0 统一控制面与数据面 OpenAPI 3.1 交互式调试控制台。'
+        : 'Interactive OpenAPI 3.1 explorer for the CubePod v0.4.0 E2B-compatible superset Control and Data Plane API.'}
+    />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #070b14;
+        color: #f8fafc;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans SC', sans-serif;
+      }
+      .cp-api-topbar {
+        position: sticky;
+        top: 0;
+        z-index: 1000;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 1rem;
+        padding: 0.65rem 1.25rem;
+        background: rgba(7, 11, 20, 0.92);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+      }
+      .cp-api-brand {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        text-decoration: none;
+        color: #f8fafc;
+        font-weight: 700;
+      }
+      .cp-api-badge {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.75rem;
+        padding: 0.2rem 0.55rem;
+        border-radius: 999px;
+        background: rgba(34, 211, 238, 0.12);
+        color: #22d3ee;
+        border: 1px solid rgba(34, 211, 238, 0.35);
+      }
+      .cp-api-nav {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 0.85rem;
+        font-size: 0.88rem;
+      }
+      .cp-api-nav a {
+        color: #cbd5e1;
+        text-decoration: none;
+        padding: 0.32rem 0.65rem;
+        border-radius: 0.45rem;
+        border: 1px solid transparent;
+      }
+      .cp-api-nav a:hover {
+        color: #22d3ee;
+        border-color: rgba(34, 211, 238, 0.3);
+        background: rgba(34, 211, 238, 0.08);
+      }
+      /* Align Scalar theme variables with CubePod dark aesthetic */
+      .dark-mode {
+        --scalar-background-1: #070b14;
+        --scalar-background-2: #0a101e;
+        --scalar-background-3: #0f172a;
+        --scalar-color-accent: #22d3ee;
+      }
+    </style>
+  </head>
+  <body class="dark-mode">
+    <header class="cp-api-topbar">
+      <a href={homeHref} class="cp-api-brand">
+        <img src="/favicon.svg" alt="CubePod" width="24" height="24" />
+        <span>CubePod</span>
+        <span class="cp-api-badge">OpenAPI 3.1 · v0.4.0</span>
+      </a>
+      <nav class="cp-api-nav">
+        <a href={docsHref}>{isZh ? '返回文档' : 'Back to Docs'}</a>
+        <a href="/openapi.yaml" target="_blank" rel="noopener noreferrer">openapi.yaml</a>
+        <a href="/llms.txt" target="_blank" rel="noopener noreferrer">llms.txt</a>
+        <a href={switchHref}>{switchLabel}</a>
+        <a href="https://github.com/cubeplexai/cubepod" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </nav>
+    </header>
+
+    <script
+      id="api-reference"
+      data-url="/openapi.yaml"
+      data-configuration={JSON.stringify({
+        theme: 'kepler',
+        darkMode: true,
+        forceDarkModeState: 'dark',
+        hideDarkModeToggle: false,
+        showSidebar: true,
+        defaultHttpClient: { targetKey: 'python', clientKey: 'httpx' },
+      })}
+    ></script>
+    <script src="/vendor/scalar-api-reference.js" is:inline></script>
+  </body>
+</html>
