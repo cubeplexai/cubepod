@@ -326,7 +326,7 @@ func (s *Server) handleConnectRPCProcessStart(w http.ResponseWriter, r *http.Req
 		}
 	}
 	if workdir == "" {
-		workdir = filepath.Join(s.workspaceBaseDir, rec.SandboxID, "workspace")
+		workdir = s.workspaceDirForSandbox(rec.SandboxID, rec.VolumeKey)
 		rec.WorkspaceDir = workdir
 	}
 	_ = os.MkdirAll(workdir, 0755)

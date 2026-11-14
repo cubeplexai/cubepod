@@ -38,6 +38,7 @@ from .models import (
     DesktopSession,
     ExecutionResult,
     FileEntry,
+    NetworkPolicySpec,
     PanelEndpoint,
     SandboxInfo,
 )
@@ -105,7 +106,7 @@ class AsyncCubePod:
         *,
         volume_key: str | None = None,
         metadata: dict[str, str] | None = None,
-        network_policy: dict[str, Any] | None = None,
+        network_policy: NetworkPolicySpec | dict[str, Any] | None = None,
         secret_bindings: builtins.list[dict[str, Any]] | None = None,
         timeout_seconds: int | None = None,
         warm_pool_ref: str | None = None,
@@ -178,9 +179,10 @@ class AsyncCubePod:
         resp.raise_for_status()
         return _parse_info(_json_dict(resp))
 
-    async def delete(self, sandbox_id: str) -> None:
+    async def delete(self, sandbox_id: str, delete_volumes: bool = False) -> None:
         """Terminate and permanently delete a sandbox."""
-        resp = await self._request("DELETE", f"/sandboxes/{sandbox_id}")
+        params = {"deleteVolumes": "true"} if delete_volumes else None
+        resp = await self._request("DELETE", f"/sandboxes/{sandbox_id}", params=params)
         resp.raise_for_status()
 
     async def renew_timeout(self, sandbox_id: str, timeout_seconds: int = 3600) -> dict[str, Any]:

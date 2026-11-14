@@ -1,12 +1,63 @@
 package controller
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"slices"
 	"strings"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
+
+const (
+	workspacePVCSuffix     = "-workspace-pvc"
+	maxWorkspacePVCNameLen = 63
+	maxWorkspacePrefixLen  = maxWorkspacePVCNameLen - len(workspacePVCSuffix) // 49
+	workspaceHashHexLen    = 8
+)
+
+// SanitizeVolumeKey normalizes a user-supplied volumeKey into a valid DNS-1123
+// label prefix so appending "-workspace-pvc" stays within 63 characters.
+func SanitizeVolumeKey(volumeKey string) string {
+	lower := strings.ToLower(volumeKey)
+	var b strings.Builder
+	b.Grow(len(lower))
+	for i := 0; i < len(lower); i++ {
+		c := lower[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' {
+			b.WriteByte(c)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	prefix := strings.Trim(b.String(), "-")
+
+	sum := sha256.Sum256([]byte(volumeKey))
+	hashSuffix := fmt.Sprintf("%x", sum[:workspaceHashHexLen/2])
+
+	if prefix == "" {
+		return "vol-" + hashSuffix
+	}
+	if len(prefix) > maxWorkspacePrefixLen {
+		keepLen := maxWorkspacePrefixLen - 1 - workspaceHashHexLen // 40
+		truncated := strings.TrimRight(prefix[:keepLen], "-")
+		if truncated == "" {
+			return "vol-" + hashSuffix
+		}
+		return truncated + "-" + hashSuffix
+	}
+	return prefix
+}
+
+// WorkspacePVCName returns the workspace PVC name for a PodBox. When
+// spec.VolumeKey is non-empty, it returns a deterministic DNS-1123 name based on
+// VolumeKey so workspace data persists across delete -> create cycles.
+func WorkspacePVCName(podBoxName string, spec v1alpha1.PodBoxSpec) string {
+	if spec.VolumeKey != "" {
+		return SanitizeVolumeKey(spec.VolumeKey) + workspacePVCSuffix
+	}
+	return fmt.Sprintf("%s-workspace-pvc", podBoxName)
+}
 
 // BlockPVCManifest represents the Kubernetes PersistentVolumeClaim specification
 // for a raw block volume (volumeMode: Block).
@@ -105,7 +156,7 @@ func BuildBlockPVCs(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.
 	if spec.RootfsGeneration > 1 {
 		rootfsName = fmt.Sprintf("%s-rootfs-gen%d-pvc", boxName, spec.RootfsGeneration)
 	}
-	workspaceName := fmt.Sprintf("%s-workspace-pvc", boxName)
+	workspaceName := WorkspacePVCName(boxName, spec)
 
 	pvcVolMode := "Block"
 	if strings.EqualFold(vm, "Filesystem") {
@@ -199,7 +250,7 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 
 	workspacePVC := status.WorkspacePVCName
 	if workspacePVC == "" {
-		workspacePVC = fmt.Sprintf("%s-workspace-pvc", boxName)
+		workspacePVC = WorkspacePVCName(boxName, spec)
 	}
 
 	volumes := []VolumeManifest{

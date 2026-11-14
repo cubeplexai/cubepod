@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 import httpx
@@ -13,6 +13,7 @@ from .models import (
     DesktopSession,
     ExecutionResult,
     FileEntry,
+    NetworkPolicySpec,
     PanelEndpoint,
     SandboxInfo,
     _build_tar_gz_bytes,
@@ -150,7 +151,7 @@ def _build_create_payload(
     *,
     volume_key: str | None = None,
     metadata: dict[str, str] | None = None,
-    network_policy: dict[str, Any] | None = None,
+    network_policy: NetworkPolicySpec | Mapping[str, Any] | None = None,
     secret_bindings: list[dict[str, Any]] | None = None,
     timeout_seconds: int | None = None,
     warm_pool_ref: str | None = None,
@@ -167,15 +168,14 @@ def _build_create_payload(
         ext["warmPoolRef"] = warm_pool_ref
     if resource:
         ext["resource"] = resource
+    if network_policy is not None:
+        ext["networkPolicy"] = dict(network_policy)
+    if secret_bindings is not None:
+        net_policy = dict(ext.get("networkPolicy") or {})
+        net_policy["secretBindings"] = secret_bindings
+        ext["networkPolicy"] = net_policy
     if ext:
         payload["extension"] = ext
-
-    if network_policy is not None:
-        payload["networkPolicy"] = dict(network_policy)
-    if secret_bindings is not None:
-        if "networkPolicy" not in payload:
-            payload["networkPolicy"] = {}
-        payload["networkPolicy"]["secretBindings"] = secret_bindings
     return payload
 
 

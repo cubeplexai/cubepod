@@ -3,6 +3,7 @@ package gateway
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
@@ -20,7 +21,7 @@ func (s *Server) resolveFilePath(rec *SandboxRecord, userPath string) (string, e
 	}
 	baseDir := rec.WorkspaceDir
 	if baseDir == "" {
-		baseDir = filepath.Join(s.workspaceBaseDir, rec.SandboxID, "workspace")
+		baseDir = s.workspaceDirForSandbox(rec.SandboxID, rec.VolumeKey)
 		_ = os.MkdirAll(baseDir, 0755)
 		rec.WorkspaceDir = baseDir
 	}
@@ -369,13 +370,19 @@ func (s *Server) handleArchiveSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Local fallback
-	if r.Body == nil {
-		http.Error(w, "empty request body", http.StatusBadRequest)
-		return
+	dest := r.URL.Query().Get("dest")
+	if dest == "" {
+		dest = r.URL.Query().Get("destination")
 	}
-
-	dest := r.URL.Query().Get("destination")
+	if dest == "" {
+		dest = r.URL.Query().Get("path")
+	}
 	baseDir := rec.WorkspaceDir
+	if baseDir == "" {
+		baseDir = s.workspaceDirForSandbox(rec.SandboxID, rec.VolumeKey)
+		_ = os.MkdirAll(baseDir, 0755)
+		rec.WorkspaceDir = baseDir
+	}
 	if dest != "" {
 		resolvedDest, err := s.resolveFilePath(rec, dest)
 		if err != nil {
@@ -389,19 +396,62 @@ func (s *Server) handleArchiveSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Remove uninstalled paths if specified
-	for _, p := range r.URL.Query()["remove_paths"] {
-		if resolved, err := s.resolveFilePath(rec, p); err == nil {
-			_ = os.RemoveAll(resolved)
-		}
-	}
-	for _, p := range r.URL.Query()["removePaths"] {
-		if resolved, err := s.resolveFilePath(rec, p); err == nil {
-			_ = os.RemoveAll(resolved)
+	var removeTargets []string
+	for _, key := range []string{"remove_paths", "removePaths"} {
+		for _, entry := range r.URL.Query()[key] {
+			for _, part := range strings.Split(entry, ",") {
+				trimmed := strings.TrimSpace(part)
+				if trimmed == "" {
+					continue
+				}
+				resolved, err := resolveArchiveRemovePath(baseDir, trimmed)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				removeTargets = append(removeTargets, resolved)
+			}
 		}
 	}
 
-	br := bufio.NewReader(r.Body)
+	var bodyBytes []byte
+	if r.Body != nil {
+		var err error
+		bodyBytes, err = io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+
+	if len(bodyBytes) == 0 {
+		if len(removeTargets) == 0 {
+			http.Error(w, "empty request body", http.StatusBadRequest)
+			return
+		}
+		for _, target := range removeTargets {
+			if err := os.RemoveAll(target); err != nil {
+				http.Error(w, "failed to remove path: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":    "ok",
+			"extracted": 0,
+		})
+		return
+	}
+
+	// Remove uninstalled paths under destination before extracting archive
+	for _, target := range removeTargets {
+		if err := os.RemoveAll(target); err != nil {
+			http.Error(w, "failed to remove path: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+
+	br := bufio.NewReader(bytes.NewReader(bodyBytes))
 	magic, err := br.Peek(2)
 	if err != nil && err != io.EOF {
 		http.Error(w, "failed to read archive: "+err.Error(), http.StatusBadRequest)
@@ -486,4 +536,27 @@ func (s *Server) handleArchiveSync(w http.ResponseWriter, r *http.Request) {
 		"status":    "ok",
 		"extracted": extractedCount,
 	})
+}
+
+func resolveArchiveRemovePath(baseDir, rawPath string) (string, error) {
+	if rawPath == "" || strings.HasPrefix(rawPath, "/") || strings.HasPrefix(rawPath, "\\") {
+		return "", fmt.Errorf("invalid archive path %q", rawPath)
+	}
+	normalized := strings.ReplaceAll(rawPath, "\\", "/")
+	for _, seg := range strings.Split(normalized, "/") {
+		if seg == ".." {
+			return "", fmt.Errorf("invalid archive path traversal %q", rawPath)
+		}
+	}
+	rel := strings.TrimPrefix(normalized, "./")
+	cleanRel := path.Clean(rel)
+	if cleanRel == "" || cleanRel == "." || cleanRel == ".." || strings.HasPrefix(cleanRel, "../") {
+		return "", fmt.Errorf("invalid archive path %q", rawPath)
+	}
+	cleanBase := filepath.Clean(baseDir)
+	target := filepath.Clean(filepath.Join(cleanBase, filepath.FromSlash(cleanRel)))
+	if target == cleanBase || !strings.HasPrefix(target, cleanBase+string(filepath.Separator)) {
+		return "", fmt.Errorf("archive path %q escapes destination", rawPath)
+	}
+	return target, nil
 }

@@ -27,9 +27,16 @@ export interface SecretBinding {
   allowedHeaders?: string[];
 }
 
+export interface NetworkEgressRule {
+  action: 'allow' | 'deny';
+  target: string;
+}
+
 export interface NetworkPolicySpec {
   defaultAction?: 'Allow' | 'Deny';
   allowHosts?: string[];
+  denyHosts?: string[];
+  egress?: NetworkEgressRule[];
   upstreamProxy?: string;
   secretBindings?: SecretBinding[];
 }

@@ -39,7 +39,8 @@ class TestAsyncCubePod(unittest.IsolatedAsyncioTestCase):
                 data = json.loads(request.content)
                 self.assertEqual(data["templateID"], "cubeplex-desktop")
                 self.assertEqual(data["extension"]["volumeKey"], "vol-123")
-                self.assertIn("networkPolicy", data)
+                self.assertNotIn("networkPolicy", data)
+                self.assertIn("networkPolicy", data["extension"])
                 return httpx.Response(
                     201,
                     json={
@@ -1424,6 +1425,135 @@ class TestV04FeaturesSync(unittest.TestCase):
             self.assertEqual(sess.desktop_url, "/panel/d/")
             self.assertEqual(client.get_desktop_status("sb-1")["status"], "running")
             self.assertEqual(client.stop_desktop("sb-1")["status"], "stopped")
+
+
+class TestProviderPrerequisites(unittest.IsolatedAsyncioTestCase):
+    async def test_async_network_policy_delete_volumes_and_empty_archive_sync(self) -> None:
+        recorded: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            recorded.append({
+                "method": request.method,
+                "path": request.url.path,
+                "params": dict(request.url.params),
+                "content": request.content,
+            })
+            if request.method == "POST" and request.url.path == "/sandboxes":
+                return httpx.Response(
+                    201,
+                    json={
+                        "sandboxID": "cpod-np-1",
+                        "templateID": "base",
+                        "state": "Running",
+                        "envdPort": 49983,
+                        "rootfsGeneration": 1,
+                    },
+                )
+            if request.method == "POST" and request.url.path == "/sandboxes/cpod-np-1/files/archive-sync":
+                return httpx.Response(200, json={"status": "ok", "extracted": 0})
+            if request.method == "DELETE" and request.url.path == "/sandboxes/cpod-np-1":
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        policy = {
+            "defaultAction": "Deny",
+            "egress": [
+                {"action": "allow", "target": "api.github.com"},
+                {"action": "deny", "target": "*"},
+            ],
+        }
+        async with AsyncCubePod("http://127.0.0.1:8000", transport=httpx.MockTransport(handler)) as client:
+            sb = await client.create(
+                "base",
+                volume_key="vol-prereq",
+                network_policy=policy,
+                secret_bindings=[{"envName": "GH_TOKEN", "placeholder": "cpodref_1"}],
+            )
+            self.assertEqual(sb.sandbox_id, "cpod-np-1")
+
+            create_body = json.loads(recorded[-1]["content"])
+            self.assertNotIn("networkPolicy", create_body)
+            self.assertEqual(create_body["extension"]["volumeKey"], "vol-prereq")
+            self.assertEqual(create_body["extension"]["networkPolicy"]["defaultAction"], "Deny")
+            self.assertEqual(
+                create_body["extension"]["networkPolicy"]["egress"],
+                [
+                    {"action": "allow", "target": "api.github.com"},
+                    {"action": "deny", "target": "*"},
+                ],
+            )
+            self.assertEqual(
+                create_body["extension"]["networkPolicy"]["secretBindings"],
+                [{"envName": "GH_TOKEN", "placeholder": "cpodref_1"}],
+            )
+
+            sync_res = await client.archive_sync(
+                "cpod-np-1",
+                b"",
+                dest="/workspace/proj",
+                remove_paths=["old.py", "sub/dir"],
+            )
+            self.assertEqual(sync_res, {"status": "ok", "extracted": 0})
+            self.assertEqual(recorded[-1]["content"], b"")
+            self.assertEqual(
+                recorded[-1]["params"],
+                {"dest": "/workspace/proj", "remove_paths": "old.py,sub/dir"},
+            )
+
+            await client.delete("cpod-np-1")
+            self.assertEqual(recorded[-1]["params"], {})
+
+            await client.delete("cpod-np-1", delete_volumes=True)
+            self.assertEqual(recorded[-1]["params"], {"deleteVolumes": "true"})
+
+    def test_sync_network_policy_and_delete_volumes(self) -> None:
+        recorded: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            recorded.append({
+                "method": request.method,
+                "path": request.url.path,
+                "params": dict(request.url.params),
+                "content": request.content,
+            })
+            if request.method == "POST" and request.url.path == "/sandboxes":
+                return httpx.Response(
+                    201,
+                    json={
+                        "sandboxID": "cpod-np-sync",
+                        "templateID": "base",
+                        "state": "Running",
+                        "envdPort": 49983,
+                        "rootfsGeneration": 1,
+                    },
+                )
+            if request.method == "DELETE" and request.url.path == "/sandboxes/cpod-np-sync":
+                return httpx.Response(204)
+            return httpx.Response(404)
+
+        with SyncCubePod("http://127.0.0.1:8000", transport=httpx.MockTransport(handler)) as client:
+            client.create(
+                "base",
+                network_policy={
+                    "defaultAction": "Deny",
+                    "egress": [{"action": "allow", "target": "*.pypi.org"}],
+                },
+            )
+            create_body = json.loads(recorded[-1]["content"])
+            self.assertNotIn("networkPolicy", create_body)
+            self.assertEqual(
+                create_body["extension"]["networkPolicy"],
+                {
+                    "defaultAction": "Deny",
+                    "egress": [{"action": "allow", "target": "*.pypi.org"}],
+                },
+            )
+
+            client.delete("cpod-np-sync")
+            self.assertEqual(recorded[-1]["params"], {})
+
+            client.delete("cpod-np-sync", delete_volumes=True)
+            self.assertEqual(recorded[-1]["params"], {"deleteVolumes": "true"})
 
 
 if __name__ == "__main__":

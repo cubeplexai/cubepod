@@ -8,6 +8,8 @@ from .models import (
     DesktopSession,
     ExecutionResult,
     FileEntry,
+    NetworkEgressRule,
+    NetworkPolicySpec,
     PanelEndpoint,
     SandboxInfo,
     _build_tar_gz_bytes,
@@ -19,6 +21,8 @@ __version__ = "0.4.0"
 __all__ = [
     "__version__",
     "SandboxInfo",
+    "NetworkEgressRule",
+    "NetworkPolicySpec",
     "ExecutionResult",
     "CommandInfo",
     "CommandLogs",

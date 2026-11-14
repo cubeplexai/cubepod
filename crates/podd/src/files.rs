@@ -392,21 +392,41 @@ pub fn apply_permissions_and_ownership(path: &Path, mode: u32, uid: u32, gid: u3
     chown_if_root(path, uid, gid);
 }
 
+fn is_invalid_remove_path(path: &str) -> bool {
+    if is_invalid_tar_path(path) {
+        return true;
+    }
+    let rel = path
+        .strip_prefix("./")
+        .unwrap_or(path)
+        .trim_start_matches('/');
+    rel.is_empty() || rel == "."
+}
+
+fn remove_archive_paths(dest_path: &Path, remove_list: &[&str]) -> Result<(), std::io::Error> {
+    for p in remove_list {
+        let rel_p = p.strip_prefix("./").unwrap_or(p).trim_start_matches('/');
+        if rel_p.is_empty() || rel_p == "." {
+            continue;
+        }
+        let target = dest_path.join(rel_p);
+        if let Ok(meta) = std::fs::symlink_metadata(&target) {
+            if meta.file_type().is_dir() {
+                std::fs::remove_dir_all(&target)?;
+            } else {
+                std::fs::remove_file(&target)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn handle_archive_sync(
     stream: &mut TcpStream,
     req: &HttpRequest,
     query_params: &HashMap<String, String>,
     config: &DaemonConfig,
 ) {
-    if req.body.is_empty() {
-        write_json(
-            stream,
-            "400 Bad Request",
-            r#"{"error":"empty_archive_body"}"#,
-        );
-        return;
-    }
-
     let dest_str = query_params
         .get("dest")
         .or_else(|| query_params.get("destination"))
@@ -415,9 +435,60 @@ pub fn handle_archive_sync(
 
     let (uid, gid) = resolve_file_ownership(query_params);
 
-    let remove_paths = query_params
+    let remove_list: Vec<&str> = query_params
         .get("remove_paths")
-        .or_else(|| query_params.get("removePaths"));
+        .or_else(|| query_params.get("removePaths"))
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for p in &remove_list {
+        if is_invalid_remove_path(p) {
+            write_json(
+                stream,
+                "400 Bad Request",
+                r#"{"error":"invalid_archive_path"}"#,
+            );
+            return;
+        }
+    }
+
+    if req.body.is_empty() {
+        if remove_list.is_empty() {
+            write_json(
+                stream,
+                "400 Bad Request",
+                r#"{"error":"empty_archive_body"}"#,
+            );
+            return;
+        }
+
+        let dest_path = Path::new(dest_str);
+        if let Err(e) = std::fs::create_dir_all(dest_path) {
+            let resp = format!(
+                r#"{{"error":"failed_to_create_dest","details":"{}"}}"#,
+                escape_json(&e.to_string())
+            );
+            write_json(stream, "500 Internal Server Error", &resp);
+            return;
+        }
+
+        if let Err(e) = remove_archive_paths(dest_path, &remove_list) {
+            let resp = format!(
+                r#"{{"error":"failed_to_remove_path","details":"{}"}}"#,
+                escape_json(&e.to_string())
+            );
+            write_json(stream, "500 Internal Server Error", &resp);
+            return;
+        }
+
+        write_json(stream, "200 OK", r#"{"status":"ok","extracted":0}"#);
+        return;
+    }
 
     let tar_data = match decompress_if_gzip(&req.body) {
         Ok(d) => d,
@@ -469,21 +540,14 @@ pub fn handle_archive_sync(
     }
 
     // Remove uninstalled paths under dest if specified
-    if let Some(remove_list) = remove_paths {
-        for p in remove_list.split(',') {
-            let p = p.trim();
-            if p.is_empty() || is_invalid_tar_path(p) {
-                continue;
-            }
-            let rel_p = p.strip_prefix("./").unwrap_or(p).trim_start_matches('/');
-            let target = dest_path.join(rel_p);
-            if target.exists() || target.is_symlink() {
-                if target.is_dir() {
-                    let _ = std::fs::remove_dir_all(&target);
-                } else {
-                    let _ = std::fs::remove_file(&target);
-                }
-            }
+    if !remove_list.is_empty() {
+        if let Err(e) = remove_archive_paths(dest_path, &remove_list) {
+            let resp = format!(
+                r#"{{"error":"failed_to_remove_path","details":"{}"}}"#,
+                escape_json(&e.to_string())
+            );
+            write_json(stream, "500 Internal Server Error", &resp);
+            return;
         }
     }
 
