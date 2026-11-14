@@ -5,7 +5,7 @@ description: 面向持久化 MicroVM 沙箱的异步优先与同步 Python 客�
 
 CubePod 官方 Python SDK（`cubepod`）针对 CubePod 控制面与数据面 HTTP API 同时提供**异步优先**（`AsyncCubePod`）和**同步**（`CubePod` / `SyncCubePod`）两套客户端。
 
-- **包名**：`cubepod`（`0.4.0`，Apache-2.0）
+- **包名**：`cubepod`（`0.4.1`，Apache-2.0）
 - **Python 版本**：`>= 3.11`，内置完整 `py.typed` 类型注解
 - **运行时依赖**：`httpx >= 0.27.0`
 

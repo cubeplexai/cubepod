@@ -5,7 +5,7 @@ description: Zero-dependency TypeScript and Node.js 20+ SDK (cubepod) with high-
 
 The official CubePod TypeScript / JavaScript SDK (`cubepod`) is a **zero-dependency** ESM library built exclusively on Web and Node.js 20+ standard APIs (`fetch`, `ReadableStream`, `TextDecoder`, `Headers`, `URLSearchParams`, and `CompressionStream`). It ships complete `.d.ts` type declarations and runs on Node.js 20+, Deno, Bun, and modern edge runtimes.
 
-- **Package**: `cubepod` (`0.4.0`, Apache-2.0)
+- **Package**: `cubepod` (`0.4.1`, Apache-2.0)
 - **Module format**: Native ESM (`"type": "module"`)
 - **Engines**: `node >= 20.0.0`
 

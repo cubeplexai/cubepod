@@ -5,7 +5,7 @@ description: 零依赖 TypeScript 与 Node.js 20+ SDK（cubepod），提供面�
 
 CubePod 官方 TypeScript / JavaScript SDK（`cubepod`）是一款**零运行时依赖**的纯 ESM 库，完全基于 Web 与 Node.js 20+ 标准 API（`fetch`、`ReadableStream`、`TextDecoder`、`Headers`、`URLSearchParams` 与 `CompressionStream`）实现，自带完整 `.d.ts` 类型定义，适用于 Node.js 20+、Deno、Bun 与现代边缘运行时。
 
-- **包名**：`cubepod`（`0.4.0`，Apache-2.0）
+- **包名**：`cubepod`（`0.4.1`，Apache-2.0）
 - **模块格式**：原生 ESM（`"type": "module"`）
 - **运行环境**：`node >= 20.0.0`
 

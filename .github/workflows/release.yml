@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing Git tag (e.g. v0.4.0) to re-run release for'
+        description: 'Existing Git tag (e.g. v0.4.1) to re-run release for'
         required: true
         type: string
 
@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   release-binaries:
-    name: Build and Publish Release Binaries
+    name: Validate, Build & Publish Release Binaries
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -34,6 +34,23 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
           fetch-depth: 0
+
+      - name: Validate release tag and version consistency
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          ./scripts/check-version-consistency.sh "$RELEASE_TAG"
+
+      - name: Prepare release notes from changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release-notes.py "$RELEASE_TAG" > release-notes.md
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$RELEASE_TAG" --jq .body > generated-release-notes.md
+          printf '\n---\n\n## Pull requests and contributors\n\n' >> release-notes.md
+          cat generated-release-notes.md >> release-notes.md
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -87,21 +104,27 @@ jobs:
           sha256sum * > SHA256SUMS
           cd ..
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           TAG_NAME="${RELEASE_TAG}"
           if gh release view "${TAG_NAME}" >/dev/null 2>&1; then
+            gh release edit "${TAG_NAME}" \
+              --title "CubePod ${TAG_NAME}" \
+              --notes-file release-notes.md
             gh release upload "${TAG_NAME}" dist/* --clobber
           else
             gh release create "${TAG_NAME}" dist/* \
-              --title "CubePod Release ${TAG_NAME}" \
-              --generate-notes
+              --verify-tag \
+              --title "CubePod ${TAG_NAME}" \
+              --notes-file release-notes.md
           fi
 
   build-python-sdk:
     name: Build Python SDK (sdist & wheel)
+    needs: [release-binaries]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -169,6 +192,7 @@ jobs:
 
   publish-npm:
     name: Publish TypeScript SDK to npm
+    needs: [release-binaries]
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -208,6 +232,31 @@ jobs:
             npm config set //registry.npmjs.org/:_authToken "${NPM_Bootstrap_TOKEN}"
           fi
           npm publish --provenance --access public
+
+  publish-helm:
+    name: Package & Push Helm Chart to GHCR OCI
+    needs: [release-binaries]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint and package Helm chart
+        run: |
+          set -euo pipefail
+          helm lint deploy/helm/cubepod
+          helm package deploy/helm/cubepod --destination dist
+
+      - name: Push Helm chart to GHCR OCI
+        run: |
+          set -euo pipefail
+          helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin <<<"${{ secrets.GITHUB_TOKEN }}"
+          helm push dist/cubepod-*.tgz "oci://ghcr.io/${{ github.repository_owner }}/charts"
 
   publish-images:
     name: Build & Push GHCR Images
@@ -269,3 +318,43 @@ jobs:
           platforms: linux/amd64,linux/arm64
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  publish-manifest:
+    name: Publish Release Image Digest Manifest
+    needs: [release-binaries, publish-images]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate and attach release manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          source_commit=$(git rev-parse HEAD)
+          manifest="release-manifest-${RELEASE_TAG}.yaml"
+          printf 'release: %s\nsource_commit: %s\nimages:\n' "$RELEASE_TAG" "$source_commit" > "$manifest"
+
+          for target in podd controller gateway egress; do
+            ref="ghcr.io/${IMAGE_OWNER}/cubepod-${target}:${RELEASE_TAG}"
+            digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
+            [[ "$digest" == sha256:* ]]
+            printf '  %s: ghcr.io/%s/cubepod-%s@%s\n' "$target" "$IMAGE_OWNER" "$target" "$digest" >> "$manifest"
+          done
+
+          cat "$manifest"
+          gh release upload "$RELEASE_TAG" "$manifest" --clobber

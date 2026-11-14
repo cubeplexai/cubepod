@@ -32,6 +32,13 @@ jobs:
         working-directory: website
         run: npm ci
 
+      - name: Verify release notes renderer and current changelog
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts/tests -p 'test_release_notes.py'
+          version=$(sed -nE 's/^version: ([^ ]+)$/\1/p' deploy/helm/cubepod/Chart.yaml | head -1)
+          python3 scripts/release-notes.py "v${version}" >/dev/null
+
       - name: Build Astro + Starlight site and llms.txt
         working-directory: website
         run: npm run build

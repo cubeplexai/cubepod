@@ -3,7 +3,7 @@ title: API Overview
 description: Complete HTTP, SSE, NDJSON, Connect-RPC, WebSocket/WebRTC Panel Proxy, and Template Build API reference grounded in api/openapi/cubepod-v1.yaml and pkg/gateway.
 ---
 
-The CubePod Gateway (`cmd/cubepod-gateway`) exposes an **E2B-compatible superset** HTTP/streaming API documented in `api/openapi/cubepod-v1.yaml` (OpenAPI `3.1.0`, spec version `0.4.0`). All official SDKs ([Python](/sdks/python/), [TypeScript](/sdks/typescript/), [Go & CLI](/sdks/go-and-cli/)) communicate with this Gateway surface.
+The CubePod Gateway (`cmd/cubepod-gateway`) exposes an **E2B-compatible superset** HTTP/streaming API documented in `api/openapi/cubepod-v1.yaml` (OpenAPI `3.1.0`, spec version `0.4.1`). All official SDKs ([Python](/sdks/python/), [TypeScript](/sdks/typescript/), [Go & CLI](/sdks/go-and-cli/)) communicate with this Gateway surface.
 
 For interactive schema exploration and copy-paste request testing, open the [Interactive API Reference](/api/) or fetch the raw OpenAPI YAML at [`/openapi.yaml`](/openapi.yaml) (also served live by every running Gateway at `GET /openapi.yaml`). For LLM agents ingesting CubePod documentation, fetch [`/llms.txt`](/llms.txt) or [`/llms-full.txt`](/llms-full.txt).
 

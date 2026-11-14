@@ -3,7 +3,7 @@ title: Kubernetes 与 Helm 部署
 description: 使用 Helm Chart 在 Kubernetes 集群中部署 CubePod Operator、Gateway、Egress 代理、CRDs 及可选的无特权 BuildKit 构建服务。
 ---
 
-在 Kubernetes 环境中，CubePod 通过位于 `deploy/helm/cubepod/` 的 Helm Chart（`cubepod`，`version: 0.4.0`，`appVersion: "0.4.0"`）进行统一打包交付，涵盖 `PodBox`、`PodTemplate`、`PodWarmPool` 三类 CRD、RBAC 权限、工作负载命名空间、Control Plane Gateway、Kubernetes Controller 以及可选的无特权 BuildKit 模板构建流水线。
+在 Kubernetes 环境中，CubePod 通过位于 `deploy/helm/cubepod/` 的 Helm Chart（`cubepod`，`version: 0.4.1`，`appVersion: "0.4.1"`）进行统一打包交付，涵盖 `PodBox`、`PodTemplate`、`PodWarmPool` 三类 CRD、RBAC 权限、工作负载命名空间、Control Plane Gateway、Kubernetes Controller 以及可选的无特权 BuildKit 模板构建流水线。
 
 由 `deploy/helm/cubepod/values.yaml` 自动生成的完整字段说明，请参阅 [Helm Values 参考](/zh/reference/helm-values/)与 [Kubernetes CRD 参考](/zh/reference/crds/)。
 
@@ -71,7 +71,7 @@ gateway:
 runtime:
   runtimeClassName: kata-qemu
   defaultTemplate: cubeplex-ubuntu24-desktop
-  poddInjectorImage: ghcr.io/cubeplexai/cubepod-podd:v0.4.0
+  poddInjectorImage: ghcr.io/cubeplexai/cubepod-podd:v0.4.1
   defaultSandboxImage: ghcr.io/cubeplexai/cubeplex-sandbox:v0.4.0
 
 storage:
@@ -89,7 +89,7 @@ egress:
   image:
     registry: "ghcr.io"
     repository: "cubeplexai/cubepod-egress"
-    tag: "v0.4.0"
+    tag: "v0.4.1"
   port: 18080
   exchangeUrl: "https://cubeplex-backend.cubeplex.svc:8443/api/v1/internal/egress/exchange"
 ```
@@ -105,7 +105,7 @@ helm upgrade --install cubepod ./deploy/helm/cubepod \
 
 ### 关键运行时与存储默认配置
 
-- **运行时注入（`runtime.poddInjectorImage`）**：默认为 `ghcr.io/cubeplexai/cubepod-podd:v0.4.0`。每个沙箱 Pod 都会通过 `initContainer` 将 `podd-init` 与 `podd` 拷贝至共享 `emptyDir`（`/opt/cubepod/bin`），从而保持基础业务镜像纯净。
+- **运行时注入（`runtime.poddInjectorImage`）**：默认为 `ghcr.io/cubeplexai/cubepod-podd:v0.4.1`。每个沙箱 Pod 都会通过 `initContainer` 将 `podd-init` 与 `podd` 拷贝至共享 `emptyDir`（`/opt/cubepod/bin`），从而保持基础业务镜像纯净。
 - **双裸块 PVC（`storage.*`）**：默认 `storageClassName: longhorn-v2-block-thin`、`volumeMode: Block`、`rootfsSize: "10Gi"`、`workspaceSize: "20Gi"`。
 - **WarmPool 预热池（`warmPool.*`）**：默认启用并维持 `3` 个预热副本，确保 `POST /sandboxes` 可亚秒级认领已就绪的 MicroVM。
 - **Zero-Trust 出站代理（`egress.*`）**：默认启用，为沙箱注入监听 `:18080` 的 `cubepod-egress` 边车容器，并通过 `egress.exchangeUrl` 按单沙箱 mTLS 置换 `cpodref_` 占位符。详情请参阅[零信任出站代理与密钥隔离](/zh/concepts/zero-trust-egress/)。

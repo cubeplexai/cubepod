@@ -3,7 +3,7 @@ title: Kubernetes & Helm Deployment
 description: Deploy the CubePod operator, gateway, egress proxy, CRDs, and optional rootless BuildKit builder on Kubernetes using Helm.
 ---
 
-For Kubernetes deployments, CubePod is packaged as Helm chart `cubepod` (`version: 0.4.0`, `appVersion: "0.4.0"`) under `deploy/helm/cubepod/`. It installs the Custom Resource Definitions (`PodBox`, `PodTemplate`, `PodWarmPool`), RBAC rules, workload namespace, Control Plane Gateway, Kubernetes Controller, and—when enabled—an isolated rootless BuildKit builder deployment.
+For Kubernetes deployments, CubePod is packaged as Helm chart `cubepod` (`version: 0.4.1`, `appVersion: "0.4.1"`) under `deploy/helm/cubepod/`. It installs the Custom Resource Definitions (`PodBox`, `PodTemplate`, `PodWarmPool`), RBAC rules, workload namespace, Control Plane Gateway, Kubernetes Controller, and—when enabled—an isolated rootless BuildKit builder deployment.
 
 For the exhaustive key-by-key schema generated directly from `deploy/helm/cubepod/values.yaml`, see the [Helm Values Reference](/reference/helm-values/) and [CRD Reference](/reference/crds/).
 
@@ -71,7 +71,7 @@ gateway:
 runtime:
   runtimeClassName: kata-qemu
   defaultTemplate: cubeplex-ubuntu24-desktop
-  poddInjectorImage: ghcr.io/cubeplexai/cubepod-podd:v0.4.0
+  poddInjectorImage: ghcr.io/cubeplexai/cubepod-podd:v0.4.1
   defaultSandboxImage: ghcr.io/cubeplexai/cubeplex-sandbox:v0.4.0
 
 storage:
@@ -89,7 +89,7 @@ egress:
   image:
     registry: "ghcr.io"
     repository: "cubeplexai/cubepod-egress"
-    tag: "v0.4.0"
+    tag: "v0.4.1"
   port: 18080
   exchangeUrl: "https://cubeplex-backend.cubeplex.svc:8443/api/v1/internal/egress/exchange"
 ```
@@ -105,7 +105,7 @@ helm upgrade --install cubepod ./deploy/helm/cubepod \
 
 ### Key Runtime & Storage Defaults
 
-- **Runtime injection (`runtime.poddInjectorImage`)**: Defaults to `ghcr.io/cubeplexai/cubepod-podd:v0.4.0`. Every sandbox pod uses an `initContainer` to copy `podd-init` and `podd` into an `emptyDir` mounted at `/opt/cubepod/bin` so user images remain clean.
+- **Runtime injection (`runtime.poddInjectorImage`)**: Defaults to `ghcr.io/cubeplexai/cubepod-podd:v0.4.1`. Every sandbox pod uses an `initContainer` to copy `podd-init` and `podd` into an `emptyDir` mounted at `/opt/cubepod/bin` so user images remain clean.
 - **Dual block PVCs (`storage.*`)**: Defaults to `storageClassName: longhorn-v2-block-thin`, `volumeMode: Block`, `rootfsSize: "10Gi"`, and `workspaceSize: "20Gi"`.
 - **WarmPool (`warmPool.*`)**: Enabled by default with `3` pre-warmed replicas so `POST /sandboxes` can claim an already-running microVM sub-second.
 - **Zero-Trust Egress (`egress.*`)**: Enabled by default, injecting the `cubepod-egress` sidecar on port `18080` and swapping `cpodref_` placeholders against `egress.exchangeUrl`. See [Zero-Trust Egress](/concepts/zero-trust-egress/).

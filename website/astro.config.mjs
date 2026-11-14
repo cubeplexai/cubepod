@@ -219,6 +219,14 @@ export default defineConfig({
           collapsed: true,
           autogenerate: { directory: 'ceps' },
         },
+        {
+          label: 'Changelog',
+          translations: { 'zh-CN': '更新日志' },
+          items: [
+            { label: '0.4.1', slug: 'changelog/0.4.1' },
+            { label: '0.4.0', slug: 'changelog/0.4.0' },
+          ],
+        },
       ],
     }),
   ],

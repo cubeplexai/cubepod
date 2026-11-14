@@ -5,7 +5,7 @@ description: Async-first and synchronous Python client (cubepod) for persistent 
 
 The official CubePod Python SDK (`cubepod`) provides both **async-first** (`AsyncCubePod`) and **synchronous** (`CubePod` / `SyncCubePod`) clients over the CubePod Control and Data Plane HTTP APIs.
 
-- **Package**: `cubepod` (`0.4.0`, Apache-2.0)
+- **Package**: `cubepod` (`0.4.1`, Apache-2.0)
 - **Python**: `>= 3.11` with inline `py.typed` type annotations
 - **Runtime dependency**: `httpx >= 0.27.0`
 

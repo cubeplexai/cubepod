@@ -3,7 +3,7 @@ title: API 概览
 description: 基于 api/openapi/cubepod-v1.yaml 与 pkg/gateway 的完整 HTTP、SSE、NDJSON、Connect-RPC、WebSocket/WebRTC Panel 代理与模板构建接口总览。
 ---
 
-CubePod Gateway（`cmd/cubepod-gateway`）对外提供一套**兼容 E2B 的超集** HTTP 与流式接口，权威契约定义在 `api/openapi/cubepod-v1.yaml`（OpenAPI `3.1.0`，规范版本 `0.4.0`）。所有官方 SDK（[Python](/zh/sdks/python/)、[TypeScript](/zh/sdks/typescript/) 与 [Go 与 CLI](/zh/sdks/go-and-cli/)）均基于这一网关接口层构建。
+CubePod Gateway（`cmd/cubepod-gateway`）对外提供一套**兼容 E2B 的超集** HTTP 与流式接口，权威契约定义在 `api/openapi/cubepod-v1.yaml`（OpenAPI `3.1.0`，规范版本 `0.4.1`）。所有官方 SDK（[Python](/zh/sdks/python/)、[TypeScript](/zh/sdks/typescript/) 与 [Go 与 CLI](/zh/sdks/go-and-cli/)）均基于这一网关接口层构建。
 
 如需在线交互调试或查看完整 Schema，请访问[交互式 API 参考](/zh/api/)或下载原始 OpenAPI YAML 文件 [`/openapi.yaml`](/openapi.yaml)（运行中的 Gateway 同样通过 `GET /openapi.yaml` 实时提供该规范）。AI 工具或文档检索代理也可直接拉取 [`/llms.txt`](/llms.txt) 或 [`/llms-full.txt`](/llms-full.txt)。
 

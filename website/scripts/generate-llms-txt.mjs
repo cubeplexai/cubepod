@@ -35,6 +35,7 @@ const SECTIONS = [
   { prefix: 'sdks/', label: 'SDKs, CLI & MCP' },
   { prefix: 'deployment/', label: 'Deployment & Operations' },
   { prefix: 'reference/', label: 'Reference' },
+  { prefix: 'changelog/', label: 'Changelog' },
   { prefix: 'ceps/', label: 'CubePod Enhancement Proposals (CEPs)' },
 ];
 
@@ -76,7 +77,7 @@ function main() {
   ];
 
   const fullParts = [
-    '# CubePod Full Documentation Corpus (v0.4.0)',
+    '# CubePod Full Documentation Corpus',
     '',
     `Source: ${SITE}`,
     '',

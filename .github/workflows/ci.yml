@@ -78,6 +78,9 @@ jobs:
       - name: Run Python SDK Unit Tests
         run: python3 -m unittest discover -s sdks/python/tests
 
+      - name: Run Release Script Tests
+        run: python3 -m unittest discover -s scripts/tests
+
   typescript-ci:
     name: TypeScript SDK Tests
     runs-on: ubuntu-latest
