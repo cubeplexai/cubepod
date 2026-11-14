@@ -689,13 +689,28 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				} else {
 					slog.Warn("failed to ensure warm pod", "pod", dummyStatus.PodName, "err", err)
 					cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+					if delErr := r.kubeClient.DeletePod(cleanupCtx, r.namespace, dummyStatus.PodName); delErr != nil {
+						slog.Warn("failed to clean up warm pod after EnsurePod error", "pod", dummyStatus.PodName, "err", delErr)
+					}
 					if delErr := r.kubeClient.DeletePVC(cleanupCtx, r.namespace, rootfsPVC.Name); delErr != nil {
 						slog.Warn("failed to clean up warm rootfs PVC after EnsurePod error", "pvc", rootfsPVC.Name, "err", delErr)
 					}
 					if delErr := r.kubeClient.DeletePVC(cleanupCtx, r.namespace, wsPVC.Name); delErr != nil {
 						slog.Warn("failed to clean up warm workspace PVC after EnsurePod error", "pvc", wsPVC.Name, "err", delErr)
 					}
+					stopPoolRetry := ctx.Err() != nil
+					if !stopPoolRetry && pool.persisted {
+						if _, getErr := r.kubeClient.GetPodWarmPool(cleanupCtx, r.namespace, poolName); getErr != nil && !errors.Is(getErr, ErrCRDNotInstalled) {
+							errLower := strings.ToLower(getErr.Error())
+							if strings.Contains(errLower, "not found") || strings.Contains(errLower, "404") {
+								stopPoolRetry = true
+							}
+						}
+					}
 					cancel()
+					if stopPoolRetry {
+						break
+					}
 					continue
 				}
 			}

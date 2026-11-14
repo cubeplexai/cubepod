@@ -2302,8 +2302,11 @@ func TestReconciler_VolumeKeyPersistenceAndWarmPoolSkip(t *testing.T) {
 type failingEnsurePodKubeClient struct {
 	*controller.MemoryKubeClient
 	cancelOnEnsure   context.CancelFunc
+	onEnsurePod      func(pod controller.PodManifest)
 	createdPVCs      []string
 	deletedPVCs      []string
+	createdPods      []string
+	deletedPods      []string
 	deleteCtxExpired bool
 }
 
@@ -2320,7 +2323,20 @@ func (f *failingEnsurePodKubeClient) DeletePVC(ctx context.Context, ns, name str
 	return f.MemoryKubeClient.DeletePVC(ctx, ns, name)
 }
 
-func (f *failingEnsurePodKubeClient) EnsurePod(_ context.Context, _ controller.PodManifest) (string, error) {
+func (f *failingEnsurePodKubeClient) DeletePod(ctx context.Context, ns, name string) error {
+	if ctx.Err() != nil {
+		f.deleteCtxExpired = true
+	}
+	f.deletedPods = append(f.deletedPods, name)
+	return f.MemoryKubeClient.DeletePod(ctx, ns, name)
+}
+
+func (f *failingEnsurePodKubeClient) EnsurePod(_ context.Context, pod controller.PodManifest) (string, error) {
+	_, _ = f.MemoryKubeClient.EnsurePod(context.Background(), pod)
+	f.createdPods = append(f.createdPods, pod.Name)
+	if f.onEnsurePod != nil {
+		f.onEnsurePod(pod)
+	}
 	if f.cancelOnEnsure != nil {
 		f.cancelOnEnsure()
 	}
@@ -2415,6 +2431,19 @@ func TestReconciler_WarmPoolEnsurePodFailureCleansPVCs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReconcileWarmPool returned unexpected error: %v", err)
 	}
+	if fk.deleteCtxExpired {
+		t.Fatal("expected rollback DeletePod/DeletePVC to use context.WithoutCancel, got canceled ctx")
+	}
+	if len(fk.createdPods) == 0 || len(fk.deletedPods) != len(fk.createdPods) {
+		t.Fatalf("expected all %d warm pods cleaned up after EnsurePod failure, got created=%v deleted=%v", len(fk.createdPods), fk.createdPods, fk.deletedPods)
+	}
+	pods, err := memKube.ListPods(context.Background(), "cubepod-workloads", "")
+	if err != nil {
+		t.Fatalf("ListPods failed: %v", err)
+	}
+	if len(pods) != 0 {
+		t.Fatalf("expected 0 remaining pods after EnsurePod failure cleanup, got %+v", pods)
+	}
 	if len(fk.createdPVCs) == 0 {
 		t.Fatal("expected warm pool PVCs created before EnsurePod failure")
 	}
@@ -2425,6 +2454,51 @@ func TestReconciler_WarmPoolEnsurePodFailureCleansPVCs(t *testing.T) {
 		if _, ok := memKube.GetPVC("cubepod-workloads", pvcName); ok {
 			t.Fatalf("warm PVC %q leaked after EnsurePod failure", pvcName)
 		}
+	}
+}
+
+func TestReconciler_WarmPoolEnsurePodFailureStopsWhenPoolDeleted(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	poolSpec := v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    2,
+	}
+	if err := memKube.UpsertPodWarmPool(ctx, v1alpha1.PodWarmPool{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodWarmPool",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "warm-del-pool",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: poolSpec,
+	}); err != nil {
+		t.Fatalf("UpsertPodWarmPool failed: %v", err)
+	}
+
+	fk := &failingEnsurePodKubeClient{
+		MemoryKubeClient: memKube,
+		onEnsurePod: func(_ controller.PodManifest) {
+			_ = memKube.DeletePodWarmPool(context.Background(), "cubepod-workloads", "warm-del-pool")
+		},
+	}
+	r := controller.NewReconciler(
+		controller.WithKubeClient(fk),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	r.RegisterTemplate("base-tpl", sampleTemplate())
+	if _, err := r.SyncFromKube(ctx); err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+
+	if _, err := r.ReconcileWarmPool(ctx, "warm-del-pool", poolSpec); err != nil {
+		t.Fatalf("ReconcileWarmPool returned unexpected error: %v", err)
+	}
+	if len(fk.createdPods) != 1 {
+		t.Fatalf("expected ReconcileWarmPool to stop after pool deletion (1 EnsurePod attempt), got %d (%v)", len(fk.createdPods), fk.createdPods)
+	}
+	if len(fk.deletedPods) != 1 || len(fk.deletedPVCs) != len(fk.createdPVCs) {
+		t.Fatalf("expected failed attempt pod+PVCs deleted, got deletedPods=%v createdPVCs=%v deletedPVCs=%v", fk.deletedPods, fk.createdPVCs, fk.deletedPVCs)
 	}
 }
 
