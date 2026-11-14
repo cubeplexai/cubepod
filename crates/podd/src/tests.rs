@@ -2327,3 +2327,33 @@ fn test_lifecycle_quiesce_thaw_and_watchdog() {
     assert_eq!(ops.thaws.load(Ordering::SeqCst), 2);
     assert_eq!(state.auto_thawed_count(), 1);
 }
+
+#[test]
+fn test_clamp_nofile_rlimit() {
+    use crate::startcmd::{
+        clamp_nofile_rlimit, compute_clamped_nofile, DEFAULT_HARD_NOFILE, DEFAULT_SOFT_NOFILE,
+    };
+
+    assert_eq!(
+        compute_clamped_nofile(1_073_741_824, 1_073_741_824),
+        Some((DEFAULT_SOFT_NOFILE, DEFAULT_HARD_NOFILE))
+    );
+    assert_eq!(
+        compute_clamped_nofile(128_000, 128_000),
+        Some((DEFAULT_SOFT_NOFILE, 128_000))
+    );
+    assert_eq!(compute_clamped_nofile(1024, 65_536), None);
+    assert_eq!(
+        compute_clamped_nofile(DEFAULT_SOFT_NOFILE, DEFAULT_HARD_NOFILE),
+        None
+    );
+
+    let _ = clamp_nofile_rlimit();
+    let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) },
+        0
+    );
+    assert!((rlim.rlim_cur as u64) <= DEFAULT_SOFT_NOFILE);
+    assert!(!clamp_nofile_rlimit());
+}

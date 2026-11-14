@@ -39,6 +39,53 @@ static SIGCHLD_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static SIGCHLD_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
 
 const DEFAULT_START_CMD_STATUS_PATH: &str = "/var/log/cubepod/start-cmd.status";
+pub const DEFAULT_SOFT_NOFILE: u64 = 65_536;
+pub const DEFAULT_HARD_NOFILE: u64 = 1_048_576;
+
+/// Compute a safe clamped `(soft, hard)` `RLIMIT_NOFILE` pair when the inherited limit
+/// is excessively large (e.g. Kata Containers / containerd passing `2^30`, which makes
+/// `start-stop-daemon` and fd-closing loops spin at 100% CPU before exec).
+pub fn compute_clamped_nofile(cur: u64, max: u64) -> Option<(u64, u64)> {
+    let new_max = max.min(DEFAULT_HARD_NOFILE);
+    let new_cur = cur.min(DEFAULT_SOFT_NOFILE).min(new_max);
+    if new_cur == cur && new_max == max {
+        None
+    } else {
+        Some((new_cur, new_max))
+    }
+}
+
+/// Clamp `RLIMIT_NOFILE` of the daemon process so inherited child processes do not inherit
+/// billion-FD limits inside Kata/containerd VMs. Best-effort; returns `true` if updated.
+pub fn clamp_nofile_rlimit() -> bool {
+    let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 {
+        return false;
+    }
+    let Some((new_cur, new_max)) =
+        compute_clamped_nofile(rlim.rlim_cur as u64, rlim.rlim_max as u64)
+    else {
+        return false;
+    };
+    let updated = libc::rlimit {
+        rlim_cur: new_cur as libc::rlim_t,
+        rlim_max: new_max as libc::rlim_t,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &updated) } != 0 {
+        // Fallback if unprivileged (CAP_SYS_RESOURCE absent): lower only rlim_cur up to rlim_max.
+        let cur_only = libc::rlimit {
+            rlim_cur: (rlim.rlim_cur as u64)
+                .min(DEFAULT_SOFT_NOFILE)
+                .min(rlim.rlim_max as u64) as libc::rlim_t,
+            rlim_max: rlim.rlim_max,
+        };
+        if (cur_only.rlim_cur as u64) != (rlim.rlim_cur as u64) {
+            return unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &cur_only) } == 0;
+        }
+        return false;
+    }
+    true
+}
 
 /// Extract an integer exit code from an `ExitStatus`, using `128 + signal` when terminated by a signal.
 pub fn exit_code_from_status(status: &ExitStatus) -> i32 {

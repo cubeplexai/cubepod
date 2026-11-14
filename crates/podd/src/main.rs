@@ -43,12 +43,12 @@ pub use interpreter::{
 pub use json::{escape_json, parse_target, url_decode, JsonParser, JsonValue};
 pub use lifecycle::{handle_quiesce, handle_thaw, QuiesceOutcome, QuiesceState};
 pub use startcmd::{
-    configure_command_credentials, ensure_sigchld_handler, ensure_subreaper, exit_code_from_status,
-    install_zombie_reaper, lookup_passwd_by_name, lookup_passwd_by_uid, maybe_spawn_start_cmd,
-    reap_zombies, reaped_orphan_count, reaped_status_count, resolve_credentials,
-    resolve_credentials_with_euid, resolve_default_credentials,
-    resolve_default_credentials_from_getter, resolve_username, spawn_start_cmd,
-    spawn_start_cmd_if_configured, spawn_tracked, tracked_pid_count, PasswdEntry,
+    clamp_nofile_rlimit, compute_clamped_nofile, configure_command_credentials,
+    ensure_sigchld_handler, ensure_subreaper, exit_code_from_status, install_zombie_reaper,
+    lookup_passwd_by_name, lookup_passwd_by_uid, maybe_spawn_start_cmd, reap_zombies,
+    reaped_orphan_count, reaped_status_count, resolve_credentials, resolve_credentials_with_euid,
+    resolve_default_credentials, resolve_default_credentials_from_getter, resolve_username,
+    spawn_start_cmd, spawn_start_cmd_if_configured, spawn_tracked, tracked_pid_count, PasswdEntry,
     ResolvedCredentials, StartCmdConfig, StartCmdCredentials, StartCmdRunner, StartCmdStatus,
     TemplateUserCredentials, TrackedChild,
 };
@@ -246,6 +246,7 @@ pub fn run_server_with_quiesce(
 }
 
 pub fn serve(listener: TcpListener, config: DaemonConfig, registry: ProcessRegistry) {
+    clamp_nofile_rlimit();
     ensure_subreaper();
     install_zombie_reaper();
     spawn_start_cmd_if_configured(&config.workdir);
@@ -261,6 +262,8 @@ pub fn serve(listener: TcpListener, config: DaemonConfig, registry: ProcessRegis
 fn main() {
     let addr = env::var("CUBEPOD_ADDR").unwrap_or_else(|_| "0.0.0.0:49983".into());
     let workdir = env::var("CUBEPOD_WORKDIR").unwrap_or_else(|_| "/workspace".into());
+
+    clamp_nofile_rlimit();
 
     eprintln!(
         "[podd] starting CubePod Rust In-Guest Daemon (pid={}, addr={}, workdir={})",
