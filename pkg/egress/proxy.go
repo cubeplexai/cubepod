@@ -23,18 +23,23 @@ import (
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
 
+// CubePlexPlaceholderPrefix is the prefix for opaque sandbox secret references minted by CubePlex.
+const CubePlexPlaceholderPrefix = "cbxref_"
+
 // ExchangeRequest represents the wire request to POST /internal/v1/egress/exchange.
 type ExchangeRequest struct {
 	SandboxID   string `json:"sandboxID"`
 	Placeholder string `json:"placeholder"`
+	Host        string `json:"host,omitempty"`
 	SNIHost     string `json:"sniHost"`
 	HeaderName  string `json:"headerName"`
 }
 
 // ExchangeResponse represents the wire response from POST /internal/v1/egress/exchange.
 type ExchangeResponse struct {
-	Secret string `json:"secret,omitempty"`
-	Error  string `json:"error,omitempty"`
+	Secret      string   `json:"secret,omitempty"`
+	HeaderNames []string `json:"header_names,omitempty"`
+	Error       string   `json:"error,omitempty"`
 }
 
 // VaultExchangeHandler returns an http.HandlerFunc implementing the mTLS secret exchange endpoint.
@@ -77,8 +82,13 @@ func VaultExchangeHandler(vault *Vault, ca *CA) http.HandlerFunc {
 			return
 		}
 
+		sniHost := req.SNIHost
+		if sniHost == "" {
+			sniHost = req.Host
+		}
+
 		// 2. Perform zero-trust exchange via Vault
-		secret, err := vault.Exchange(clientSandboxID, req.Placeholder, req.SNIHost, req.HeaderName)
+		secret, err := vault.Exchange(clientSandboxID, req.Placeholder, sniHost, req.HeaderName)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
@@ -164,9 +174,16 @@ func NewEgressProxy(cfg EgressProxyConfig) *EgressProxy {
 	if cfg.Transport != nil {
 		p.transport = cfg.Transport
 	} else {
-		p.transport = &http.Transport{
+		tr := &http.Transport{
 			DialContext: p.dialUpstreamAddr,
 		}
+		if cfg.UpstreamRootCAs != nil {
+			tr.TLSClientConfig = &tls.Config{
+				RootCAs:    cfg.UpstreamRootCAs,
+				MinVersion: tls.VersionTLS12,
+			}
+		}
+		p.transport = tr
 	}
 
 	return p
@@ -196,6 +213,36 @@ func (p *EgressProxy) GetPolicy() v1alpha1.NetworkPolicySpec {
 	return p.policy
 }
 
+func headerNameAllowed(allowed []string, headerName string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	if headerName == "" {
+		return false
+	}
+	for _, h := range allowed {
+		trimmed := strings.TrimSpace(h)
+		if trimmed == "*" || strings.EqualFold(trimmed, headerName) {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeAndValidateExchangeResponse(body io.Reader, headerName string) (string, error) {
+	var exResp ExchangeResponse
+	if err := json.NewDecoder(body).Decode(&exResp); err != nil {
+		return "", fmt.Errorf("failed to decode exchange response: %w", err)
+	}
+	if exResp.Secret == "" {
+		return "", errors.New("empty secret returned from exchange")
+	}
+	if !headerNameAllowed(exResp.HeaderNames, headerName) {
+		return "", fmt.Errorf("exchange rejected: header %q not allowed", headerName)
+	}
+	return exResp.Secret, nil
+}
+
 // exchangeSecret invokes the Vault exchange endpoint over mTLS (or in-memory handler).
 func (p *EgressProxy) exchangeSecret(ctx context.Context, placeholder, host, headerName string) (string, error) {
 	p.mu.RLock()
@@ -208,6 +255,7 @@ func (p *EgressProxy) exchangeSecret(ctx context.Context, placeholder, host, hea
 	reqPayload := ExchangeRequest{
 		SandboxID:   sandboxID,
 		Placeholder: placeholder,
+		Host:        host,
 		SNIHost:     host,
 		HeaderName:  headerName,
 	}
@@ -227,14 +275,7 @@ func (p *EgressProxy) exchangeSecret(ctx context.Context, placeholder, host, hea
 		if rec.Code != http.StatusOK {
 			return "", fmt.Errorf("exchange returned status %d: %s", rec.Code, strings.TrimSpace(rec.Body.String()))
 		}
-		var resp ExchangeResponse
-		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-			return "", err
-		}
-		if resp.Secret == "" {
-			return "", errors.New("empty secret returned from exchange")
-		}
-		return resp.Secret, nil
+		return decodeAndValidateExchangeResponse(rec.Body, headerName)
 	}
 
 	if exchangeURL == "" {
@@ -260,28 +301,62 @@ func (p *EgressProxy) exchangeSecret(ctx context.Context, placeholder, host, hea
 		return "", fmt.Errorf("exchange rejected (%d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
-	var exResp ExchangeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&exResp); err != nil {
-		return "", fmt.Errorf("failed to decode exchange response: %w", err)
-	}
-	if exResp.Secret == "" {
-		return "", errors.New("empty secret returned from exchange")
-	}
-	return exResp.Secret, nil
+	return decodeAndValidateExchangeResponse(resp.Body, headerName)
 }
 
-// replaceHeaderPlaceholders clones src headers and replaces all cpodref_ placeholders via Vault exchange.
+func isBase32TokenChar(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= '2' && b <= '7')
+}
+
+func findNextPlaceholder(s string, start int) (int, int, bool) {
+	prefixes := []string{DefaultPlaceholderPrefix, CubePlexPlaceholderPrefix}
+	pos := start
+	for pos < len(s) {
+		bestIdx := -1
+		bestPrefixLen := 0
+		for _, pfx := range prefixes {
+			if rel := strings.Index(s[pos:], pfx); rel != -1 {
+				cand := pos + rel
+				if bestIdx == -1 || cand < bestIdx {
+					bestIdx = cand
+					bestPrefixLen = len(pfx)
+				}
+			}
+		}
+		if bestIdx == -1 {
+			return 0, 0, false
+		}
+		end := bestIdx + bestPrefixLen + 32
+		if end <= len(s) {
+			valid := true
+			for i := bestIdx + bestPrefixLen; i < end; i++ {
+				if !isBase32TokenChar(s[i]) {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				return bestIdx, end, true
+			}
+		}
+		pos = bestIdx + bestPrefixLen
+	}
+	return 0, 0, false
+}
+
+// replaceHeaderPlaceholders clones src headers and replaces all cpodref_/cbxref_ placeholders via Vault exchange.
 func (p *EgressProxy) replaceHeaderPlaceholders(ctx context.Context, src http.Header, targetHost string) (http.Header, error) {
 	newHeaders := make(http.Header, len(src))
 	for key, values := range src {
 		for _, val := range values {
 			replacedVal := val
+			searchFrom := 0
 			for {
-				idx := strings.Index(replacedVal, DefaultPlaceholderPrefix)
-				if idx == -1 || idx+40 > len(replacedVal) {
+				idx, end, ok := findNextPlaceholder(replacedVal, searchFrom)
+				if !ok {
 					break
 				}
-				placeholder := replacedVal[idx : idx+40]
+				placeholder := replacedVal[idx:end]
 				realSecret, err := p.exchangeSecret(ctx, placeholder, targetHost, key)
 				if err != nil {
 					if strings.Contains(err.Error(), "rejected") || strings.Contains(err.Error(), "status 403") {
@@ -292,7 +367,8 @@ func (p *EgressProxy) replaceHeaderPlaceholders(ctx context.Context, src http.He
 					return nil, fmt.Errorf("header %q: %w", key, err)
 				}
 				p.metrics.IncSecretExchange("ok")
-				replacedVal = strings.Replace(replacedVal, placeholder, realSecret, 1)
+				replacedVal = replacedVal[:idx] + realSecret + replacedVal[end:]
+				searchFrom = idx + len(realSecret)
 			}
 			newHeaders.Add(key, replacedVal)
 		}
@@ -451,7 +527,7 @@ func (p *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if hostMatchesSecretBinding(policy, sniHost) && p.mitmCA != nil {
+	if p.shouldMITM(policy, sniHost) {
 		p.metrics.IncRequest("mitm", "allow")
 		p.serveMITMTLS(replayedConn, sniHost, targetPort)
 		return
@@ -503,7 +579,7 @@ func (p *EgressProxy) ServeTransparentTLS(conn net.Conn) {
 		return
 	}
 
-	if hostMatchesSecretBinding(policy, sniHost) && p.mitmCA != nil {
+	if p.shouldMITM(policy, sniHost) {
 		p.metrics.IncRequest("mitm", "allow")
 		p.serveMITMTLS(replayedConn, sniHost, "443")
 		return
@@ -740,6 +816,19 @@ func dialViaHTTPProxy(ctx context.Context, proxyURLStr, targetHostPort string) (
 		return newPrefixConn(conn, peeked), nil
 	}
 	return conn, nil
+}
+
+func (p *EgressProxy) shouldMITM(policy v1alpha1.NetworkPolicySpec, sniHost string) bool {
+	if p.mitmCA == nil {
+		return false
+	}
+	if hostMatchesSecretBinding(policy, sniHost) {
+		return true
+	}
+	p.mu.RLock()
+	hasExchange := p.exchangeURL != "" || p.exchangeHandler != nil
+	p.mu.RUnlock()
+	return hasExchange && len(policy.SecretBindings) == 0
 }
 
 func hostMatchesSecretBinding(policy v1alpha1.NetworkPolicySpec, host string) bool {

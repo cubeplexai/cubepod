@@ -157,7 +157,9 @@ func (s *Server) resolveSandbox(ctx context.Context, sandboxID string) (*Sandbox
 			}
 			if err == nil && found {
 				s.mu.Lock()
-				rec.State = string(box.Status.Phase)
+				if box.Status.Phase != "" {
+					rec.State = string(box.Status.Phase)
+				}
 				rec.Reason = box.Status.Reason
 				if box.Spec.VolumeKey != "" && rec.VolumeKey == "" {
 					rec.VolumeKey = box.Spec.VolumeKey

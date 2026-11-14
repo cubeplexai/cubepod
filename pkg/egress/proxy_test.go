@@ -1,6 +1,8 @@
 package egress_test
 
 import (
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -230,5 +232,129 @@ func TestVaultExchangeHandlerDirect(t *testing.T) {
 	handler.ServeHTTP(recMismatch, reqMismatch)
 	if recMismatch.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden on sandbox mismatch, got %d", recMismatch.Code)
+	}
+}
+
+func TestEgressProxyCubePlexWireContractAndMITM(t *testing.T) {
+	originCA, _ := egress.NewCA()
+	mitmCA, _ := egress.NewCA()
+	sandboxID := "cpod-cbx-mitm-1"
+	placeholder := "cbxref_ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+	var upstreamAuth string
+	var upstreamHits int
+	_, originAddr := startTLSOrigin(t, originCA, "api.example.com", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits++
+		upstreamAuth = r.Header.Get("Authorization")
+		if upstreamAuth != "Bearer sk-live-cbx-42" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("cbx-mitm-ok"))
+	}))
+
+	exchangeCA, err := egress.NewCA()
+	if err != nil {
+		t.Fatalf("NewCA exchangeCA: %v", err)
+	}
+	var lastHost string
+	exchangeSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Placeholder string `json:"placeholder"`
+			Host        string `json:"host"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		lastHost = body.Host
+		if body.Placeholder != placeholder {
+			http.Error(w, "unknown placeholder", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"secret":       "sk-live-cbx-42",
+			"header_names": []string{"Authorization"},
+		})
+	}))
+	srvTLS, err := exchangeCA.ServerTLSConfig("127.0.0.1", "localhost")
+	if err != nil {
+		t.Fatalf("ServerTLSConfig: %v", err)
+	}
+	exchangeSrv.TLS = srvTLS
+	exchangeSrv.StartTLS()
+	defer exchangeSrv.Close()
+
+	certPEM, keyPEM, err := exchangeCA.MintSandboxCert(sandboxID, time.Hour)
+	if err != nil {
+		t.Fatalf("MintSandboxCert: %v", err)
+	}
+	clientTLS, err := exchangeCA.ClientTLSConfig(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("ClientTLSConfig: %v", err)
+	}
+
+	// Empty SecretBindings with ExchangeURL configured must still trigger MITM over CONNECT.
+	proxy := egress.NewEgressProxy(egress.EgressProxyConfig{
+		SandboxID:        sandboxID,
+		ExchangeURL:      exchangeSrv.URL,
+		ClientTLSConfig:  clientTLS,
+		MITMCA:           mitmCA,
+		UpstreamRootCAs:  originCA.CertPool(),
+		UpstreamDialAddr: map[string]string{"api.example.com": originAddr},
+		Policy: v1alpha1.NetworkPolicySpec{
+			DefaultAction: v1alpha1.NetworkDefaultDeny,
+			AllowHosts:    []string{"api.example.com"},
+		},
+	})
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	proxyURL, _ := url.Parse(proxySrv.URL)
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				RootCAs: mitmCA.CertPool(),
+			},
+		},
+		Timeout: 5 * time.Second,
+	}
+
+	// 1. Allowed header (Authorization) succeeds and sends wire field "host".
+	req, _ := http.NewRequest(http.MethodGet, "https://api.example.com/v1/test", nil)
+	req.Header.Set("Authorization", "Bearer "+placeholder)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("HTTPS request via MITM failed: %v", err)
+	}
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(bodyBytes) != "cbx-mitm-ok" {
+		t.Fatalf("expected 200 OK cbx-mitm-ok, got %d %q", resp.StatusCode, string(bodyBytes))
+	}
+	if lastHost != "api.example.com" {
+		t.Fatalf("expected exchange host api.example.com, got %q", lastHost)
+	}
+	if upstreamAuth != "Bearer sk-live-cbx-42" {
+		t.Fatalf("expected upstream Authorization swap, got %q", upstreamAuth)
+	}
+
+	// 2. Disallowed header (X-Leak) must be blocked 403 before reaching upstream.
+	hitsBefore := upstreamHits
+	leakReq, _ := http.NewRequest(http.MethodGet, "https://api.example.com/v1/leak", nil)
+	leakReq.Header.Set("X-Leak", placeholder)
+	leakResp, err := client.Do(leakReq)
+	if err != nil {
+		t.Fatalf("leak request failed: %v", err)
+	}
+	_ = leakResp.Body.Close()
+	if leakResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for disallowed header X-Leak, got %d", leakResp.StatusCode)
+	}
+	if upstreamHits != hitsBefore {
+		t.Fatalf("upstream should not have been called on disallowed header (%d -> %d)", hitsBefore, upstreamHits)
 	}
 }
