@@ -9,7 +9,7 @@ const prefix = isZh ? '/zh' : '';
 
 const copy = isZh
   ? {
-      badge: 'v0.4.1 · Apache 2.0 · 100% E2B 协议兼容',
+      badge: 'v0.4.2 · Apache 2.0 · 100% E2B 协议兼容',
       h1Rest: '专为长生命周期自主 Agent',
       h1Accent: '打造的持久微虚拟机沙箱',
       heroSubhead: 'Persistent Writable RootFS MicroVM Execution Platform · 持久化可写 RootFS 微虚拟机执行平台',
@@ -210,7 +210,7 @@ const copy = isZh
       ],
       compareEyebrow: 'COMPARISON',
       compareTitle: 'CubePod vs. 上游 E2B vs. 传统容器',
-      compareHeaders: ['对比维度', 'CubePod v0.4.1', '上游 E2B Cloud', '传统容器沙箱'],
+      compareHeaders: ['对比维度', 'CubePod v0.4.2', '上游 E2B Cloud', '传统容器沙箱'],
       compareRows: [
         ['系统盘持久化', 'RootFS + /workspace 双持久', '仅临时 RootFS', '重启即丢失'],
         ['存储性能模型', 'Dual CSI Raw Block (NVMe-oF)', '临时 overlay / 共享 FS', 'OverlayFS / NFS'],
@@ -250,15 +250,15 @@ const copy = isZh
             { label: '零信任出站', href: `${prefix}/concepts/zero-trust-egress/` },
             { label: 'CEPs 提案', href: `${prefix}/ceps/` },
             { label: 'CRDs 字典', href: `${prefix}/reference/crds/` },
-            { label: 'v0.4.1 日志', href: `${prefix}/changelog/0.4.1/` },
+            { label: 'v0.4.2 日志', href: `${prefix}/changelog/0.4.2/` },
           ],
         },
       ],
       copyright: 'Apache 2.0 · CubePlex AI Infrastructure',
-      statusNominal: 'v0.4.1 Docs & OpenAPI Synced',
+      statusNominal: 'v0.4.2 Docs & OpenAPI Synced',
     }
   : {
-      badge: 'v0.4.1 · Apache 2.0 · 100% E2B Compatible',
+      badge: 'v0.4.2 · Apache 2.0 · 100% E2B Compatible',
       h1Rest: 'Sandbox Built for',
       h1Accent: 'Long-Lived Autonomous Agents',
       heroSubhead: 'Persistent Writable RootFS MicroVM Execution Platform',
@@ -459,7 +459,7 @@ const copy = isZh
       ],
       compareEyebrow: 'COMPARISON',
       compareTitle: 'CubePod vs. Upstream E2B & Containers',
-      compareHeaders: ['Dimension', 'CubePod v0.4.1', 'Upstream E2B', 'Containers'],
+      compareHeaders: ['Dimension', 'CubePod v0.4.2', 'Upstream E2B', 'Containers'],
       compareRows: [
         ['System Persistence', 'RootFS + /workspace persistent', 'Ephemeral RootFS', 'Lost on restart'],
         ['Storage Engine', 'Dual CSI Raw Block (NVMe-oF)', 'Ephemeral overlay', 'Overlay / NFS'],
@@ -499,12 +499,12 @@ const copy = isZh
             { label: 'Zero-Trust Egress', href: `${prefix}/concepts/zero-trust-egress/` },
             { label: 'CEPs Index', href: `${prefix}/ceps/` },
             { label: 'CRDs Reference', href: `${prefix}/reference/crds/` },
-            { label: 'Release v0.4.1', href: `${prefix}/changelog/0.4.1/` },
+            { label: 'Release v0.4.2', href: `${prefix}/changelog/0.4.2/` },
           ],
         },
       ],
       copyright: 'Apache 2.0 · CubePlex AI Infrastructure',
-      statusNominal: 'v0.4.1 Docs & OpenAPI Synced',
+      statusNominal: 'v0.4.2 Docs & OpenAPI Synced',
     };
 
 const snippets = {
@@ -1074,7 +1074,7 @@ const installCmds = {
           <div class="cp-footer-logo">
             <img src="/favicon.svg" alt="CubePod" width="22" height="22" />
             <span>CubePod</span>
-            <span class="cp-chip cp-chip-primary">v0.4.1</span>
+            <span class="cp-chip cp-chip-primary">v0.4.2</span>
           </div>
           <p>{copy.footerDesc}</p>
         </div>
