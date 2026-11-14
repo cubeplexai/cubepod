@@ -74,9 +74,10 @@ set -euo pipefail
 # (for example during dmsetup/nvme teardown). Mark reactor_* threads SCHED_IDLE and keep
 # a 95% per-reactor cpu.max floor on the spdk_tgt container cgroup.
 for pid_dir in /proc/[0-9]*; do
-  [[ -r "$pid_dir/comm" ]] || continue
-  comm="$(cat "$pid_dir/comm" 2>/dev/null || true)"
-  [[ "$comm" == "spdk_tgt" ]] || continue
+  [[ -r "$pid_dir/cmdline" ]] || continue
+  argv0=""
+  IFS= read -r -d '' argv0 < "$pid_dir/cmdline" 2>/dev/null || true
+  [[ "${argv0##*/}" == "spdk_tgt" ]] || continue
   pid="${pid_dir#/proc/}"
 
   reactors=0
