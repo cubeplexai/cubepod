@@ -13,7 +13,7 @@ class NetworkEgressRule(TypedDict):
 
 
 class NetworkPolicySpec(TypedDict, total=False):
-    defaultAction: Literal["Allow", "Deny"] | str
+    defaultAction: Literal["allow", "deny", "Allow", "Deny"] | str
     allowHosts: list[str]
     denyHosts: list[str]
     egress: list[NetworkEgressRule]

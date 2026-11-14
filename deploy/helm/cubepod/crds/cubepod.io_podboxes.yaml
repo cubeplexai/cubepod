@@ -33,6 +33,8 @@ spec:
                   type: string
                 warmPoolRef:
                   type: string
+                volumeKey:
+                  type: string
                 desiredState:
                   type: string
                   enum:
@@ -71,6 +73,21 @@ spec:
                       type: array
                       items:
                         type: string
+                    egress:
+                      type: array
+                      items:
+                        type: object
+                        required:
+                          - action
+                          - target
+                        properties:
+                          action:
+                            type: string
+                            enum:
+                              - allow
+                              - deny
+                          target:
+                            type: string
                     upstreamProxy:
                       type: string
                     secretBindings:

@@ -48,6 +48,12 @@ func cloneNetworkPolicy(p *v1alpha1.NetworkPolicySpec) *v1alpha1.NetworkPolicySp
 		return nil
 	}
 	cp := *p
+	switch strings.ToLower(strings.TrimSpace(string(cp.DefaultAction))) {
+	case "allow":
+		cp.DefaultAction = v1alpha1.NetworkDefaultAllow
+	case "deny":
+		cp.DefaultAction = v1alpha1.NetworkDefaultDeny
+	}
 	if len(p.AllowHosts) > 0 {
 		cp.AllowHosts = append([]string(nil), p.AllowHosts...)
 	}
@@ -55,7 +61,16 @@ func cloneNetworkPolicy(p *v1alpha1.NetworkPolicySpec) *v1alpha1.NetworkPolicySp
 		cp.DenyHosts = append([]string(nil), p.DenyHosts...)
 	}
 	if len(p.Egress) > 0 {
-		cp.Egress = append([]v1alpha1.NetworkEgressRule(nil), p.Egress...)
+		cp.Egress = make([]v1alpha1.NetworkEgressRule, len(p.Egress))
+		for i, rule := range p.Egress {
+			switch strings.ToLower(strings.TrimSpace(rule.Action)) {
+			case "allow":
+				rule.Action = "allow"
+			case "deny":
+				rule.Action = "deny"
+			}
+			cp.Egress[i] = rule
+		}
 	}
 	if len(p.SecretBindings) > 0 {
 		cp.SecretBindings = make([]v1alpha1.SecretBinding, len(p.SecretBindings))

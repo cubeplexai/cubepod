@@ -2176,10 +2176,10 @@ func TestNetworkPolicyPropagationAcrossLifecycleAndFailover(t *testing.T) {
 		"extension": {
 			"volumeKey": "np-ws-1",
 			"networkPolicy": {
-				"defaultAction": "Deny",
+				"defaultAction": "deny",
 				"egress": [
-					{"action": "allow", "target": "api.github.com"},
-					{"action": "deny", "target": "*"}
+					{"action": "Allow", "target": "api.github.com"},
+					{"action": "DENY", "target": "*"}
 				]
 			}
 		}
