@@ -185,8 +185,13 @@ func main() {
 	}
 	if volDir != "" {
 		vcfg := gateway.E2BVolumeConfig{
-			Dir:     volDir,
-			HostDir: strings.TrimSpace(os.Getenv("CUBEPOD_E2B_VOLUME_HOST_DIR")),
+			Dir:           volDir,
+			HostDir:       strings.TrimSpace(os.Getenv("CUBEPOD_E2B_VOLUME_HOST_DIR")),
+			SharedPVCName: strings.TrimSpace(os.Getenv("CUBEPOD_E2B_SHARED_PVC")),
+		}
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_K8S_E2B_VOLUME_MOUNTS"))) {
+		case "1", "true", "yes":
+			vcfg.K8sE2BVolumeMounts = true
 		}
 		if raw := strings.TrimSpace(os.Getenv("CUBEPOD_E2B_MAX_FILE_BYTES")); raw != "" {
 			if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {

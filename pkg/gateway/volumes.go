@@ -39,6 +39,10 @@ type E2BVolumeConfig struct {
 	MaxFileSizeBytes int64
 	// MaxVolumesPerTenant caps volumes per API key tenant (default 64).
 	MaxVolumesPerTenant int
+	// K8sE2BVolumeMounts enables official E2B volumeMounts on live Kubernetes.
+	K8sE2BVolumeMounts bool
+	// SharedPVCName is the cluster-wide RWX PVC shared between gateway and Kata pods.
+	SharedPVCName string
 }
 
 // E2BVolumeMount is the runtime attachment for one sandbox mount.
@@ -72,6 +76,8 @@ func (s *Server) ConfigureE2BVolumes(cfg E2BVolumeConfig) error {
 	s.e2bDir = cfg.Dir
 	s.e2bCfg = vcfg
 	s.e2bMaxFileBytes = cfg.MaxFileSizeBytes
+	s.e2bK8sMounts = cfg.K8sE2BVolumeMounts
+	s.e2bSharedPVC = strings.TrimSpace(cfg.SharedPVCName)
 	active := make(map[string]struct{}, len(s.sandboxes))
 	for id := range s.sandboxes {
 		active[id] = struct{}{}
@@ -92,8 +98,19 @@ func (s *Server) maxVolumeFileBytes() int64 {
 	return n
 }
 
+func (s *Server) sharedE2BPVC() string {
+	s.mu.RLock()
+	pvc := s.e2bSharedPVC
+	s.mu.RUnlock()
+	return pvc
+}
+
 func (s *Server) isKubeVolumeMountsUnsupported() bool {
-	return s.livePodRouting && s.runtime == nil
+	s.mu.RLock()
+	k8sMounts := s.e2bK8sMounts
+	sharedPVC := s.e2bSharedPVC
+	s.mu.RUnlock()
+	return s.livePodRouting && s.runtime == nil && (!k8sMounts || sharedPVC == "")
 }
 
 // E2BVolumeMounts returns the volumes attached to a sandbox. The compose
@@ -571,11 +588,14 @@ func (s *Server) ensureE2BVolumePVC(ctx context.Context, st *volume.Store, volum
 	if s.reconciler == nil || s.reconciler.KubeClient() == nil || volumeID == "" {
 		return
 	}
-	name := e2bPVCPrefix + volumeID
-	if !strings.HasPrefix(name, e2bPVCPrefix) {
+	ns := s.reconciler.Namespace()
+	if sharedPVC := s.sharedE2BPVC(); sharedPVC != "" {
+		if err := st.NotePVC(volumeID, sharedPVC, ns); err != nil {
+			slog.Warn("e2b volume shared PVC note failed", "volumeID", volumeID, "pvc", sharedPVC, "err", err)
+		}
 		return
 	}
-	ns := s.reconciler.Namespace()
+	name := e2bPVCPrefix + volumeID
 	pvc := controller.BlockPVCManifest{
 		Name:             name,
 		Namespace:        ns,
@@ -604,6 +624,9 @@ func (s *Server) deleteE2BVolumePVC(ctx context.Context, namespace, pvcName, vol
 		return
 	}
 	if pvcName == "" || volumeID == "" {
+		return
+	}
+	if shared := s.sharedE2BPVC(); shared != "" && pvcName == shared {
 		return
 	}
 	if pvcName != e2bPVCPrefix+volumeID || !strings.HasPrefix(pvcName, e2bPVCPrefix) {

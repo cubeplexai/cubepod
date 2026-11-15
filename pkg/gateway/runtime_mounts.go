@@ -12,14 +12,27 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
-func plannedToPodBoxMounts(planned []volume.PlannedMount) []v1alpha1.E2BVolumeMount {
+func (s *Server) plannedToPodBoxMounts(planned []volume.PlannedMount) []v1alpha1.E2BVolumeMount {
 	if len(planned) == 0 {
 		return nil
+	}
+	sharedPVC := ""
+	if s != nil && s.livePodRouting && s.runtime == nil {
+		sharedPVC = s.sharedE2BPVC()
 	}
 	out := make([]v1alpha1.E2BVolumeMount, 0, len(planned))
 	for _, p := range planned {
 		pvc, ok := controller.E2BPVCName(p.VolumeID)
 		if !ok {
+			continue
+		}
+		if sharedPVC != "" {
+			out = append(out, v1alpha1.E2BVolumeMount{
+				VolumeID: p.VolumeID,
+				PVCName:  sharedPVC,
+				SubPath:  p.VolumeID + "/data",
+				Path:     p.Path,
+			})
 			continue
 		}
 		out = append(out, v1alpha1.E2BVolumeMount{
@@ -44,7 +57,7 @@ func (s *Server) podBoxE2BMounts(sandboxID string) []v1alpha1.E2BVolumeMount {
 	for _, m := range specs {
 		planned = append(planned, volume.PlannedMount{VolumeID: m.VolumeID, Name: m.VolumeName, Path: m.ContainerPath})
 	}
-	return plannedToPodBoxMounts(planned)
+	return s.plannedToPodBoxMounts(planned)
 }
 
 func (s *Server) withOfficialMounts(spec v1alpha1.PodBoxSpec, sandboxID string) v1alpha1.PodBoxSpec {

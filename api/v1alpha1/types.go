@@ -219,6 +219,7 @@ type NetworkPolicySpec struct {
 type E2BVolumeMount struct {
 	VolumeID string `json:"volumeID"`
 	PVCName  string `json:"pvcName"`
+	SubPath  string `json:"subPath,omitempty"`
 	Path     string `json:"path"`
 }
 

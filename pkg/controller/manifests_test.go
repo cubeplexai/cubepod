@@ -252,9 +252,10 @@ func TestBuildKataPod_OfficialE2BVolumeMounts(t *testing.T) {
 	if main == nil {
 		t.Fatal("missing sandbox container")
 	}
+	stagingPath := "/run/cubepod/volumes/" + id
 	var sawMount, sawWorkspace bool
 	for _, m := range main.VolumeMounts {
-		if m.Name == pvc && m.MountPath == "/mnt/cpod-test-vol" {
+		if m.Name == pvc && m.MountPath == stagingPath {
 			sawMount = true
 		}
 		if m.MountPath == "/workspace" {
@@ -262,7 +263,17 @@ func TestBuildKataPod_OfficialE2BVolumeMounts(t *testing.T) {
 		}
 	}
 	if !sawMount || !sawWorkspace {
-		t.Fatalf("expected official mount and /workspace, got %+v", main.VolumeMounts)
+		t.Fatalf("expected official staging mount %s and /workspace, got %+v", stagingPath, main.VolumeMounts)
+	}
+	wantEnv := `[{"volume_id":"` + id + `","staging_path":"` + stagingPath + `","target_path":"/mnt/cpod-test-vol"}]`
+	var sawEnv bool
+	for _, e := range main.Env {
+		if e.Name == "CUBEPOD_E2B_MOUNTS" && e.Value == wantEnv {
+			sawEnv = true
+		}
+	}
+	if !sawEnv {
+		t.Fatalf("expected CUBEPOD_E2B_MOUNTS=%s, got env=%+v", wantEnv, main.Env)
 	}
 }
 
@@ -283,17 +294,72 @@ func TestBuildKataPod_OfficialMountsWithBlockWorkspace(t *testing.T) {
 	if main == nil {
 		t.Fatal("missing sandbox container")
 	}
+	stagingPath := "/run/cubepod/volumes/" + id
 	var sawFS bool
 	for _, m := range main.VolumeMounts {
-		if m.Name == pvc && m.MountPath == "/mnt/data" {
+		if m.Name == pvc && m.MountPath == stagingPath {
 			sawFS = true
 		}
 	}
 	if !sawFS {
-		t.Fatalf("expected filesystem official mount alongside block devices, mounts=%+v devices=%+v", main.VolumeMounts, main.VolumeDevices)
+		t.Fatalf("expected filesystem official staging mount %s alongside block devices, mounts=%+v devices=%+v", stagingPath, main.VolumeMounts, main.VolumeDevices)
 	}
 	if len(main.VolumeDevices) < 2 {
 		t.Fatalf("expected workspace/rootfs block devices to remain, got %+v", main.VolumeDevices)
+	}
+}
+
+func TestBuildKataPod_SharedRWXPVCDeduplicationAndSubPath(t *testing.T) {
+	id1 := "0123456789abcdef0123456789abcdef"
+	id2 := "fedcba9876543210fedcba9876543210"
+	sharedPVC := "cubepod-e2b-volumes"
+	spec := v1alpha1.PodBoxSpec{
+		E2BVolumeMounts: []v1alpha1.E2BVolumeMount{
+			{VolumeID: id1, PVCName: sharedPVC, SubPath: id1 + "/data", Path: "/mnt/ds1"},
+			{VolumeID: id2, PVCName: sharedPVC, SubPath: id2 + "/data", Path: "/mnt/ds2"},
+		},
+	}
+	pod := controller.BuildKataPod("box-shared", v1alpha1.PodTemplateSpec{Image: "ubuntu:24.04", RuntimeClassName: "kata-qemu"}, spec, v1alpha1.PodBoxStatus{}, "Block")
+	pvcCount := 0
+	for _, v := range pod.Volumes {
+		if v.PersistentVolumeClaim == sharedPVC {
+			pvcCount++
+		}
+	}
+	if pvcCount != 1 {
+		t.Fatalf("expected shared PVC %s to be added once to pod.Volumes, got %d (%+v)", sharedPVC, pvcCount, pod.Volumes)
+	}
+	var main *controller.ContainerManifest
+	for i := range pod.Containers {
+		if pod.Containers[i].Name == "sandbox" {
+			main = &pod.Containers[i]
+			break
+		}
+	}
+	if main == nil {
+		t.Fatal("missing sandbox container")
+	}
+	var m1, m2 bool
+	for _, m := range main.VolumeMounts {
+		if m.Name == sharedPVC && m.MountPath == "/run/cubepod/volumes/"+id1 && m.SubPath == id1+"/data" {
+			m1 = true
+		}
+		if m.Name == sharedPVC && m.MountPath == "/run/cubepod/volumes/"+id2 && m.SubPath == id2+"/data" {
+			m2 = true
+		}
+	}
+	if !m1 || !m2 {
+		t.Fatalf("expected both subPath staging mounts on shared PVC, got %+v", main.VolumeMounts)
+	}
+	wantEnv := `[{"volume_id":"` + id1 + `","staging_path":"/run/cubepod/volumes/` + id1 + `","target_path":"/mnt/ds1"},{"volume_id":"` + id2 + `","staging_path":"/run/cubepod/volumes/` + id2 + `","target_path":"/mnt/ds2"}]`
+	var sawEnv bool
+	for _, e := range main.Env {
+		if e.Name == "CUBEPOD_E2B_MOUNTS" && e.Value == wantEnv {
+			sawEnv = true
+		}
+	}
+	if !sawEnv {
+		t.Fatalf("expected CUBEPOD_E2B_MOUNTS=%s, got env=%+v", wantEnv, main.Env)
 	}
 }
 
@@ -322,6 +388,11 @@ func TestValidateOfficialVolumeMounts_RejectsInvalid(t *testing.T) {
 			{VolumeID: id, PVCName: "e2bvol-" + id, Path: "/mnt/dup"},
 			{VolumeID: id, PVCName: "e2bvol-" + id, Path: "/mnt/dup"},
 		},
+		{{VolumeID: id, PVCName: "cubepod-e2b-volumes", SubPath: "/abs/path", Path: "/mnt/data"}},
+		{{VolumeID: id, PVCName: "cubepod-e2b-volumes", SubPath: "../escape", Path: "/mnt/data"}},
+		{{VolumeID: id, PVCName: "cubepod-e2b-volumes", SubPath: "a/../b", Path: "/mnt/data"}},
+		{{VolumeID: id, PVCName: "", SubPath: id + "/data", Path: "/mnt/data"}},
+		{{VolumeID: id, PVCName: "cubepod-e2b-volumes", Path: "/mnt/data"}},
 	}
 	for _, tc := range cases {
 		if err := controller.ValidateOfficialVolumeMounts(tc); err == nil {

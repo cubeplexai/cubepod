@@ -17,6 +17,7 @@
 //!    and K8s `/etc/resolv.conf`, `/etc/hosts`, `/etc/hostname`.
 //! 5. Calls `pivot_root(2)`, detaches `/.old_root`, and `execvp(3)`s into `/opt/cubepod/bin/podd`.
 
+use std::collections::HashSet;
 use std::env;
 use std::ffi::CString;
 use std::fs;
@@ -240,6 +241,8 @@ pub fn ensure_ext4(device: &Path, label: &str) -> Result<VolumeAction, String> {
 
 pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
     let start = Instant::now();
+    let ws_str = cfg.workspace_dir.to_string_lossy();
+    let e2b_mounts = load_e2b_mounts(&ws_str)?;
 
     if cfg.skip_pivot || !cfg.rootfs_device.exists() {
         if cfg.skip_pivot {
@@ -253,6 +256,14 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         let _ = fs::create_dir_all(&cfg.workspace_dir);
         let _ = chown_path(&cfg.workspace_dir, cfg.default_uid, cfg.default_gid);
         let _ = fs::set_permissions(&cfg.workspace_dir, fs::Permissions::from_mode(0o777));
+        if !e2b_mounts.is_empty() {
+            mount_e2b_volumes(
+                &e2b_mounts,
+                Path::new("/"),
+                cfg.default_uid,
+                cfg.default_gid,
+            )?;
+        }
         let state = InitState {
             pivoted: false,
             rootfs_device: cfg.rootfs_device.to_string_lossy().to_string(),
@@ -389,6 +400,16 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         Err(err) => {
             eprintln!("[podd-init] warning: failed to compose CA bundle: {err}");
         }
+    }
+
+    if !e2b_mounts.is_empty() {
+        mount_e2b_volumes(
+            &e2b_mounts,
+            &cfg.merged_root_path,
+            cfg.default_uid,
+            cfg.default_gid,
+        )?;
+        unmount_lazy_ignore_missing(&cfg.merged_root_path.join("run/cubepod/volumes"));
     }
 
     // 6. Perform pivot_root(2) into the merged root.
@@ -564,6 +585,535 @@ fn unmount_lazy(target: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn unmount_lazy_ignore_missing(target: &Path) {
+    let Ok(c_target) = CString::new(target.to_string_lossy().as_bytes()) else {
+        return;
+    };
+    let rc = unsafe { libc::umount2(c_target.as_ptr(), libc::MNT_DETACH) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        if !matches!(err.raw_os_error(), Some(libc::ENOENT) | Some(libc::EINVAL)) {
+            eprintln!(
+                "[podd-init] warning: umount2 MNT_DETACH {} failed: {err}",
+                target.display()
+            );
+        }
+    }
+}
+
+const E2B_MOUNTS_ENV: &str = "CUBEPOD_E2B_MOUNTS";
+const E2B_MOUNTS_FILE: &str = "/etc/cubepod/e2b-mounts.json";
+const E2B_RESERVED_PATHS: &[&str] = &[
+    "/rootfs-upper",
+    "/opt/cubepod",
+    "/mnt/cubepod",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/run",
+    "/etc",
+    "/bin",
+    "/sbin",
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/root",
+    "/boot",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2BMountSpec {
+    pub volume_id: String,
+    pub staging_path: String,
+    pub target_path: String,
+}
+
+fn load_e2b_mounts(workspace_dir: &str) -> Result<Vec<E2BMountSpec>, String> {
+    let env_val = env::var(E2B_MOUNTS_ENV).ok();
+    load_e2b_mounts_from(
+        env_val.as_deref(),
+        Path::new(E2B_MOUNTS_FILE),
+        workspace_dir,
+    )
+}
+
+fn load_e2b_mounts_from(
+    env_val: Option<&str>,
+    file_path: &Path,
+    workspace_dir: &str,
+) -> Result<Vec<E2BMountSpec>, String> {
+    if let Some(raw) = env_val {
+        if !raw.trim().is_empty() {
+            return parse_and_validate_e2b_mounts(raw, workspace_dir);
+        }
+    }
+    if file_path.exists() {
+        let raw = fs::read_to_string(file_path)
+            .map_err(|e| format!("failed to read {}: {e}", file_path.display()))?;
+        if raw.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        return parse_and_validate_e2b_mounts(&raw, workspace_dir);
+    }
+    Ok(Vec::new())
+}
+
+pub fn parse_and_validate_e2b_mounts(
+    raw: &str,
+    workspace_dir: &str,
+) -> Result<Vec<E2BMountSpec>, String> {
+    let items = JsonParser::new(raw).parse_root_array()?;
+    let norm_workspace = normalize_abs_path(workspace_dir, "workspace_dir")?;
+
+    let mut seen_targets = HashSet::new();
+    let mut specs = Vec::with_capacity(items.len());
+
+    for (idx, item) in items.into_iter().enumerate() {
+        let JsonValue::Object(fields) = item else {
+            return Err(format!("e2b mount entry {idx} must be a JSON object"));
+        };
+
+        let mut volume_id: Option<String> = None;
+        let mut staging_path: Option<String> = None;
+        let mut target_path: Option<String> = None;
+
+        for (k, v) in fields {
+            match k.as_str() {
+                "volume_id" => {
+                    volume_id = Some(expect_json_string(v, idx, "volume_id")?);
+                }
+                "staging_path" => {
+                    staging_path = Some(expect_json_string(v, idx, "staging_path")?);
+                }
+                "target_path" => {
+                    target_path = Some(expect_json_string(v, idx, "target_path")?);
+                }
+                _ => {}
+            }
+        }
+
+        let volume_id =
+            volume_id.ok_or_else(|| format!("e2b mount entry {idx} missing volume_id"))?;
+        let staging_path =
+            staging_path.ok_or_else(|| format!("e2b mount entry {idx} missing staging_path"))?;
+        let target_path =
+            target_path.ok_or_else(|| format!("e2b mount entry {idx} missing target_path"))?;
+
+        if !is_valid_volume_id(&volume_id) {
+            return Err(format!(
+                "e2b mount entry {idx} has invalid volume_id {volume_id:?}: must be 32 lowercase hex chars"
+            ));
+        }
+
+        let expected_staging = format!("/run/cubepod/volumes/{volume_id}");
+        if staging_path != expected_staging {
+            return Err(format!(
+                "e2b mount entry {idx} has invalid staging_path {staging_path:?}: expected {expected_staging:?}"
+            ));
+        }
+
+        let norm_target = normalize_abs_path(&target_path, "target_path")?;
+
+        if paths_overlap(&norm_target, &norm_workspace) {
+            return Err(format!(
+                "e2b mount target_path {norm_target:?} overlaps workspace_dir {norm_workspace:?}"
+            ));
+        }
+        for reserved in E2B_RESERVED_PATHS {
+            if paths_overlap(&norm_target, reserved) {
+                return Err(format!(
+                    "e2b mount target_path {norm_target:?} overlaps reserved path {reserved:?}"
+                ));
+            }
+        }
+        if !seen_targets.insert(norm_target.clone()) {
+            return Err(format!("duplicate e2b mount target_path {norm_target:?}"));
+        }
+
+        specs.push(E2BMountSpec {
+            volume_id,
+            staging_path,
+            target_path: norm_target,
+        });
+    }
+
+    Ok(specs)
+}
+
+pub fn mount_e2b_volumes(
+    mounts: &[E2BMountSpec],
+    root: &Path,
+    default_uid: u32,
+    default_gid: u32,
+) -> Result<(), String> {
+    for mount in mounts {
+        let src_path = Path::new(&mount.staging_path);
+        if !src_path.is_dir() {
+            return Err(format!(
+                "e2b volume {} staging path {} does not exist or is not a directory",
+                mount.volume_id, mount.staging_path
+            ));
+        }
+
+        let dst = root.join(mount.target_path.trim_start_matches('/'));
+        fs::create_dir_all(&dst).map_err(|e| format!("mkdir e2b target {}: {e}", dst.display()))?;
+        chown_path(&dst, default_uid, default_gid)?;
+
+        let c_src = CString::new(mount.staging_path.as_bytes())
+            .map_err(|e| format!("invalid staging_path {}: {e}", mount.staging_path))?;
+        let c_dst = CString::new(dst.to_string_lossy().as_bytes())
+            .map_err(|e| format!("invalid target_path {}: {e}", dst.display()))?;
+
+        let rc = unsafe {
+            libc::mount(
+                c_src.as_ptr(),
+                c_dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND as libc::c_ulong,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "bind mount {} -> {} failed: {}",
+                mount.staging_path,
+                dst.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let remount_flags =
+            (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
+        let rc = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c_dst.as_ptr(),
+                std::ptr::null(),
+                remount_flags,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!(
+                "remount nosuid,nodev on {} failed: {}",
+                dst.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn expect_json_string(val: JsonValue, idx: usize, field: &str) -> Result<String, String> {
+    match val {
+        JsonValue::String(s) => Ok(s),
+        _ => Err(format!(
+            "e2b mount entry {idx} field {field} must be a string"
+        )),
+    }
+}
+
+fn is_valid_volume_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn normalize_abs_path(raw: &str, label: &str) -> Result<String, String> {
+    if raw.contains('\0') {
+        return Err(format!("{label} contains NUL byte"));
+    }
+    if !raw.starts_with('/') {
+        return Err(format!("{label} {raw:?} must start with '/'"));
+    }
+    let mut segments = Vec::new();
+    for seg in raw.split('/') {
+        if seg.is_empty() {
+            continue;
+        }
+        if seg == "." || seg == ".." {
+            return Err(format!(
+                "{label} {raw:?} must not contain '.' or '..' segments"
+            ));
+        }
+        segments.push(seg);
+    }
+    if segments.is_empty() {
+        return Err(format!("{label} must not be '/'"));
+    }
+    Ok(format!("/{}", segments.join("/")))
+}
+
+fn paths_overlap(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let a_child_of_b = a.len() > b.len() && a.starts_with(b) && a.as_bytes()[b.len()] == b'/';
+    let b_child_of_a = b.len() > a.len() && b.starts_with(a) && b.as_bytes()[a.len()] == b'/';
+    a_child_of_b || b_child_of_a
+}
+
+#[derive(Debug)]
+enum JsonValue {
+    String(String),
+    Object(Vec<(String, JsonValue)>),
+    Other,
+}
+
+struct JsonParser<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(input: &'a str) -> Self {
+        Self {
+            bytes: input.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn parse_root_array(&mut self) -> Result<Vec<JsonValue>, String> {
+        self.skip_ws();
+        let arr = self.parse_array()?;
+        self.skip_ws();
+        if self.pos != self.bytes.len() {
+            return Err(format!(
+                "unexpected trailing characters at byte {}",
+                self.pos
+            ));
+        }
+        Ok(arr)
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn next(&mut self) -> Option<u8> {
+        let b = self.bytes.get(self.pos).copied()?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn expect(&mut self, expected: u8) -> Result<(), String> {
+        match self.next() {
+            Some(b) if b == expected => Ok(()),
+            Some(b) => Err(format!(
+                "expected '{}' at byte {}, got '{}'",
+                expected as char,
+                self.pos - 1,
+                b as char
+            )),
+            None => Err(format!("unexpected EOF, expected '{}'", expected as char)),
+        }
+    }
+
+    fn parse_value(&mut self) -> Result<JsonValue, String> {
+        self.skip_ws();
+        match self.peek() {
+            Some(b'"') => Ok(JsonValue::String(self.parse_string()?)),
+            Some(b'[') => {
+                self.parse_array()?;
+                Ok(JsonValue::Other)
+            }
+            Some(b'{') => Ok(JsonValue::Object(self.parse_object()?)),
+            Some(b't') => self.parse_literal(b"true"),
+            Some(b'f') => self.parse_literal(b"false"),
+            Some(b'n') => self.parse_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(),
+            Some(b) => Err(format!(
+                "unexpected character '{}' at byte {}",
+                b as char, self.pos
+            )),
+            None => Err("unexpected EOF while parsing JSON value".to_string()),
+        }
+    }
+
+    fn parse_array(&mut self) -> Result<Vec<JsonValue>, String> {
+        self.expect(b'[')?;
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(items);
+        }
+        loop {
+            items.push(self.parse_value()?);
+            self.skip_ws();
+            match self.next() {
+                Some(b',') => {}
+                Some(b']') => return Ok(items),
+                Some(b) => {
+                    return Err(format!(
+                        "expected ',' or ']' at byte {}, got '{}'",
+                        self.pos - 1,
+                        b as char
+                    ))
+                }
+                None => return Err("unexpected EOF in JSON array".to_string()),
+            }
+        }
+    }
+
+    fn parse_object(&mut self) -> Result<Vec<(String, JsonValue)>, String> {
+        self.expect(b'{')?;
+        let mut fields = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(fields);
+        }
+        loop {
+            self.skip_ws();
+            let key = self.parse_string()?;
+            self.skip_ws();
+            self.expect(b':')?;
+            let val = self.parse_value()?;
+            fields.push((key, val));
+            self.skip_ws();
+            match self.next() {
+                Some(b',') => {}
+                Some(b'}') => return Ok(fields),
+                Some(b) => {
+                    return Err(format!(
+                        "expected ',' or '}}' at byte {}, got '{}'",
+                        self.pos - 1,
+                        b as char
+                    ))
+                }
+                None => return Err("unexpected EOF in JSON object".to_string()),
+            }
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        self.expect(b'"')?;
+        let start = self.pos;
+        let mut out = String::new();
+        let mut chunk_start = start;
+
+        while let Some(b) = self.next() {
+            match b {
+                b'"' => {
+                    let tail = std::str::from_utf8(&self.bytes[chunk_start..self.pos - 1])
+                        .map_err(|e| format!("invalid UTF-8 in JSON string: {e}"))?;
+                    out.push_str(tail);
+                    return Ok(out);
+                }
+                b'\\' => {
+                    let prefix = std::str::from_utf8(&self.bytes[chunk_start..self.pos - 1])
+                        .map_err(|e| format!("invalid UTF-8 in JSON string: {e}"))?;
+                    out.push_str(prefix);
+                    let esc = self
+                        .next()
+                        .ok_or_else(|| "unexpected EOF in JSON string escape".to_string())?;
+                    match esc {
+                        b'"' => out.push('"'),
+                        b'\\' => out.push('\\'),
+                        b'/' => out.push('/'),
+                        b'b' => out.push('\x08'),
+                        b'f' => out.push('\x0c'),
+                        b'n' => out.push('\n'),
+                        b'r' => out.push('\r'),
+                        b't' => out.push('\t'),
+                        b'u' => {
+                            let cp = self.parse_hex4()?;
+                            let ch = char::from_u32(cp as u32)
+                                .ok_or_else(|| format!("invalid unicode escape \\u{cp:04x}"))?;
+                            out.push(ch);
+                        }
+                        other => {
+                            return Err(format!("invalid JSON escape \\{}", other as char));
+                        }
+                    }
+                    chunk_start = self.pos;
+                }
+                0x00..=0x1f => {
+                    return Err("unescaped control character in JSON string".to_string());
+                }
+                _ => {}
+            }
+        }
+        Err("unterminated JSON string".to_string())
+    }
+
+    fn parse_hex4(&mut self) -> Result<u16, String> {
+        let mut val: u16 = 0;
+        for _ in 0..4 {
+            let b = self
+                .next()
+                .ok_or_else(|| "unexpected EOF in \\u escape".to_string())?;
+            let digit = match b {
+                b'0'..=b'9' => (b - b'0') as u16,
+                b'a'..=b'f' => (b - b'a' + 10) as u16,
+                b'A'..=b'F' => (b - b'A' + 10) as u16,
+                _ => return Err(format!("invalid hex digit '{}' in \\u escape", b as char)),
+            };
+            val = (val << 4) | digit;
+        }
+        Ok(val)
+    }
+
+    fn parse_literal(&mut self, lit: &[u8]) -> Result<JsonValue, String> {
+        if self.bytes[self.pos..].starts_with(lit) {
+            self.pos += lit.len();
+            Ok(JsonValue::Other)
+        } else {
+            Err(format!("invalid JSON literal at byte {}", self.pos))
+        }
+    }
+
+    fn parse_number(&mut self) -> Result<JsonValue, String> {
+        let start = self.pos;
+        if self.peek() == Some(b'-') {
+            self.pos += 1;
+        }
+        let mut has_digits = false;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.pos += 1;
+            has_digits = true;
+        }
+        if !has_digits {
+            return Err(format!("invalid JSON number at byte {start}"));
+        }
+        if self.peek() == Some(b'.') {
+            self.pos += 1;
+            let mut frac_digits = false;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+                frac_digits = true;
+            }
+            if !frac_digits {
+                return Err(format!("invalid JSON number fraction at byte {start}"));
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            let mut exp_digits = false;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+                exp_digits = true;
+            }
+            if !exp_digits {
+                return Err(format!("invalid JSON number exponent at byte {start}"));
+            }
+        }
+        Ok(JsonValue::Other)
+    }
 }
 
 fn main() -> ExitCode {
@@ -777,5 +1327,188 @@ mod tests {
         let skipped = compose_ca_bundle(Some(&base_path), &missing_extra, &out_path)
             .expect("missing extra should skip cleanly");
         assert!(!skipped);
+    }
+
+    #[test]
+    fn e2b_mounts_valid_parsing_and_normalization() {
+        let vid1 = "0123456789abcdef0123456789abcdef";
+        let vid2 = "fedcba9876543210fedcba9876543210";
+        let raw = format!(
+            r#"[
+                {{
+                    "volume_id": "{vid1}",
+                    "staging_path": "/run/cubepod/volumes/{vid1}",
+                    "target_path": "/mnt/dataset"
+                }},
+                {{
+                    "target_path": "//mnt//models/",
+                    "staging_path": "/run/cubepod/volumes/{vid2}",
+                    "volume_id": "{vid2}"
+                }}
+            ]"#
+        );
+
+        let specs = parse_and_validate_e2b_mounts(&raw, "/workspace").expect("valid mounts");
+        assert_eq!(
+            specs,
+            vec![
+                E2BMountSpec {
+                    volume_id: vid1.to_string(),
+                    staging_path: format!("/run/cubepod/volumes/{vid1}"),
+                    target_path: "/mnt/dataset".to_string(),
+                },
+                E2BMountSpec {
+                    volume_id: vid2.to_string(),
+                    staging_path: format!("/run/cubepod/volumes/{vid2}"),
+                    target_path: "/mnt/models".to_string(),
+                },
+            ]
+        );
+
+        // Empty array is valid
+        assert!(parse_and_validate_e2b_mounts("[]", "/workspace")
+            .unwrap()
+            .is_empty());
+
+        // Sibling prefix like /workspace2 does not overlap /workspace
+        let sibling = format!(
+            r#"[{{"volume_id":"{vid1}","staging_path":"/run/cubepod/volumes/{vid1}","target_path":"/workspace2"}}]"#
+        );
+        assert_eq!(
+            parse_and_validate_e2b_mounts(&sibling, "/workspace")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn e2b_mounts_rejects_invalid_volume_id() {
+        let cases = [
+            // Missing volume_id
+            r#"[{"staging_path":"/run/cubepod/volumes/0123456789abcdef0123456789abcdef","target_path":"/mnt/data"}]"#,
+            // Too short
+            r#"[{"volume_id":"0123456789abcdef","staging_path":"/run/cubepod/volumes/0123456789abcdef","target_path":"/mnt/data"}]"#,
+            // Uppercase hex
+            r#"[{"volume_id":"0123456789ABCDEF0123456789abcdef","staging_path":"/run/cubepod/volumes/0123456789ABCDEF0123456789abcdef","target_path":"/mnt/data"}]"#,
+            // Non-hex char 'g'
+            r#"[{"volume_id":"0123456789abcdeg0123456789abcdef","staging_path":"/run/cubepod/volumes/0123456789abcdeg0123456789abcdef","target_path":"/mnt/data"}]"#,
+        ];
+
+        for raw in cases {
+            assert!(
+                parse_and_validate_e2b_mounts(raw, "/workspace").is_err(),
+                "expected error for {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn e2b_mounts_rejects_bad_staging_path() {
+        let vid = "0123456789abcdef0123456789abcdef";
+        let other_vid = "ffffffffffffffffffffffffffffffff";
+        let cases = [
+            format!(
+                r#"[{{"volume_id":"{vid}","staging_path":"/tmp/volumes/{vid}","target_path":"/mnt/data"}}]"#
+            ),
+            format!(
+                r#"[{{"volume_id":"{vid}","staging_path":"/run/cubepod/volumes/{other_vid}","target_path":"/mnt/data"}}]"#
+            ),
+            format!(
+                r#"[{{"volume_id":"{vid}","staging_path":"/run/cubepod/volumes/{vid}/extra","target_path":"/mnt/data"}}]"#
+            ),
+        ];
+
+        for raw in cases {
+            assert!(
+                parse_and_validate_e2b_mounts(&raw, "/workspace").is_err(),
+                "expected error for {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn e2b_mounts_rejects_reserved_workspace_traversal_and_duplicates() {
+        let vid1 = "0123456789abcdef0123456789abcdef";
+        let vid2 = "fedcba9876543210fedcba9876543210";
+
+        let bad_targets = [
+            "/workspace",
+            "/workspace/sub",
+            "/rootfs-upper",
+            "/rootfs-upper/data",
+            "/etc",
+            "/etc/ssl",
+            "/mnt",
+            "/opt",
+            "/",
+            "mnt/data",
+            "/mnt/../etc",
+            "/mnt/./data",
+            "/..",
+        ];
+
+        for target in bad_targets {
+            let raw = format!(
+                r#"[{{"volume_id":"{vid1}","staging_path":"/run/cubepod/volumes/{vid1}","target_path":"{target}"}}]"#
+            );
+            assert!(
+                parse_and_validate_e2b_mounts(&raw, "/workspace").is_err(),
+                "expected target_path {target:?} to be rejected"
+            );
+        }
+
+        // Duplicate target_path (including after consecutive-slash normalization)
+        let dup_raw = format!(
+            r#"[
+                {{"volume_id":"{vid1}","staging_path":"/run/cubepod/volumes/{vid1}","target_path":"/mnt/data"}},
+                {{"volume_id":"{vid2}","staging_path":"/run/cubepod/volumes/{vid2}","target_path":"//mnt//data/"}}
+            ]"#
+        );
+        let err = parse_and_validate_e2b_mounts(&dup_raw, "/workspace").unwrap_err();
+        assert!(err.contains("duplicate"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn e2b_mounts_env_and_file_fallback() {
+        let vid1 = "0123456789abcdef0123456789abcdef";
+        let vid2 = "fedcba9876543210fedcba9876543210";
+        let file_path = unique_temp_path("test-e2b-mounts", "json");
+        let _guard = TempFileGuard(file_path.clone());
+
+        // Missing file and no env -> empty
+        assert!(load_e2b_mounts_from(None, &file_path, "/workspace")
+            .unwrap()
+            .is_empty());
+
+        // File fallback when env is None or empty
+        let file_json = format!(
+            r#"[{{"volume_id":"{vid1}","staging_path":"/run/cubepod/volumes/{vid1}","target_path":"/mnt/from-file"}}]"#
+        );
+        fs::write(&file_path, file_json).expect("write e2b-mounts.json");
+
+        let from_file = load_e2b_mounts_from(Some(""), &file_path, "/workspace").unwrap();
+        assert_eq!(from_file.len(), 1);
+        assert_eq!(from_file[0].target_path, "/mnt/from-file");
+
+        // Non-empty env overrides file
+        let env_json = format!(
+            r#"[{{"volume_id":"{vid2}","staging_path":"/run/cubepod/volumes/{vid2}","target_path":"/mnt/from-env"}}]"#
+        );
+        let from_env = load_e2b_mounts_from(Some(&env_json), &file_path, "/workspace").unwrap();
+        assert_eq!(from_env.len(), 1);
+        assert_eq!(from_env[0].target_path, "/mnt/from-env");
+    }
+
+    #[test]
+    fn mount_e2b_volumes_fails_fast_when_staging_missing() {
+        let vid = "0123456789abcdef0123456789abcdef";
+        let spec = E2BMountSpec {
+            volume_id: vid.to_string(),
+            staging_path: format!("/run/cubepod/volumes/{vid}-nonexistent"),
+            target_path: "/mnt/dataset".to_string(),
+        };
+        let err = mount_e2b_volumes(&[spec], Path::new("/"), 1000, 1000).unwrap_err();
+        assert!(err.contains("does not exist"), "unexpected error: {err}");
     }
 }
