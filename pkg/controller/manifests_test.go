@@ -219,3 +219,95 @@ func TestBuildKataPod_EgressEnvVars(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildKataPod_OfficialE2BVolumeMounts(t *testing.T) {
+	id := "0123456789abcdef0123456789abcdef"
+	pvc := "e2bvol-" + id
+	spec := v1alpha1.PodBoxSpec{
+		TemplateRef: "base",
+		E2BVolumeMounts: []v1alpha1.E2BVolumeMount{
+			{VolumeID: id, PVCName: pvc, Path: "/mnt/cpod-test-vol"},
+		},
+	}
+	pod := controller.BuildKataPod("box-vol", v1alpha1.PodTemplateSpec{Image: "ubuntu:24.04"}, spec, v1alpha1.PodBoxStatus{}, "Filesystem")
+	var sawVol, sawWS bool
+	for _, v := range pod.Volumes {
+		if v.Name == pvc && v.PersistentVolumeClaim == pvc {
+			sawVol = true
+		}
+		if v.Name == "workspace-volume" {
+			sawWS = true
+		}
+	}
+	if !sawVol || !sawWS {
+		t.Fatalf("expected official PVC %s and workspace volume, got %+v", pvc, pod.Volumes)
+	}
+	var main *controller.ContainerManifest
+	for i := range pod.Containers {
+		if pod.Containers[i].Name == "sandbox" {
+			main = &pod.Containers[i]
+			break
+		}
+	}
+	if main == nil {
+		t.Fatal("missing sandbox container")
+	}
+	var sawMount, sawWorkspace bool
+	for _, m := range main.VolumeMounts {
+		if m.Name == pvc && m.MountPath == "/mnt/cpod-test-vol" {
+			sawMount = true
+		}
+		if m.MountPath == "/workspace" {
+			sawWorkspace = true
+		}
+	}
+	if !sawMount || !sawWorkspace {
+		t.Fatalf("expected official mount and /workspace, got %+v", main.VolumeMounts)
+	}
+}
+
+func TestBuildKataPod_OfficialMountsWithBlockWorkspace(t *testing.T) {
+	id := "0123456789abcdef0123456789abcdef"
+	pvc := "e2bvol-" + id
+	spec := v1alpha1.PodBoxSpec{
+		E2BVolumeMounts: []v1alpha1.E2BVolumeMount{{VolumeID: id, PVCName: pvc, Path: "/mnt/data"}},
+	}
+	pod := controller.BuildKataPod("box-block", v1alpha1.PodTemplateSpec{Image: "ubuntu:24.04", RuntimeClassName: "kata-qemu"}, spec, v1alpha1.PodBoxStatus{}, "Block")
+	var main *controller.ContainerManifest
+	for i := range pod.Containers {
+		if pod.Containers[i].Name == "sandbox" {
+			main = &pod.Containers[i]
+			break
+		}
+	}
+	if main == nil {
+		t.Fatal("missing sandbox container")
+	}
+	var sawFS bool
+	for _, m := range main.VolumeMounts {
+		if m.Name == pvc && m.MountPath == "/mnt/data" {
+			sawFS = true
+		}
+	}
+	if !sawFS {
+		t.Fatalf("expected filesystem official mount alongside block devices, mounts=%+v devices=%+v", main.VolumeMounts, main.VolumeDevices)
+	}
+	if len(main.VolumeDevices) < 2 {
+		t.Fatalf("expected workspace/rootfs block devices to remain, got %+v", main.VolumeDevices)
+	}
+}
+
+func TestValidE2BContainerPath(t *testing.T) {
+	allow := []string{"/mnt/cpod-test-vol", "/mnt/data", "/data"}
+	deny := []string{"/", "/workspace", "/workspace/sub", "/etc/passwd", "/proc", "/sys", "/dev/sda", "/opt/cubepod/bin", "/mnt/cubepod/rootfs", "/usr/bin", ""}
+	for _, p := range allow {
+		if !v1alpha1.ValidE2BContainerPath(p) {
+			t.Fatalf("expected allow %q", p)
+		}
+	}
+	for _, p := range deny {
+		if v1alpha1.ValidE2BContainerPath(p) {
+			t.Fatalf("expected deny %q", p)
+		}
+	}
+}

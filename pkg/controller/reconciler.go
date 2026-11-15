@@ -1004,8 +1004,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 
 	createdCold := false
 	if !exists {
-		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set, no ForkFrom, and no deterministic VolumeKey)
-		if spec.WarmPoolRef != "" && spec.ForkFrom == nil && spec.VolumeKey == "" {
+		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set, no ForkFrom,
+		// no deterministic VolumeKey, and no official E2B volume mounts).
+		// Standby pods do not have those mounts, so a claim would drop them.
+		if spec.WarmPoolRef != "" && spec.ForkFrom == nil && spec.VolumeKey == "" && len(spec.E2BVolumeMounts) == 0 {
 			entry, err := r.claimWarmPodLocked(ctx, spec.WarmPoolRef, name)
 			if err != nil {
 				return nil, fmt.Errorf("failed to claim from warm pool %q for box %q: %w", spec.WarmPoolRef, name, err)
