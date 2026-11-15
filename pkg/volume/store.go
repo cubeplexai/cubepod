@@ -16,6 +16,7 @@ package volume
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,17 +29,18 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
+	"golang.org/x/sys/unix"
 )
 
 const (
-	defaultDockerPrefix = "cpod-test-vol-"
-	maxVolumeNameLen    = 128
-	maxMountsPerSandbox = 32
-	maxListDepth        = 64
+	defaultDockerPrefix        = "cpod-test-vol-"
+	maxVolumeNameLen           = 128
+	maxMountsPerSandbox        = 32
+	maxListDepth               = 64
+	defaultMaxVolumesPerTenant = 64
 	// defaultDataUID is the sandbox user (ubuntu) that must be able to write
 	// the mounted data directory. The store root stays root-owned and 0700.
 	defaultDataUID = 1000
@@ -66,6 +68,8 @@ var (
 	ErrConflict = errors.New("conflict")
 	// ErrUnauthorized is a bad or missing content token.
 	ErrUnauthorized = errors.New("unauthorized")
+	// ErrLimitExceeded means the tenant has reached its volume quota.
+	ErrLimitExceeded = errors.New("volume limit exceeded")
 
 	volumeNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 	volumeIDRe   = regexp.MustCompile(`^[a-f0-9]{32}$`)
@@ -84,6 +88,8 @@ type Config struct {
 	DockerPrefix string
 	// DockerHost is DOCKER_HOST (tcp:// or unix://). Empty uses the environment.
 	DockerHost string
+	// MaxVolumesPerTenant caps volumes per API key tenant (default 64).
+	MaxVolumesPerTenant int
 }
 
 // Volume is the durable record returned to the management API.
@@ -157,6 +163,7 @@ type fileAttr struct {
 }
 
 type volRec struct {
+	mu    sync.Mutex
 	meta  Volume
 	attrs map[string]fileAttr
 }
@@ -210,6 +217,9 @@ func Open(dir string, cfg Config) (*Store, error) {
 		}
 		cfg.HostDir = host
 	}
+	if cfg.MaxVolumesPerTenant <= 0 {
+		cfg.MaxVolumesPerTenant = defaultMaxVolumesPerTenant
+	}
 	s := &Store{
 		dir:    abs,
 		cfg:    cfg,
@@ -248,18 +258,30 @@ func (s *Store) Create(apiKey, name string) (Volume, error) {
 		return Volume{}, ErrInvalidName
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	tenant := tenantOf(apiKey)
 	if _, ok := s.byName[nameKey(tenant, name)]; ok {
+		s.mu.Unlock()
 		return Volume{}, ErrExists
+	}
+	tenantCount := 0
+	for _, r := range s.vols {
+		if r.meta.Tenant == tenant {
+			tenantCount++
+		}
+	}
+	if tenantCount >= s.cfg.MaxVolumesPerTenant {
+		s.mu.Unlock()
+		return Volume{}, ErrLimitExceeded
 	}
 	id, err := newID()
 	if err != nil {
+		s.mu.Unlock()
 		return Volume{}, err
 	}
 	token, err := newToken()
 	if err != nil {
+		s.mu.Unlock()
 		return Volume{}, err
 	}
 	rec := &volRec{
@@ -278,33 +300,48 @@ func (s *Store) Create(apiKey, name string) (Volume, error) {
 	// Parent holds metadata and stays 0700 so a sandbox user cannot walk
 	// sibling volumes. Only data/ is mounted, and it is owned by uid 1000.
 	if err := os.MkdirAll(volDir, 0o700); err != nil {
+		s.mu.Unlock()
 		return Volume{}, err
 	}
 	if err := os.Chmod(volDir, 0o700); err != nil {
 		_ = os.RemoveAll(volDir)
+		s.mu.Unlock()
 		return Volume{}, err
 	}
 	if err := os.Mkdir(rec.meta.DataDir, 0o755); err != nil {
 		_ = os.RemoveAll(volDir)
+		s.mu.Unlock()
 		return Volume{}, err
 	}
 	if err := ownPath(rec.meta.DataDir, WriteOpts{}, true); err != nil {
 		_ = os.RemoveAll(volDir)
+		s.mu.Unlock()
 		return Volume{}, err
 	}
 	if err := s.saveMeta(rec); err != nil {
 		_ = os.RemoveAll(volDir)
+		s.mu.Unlock()
 		return Volume{}, err
-	}
-	if s.cfg.DockerVolumes {
-		if dockerName, err := s.ensureDockerVolume(id, rec.meta.DaemonDataDir); err == nil {
-			rec.meta.DockerVolume = dockerName
-			_ = s.saveMeta(rec)
-		}
 	}
 	s.vols[id] = rec
 	s.byName[nameKey(tenant, name)] = id
-	return rec.meta, nil
+	out := rec.meta
+	dockerVolumes := s.cfg.DockerVolumes
+	daemonDataDir := rec.meta.DaemonDataDir
+	s.mu.Unlock()
+
+	if dockerVolumes {
+		if dockerName, err := s.ensureDockerVolume(id, daemonDataDir); err == nil {
+			s.mu.Lock()
+			if cur, ok := s.vols[id]; ok {
+				cur.meta.DockerVolume = dockerName
+				_ = s.saveMeta(cur)
+				out = cur.meta
+			}
+			s.mu.Unlock()
+		}
+	}
+	return out, nil
 }
 
 // List returns volumes for this API key. Tokens are not included.
@@ -373,29 +410,34 @@ func (s *Store) Delete(apiKey, id string) (Volume, error) {
 		return Volume{}, ErrNotFound
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	rec, ok := s.vols[id]
 	if !ok || rec.meta.Tenant != tenantOf(apiKey) {
+		s.mu.Unlock()
 		return Volume{}, ErrNotFound
 	}
 	for _, ms := range s.mounts {
 		for _, m := range ms {
 			if m.VolumeID == id {
+				s.mu.Unlock()
 				return Volume{}, ErrInUse
 			}
 		}
 	}
 	volDir := filepath.Join(s.dir, id)
 	if !s.withinRoot(volDir) {
+		s.mu.Unlock()
 		return Volume{}, ErrInvalidPath
 	}
 	dockerName := rec.meta.DockerVolume
 	if err := os.RemoveAll(volDir); err != nil {
+		s.mu.Unlock()
 		return Volume{}, err
 	}
 	delete(s.byName, nameKey(rec.meta.Tenant, rec.meta.Name))
 	delete(s.vols, id)
 	cp := rec.meta
+	s.mu.Unlock()
+
 	if dockerName != "" {
 		_ = s.removeDockerVolume(id, dockerName)
 	}
@@ -506,26 +548,45 @@ func (s *Store) UnmountSandbox(sandboxID string) {
 	_ = s.saveMounts()
 }
 
+// ReconcileMounts drops persisted mount records for sandboxes that are no
+// longer active, preventing stale records after a gateway restart from blocking
+// volume deletion forever.
+func (s *Store) ReconcileMounts(active map[string]struct{}) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := 0
+	for sb := range s.mounts {
+		if _, ok := active[sb]; !ok {
+			delete(s.mounts, sb)
+			removed++
+		}
+	}
+	if removed > 0 {
+		_ = s.saveMounts()
+	}
+	return removed
+}
+
 // MountsForSandbox returns runtime mount instructions. It retries Docker
 // volume creation when provisioning is enabled and the named volume is missing.
 func (s *Store) MountsForSandbox(sandboxID string) []MountSpec {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	src := s.mounts[sandboxID]
 	if len(src) == 0 {
+		s.mu.Unlock()
 		return nil
 	}
 	out := make([]MountSpec, 0, len(src))
+	type pendingDocker struct {
+		idx           int
+		volID         string
+		daemonDataDir string
+	}
+	var pending []pendingDocker
 	for _, m := range src {
 		rec, ok := s.vols[m.VolumeID]
 		if !ok {
 			continue
-		}
-		if s.cfg.DockerVolumes && rec.meta.DockerVolume == "" {
-			if name, err := s.ensureDockerVolume(m.VolumeID, s.daemonDataPath(m.VolumeID)); err == nil {
-				rec.meta.DockerVolume = name
-				_ = s.saveMeta(rec)
-			}
 		}
 		host := s.daemonDataPath(m.VolumeID)
 		local := filepath.Join(s.dir, m.VolumeID, "data")
@@ -533,6 +594,7 @@ func (s *Store) MountsForSandbox(sandboxID string) []MountSpec {
 		if filepath.Base(host) != "data" || filepath.Base(local) != "data" {
 			continue
 		}
+		idx := len(out)
 		out = append(out, MountSpec{
 			VolumeName:    m.Name,
 			VolumeID:      m.VolumeID,
@@ -541,6 +603,24 @@ func (s *Store) MountsForSandbox(sandboxID string) []MountSpec {
 			LocalPath:     local,
 			DockerVolume:  rec.meta.DockerVolume,
 		})
+		if s.cfg.DockerVolumes && rec.meta.DockerVolume == "" {
+			pending = append(pending, pendingDocker{idx: idx, volID: m.VolumeID, daemonDataDir: host})
+		}
+	}
+	s.mu.Unlock()
+
+	for _, p := range pending {
+		name, err := s.ensureDockerVolume(p.volID, p.daemonDataDir)
+		if err != nil {
+			continue
+		}
+		out[p.idx].DockerVolume = name
+		s.mu.Lock()
+		if rec, ok := s.vols[p.volID]; ok {
+			rec.meta.DockerVolume = name
+			_ = s.saveMeta(rec)
+		}
+		s.mu.Unlock()
 	}
 	return out
 }
@@ -601,13 +681,18 @@ func (s *Store) MapSandboxPath(sandboxID, userPath string) (string, bool, error)
 
 // Stat returns metadata for a path inside the volume.
 func (s *Store) Stat(id, userPath string) (Entry, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, abs, full, err := s.prepare(id, userPath)
+	rec, abs, rel, err := s.lookupVol(id, userPath)
 	if err != nil {
 		return Entry{}, err
 	}
-	return s.statFull(rec, abs, full)
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	root, err := openDataRoot(rec.meta.DataDir)
+	if err != nil {
+		return Entry{}, err
+	}
+	defer root.Close()
+	return statBeneath(int(root.Fd()), abs, rel, rec.attrs)
 }
 
 // ListDir returns directory entries. depth is the number of levels below the
@@ -619,24 +704,30 @@ func (s *Store) ListDir(id, userPath string, depth int) ([]Entry, error) {
 	if depth == 0 {
 		return []Entry{}, nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, abs, full, err := s.prepare(id, userPath)
+	rec, abs, rel, err := s.lookupVol(id, userPath)
 	if err != nil {
 		return nil, err
 	}
-	fi, err := os.Lstat(full)
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	root, err := openDataRoot(rec.meta.DataDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrNotExist
+		return nil, err
+	}
+	defer root.Close()
+	dir, err := resolveDirFD(int(root.Fd()), rel, false, 0)
+	if err != nil {
+		if errors.Is(err, ErrInvalidPath) && rel != "" {
+			// Check if the final component itself is a symlink so ListDir returns ErrNotDir.
+			if ent, stErr := statBeneath(int(root.Fd()), abs, rel, rec.attrs); stErr == nil && ent.Type == "symlink" {
+				return nil, ErrNotDir
+			}
 		}
 		return nil, err
 	}
-	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-		return nil, ErrNotDir
-	}
+	defer dir.Close()
 	var out []Entry
-	if err := s.walk(rec, abs, full, depth, &out); err != nil {
+	if err := walkDirFD(dir, abs, depth, rec.attrs, &out); err != nil {
 		return nil, err
 	}
 	if out == nil {
@@ -648,71 +739,90 @@ func (s *Store) ListDir(id, userPath string, depth int) ([]Entry, error) {
 
 // MakeDir creates a directory. Force creates missing parents.
 func (s *Store) MakeDir(id, userPath string, opts WriteOpts) (Entry, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, abs, full, err := s.prepare(id, userPath)
+	rec, abs, rel, err := s.lookupVol(id, userPath)
 	if err != nil {
 		return Entry{}, err
 	}
-	if abs == "/" {
-		return s.statFull(rec, abs, full)
+	if abs != "/" {
+		if err := validateModeOwner(opts); err != nil {
+			return Entry{}, err
+		}
 	}
-	if err := validateModeOwner(opts); err != nil {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	root, err := openDataRoot(rec.meta.DataDir)
+	if err != nil {
 		return Entry{}, err
 	}
-	if fi, err := os.Lstat(full); err == nil {
-		if fi.Mode()&os.ModeSymlink != 0 {
+	defer root.Close()
+	if abs == "/" {
+		return statBeneath(int(root.Fd()), abs, rel, rec.attrs)
+	}
+
+	dirMode := os.FileMode(0o755)
+	if opts.Mode != nil {
+		dirMode = os.FileMode(*opts.Mode & 0o777)
+	}
+	parentRel, base := splitRel(rel)
+	var parent *os.File
+	if opts.Force {
+		parent, err = resolveDirFD(int(root.Fd()), parentRel, true, 0o755)
+	} else {
+		parent, err = resolveDirFD(int(root.Fd()), parentRel, false, 0)
+	}
+	if err != nil {
+		return Entry{}, err
+	}
+	defer parent.Close()
+
+	var st unix.Stat_t
+	statErr := unix.Fstatat(int(parent.Fd()), base, &st, unix.AT_SYMLINK_NOFOLLOW)
+	if statErr == nil {
+		if st.Mode&unix.S_IFMT == unix.S_IFLNK {
 			return Entry{}, ErrInvalidPath
 		}
-		if !fi.IsDir() {
+		if st.Mode&unix.S_IFMT != unix.S_IFDIR {
 			return Entry{}, ErrConflict
 		}
-		if opts.Mode != nil || opts.UID != nil || opts.GID != nil {
-			if err := applyMeta(full, opts); err != nil {
+		if opts.Mode != nil {
+			d, err := openFileBeneath(int(root.Fd()), rel, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+			if err != nil {
 				return Entry{}, err
 			}
+			chErr := d.Chmod(dirMode)
+			_ = d.Close()
+			if chErr != nil {
+				return Entry{}, chErr
+			}
 		}
-	} else if !os.IsNotExist(err) {
-		return Entry{}, err
-	} else if opts.Force {
-		if err := s.ensureDir(rec.meta.DataDir, full, opts); err != nil {
-			return Entry{}, err
-		}
+	} else if !errors.Is(statErr, unix.ENOENT) {
+		return Entry{}, mapUnixErr(statErr)
 	} else {
-		parent := filepath.Dir(full)
-		pfi, err := os.Lstat(parent)
+		if mkErr := unix.Mkdirat(int(parent.Fd()), base, uint32(dirMode)); mkErr != nil && !errors.Is(mkErr, unix.EEXIST) {
+			return Entry{}, mapUnixErr(mkErr)
+		}
+		d, err := openFileBeneath(int(root.Fd()), rel, unix.O_RDONLY|unix.O_DIRECTORY, 0)
 		if err != nil {
-			if os.IsNotExist(err) {
-				return Entry{}, ErrNotExist
-			}
 			return Entry{}, err
 		}
-		if pfi.Mode()&os.ModeSymlink != 0 || !pfi.IsDir() {
-			return Entry{}, ErrNotDir
-		}
-		if err := os.Mkdir(full, 0o755); err != nil {
-			if os.IsExist(err) {
-				return s.statFull(rec, abs, full)
-			}
-			return Entry{}, err
-		}
-		if err := ownPath(full, opts, true); err != nil {
-			return Entry{}, err
+		chErr := ownFileFD(d, dirMode)
+		_ = d.Close()
+		if chErr != nil {
+			return Entry{}, chErr
 		}
 	}
 	s.putAttr(rec, abs, opts)
 	if err := s.saveAttrs(rec); err != nil {
 		return Entry{}, err
 	}
-	return s.statFull(rec, abs, full)
+	return statBeneath(int(root.Fd()), abs, rel, rec.attrs)
 }
 
 // WriteFile creates or overwrites a file. Force creates missing parents.
 // Existing files are overwritten even when Force is false (2.64.0 write_file).
+// Request body I/O is streamed to a private temp file outside any store/volume lock.
 func (s *Store) WriteFile(id, userPath string, r io.Reader, opts WriteOpts) (Entry, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, abs, full, err := s.prepare(id, userPath)
+	rec, abs, rel, err := s.lookupVol(id, userPath)
 	if err != nil {
 		return Entry{}, err
 	}
@@ -722,157 +832,204 @@ func (s *Store) WriteFile(id, userPath string, r io.Reader, opts WriteOpts) (Ent
 	if err := validateModeOwner(opts); err != nil {
 		return Entry{}, err
 	}
-	parent := filepath.Dir(full)
-	pfi, err := os.Lstat(parent)
+
+	// Stage the upload into the volume's private 0700 directory (outside data/)
+	// so no lock is held during network I/O and partial writes never touch data/.
+	volDir := filepath.Join(s.dir, id)
+	tmpFile, err := os.CreateTemp(volDir, ".upload-*")
 	if err != nil {
-		if !os.IsNotExist(err) {
-			return Entry{}, err
-		}
-		if !opts.Force {
-			return Entry{}, ErrNotExist
-		}
-		parentOpts := opts
-		parentOpts.Mode = nil
-		if err := s.ensureDir(rec.meta.DataDir, parent, parentOpts); err != nil {
-			return Entry{}, err
-		}
-	} else if pfi.Mode()&os.ModeSymlink != 0 || !pfi.IsDir() {
-		return Entry{}, ErrNotDir
+		return Entry{}, err
 	}
-	if fi, err := os.Lstat(full); err == nil {
-		if fi.IsDir() || fi.Mode()&os.ModeSymlink != 0 {
+	tmpPath := tmpFile.Name()
+	tmpName := filepath.Base(tmpPath)
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := io.Copy(tmpFile, r); err != nil {
+		return Entry{}, err
+	}
+	fileMode := os.FileMode(0o644)
+	if opts.Mode != nil {
+		fileMode = os.FileMode(*opts.Mode & 0o777)
+	}
+	if err := ownFileFD(tmpFile, fileMode); err != nil {
+		return Entry{}, err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return Entry{}, err
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	root, err := openDataRoot(rec.meta.DataDir)
+	if err != nil {
+		return Entry{}, err
+	}
+	defer root.Close()
+
+	parentRel, base := splitRel(rel)
+	var parent *os.File
+	if opts.Force {
+		parent, err = resolveDirFD(int(root.Fd()), parentRel, true, 0o755)
+	} else {
+		parent, err = resolveDirFD(int(root.Fd()), parentRel, false, 0)
+	}
+	if err != nil {
+		return Entry{}, err
+	}
+	defer parent.Close()
+
+	var st unix.Stat_t
+	if statErr := unix.Fstatat(int(parent.Fd()), base, &st, unix.AT_SYMLINK_NOFOLLOW); statErr == nil {
+		if st.Mode&unix.S_IFMT == unix.S_IFDIR || st.Mode&unix.S_IFMT == unix.S_IFLNK {
 			return Entry{}, ErrConflict
 		}
-	} else if !os.IsNotExist(err) {
-		return Entry{}, err
+	} else if !errors.Is(statErr, unix.ENOENT) {
+		return Entry{}, mapUnixErr(statErr)
 	}
-	f, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+
+	volDirFile, err := os.Open(volDir)
 	if err != nil {
 		return Entry{}, err
 	}
-	_, copyErr := io.Copy(f, r)
-	closeErr := f.Close()
-	if copyErr != nil {
-		return Entry{}, copyErr
+	defer volDirFile.Close()
+	if err := unix.Renameat(int(volDirFile.Fd()), tmpName, int(parent.Fd()), base); err != nil {
+		if !errors.Is(err, unix.EXDEV) {
+			return Entry{}, mapUnixErr(err)
+		}
+		// Fallback across filesystems: open target with O_NOFOLLOW and copy.
+		dstFD, openErr := unix.Openat(int(parent.Fd()), base, unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_NOFOLLOW|unix.O_CLOEXEC, uint32(fileMode))
+		if openErr != nil {
+			return Entry{}, mapUnixErr(openErr)
+		}
+		dst := os.NewFile(uintptr(dstFD), base)
+		src, srcErr := os.Open(tmpPath)
+		if srcErr != nil {
+			_ = dst.Close()
+			return Entry{}, srcErr
+		}
+		_, cpErr := io.Copy(dst, src)
+		_ = src.Close()
+		if cpErr != nil {
+			_ = dst.Close()
+			return Entry{}, cpErr
+		}
+		if err := ownFileFD(dst, fileMode); err != nil {
+			_ = dst.Close()
+			return Entry{}, err
+		}
+		if err := dst.Close(); err != nil {
+			return Entry{}, err
+		}
+		_ = os.Remove(tmpPath)
 	}
-	if closeErr != nil {
-		return Entry{}, closeErr
-	}
-	if err := ownPath(full, opts, false); err != nil {
-		return Entry{}, err
-	}
+	committed = true
 	s.putAttr(rec, abs, opts)
 	if err := s.saveAttrs(rec); err != nil {
 		return Entry{}, err
 	}
-	return s.statFull(rec, abs, full)
+	return statBeneath(int(root.Fd()), abs, rel, rec.attrs)
 }
 
 // OpenFile opens a regular file for reading without following a symlink.
 func (s *Store) OpenFile(id, userPath string) (*os.File, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, abs, full, err := s.prepare(id, userPath)
+	rec, abs, rel, err := s.lookupVol(id, userPath)
 	if err != nil {
 		return nil, err
 	}
 	if abs == "/" {
 		return nil, ErrIsDir
 	}
-	fi, err := os.Lstat(full)
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	root, err := openDataRoot(rec.meta.DataDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrNotExist
-		}
+		return nil, err
+	}
+	defer root.Close()
+	f, err := openFileBeneath(int(root.Fd()), rel, unix.O_RDONLY, 0)
+	if err != nil {
+		return nil, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
 		return nil, err
 	}
 	if fi.IsDir() {
+		_ = f.Close()
 		return nil, ErrIsDir
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil, ErrInvalidPath
-	}
-	f, err := os.OpenFile(full, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, ErrNotExist
-		}
-		return nil, err
 	}
 	return f, nil
 }
 
-// Patch updates uid, gid, and mode. Nil fields are left unchanged.
+// Patch updates uid, gid, and mode metadata. On disk, only mode (masked to 0o777)
+// is applied via fchmod; ownership stays defaultDataUID:defaultDataGID (1000:1000).
 func (s *Store) Patch(id, userPath string, opts WriteOpts) (Entry, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, abs, full, err := s.prepare(id, userPath)
+	rec, abs, rel, err := s.lookupVol(id, userPath)
 	if err != nil {
 		return Entry{}, err
 	}
 	if err := validateModeOwner(opts); err != nil {
 		return Entry{}, err
 	}
-	fi, err := os.Lstat(full)
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	root, err := openDataRoot(rec.meta.DataDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return Entry{}, ErrNotExist
+		return Entry{}, err
+	}
+	defer root.Close()
+	f, err := openFileBeneath(int(root.Fd()), rel, unix.O_RDONLY, 0)
+	if err != nil {
+		return Entry{}, err
+	}
+	if opts.Mode != nil {
+		if err := f.Chmod(os.FileMode(*opts.Mode & 0o777)); err != nil {
+			_ = f.Close()
+			return Entry{}, err
 		}
-		return Entry{}, err
 	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return Entry{}, ErrInvalidPath
-	}
-	if err := applyMeta(full, opts); err != nil {
-		return Entry{}, err
-	}
+	_ = f.Close()
 	s.putAttr(rec, abs, opts)
 	if err := s.saveAttrs(rec); err != nil {
 		return Entry{}, err
 	}
-	return s.statFull(rec, abs, full)
+	return statBeneath(int(root.Fd()), abs, rel, rec.attrs)
 }
 
 // Remove deletes a file, symlink, or directory. Directories are removed with
 // their children because 2.64.0 Volume.remove sends no recursive flag.
 // The volume root itself cannot be removed.
 func (s *Store) Remove(id, userPath string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rec, abs, full, err := s.prepare(id, userPath)
+	rec, abs, rel, err := s.lookupVol(id, userPath)
 	if err != nil {
 		return err
 	}
 	if abs == "/" {
 		return ErrInvalidPath
 	}
-	fi, err := os.Lstat(full)
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	root, err := openDataRoot(rec.meta.DataDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return ErrNotExist
-		}
 		return err
 	}
-	if fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
-		if err := os.RemoveAll(full); err != nil {
-			return err
-		}
-		s.dropAttrs(rec, abs, true)
-	} else {
-		if err := os.Remove(full); err != nil {
-			return err
-		}
-		s.dropAttrs(rec, abs, false)
+	defer root.Close()
+	isDir, err := removeBeneath(int(root.Fd()), rel)
+	if err != nil {
+		return err
 	}
+	s.dropAttrs(rec, abs, isDir)
 	return s.saveAttrs(rec)
 }
 
-func (s *Store) prepare(id, userPath string) (*volRec, string, string, error) {
+func (s *Store) lookupVol(id, userPath string) (*volRec, string, string, error) {
 	if !volumeIDRe.MatchString(id) {
-		return nil, "", "", ErrNotFound
-	}
-	rec, ok := s.vols[id]
-	if !ok {
 		return nil, "", "", ErrNotFound
 	}
 	abs, err := cleanUserPath(userPath)
@@ -880,85 +1037,13 @@ func (s *Store) prepare(id, userPath string) (*volRec, string, string, error) {
 		return nil, "", "", err
 	}
 	rel := strings.TrimPrefix(abs, "/")
-	full, err := secureJoin(rec.meta.DataDir, rel)
-	if err != nil {
-		return nil, "", "", err
+	s.mu.Lock()
+	rec, ok := s.vols[id]
+	s.mu.Unlock()
+	if !ok {
+		return nil, "", "", ErrNotFound
 	}
-	return rec, abs, full, nil
-}
-
-func (s *Store) statFull(rec *volRec, abs, full string) (Entry, error) {
-	fi, err := os.Lstat(full)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return Entry{}, ErrNotExist
-		}
-		return Entry{}, err
-	}
-	ent := entryFrom(abs, fi)
-	if ent.Type == "symlink" {
-		if t, err := os.Readlink(full); err == nil {
-			ent.Target = t
-		}
-	}
-	if a, ok := rec.attrs[abs]; ok {
-		if a.UID != nil {
-			ent.UID = *a.UID
-		}
-		if a.GID != nil {
-			ent.GID = *a.GID
-		}
-		if a.Mode != nil {
-			ent.Mode = *a.Mode
-		}
-	}
-	return ent, nil
-}
-
-func (s *Store) walk(rec *volRec, abs, full string, depth int, out *[]Entry) error {
-	if depth < 1 {
-		return nil
-	}
-	entries, err := os.ReadDir(full)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		name := e.Name()
-		if name == "." || name == ".." {
-			continue
-		}
-		childAbs := path.Join(abs, name)
-		childFull := filepath.Join(full, name)
-		fi, err := os.Lstat(childFull)
-		if err != nil {
-			return err
-		}
-		ent := entryFrom(childAbs, fi)
-		if ent.Type == "symlink" {
-			if t, err := os.Readlink(childFull); err == nil {
-				ent.Target = t
-			}
-		}
-		if a, ok := rec.attrs[childAbs]; ok {
-			if a.UID != nil {
-				ent.UID = *a.UID
-			}
-			if a.GID != nil {
-				ent.GID = *a.GID
-			}
-			if a.Mode != nil {
-				ent.Mode = *a.Mode
-			}
-		}
-		*out = append(*out, ent)
-		if ent.Type == "directory" && depth > 1 {
-			if err := s.walk(rec, childAbs, childFull, depth-1, out); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return rec, abs, rel, nil
 }
 
 func (s *Store) putAttr(rec *volRec, abs string, opts WriteOpts) {
@@ -975,7 +1060,7 @@ func (s *Store) putAttr(rec *volRec, abs string, opts WriteOpts) {
 		a.GID = &v
 	}
 	if opts.Mode != nil {
-		v := *opts.Mode
+		v := *opts.Mode & 0o777
 		a.Mode = &v
 	}
 	if rec.attrs == nil {
@@ -1191,14 +1276,7 @@ func tokenMatch(got, want string) bool {
 	if len(got) != len(want) {
 		return false
 	}
-	// Equal length, so a constant-time compare does not leak the token.
-	gb := []byte(got)
-	wb := []byte(want)
-	diff := 0
-	for i := range gb {
-		diff |= int(gb[i] ^ wb[i])
-	}
-	return diff == 0
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 func cleanMountPath(p string) (string, error) {
@@ -1233,8 +1311,13 @@ func cleanUserPath(p string) (string, error) {
 		}
 	}
 	c := path.Clean("/" + strings.TrimPrefix(p, "/"))
-	if !strings.HasPrefix(c, "/") || strings.Contains(c, "..") {
+	if !strings.HasPrefix(c, "/") {
 		return "", ErrInvalidPath
+	}
+	for _, seg := range strings.Split(c, "/") {
+		if seg == ".." {
+			return "", ErrInvalidPath
+		}
 	}
 	return c, nil
 }
@@ -1304,56 +1387,6 @@ func within(root, full string) bool {
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func entryFrom(abs string, fi os.FileInfo) Entry {
-	atime, mtime, ctime, uid, gid := statTimes(fi)
-	name := path.Base(abs)
-	if abs == "/" {
-		name = "/"
-	}
-	mode := int(fi.Mode().Perm())
-	return Entry{
-		Name:  name,
-		Type:  entryType(fi),
-		Path:  abs,
-		Size:  fi.Size(),
-		Mode:  mode,
-		UID:   uid,
-		GID:   gid,
-		Atime: atime,
-		Mtime: mtime,
-		Ctime: ctime,
-	}
-}
-
-func entryType(fi os.FileInfo) string {
-	m := fi.Mode()
-	switch {
-	case m&os.ModeSymlink != 0:
-		return "symlink"
-	case m.IsDir():
-		return "directory"
-	case m.IsRegular():
-		return "file"
-	default:
-		return "unknown"
-	}
-}
-
-func statTimes(fi os.FileInfo) (atime, mtime, ctime time.Time, uid, gid int) {
-	mtime = fi.ModTime().UTC()
-	atime, ctime = mtime, mtime
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return
-	}
-	atime = time.Unix(st.Atim.Sec, st.Atim.Nsec).UTC()
-	mtime = time.Unix(st.Mtim.Sec, st.Mtim.Nsec).UTC()
-	ctime = time.Unix(st.Ctim.Sec, st.Ctim.Nsec).UTC()
-	uid = int(st.Uid)
-	gid = int(st.Gid)
-	return
-}
-
 func validateModeOwner(opts WriteOpts) error {
 	if opts.Mode != nil && (*opts.Mode < 0 || *opts.Mode > 0o7777) {
 		return ErrInvalidPath
@@ -1367,82 +1400,13 @@ func validateModeOwner(opts WriteOpts) error {
 	return nil
 }
 
-// ownPath chowns a data file or directory, then sets its mode.
-// The default owner is uid/gid 1000. An explicit write or mkdir uid/gid wins.
-// The default mode is 0644 for a file and 0755 for a directory.
-// Chown is best-effort so a non-root unit test can still chmod.
-func ownPath(full string, opts WriteOpts, isDir bool) error {
-	uid, gid := defaultDataUID, defaultDataGID
-	if opts.UID != nil {
-		uid = *opts.UID
+// ownPath initializes the volume's data root directory with 1000:1000 ownership
+// and 0755 mode via openDataRoot + fchown/fchmod.
+func ownPath(full string, _ WriteOpts, _ bool) error {
+	f, err := openDataRoot(full)
+	if err != nil {
+		return err
 	}
-	if opts.GID != nil {
-		gid = *opts.GID
-	}
-	_ = os.Chown(full, uid, gid)
-	mode := os.FileMode(0o644)
-	if isDir {
-		mode = 0o755
-	}
-	if opts.Mode != nil {
-		mode = os.FileMode(*opts.Mode & 0o7777)
-	}
-	return os.Chmod(full, mode)
-}
-
-// ensureDir creates full and any missing parents inside the volume data root.
-// Parents use the default directory mode. full uses opts.Mode when set.
-func (s *Store) ensureDir(dataRoot, full string, opts WriteOpts) error {
-	rel, err := filepath.Rel(dataRoot, full)
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-		return ErrInvalidPath
-	}
-	cur := dataRoot
-	parts := strings.Split(rel, string(filepath.Separator))
-	for i, part := range parts {
-		if part == "" || part == "." || part == ".." {
-			return ErrInvalidPath
-		}
-		next := filepath.Join(cur, part)
-		fi, err := os.Lstat(next)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				return err
-			}
-			if err := os.Mkdir(next, 0o755); err != nil && !os.IsExist(err) {
-				return err
-			}
-			partOpts := opts
-			if i != len(parts)-1 {
-				partOpts.Mode = nil
-			}
-			if err := ownPath(next, partOpts, true); err != nil {
-				return err
-			}
-		} else if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-			return ErrNotDir
-		}
-		cur = next
-	}
-	return nil
-}
-
-func applyMeta(full string, opts WriteOpts) error {
-	if opts.Mode != nil {
-		if err := os.Chmod(full, os.FileMode(*opts.Mode&0o7777)); err != nil {
-			return err
-		}
-	}
-	if opts.UID != nil || opts.GID != nil {
-		uid, gid := -1, -1
-		if opts.UID != nil {
-			uid = *opts.UID
-		}
-		if opts.GID != nil {
-			gid = *opts.GID
-		}
-		// Not running as root is fine: the stored override is what stat returns.
-		_ = os.Chown(full, uid, gid)
-	}
-	return nil
+	defer f.Close()
+	return ownFileFD(f, 0o755)
 }

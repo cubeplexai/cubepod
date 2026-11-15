@@ -39,7 +39,7 @@ func (d dockerClient) ensureBindVolume(name, device string) error {
 		"Driver": "local",
 		"DriverOpts": map[string]string{
 			"type":   "none",
-			"o":      "bind",
+			"o":      "bind,nosuid,nodev",
 			"device": device,
 		},
 	}
@@ -49,10 +49,33 @@ func (d dockerClient) ensureBindVolume(name, device string) error {
 	if err != nil {
 		return err
 	}
-	if code == http.StatusCreated || code == http.StatusOK || code == http.StatusConflict {
+	if code == http.StatusCreated || code == http.StatusOK {
 		return nil
 	}
+	if code == http.StatusConflict {
+		return d.verifyBindVolumeDevice(ctx, client, base, name, device)
+	}
 	return fmt.Errorf("docker volume create %s: %d %s", name, code, strings.TrimSpace(string(resp)))
+}
+
+func (d dockerClient) verifyBindVolumeDevice(ctx context.Context, client *http.Client, base, name, wantDevice string) error {
+	code, resp, err := dockerDo(ctx, client, base, http.MethodGet, "/volumes/"+url.PathEscape(name), nil)
+	if err != nil {
+		return err
+	}
+	if code != http.StatusOK {
+		return fmt.Errorf("docker volume inspect %s: %d %s", name, code, strings.TrimSpace(string(resp)))
+	}
+	var info struct {
+		Options map[string]string `json:"Options"`
+	}
+	if err := json.Unmarshal(resp, &info); err != nil {
+		return fmt.Errorf("docker volume inspect %s: %w", name, err)
+	}
+	if got := info.Options["device"]; got != wantDevice {
+		return fmt.Errorf("docker volume %s device mismatch: got %q, want %q", name, got, wantDevice)
+	}
+	return nil
 }
 
 func (d dockerClient) removeVolume(name string) error {
