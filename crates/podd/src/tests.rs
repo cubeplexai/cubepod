@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::commands::ProcessRegistry;
+use crate::commands::{base64_encode, ProcessRegistry};
 use crate::http::find_subsequence;
 use crate::json::{escape_json, JsonValue};
 use crate::{serve, DaemonConfig};
@@ -2726,4 +2726,1173 @@ fn test_clamp_nofile_rlimit() {
     );
     assert!((rlim.rlim_cur as u64) <= DEFAULT_SOFT_NOFILE);
     assert!(!clamp_nofile_rlimit());
+}
+
+fn read_connect_frame_from_stream<R: std::io::Read>(
+    reader: &mut R,
+) -> std::io::Result<Option<(u8, Vec<u8>)>> {
+    let mut header = [0u8; 5];
+    match reader.read_exact(&mut header) {
+        Ok(()) => {
+            let flag = header[0];
+            let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+            let mut data = vec![0u8; len];
+            reader.read_exact(&mut data)?;
+            Ok(Some((flag, data)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn skip_http_headers_from_stream<R: std::io::Read>(reader: &mut R) -> std::io::Result<()> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    while reader.read_exact(&mut byte).is_ok() {
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "end of stream before header delimiter",
+    ))
+}
+
+fn wait_for_pty_output<R: std::io::Read>(
+    reader: &mut R,
+    pred: impl Fn(&str) -> bool,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut accumulated = String::new();
+    while std::time::Instant::now() < deadline {
+        match read_connect_frame_from_stream(reader) {
+            Ok(Some((flag, data))) => {
+                if flag == 0 {
+                    if let Ok(json_str) = std::str::from_utf8(&data) {
+                        if let Ok(json) = JsonValue::parse(json_str) {
+                            if let Some(pty_b64) = json
+                                .get("event")
+                                .and_then(|e| e.get("data"))
+                                .and_then(|d| d.get("pty"))
+                                .and_then(|p| p.as_str())
+                            {
+                                let bytes = base64_decode(pty_b64);
+                                accumulated.push_str(&String::from_utf8_lossy(&bytes));
+                                if pred(&accumulated) {
+                                    return Ok(accumulated);
+                                }
+                            }
+                        }
+                    }
+                } else if flag == 2 {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err(format!("timed out waiting for output; got={accumulated:?}"))
+}
+
+fn pty_entry(
+    running: bool,
+) -> (
+    crate::commands::PtyHandle,
+    std::sync::Mutex<crate::commands::ProcessEntry>,
+) {
+    use crate::commands::{ProcessEntry, PtyHandle};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    let pty = PtyHandle {
+        master: Arc::new(Mutex::new(None)),
+        closed: Arc::new(AtomicBool::new(false)),
+        subscribers: Arc::new(Mutex::new(Vec::new())),
+    };
+    let entry = Mutex::new(ProcessEntry {
+        id: "proc-test".into(),
+        pid: 1,
+        tag: None,
+        running,
+        exit_code: None,
+        exited_at: None,
+        output: Vec::new(),
+        cmd: "test".into(),
+        args: Vec::new(),
+        envs: HashMap::new(),
+        cwd: None,
+        pty_handle: None,
+    });
+    (pty, entry)
+}
+
+fn start_pty(addr: &str, body: &str) -> (TcpStream, u64) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let req = format!(
+        "POST /process.Process/Start HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    skip_http_headers_from_stream(&mut stream).unwrap();
+    let (flag, data) = read_connect_frame_from_stream(&mut stream)
+        .unwrap()
+        .unwrap();
+    assert_eq!(flag, 0);
+    let start_json = JsonValue::parse(std::str::from_utf8(&data).unwrap()).unwrap();
+    let pid = start_json
+        .get("event")
+        .unwrap()
+        .get("start")
+        .unwrap()
+        .get("pid")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+    (stream, pid)
+}
+
+#[test]
+fn test_pty_start_isatty_resize_bidirectional_and_kill() {
+    let (addr, _) = start_test_server("/tmp");
+
+    // 1. Start real PTY with cols=80, rows=24
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+
+    let req_body = r#"{"process":{"cmd":"/bin/bash","args":["-i","-l"]},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let req = format!(
+        "POST /process.Process/Start HTTP/1.1\r\nHost: {}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        addr,
+        req_body.len(),
+        req_body
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    skip_http_headers_from_stream(&mut stream).unwrap();
+
+    // Frame 0 must be StartEvent with pid
+    let (flag0, data0) = read_connect_frame_from_stream(&mut stream)
+        .unwrap()
+        .unwrap();
+    assert_eq!(flag0, 0);
+    let start_json = JsonValue::parse(std::str::from_utf8(&data0).unwrap()).unwrap();
+    let pid = start_json
+        .get("event")
+        .unwrap()
+        .get("start")
+        .unwrap()
+        .get("pid")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+    assert!(pid > 0);
+
+    // 2. Test isatty: child test -t 0 && test -t 1 must succeed
+    let input_isatty = base64_encode(b"if [ -t 0 ] && [ -t 1 ]; then echo PTY_ISATTY_PASS; fi\n");
+    let send_req = format!(
+        r#"{{"process":{{"pid":{}}},"input":{{"pty":"{}"}}}}"#,
+        pid, input_isatty
+    );
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendInput",
+        "application/json",
+        send_req.as_bytes(),
+    );
+    assert_eq!(s, 200);
+
+    let isatty_out = wait_for_pty_output(
+        &mut stream,
+        |out| out.contains("PTY_ISATTY_PASS"),
+        Duration::from_secs(10),
+    )
+    .expect("PTY isatty check failed");
+    assert!(isatty_out.contains("PTY_ISATTY_PASS"));
+
+    // 3. Test initial stty size matches create size (rows=24 cols=80)
+    let input_stty = base64_encode(b"stty size\n");
+    let send_req = format!(
+        r#"{{"process":{{"pid":{}}},"input":{{"pty":"{}"}}}}"#,
+        pid, input_stty
+    );
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendInput",
+        "application/json",
+        send_req.as_bytes(),
+    );
+    assert_eq!(s, 200);
+
+    wait_for_pty_output(
+        &mut stream,
+        |out| out.contains("24 80"),
+        Duration::from_secs(10),
+    )
+    .expect("PTY initial size 24 80 not seen");
+
+    // 4. Resize via Update to cols=40, rows=12
+    let update_req = format!(
+        r#"{{"process":{{"pid":{}}},"pty":{{"size":{{"cols":40,"rows":12}}}}}}"#,
+        pid
+    );
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/Update",
+        "application/json",
+        update_req.as_bytes(),
+    );
+    assert_eq!(s, 200);
+
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Send stty size again to verify resize
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendInput",
+        "application/json",
+        send_req.as_bytes(),
+    );
+    assert_eq!(s, 200);
+
+    wait_for_pty_output(
+        &mut stream,
+        |out| out.contains("12 40"),
+        Duration::from_secs(10),
+    )
+    .expect("PTY resized size 12 40 not seen");
+
+    // 5. Test bidirectional I/O and multibyte (UTF-8)
+    let input_mb = base64_encode("echo 你好多字节\n".as_bytes());
+    let send_req = format!(
+        r#"{{"process":{{"pid":{}}},"input":{{"pty":"{}"}}}}"#,
+        pid, input_mb
+    );
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendInput",
+        "application/json",
+        send_req.as_bytes(),
+    );
+    assert_eq!(s, 200);
+
+    wait_for_pty_output(
+        &mut stream,
+        |out| out.contains("你好多字节"),
+        Duration::from_secs(10),
+    )
+    .expect("Multibyte UTF-8 output not seen");
+
+    // 6. Test binary bytes
+    let input_bin = base64_encode(b"printf 'BIN:%s:\n' $'\\x00\\x01\\xffXYZ'\n");
+    let send_req = format!(
+        r#"{{"process":{{"pid":{}}},"input":{{"pty":"{}"}}}}"#,
+        pid, input_bin
+    );
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendInput",
+        "application/json",
+        send_req.as_bytes(),
+    );
+    assert_eq!(s, 200);
+
+    wait_for_pty_output(
+        &mut stream,
+        |out| out.contains("BIN:") && out.contains("XYZ"),
+        Duration::from_secs(10),
+    )
+    .expect("Binary output marker not seen");
+
+    // 7. Kill process
+    let kill_req = format!(r#"{{"process":{{"pid":{}}},"signal":"SIGKILL"}}"#, pid);
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+    assert_eq!(s, 200);
+
+    // Read until EndEvent and EOS frame
+    let mut saw_end = false;
+    let mut saw_eos = false;
+    while let Ok(Some((flag, data))) = read_connect_frame_from_stream(&mut stream) {
+        if flag == 0 {
+            if let Ok(json_str) = std::str::from_utf8(&data) {
+                if let Ok(json) = JsonValue::parse(json_str) {
+                    if let Some(end) = json.get("event").and_then(|e| e.get("end")) {
+                        saw_end = true;
+                        let exit_code = end.get("exitCode").and_then(|v| v.as_i64()).unwrap();
+                        assert!(exit_code == 137 || exit_code == -1);
+                        assert_eq!(end.get("exited").and_then(|v| v.as_bool()), Some(true));
+                        assert!(
+                            end.get("exit_code").is_none(),
+                            "duplicate exit_code must not be present"
+                        );
+                    }
+                }
+            }
+        } else if flag == 2 {
+            saw_eos = true;
+            break;
+        }
+    }
+    assert!(saw_end, "EndEvent must be received after kill");
+    assert!(saw_eos, "EOS trailer frame must be received");
+
+    // Second kill must return 404
+    let (s2, _, body2) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+    assert_eq!(s2, 404);
+    assert!(std::str::from_utf8(&body2).unwrap().contains("not_found"));
+}
+
+#[test]
+fn test_pty_reconnect() {
+    let (addr, _) = start_test_server("/tmp");
+
+    // 1. Start PTY
+    let mut stream1 = TcpStream::connect(&addr).unwrap();
+    stream1
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+
+    let req_body = r#"{"process":{"cmd":"/bin/bash","args":["-i","-l"]},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let req = format!(
+        "POST /process.Process/Start HTTP/1.1\r\nHost: {}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        addr,
+        req_body.len(),
+        req_body
+    );
+    stream1.write_all(req.as_bytes()).unwrap();
+    stream1.flush().unwrap();
+
+    skip_http_headers_from_stream(&mut stream1).unwrap();
+
+    let (flag0, data0) = read_connect_frame_from_stream(&mut stream1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(flag0, 0);
+    let start_json = JsonValue::parse(std::str::from_utf8(&data0).unwrap()).unwrap();
+    let pid = start_json
+        .get("event")
+        .unwrap()
+        .get("start")
+        .unwrap()
+        .get("pid")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+
+    // Send input on stream 1
+    let input1 = base64_encode(b"echo BEFORE_DISCONNECT\n");
+    let send_req1 = format!(
+        r#"{{"process":{{"pid":{}}},"input":{{"pty":"{}"}}}}"#,
+        pid, input1
+    );
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendInput",
+        "application/json",
+        send_req1.as_bytes(),
+    );
+    assert_eq!(s, 200);
+
+    wait_for_pty_output(
+        &mut stream1,
+        |out| out.contains("BEFORE_DISCONNECT"),
+        Duration::from_secs(10),
+    )
+    .expect("BEFORE_DISCONNECT not seen");
+
+    // Close first stream (disconnect)
+    drop(stream1);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Connect second stream
+    let mut stream2 = TcpStream::connect(&addr).unwrap();
+    stream2
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+
+    let conn_body = format!(r#"{{"process":{{"pid":{}}}}}"#, pid);
+    let conn_req = format!(
+        "POST /process.Process/Connect HTTP/1.1\r\nHost: {}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        addr,
+        conn_body.len(),
+        conn_body
+    );
+    stream2.write_all(conn_req.as_bytes()).unwrap();
+    stream2.flush().unwrap();
+
+    skip_http_headers_from_stream(&mut stream2).unwrap();
+
+    // Start event on stream2
+    let (flag_conn0, data_conn0) = read_connect_frame_from_stream(&mut stream2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(flag_conn0, 0);
+    let start2_json = JsonValue::parse(std::str::from_utf8(&data_conn0).unwrap()).unwrap();
+    assert_eq!(
+        start2_json
+            .get("event")
+            .unwrap()
+            .get("start")
+            .unwrap()
+            .get("pid")
+            .unwrap()
+            .as_u64()
+            .unwrap(),
+        pid
+    );
+
+    // Send input after reconnect
+    let input2 = base64_encode(b"echo AFTER_RECONNECT\n");
+    let send_req2 = format!(
+        r#"{{"process":{{"pid":{}}},"input":{{"pty":"{}"}}}}"#,
+        pid, input2
+    );
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendInput",
+        "application/json",
+        send_req2.as_bytes(),
+    );
+    assert_eq!(s, 200);
+
+    wait_for_pty_output(
+        &mut stream2,
+        |out| out.contains("AFTER_RECONNECT"),
+        Duration::from_secs(10),
+    )
+    .expect("AFTER_RECONNECT not seen");
+
+    // Kill process
+    let kill_req = format!(r#"{{"process":{{"pid":{}}},"signal":"SIGKILL"}}"#, pid);
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+    assert_eq!(s, 200);
+}
+
+#[test]
+fn test_pty_exit_code_nonzero() {
+    let (addr, _) = start_test_server("/tmp");
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+
+    let req_body = r#"{"process":{"cmd":"/bin/bash","args":["-i","-l"]},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let req = format!(
+        "POST /process.Process/Start HTTP/1.1\r\nHost: {}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        addr,
+        req_body.len(),
+        req_body
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    skip_http_headers_from_stream(&mut stream).unwrap();
+
+    let (_, data0) = read_connect_frame_from_stream(&mut stream)
+        .unwrap()
+        .unwrap();
+    let start_json = JsonValue::parse(std::str::from_utf8(&data0).unwrap()).unwrap();
+    let pid = start_json
+        .get("event")
+        .unwrap()
+        .get("start")
+        .unwrap()
+        .get("pid")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+
+    // Send exit 7
+    let input = base64_encode(b"exit 7\n");
+    let send_req = format!(
+        r#"{{"process":{{"pid":{}}},"input":{{"pty":"{}"}}}}"#,
+        pid, input
+    );
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendInput",
+        "application/json",
+        send_req.as_bytes(),
+    );
+    assert_eq!(s, 200);
+
+    let mut exit_code = None;
+    while let Ok(Some((flag, data))) = read_connect_frame_from_stream(&mut stream) {
+        if flag == 0 {
+            if let Ok(json_str) = std::str::from_utf8(&data) {
+                if let Ok(json) = JsonValue::parse(json_str) {
+                    if let Some(end) = json.get("event").and_then(|e| e.get("end")) {
+                        exit_code = end.get("exitCode").and_then(|v| v.as_i64());
+                        assert_eq!(end.get("exited").and_then(|v| v.as_bool()), Some(true));
+                        assert!(end.get("exit_code").is_none());
+                    }
+                }
+            }
+        } else if flag == 2 {
+            break;
+        }
+    }
+    assert_eq!(exit_code, Some(7), "expected exit 7 from PTY process");
+}
+
+#[test]
+fn test_pty_stream_input() {
+    use crate::commands::make_connect_frame;
+
+    let (addr, _) = start_test_server("/tmp");
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+
+    let req_body = r#"{"process":{"cmd":"/bin/bash","args":["-i","-l"]},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let req = format!(
+        "POST /process.Process/Start HTTP/1.1\r\nHost: {}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        addr,
+        req_body.len(),
+        req_body
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    skip_http_headers_from_stream(&mut stream).unwrap();
+
+    let (_, data0) = read_connect_frame_from_stream(&mut stream)
+        .unwrap()
+        .unwrap();
+    let start_json = JsonValue::parse(std::str::from_utf8(&data0).unwrap()).unwrap();
+    let pid = start_json
+        .get("event")
+        .unwrap()
+        .get("start")
+        .unwrap()
+        .get("pid")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+
+    // Send StreamInput frames
+    let f1 = format!(r#"{{"start":{{"process":{{"pid":{}}}}}}}"#, pid);
+    let input_b64 = base64_encode(b"echo STREAM_INPUT_OK\n");
+    let f2 = format!(r#"{{"data":{{"input":{{"pty":"{}"}}}}}}"#, input_b64);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&make_connect_frame(f1.as_bytes(), false));
+    body.extend_from_slice(&make_connect_frame(f2.as_bytes(), false));
+    body.extend_from_slice(&make_connect_frame(b"{}", true));
+
+    let (s, _, _) = post_raw(
+        &addr,
+        "/process.Process/StreamInput",
+        "application/connect+json",
+        &body,
+    );
+    assert_eq!(s, 200);
+
+    wait_for_pty_output(
+        &mut stream,
+        |out| out.contains("STREAM_INPUT_OK"),
+        Duration::from_secs(10),
+    )
+    .expect("STREAM_INPUT_OK not seen via StreamInput");
+
+    // Cleanup
+    let kill_req = format!(r#"{{"process":{{"pid":{}}},"signal":"SIGKILL"}}"#, pid);
+    let _ = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+}
+
+#[test]
+fn test_pty_process_list() {
+    let (addr, _) = start_test_server("/tmp");
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+
+    let req_body = r#"{"process":{"cmd":"/bin/bash","args":["-i","-l"]},"tag":"test-pty-listing","pty":{"size":{"cols":80,"rows":24}}}"#;
+    let req = format!(
+        "POST /process.Process/Start HTTP/1.1\r\nHost: {}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        addr,
+        req_body.len(),
+        req_body
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    skip_http_headers_from_stream(&mut stream).unwrap();
+
+    let (_, data0) = read_connect_frame_from_stream(&mut stream)
+        .unwrap()
+        .unwrap();
+    let start_json = JsonValue::parse(std::str::from_utf8(&data0).unwrap()).unwrap();
+    let pid = start_json
+        .get("event")
+        .unwrap()
+        .get("start")
+        .unwrap()
+        .get("pid")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+
+    // Call Process/List
+    let (s, _, body) = post_raw(&addr, "/process.Process/List", "application/json", b"{}");
+    assert_eq!(s, 200);
+    let list_json = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    let procs = list_json
+        .get("processes")
+        .and_then(|v| v.as_array())
+        .unwrap();
+    let found = procs.iter().any(|p| {
+        p.get("pid").and_then(|v| v.as_u64()) == Some(pid)
+            && p.get("tag").and_then(|v| v.as_str()) == Some("test-pty-listing")
+    });
+    assert!(found, "PTY process must be present in Process/List");
+
+    // Cleanup
+    let kill_req = format!(r#"{{"process":{{"pid":{}}},"signal":"SIGKILL"}}"#, pid);
+    let _ = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+}
+
+#[test]
+fn test_pty_kill_all_managed() {
+    use crate::commands::kill_all_managed;
+
+    let (addr, registry) = start_test_server("/tmp");
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+
+    let req_body = r#"{"process":{"cmd":"/bin/bash","args":["-i","-l"]},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let req = format!(
+        "POST /process.Process/Start HTTP/1.1\r\nHost: {}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        addr,
+        req_body.len(),
+        req_body
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    skip_http_headers_from_stream(&mut stream).unwrap();
+
+    let (_, data0) = read_connect_frame_from_stream(&mut stream)
+        .unwrap()
+        .unwrap();
+    let start_json = JsonValue::parse(std::str::from_utf8(&data0).unwrap()).unwrap();
+    let pid = start_json
+        .get("event")
+        .unwrap()
+        .get("start")
+        .unwrap()
+        .get("pid")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+
+    let killed = kill_all_managed(&registry);
+    assert!(killed >= 1);
+
+    let entry = registry.get_by_pid(pid as u32).expect("pty entry");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut alive = true;
+    let mut master_cleared = false;
+    while std::time::Instant::now() < deadline {
+        alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        master_cleared = entry
+            .lock()
+            .unwrap()
+            .pty_handle
+            .as_ref()
+            .unwrap()
+            .acquire_master()
+            .is_none();
+        if !alive && master_cleared {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(master_cleared, "kill_all_managed must close the PTY master");
+    assert!(!alive, "process must not be alive after kill_all_managed");
+}
+
+#[test]
+fn test_pty_replay_bounded_snapshot_has_no_gap_or_dup() {
+    use crate::commands::{publish_pty_chunk, subscribe_pty, PtyBroadcastEvent, PTY_REPLAY_CAP};
+
+    let (pty, entry) = pty_entry(true);
+    let mut before = Vec::new();
+    for i in 0..20u8 {
+        let chunk = vec![i, i.wrapping_add(3)];
+        before.extend_from_slice(&chunk);
+        publish_pty_chunk(&pty, &entry, &chunk);
+    }
+    let sub = subscribe_pty(&pty, &entry);
+    assert!(sub.running);
+    assert_eq!(
+        sub.snapshot, before,
+        "snapshot is the replay tail at subscribe time"
+    );
+
+    let mut after = Vec::new();
+    for i in 20..30u8 {
+        let chunk = vec![i];
+        after.extend_from_slice(&chunk);
+        publish_pty_chunk(&pty, &entry, &chunk);
+    }
+    let mut live = Vec::new();
+    while let Ok(PtyBroadcastEvent::Data(d)) = sub.rx.try_recv() {
+        live.extend_from_slice(&d);
+    }
+    assert_eq!(live, after, "live queue must not repeat the snapshot");
+    let mut combined = sub.snapshot.clone();
+    combined.extend_from_slice(&live);
+    let mut expected = before.clone();
+    expected.extend_from_slice(&after);
+    assert_eq!(
+        combined, expected,
+        "snapshot plus live must cover every published byte"
+    );
+
+    publish_pty_chunk(&pty, &entry, &vec![0xAB; PTY_REPLAY_CAP + 80]);
+    let buffered = entry.lock().unwrap().output.len();
+    assert_eq!(buffered, PTY_REPLAY_CAP);
+}
+
+#[test]
+fn test_pty_subscriber_overflow_sets_flag() {
+    use crate::commands::{publish_pty_chunk, subscribe_pty, PTY_SUBSCRIBER_QUEUE};
+    use std::sync::atomic::Ordering;
+
+    let (pty, entry) = pty_entry(true);
+    let sub = subscribe_pty(&pty, &entry);
+    for i in 0..(PTY_SUBSCRIBER_QUEUE + 3) {
+        publish_pty_chunk(&pty, &entry, &[i as u8]);
+    }
+    assert!(
+        sub.overflow.load(Ordering::SeqCst),
+        "a full subscriber queue must fail that subscriber"
+    );
+    let mut n = 0;
+    while sub.rx.try_recv().is_ok() {
+        n += 1;
+    }
+    assert!(n <= PTY_SUBSCRIBER_QUEUE);
+}
+
+#[test]
+fn test_pty_start_disconnect_does_not_kill() {
+    let (addr, registry) = start_test_server("/tmp");
+    let (stream, pid) = start_pty(
+        &addr,
+        r#"{"process":{"cmd":"/bin/bash","args":["-i","-l"]},"pty":{"size":{"cols":80,"rows":24}}}"#,
+    );
+    drop(stream);
+    std::thread::sleep(Duration::from_millis(200));
+
+    let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+    assert!(
+        alive,
+        "closing the Start stream must leave the PTY process running"
+    );
+    let entry = registry.get_by_pid(pid as u32).expect("entry");
+    let has_master = entry
+        .lock()
+        .unwrap()
+        .pty_handle
+        .as_ref()
+        .unwrap()
+        .acquire_master()
+        .is_some();
+    assert!(has_master, "master fd stays open after stream disconnect");
+
+    let input = base64_encode(b"echo STILL_RUNNING\n");
+    let send_req = format!(r#"{{"process":{{"pid":{pid}}},"input":{{"pty":"{input}"}}}}"#);
+    let (status, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendInput",
+        "application/json",
+        send_req.as_bytes(),
+    );
+    assert_eq!(status, 200);
+
+    let mut stream2 = TcpStream::connect(&addr).unwrap();
+    stream2
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .unwrap();
+    let conn_body = format!(r#"{{"process":{{"pid":{pid}}}}}"#);
+    let conn_req = format!(
+        "POST /process.Process/Connect HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{conn_body}",
+        conn_body.len()
+    );
+    stream2.write_all(conn_req.as_bytes()).unwrap();
+    stream2.flush().unwrap();
+    skip_http_headers_from_stream(&mut stream2).unwrap();
+    let out = wait_for_pty_output(
+        &mut stream2,
+        |s| s.contains("STILL_RUNNING"),
+        Duration::from_secs(10),
+    )
+    .expect("Connect after Start disconnect must still deliver PTY output");
+    assert!(out.contains("STILL_RUNNING"));
+
+    let kill_req = format!(r#"{{"process":{{"pid":{pid}}},"signal":"SIGKILL"}}"#);
+    let (status, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut still_alive = true;
+    let mut master_cleared = false;
+    while std::time::Instant::now() < deadline {
+        still_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        master_cleared = entry
+            .lock()
+            .unwrap()
+            .pty_handle
+            .as_ref()
+            .unwrap()
+            .acquire_master()
+            .is_none();
+        if !still_alive && master_cleared {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(master_cleared, "explicit kill closes the master fd");
+    assert!(!still_alive, "explicit kill must reap the PTY process");
+}
+
+#[test]
+fn test_pty_slow_start_consumer_ends_with_resource_exhausted() {
+    let (addr, _) = start_test_server("/tmp");
+    let (mut stream, _pid) = start_pty(
+        &addr,
+        r#"{"process":{"cmd":"/bin/bash","args":["-c","dd if=/dev/zero bs=4096 count=1024 status=none"]},"pty":{"size":{"cols":80,"rows":24}}}"#,
+    );
+    // Stop reading so the subscriber queue fills. The stream must end with
+    // resource_exhausted, not a successful EndEvent.
+    std::thread::sleep(Duration::from_millis(400));
+
+    let mut saw_overflow = false;
+    let mut saw_end = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        match read_connect_frame_from_stream(&mut stream) {
+            Ok(Some((flag, data))) => {
+                let text = String::from_utf8_lossy(&data);
+                if flag == 2 && text.contains("resource_exhausted") {
+                    saw_overflow = true;
+                    break;
+                }
+                if flag == 0 && text.contains("\"end\"") {
+                    saw_end = true;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(e) => panic!("read frame: {e}"),
+        }
+    }
+    assert!(saw_overflow, "slow consumer must see resource_exhausted");
+    assert!(
+        !saw_end,
+        "overflow must not finish as a successful end event"
+    );
+}
+
+#[test]
+fn test_pty_background_child_holding_slave_publishes_end_and_reaps() {
+    let (addr, registry) = start_test_server("/tmp");
+    let body = r#"{"process":{"cmd":"/bin/sh","args":["-c","sleep 5 >/dev/null 2>&1 & exit 3"]},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let (mut stream, pid) = start_pty(&addr, body);
+
+    let mut exit_code = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match read_connect_frame_from_stream(&mut stream) {
+            Ok(Some((0, data))) => {
+                if let Ok(s) = std::str::from_utf8(&data) {
+                    if let Ok(json) = JsonValue::parse(s) {
+                        if let Some(end) = json.get("event").and_then(|e| e.get("end")) {
+                            exit_code = end.get("exitCode").and_then(|v| v.as_i64());
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(Some((2, _))) | Ok(None) => break,
+            Ok(Some(_)) => {}
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        exit_code,
+        Some(3),
+        "End event must be published immediately when main child exits even if background job holds slave"
+    );
+
+    // Ensure child is reaped (not a zombie)
+    let entry = registry.get_by_pid(pid as u32).expect("entry");
+    assert!(!entry.lock().unwrap().running);
+    let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+}
+
+#[test]
+fn test_pty_concurrent_send_input_and_kill_safe() {
+    let (addr, _registry) = start_test_server("/tmp");
+    let body = r#"{"process":{"cmd":"/bin/cat"},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let (_stream, pid) = start_pty(&addr, body);
+
+    let addr_in = addr.clone();
+    let input_handle = std::thread::spawn(move || {
+        let b64 = base64_encode(b"hello\n");
+        let send_req = format!(r#"{{"process":{{"pid":{pid}}},"input":{{"pty":"{b64}"}}}}"#);
+        for _ in 0..30 {
+            let (status, _, _) = post_raw(
+                &addr_in,
+                "/process.Process/SendInput",
+                "application/json",
+                send_req.as_bytes(),
+            );
+            assert!(
+                status == 200 || status == 404 || status == 500,
+                "unexpected status {status}"
+            );
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(20));
+    let kill_req = format!(r#"{{"process":{{"pid":{pid}}},"signal":"SIGKILL"}}"#);
+    let (status, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    input_handle.join().unwrap();
+}
+
+#[test]
+fn test_pty_send_signal_trapped_sigterm_stays_running() {
+    let (addr, registry) = start_test_server("/tmp");
+    let body = r#"{"process":{"cmd":"/bin/sh","args":["-c","trap '' TERM; sleep 5"]},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let (_stream, pid) = start_pty(&addr, body);
+
+    std::thread::sleep(Duration::from_millis(100));
+    let term_req = format!(r#"{{"process":{{"pid":{pid}}},"signal":"SIGTERM"}}"#);
+    let (status, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        term_req.as_bytes(),
+    );
+    assert_eq!(status, 200);
+
+    std::thread::sleep(Duration::from_millis(150));
+    let entry = registry.get_by_pid(pid as u32).expect("entry");
+    assert!(
+        entry.lock().unwrap().running,
+        "SIGTERM ignored by process must not mark entry dead"
+    );
+
+    let kill_req = format!(r#"{{"process":{{"pid":{pid}}},"signal":"SIGKILL"}}"#);
+    let (status, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn test_process_connect_running_non_pty_waits_for_exit() {
+    let (addr, _registry) = start_test_server("/tmp");
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    let req_body =
+        r#"{"process":{"cmd":"/bin/sh","args":["-c","sleep 0.3; echo DONE_NON_PTY; exit 5"]}}"#;
+    let req = format!(
+        "POST /process.Process/Start HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{req_body}",
+        req_body.len()
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    skip_http_headers_from_stream(&mut stream).unwrap();
+
+    let (_, data0) = read_connect_frame_from_stream(&mut stream)
+        .unwrap()
+        .unwrap();
+    let start_json = JsonValue::parse(std::str::from_utf8(&data0).unwrap()).unwrap();
+    let pid = start_json
+        .get("event")
+        .unwrap()
+        .get("start")
+        .unwrap()
+        .get("pid")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+
+    let mut conn = TcpStream::connect(&addr).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let conn_body = format!(r#"{{"process":{{"pid":{pid}}}}}"#);
+    let conn_req = format!(
+        "POST /process.Process/Connect HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{conn_body}",
+        conn_body.len()
+    );
+    conn.write_all(conn_req.as_bytes()).unwrap();
+    conn.flush().unwrap();
+    skip_http_headers_from_stream(&mut conn).unwrap();
+
+    let mut exit_code = None;
+    let mut out = String::new();
+    while let Ok(Some((flag, data))) = read_connect_frame_from_stream(&mut conn) {
+        if flag == 0 {
+            if let Ok(s) = std::str::from_utf8(&data) {
+                if let Ok(json) = JsonValue::parse(s) {
+                    if let Some(b64) = json
+                        .get("event")
+                        .and_then(|e| e.get("data"))
+                        .and_then(|d| d.get("stdout"))
+                        .and_then(|v| v.as_str())
+                    {
+                        out.push_str(&String::from_utf8_lossy(&base64_decode(b64)));
+                    }
+                    if let Some(end) = json.get("event").and_then(|e| e.get("end")) {
+                        exit_code = end.get("exitCode").and_then(|v| v.as_i64());
+                    }
+                }
+            }
+        } else if flag == 2 {
+            break;
+        }
+    }
+    assert!(out.contains("DONE_NON_PTY"), "got output: {out}");
+    assert_eq!(exit_code, Some(5));
+}
+
+#[test]
+fn test_pty_rejects_invalid_base64_and_duplicate_id() {
+    let (addr, _registry) = start_test_server("/tmp");
+    let body =
+        r#"{"id":"dup-pty-1","process":{"cmd":"/bin/cat"},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let (_stream, pid) = start_pty(&addr, body);
+
+    // Duplicate id rejected with 409
+    let (dup_status, _, dup_body) = post_raw(
+        &addr,
+        "/process.Process/Start",
+        "application/json",
+        body.as_bytes(),
+    );
+    assert_eq!(
+        dup_status,
+        409,
+        "dup body: {}",
+        String::from_utf8_lossy(&dup_body)
+    );
+
+    // Invalid base64 rejected with 400
+    let bad_req = format!(r#"{{"process":{{"pid":{pid}}},"input":{{"pty":"not!valid!b64"}}}}"#);
+    let (bad_status, _, bad_body) = post_raw(
+        &addr,
+        "/process.Process/SendInput",
+        "application/json",
+        bad_req.as_bytes(),
+    );
+    assert_eq!(
+        bad_status,
+        400,
+        "bad base64 body: {}",
+        String::from_utf8_lossy(&bad_body)
+    );
+
+    let kill_req = format!(r#"{{"process":{{"pid":{pid}}},"signal":"SIGKILL"}}"#);
+    let _ = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+}
+
+#[test]
+fn test_unpack_all_connect_frames_no_gzip_sniff() {
+    use crate::commands::unpack_all_connect_frames;
+    // Raw bytes starting with 0x1f 0x8b (gzip magic) without Connect compression flag
+    // must NOT be treated as gzip.
+    let raw = [0x1fu8, 0x8b, 0x08, 0x00];
+    let frames = unpack_all_connect_frames(&raw).expect("unpack");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].0, 0);
+    assert_eq!(frames[0].1, raw);
+}
+
+#[test]
+fn test_pty_close_stdin_returns_unimplemented() {
+    let (addr, _registry) = start_test_server("/tmp");
+    let (status, _, body) = post_raw(
+        &addr,
+        "/process.Process/CloseStdin",
+        "application/json",
+        b"{}",
+    );
+    let body_str = String::from_utf8_lossy(&body);
+    assert_eq!(status, 501);
+    assert!(body_str.contains("unimplemented"), "body: {body_str}");
 }

@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -113,7 +114,8 @@ func TestConnectRPC_ProcessStart_Success(t *testing.T) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 OK, got %d; body=%s", resp.StatusCode, string(b))
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -211,7 +213,8 @@ func TestConnectRPC_ProcessStart_StderrAndExitCode(t *testing.T) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 OK, got %d; body=%s", resp.StatusCode, string(b))
 	}
 
 	body, _ := io.ReadAll(resp.Body)
@@ -267,13 +270,14 @@ func TestConnectRPC_ProcessSendSignalAndConnect(t *testing.T) {
 	defer cancel()
 
 	cmdEntry := &commandEntry{
-		id:       cmdID,
-		cmdID:    cmdID,
-		pid:      9999,
-		running:  true,
-		buf:      bytes.NewBufferString("background output"),
-		cancel:   cancel,
-		exitCode: 0,
+		id:        cmdID,
+		cmdID:     cmdID,
+		pid:       9999,
+		sandboxID: rec.SandboxID,
+		running:   true,
+		buf:       bytes.NewBufferString("background output"),
+		cancel:    cancel,
+		exitCode:  0,
 	}
 	srv.mu.Lock()
 	srv.commands["9999"] = cmdEntry
@@ -333,11 +337,12 @@ func TestConnectRPC_ProcessList(t *testing.T) {
 
 	srv.mu.Lock()
 	srv.commands["1001"] = &commandEntry{
-		id:      "cmd-1001",
-		cmdID:   "cmd-1001",
-		pid:     1001,
-		running: true,
-		buf:     &bytes.Buffer{},
+		id:        "cmd-1001",
+		cmdID:     "cmd-1001",
+		pid:       1001,
+		sandboxID: rec.SandboxID,
+		running:   true,
+		buf:       &bytes.Buffer{},
 	}
 	srv.mu.Unlock()
 
@@ -352,7 +357,8 @@ func TestConnectRPC_ProcessList(t *testing.T) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d", resp.StatusCode)
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 OK, got %d; body=%s", resp.StatusCode, string(b))
 	}
 
 	var listResp struct {
@@ -816,5 +822,817 @@ func TestFiles_MockPoddForwarding(t *testing.T) {
 	}
 	if len(fwdRes) != 1 || fwdRes[0]["name"] != "forward-smoke.txt" {
 		t.Fatalf("unexpected forwarded response: %+v", fwdRes)
+	}
+}
+
+func readNextConnectFrame(r io.Reader) (*parsedConnectFrame, error) {
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, err
+	}
+	flag := header[0]
+	length := binary.BigEndian.Uint32(header[1:5])
+	payload := make([]byte, length)
+	if length > 0 {
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return nil, err
+		}
+	}
+	return &parsedConnectFrame{
+		Flag:    flag,
+		Length:  length,
+		Payload: payload,
+	}, nil
+}
+
+func waitForPtyOutput(r io.Reader, pred func(string) bool, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	accumulated := ""
+	for time.Now().Before(deadline) {
+		frame, err := readNextConnectFrame(r)
+		if err != nil {
+			return accumulated, err
+		}
+		if frame.Flag == 0 {
+			var event struct {
+				Event struct {
+					Data struct {
+						Pty string `json:"pty"`
+					} `json:"data"`
+				} `json:"event"`
+			}
+			if err := json.Unmarshal(frame.Payload, &event); err == nil {
+				if event.Event.Data.Pty != "" {
+					decoded, _ := base64.StdEncoding.DecodeString(event.Event.Data.Pty)
+					accumulated += string(decoded)
+					if pred(accumulated) {
+						return accumulated, nil
+					}
+				}
+			}
+		} else if frame.Flag == 2 {
+			break
+		}
+	}
+	return accumulated, fmt.Errorf("timeout waiting for output, accumulated: %q", accumulated)
+}
+
+func TestConnectRPC_PTY_Start_RealOSPTY_And_SendInput_And_Resize(t *testing.T) {
+	srv, ts, rec := setupTestServerWithSandbox(t)
+	_ = srv
+
+	reqPayload := map[string]interface{}{
+		"process": map[string]interface{}{
+			"cmd":  "/bin/bash",
+			"args": []string{"-i", "-l"},
+		},
+		"pty": map[string]interface{}{
+			"size": map[string]interface{}{
+				"cols": 80,
+				"rows": 24,
+			},
+		},
+	}
+	rawJSON, _ := json.Marshal(reqPayload)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Start", bytes.NewReader(rawJSON))
+	req.Header.Set("Content-Type", "application/connect+json")
+	req.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PTY Start failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 OK, got %d; body=%s", resp.StatusCode, string(b))
+	}
+
+	// 1. Frame 0 must be Start event with pid
+	frame0, err := readNextConnectFrame(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read start frame: %v", err)
+	}
+	var startEvent struct {
+		Event struct {
+			Start struct {
+				Pid int `json:"pid"`
+			} `json:"start"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(frame0.Payload, &startEvent); err != nil {
+		t.Fatalf("failed to unmarshal start event: %v", err)
+	}
+	pid := startEvent.Event.Start.Pid
+	if pid <= 0 {
+		t.Fatalf("expected valid pid > 0, got %d", pid)
+	}
+
+	// 2. Test isatty
+	sendInputPayload, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{"pid": pid},
+		"input": map[string]interface{}{
+			"pty": base64.StdEncoding.EncodeToString([]byte("if [ -t 0 ] && [ -t 1 ]; then echo GATEWAY_PTY_ISATTY; fi\n")),
+		},
+	})
+	inReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendInput", bytes.NewReader(sendInputPayload))
+	inReq.Header.Set("Content-Type", "application/json")
+	inReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	inResp, err := http.DefaultClient.Do(inReq)
+	if err != nil {
+		t.Fatalf("SendInput failed: %v", err)
+	}
+	inResp.Body.Close()
+	if inResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected SendInput 200 OK, got %d", inResp.StatusCode)
+	}
+
+	out, err := waitForPtyOutput(resp.Body, func(s string) bool {
+		return strings.Contains(s, "GATEWAY_PTY_ISATTY")
+	}, 10*time.Second)
+	if err != nil {
+		t.Fatalf("failed waiting for GATEWAY_PTY_ISATTY: %v", err)
+	}
+	if !strings.Contains(out, "GATEWAY_PTY_ISATTY") {
+		t.Fatalf("GATEWAY_PTY_ISATTY not in output: %q", out)
+	}
+
+	// 3. Test initial stty size
+	sendInputStty, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{"pid": pid},
+		"input": map[string]interface{}{
+			"pty": base64.StdEncoding.EncodeToString([]byte("stty size\n")),
+		},
+	})
+	inReq2, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendInput", bytes.NewReader(sendInputStty))
+	inReq2.Header.Set("Content-Type", "application/json")
+	inReq2.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	inResp2, err := http.DefaultClient.Do(inReq2)
+	if err != nil {
+		t.Fatalf("SendInput failed: %v", err)
+	}
+	inResp2.Body.Close()
+
+	out, err = waitForPtyOutput(resp.Body, func(s string) bool {
+		return strings.Contains(s, "24 80")
+	}, 10*time.Second)
+	if err != nil {
+		t.Fatalf("failed waiting for 24 80: %v", err)
+	}
+
+	// 4. Update resize to 40 cols, 12 rows
+	updatePayload, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{"pid": pid},
+		"pty": map[string]interface{}{
+			"size": map[string]interface{}{
+				"cols": 40,
+				"rows": 12,
+			},
+		},
+	})
+	upReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Update", bytes.NewReader(updatePayload))
+	upReq.Header.Set("Content-Type", "application/json")
+	upReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	upResp, err := http.DefaultClient.Do(upReq)
+	if err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+	upResp.Body.Close()
+	if upResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected Update 200 OK, got %d", upResp.StatusCode)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Send stty size again to verify resize
+	inReq3, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendInput", bytes.NewReader(sendInputStty))
+	inReq3.Header.Set("Content-Type", "application/json")
+	inReq3.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	inResp3, _ := http.DefaultClient.Do(inReq3)
+	inResp3.Body.Close()
+
+	out, err = waitForPtyOutput(resp.Body, func(s string) bool {
+		return strings.Contains(s, "12 40")
+	}, 10*time.Second)
+	if err != nil {
+		t.Fatalf("failed waiting for 12 40: %v", err)
+	}
+
+	// 5. SendSignal to kill
+	killPayload, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{"pid": pid},
+		"signal":  9,
+	})
+	sigReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendSignal", bytes.NewReader(killPayload))
+	sigReq.Header.Set("Content-Type", "application/json")
+	sigReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	sigResp, err := http.DefaultClient.Do(sigReq)
+	if err != nil {
+		t.Fatalf("SendSignal failed: %v", err)
+	}
+	sigResp.Body.Close()
+	if sigResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected SendSignal 200 OK, got %d", sigResp.StatusCode)
+	}
+
+	// Verify EndEvent on resp.Body
+	sawEnd := false
+	sawEOS := false
+	for {
+		frame, err := readNextConnectFrame(resp.Body)
+		if err != nil {
+			break
+		}
+		if frame.Flag == 0 {
+			var endEvent struct {
+				Event struct {
+					End *struct {
+						ExitCode int  `json:"exitCode"`
+						Exited   bool `json:"exited"`
+					} `json:"end"`
+				} `json:"event"`
+			}
+			if err := json.Unmarshal(frame.Payload, &endEvent); err == nil && endEvent.Event.End != nil {
+				sawEnd = true
+				if !endEvent.Event.End.Exited {
+					t.Errorf("expected exited: true")
+				}
+			}
+		} else if frame.Flag == 2 {
+			sawEOS = true
+			break
+		}
+	}
+	if !sawEnd {
+		t.Errorf("expected EndEvent after kill")
+	}
+	if !sawEOS {
+		t.Errorf("expected EOS trailer frame")
+	}
+
+	// Second kill must return 404
+	sigReq2, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendSignal", bytes.NewReader(killPayload))
+	sigReq2.Header.Set("Content-Type", "application/json")
+	sigReq2.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	sigResp2, err := http.DefaultClient.Do(sigReq2)
+	if err != nil {
+		t.Fatalf("SendSignal 2 failed: %v", err)
+	}
+	sigResp2.Body.Close()
+	if sigResp2.StatusCode != http.StatusNotFound {
+		t.Errorf("expected second SendSignal to return 404, got %d", sigResp2.StatusCode)
+	}
+}
+
+func TestConnectRPC_PTY_Forwarding_Routes(t *testing.T) {
+	srv, ts, rec := setupTestServerWithSandbox(t)
+
+	hits := make(map[string]int)
+	mockPodd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits[r.URL.Path]++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("{}"))
+	}))
+	t.Cleanup(mockPodd.Close)
+
+	srv.SetPoddURL(rec.SandboxID, mockPodd.URL)
+
+	endpoints := []string{
+		"/process.Process/SendInput",
+		"/process.Process/Update",
+		"/process.Process/StreamInput",
+		"/process.Process/CloseStdin",
+		"/sandboxes/" + rec.SandboxID + "/process.Process/SendInput",
+		"/sandboxes/" + rec.SandboxID + "/process.Process/Update",
+		"/sandboxes/" + rec.SandboxID + "/process.Process/StreamInput",
+		"/sandboxes/" + rec.SandboxID + "/process.Process/CloseStdin",
+	}
+
+	for _, ep := range endpoints {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+ep, bytes.NewReader([]byte("{}")))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request to %s failed: %v", ep, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("expected 200 OK for %s, got %d", ep, resp.StatusCode)
+		}
+	}
+
+	expectedPaths := []string{
+		"/process.Process/SendInput",
+		"/process.Process/Update",
+		"/process.Process/StreamInput",
+		"/process.Process/CloseStdin",
+	}
+	for _, p := range expectedPaths {
+		if hits[p] != 2 {
+			t.Errorf("expected 2 hits for forwarded path %s, got %d", p, hits[p])
+		}
+	}
+}
+
+func TestConnectRPC_PTY_Connect_And_Multibyte_And_ExitCode(t *testing.T) {
+	_, ts, rec := setupTestServerWithSandbox(t)
+
+	// 1. Start PTY
+	reqPayload := map[string]interface{}{
+		"process": map[string]interface{}{
+			"cmd":  "/bin/bash",
+			"args": []string{"-i", "-l"},
+		},
+		"pty": map[string]interface{}{
+			"size": map[string]interface{}{
+				"cols": 80,
+				"rows": 24,
+			},
+		},
+	}
+	rawJSON, _ := json.Marshal(reqPayload)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Start", bytes.NewReader(rawJSON))
+	req.Header.Set("Content-Type", "application/connect+json")
+	req.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PTY Start failed: %v", err)
+	}
+
+	frame0, err := readNextConnectFrame(resp.Body)
+	if err != nil {
+		resp.Body.Close()
+		t.Fatalf("failed to read start frame: %v", err)
+	}
+	var startEvent struct {
+		Event struct {
+			Start struct {
+				Pid int `json:"pid"`
+			} `json:"start"`
+		} `json:"event"`
+	}
+	_ = json.Unmarshal(frame0.Payload, &startEvent)
+	pid := startEvent.Event.Start.Pid
+
+	// Send input before disconnect
+	sendInputPayload, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{"pid": pid},
+		"input": map[string]interface{}{
+			"pty": base64.StdEncoding.EncodeToString([]byte("echo BEFORE_DISCONNECT\n")),
+		},
+	})
+	inReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendInput", bytes.NewReader(sendInputPayload))
+	inReq.Header.Set("Content-Type", "application/json")
+	inReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	inResp, _ := http.DefaultClient.Do(inReq)
+	inResp.Body.Close()
+
+	_, err = waitForPtyOutput(resp.Body, func(s string) bool {
+		return strings.Contains(s, "BEFORE_DISCONNECT")
+	}, 10*time.Second)
+	if err != nil {
+		resp.Body.Close()
+		t.Fatalf("failed waiting for BEFORE_DISCONNECT: %v", err)
+	}
+
+	// Disconnect first stream
+	resp.Body.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// 2. Connect second stream
+	connPayload, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{"pid": pid},
+	})
+	connReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Connect", bytes.NewReader(connPayload))
+	connReq.Header.Set("Content-Type", "application/connect+json")
+	connReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+
+	connResp, err := http.DefaultClient.Do(connReq)
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer connResp.Body.Close()
+
+	if connResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected Connect 200 OK, got %d", connResp.StatusCode)
+	}
+
+	frameConn0, err := readNextConnectFrame(connResp.Body)
+	if err != nil {
+		t.Fatalf("failed to read start frame on connect: %v", err)
+	}
+	var connStartEvent struct {
+		Event struct {
+			Start struct {
+				Pid int `json:"pid"`
+			} `json:"start"`
+		} `json:"event"`
+	}
+	_ = json.Unmarshal(frameConn0.Payload, &connStartEvent)
+	if connStartEvent.Event.Start.Pid != pid {
+		t.Fatalf("expected connect pid %d, got %d", pid, connStartEvent.Event.Start.Pid)
+	}
+
+	// Send multibyte UTF-8 input
+	sendInputMB, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{"pid": pid},
+		"input": map[string]interface{}{
+			"pty": base64.StdEncoding.EncodeToString([]byte("echo 你好世界\n")),
+		},
+	})
+	inReqMB, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendInput", bytes.NewReader(sendInputMB))
+	inReqMB.Header.Set("Content-Type", "application/json")
+	inReqMB.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	inRespMB, _ := http.DefaultClient.Do(inReqMB)
+	inRespMB.Body.Close()
+
+	_, err = waitForPtyOutput(connResp.Body, func(s string) bool {
+		return strings.Contains(s, "你好世界")
+	}, 10*time.Second)
+	if err != nil {
+		t.Fatalf("failed waiting for 你好世界: %v", err)
+	}
+
+	// 3. Send exit 7 to test non-zero exit code
+	sendExit, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{"pid": pid},
+		"input": map[string]interface{}{
+			"pty": base64.StdEncoding.EncodeToString([]byte("exit 7\n")),
+		},
+	})
+	inReqExit, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendInput", bytes.NewReader(sendExit))
+	inReqExit.Header.Set("Content-Type", "application/json")
+	inReqExit.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	inRespExit, _ := http.DefaultClient.Do(inReqExit)
+	inRespExit.Body.Close()
+
+	sawExitCode := -1
+	for {
+		frame, err := readNextConnectFrame(connResp.Body)
+		if err != nil {
+			break
+		}
+		if frame.Flag == 0 {
+			var endEvent struct {
+				Event struct {
+					End *struct {
+						ExitCode int  `json:"exitCode"`
+						Exited   bool `json:"exited"`
+					} `json:"end"`
+				} `json:"event"`
+			}
+			if err := json.Unmarshal(frame.Payload, &endEvent); err == nil && endEvent.Event.End != nil {
+				sawExitCode = endEvent.Event.End.ExitCode
+			}
+		} else if frame.Flag == 2 {
+			break
+		}
+	}
+	if sawExitCode != 7 {
+		t.Fatalf("expected exit code 7, got %d", sawExitCode)
+	}
+}
+
+func TestConnectRPC_PTY_StreamInput(t *testing.T) {
+	_, ts, rec := setupTestServerWithSandbox(t)
+
+	reqPayload := map[string]interface{}{
+		"process": map[string]interface{}{
+			"cmd":  "/bin/bash",
+			"args": []string{"-i", "-l"},
+		},
+		"pty": map[string]interface{}{
+			"size": map[string]interface{}{
+				"cols": 80,
+				"rows": 24,
+			},
+		},
+	}
+	rawJSON, _ := json.Marshal(reqPayload)
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Start", bytes.NewReader(rawJSON))
+	req.Header.Set("Content-Type", "application/connect+json")
+	req.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PTY Start failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	frame0, err := readNextConnectFrame(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read start frame: %v", err)
+	}
+	var startEvent struct {
+		Event struct {
+			Start struct {
+				Pid int `json:"pid"`
+			} `json:"start"`
+		} `json:"event"`
+	}
+	_ = json.Unmarshal(frame0.Payload, &startEvent)
+	pid := startEvent.Event.Start.Pid
+
+	// Send StreamInput
+	f1, _ := json.Marshal(map[string]interface{}{
+		"start": map[string]interface{}{
+			"process": map[string]interface{}{"pid": pid},
+		},
+	})
+	f2, _ := json.Marshal(map[string]interface{}{
+		"data": map[string]interface{}{
+			"input": map[string]interface{}{
+				"pty": base64.StdEncoding.EncodeToString([]byte("echo GW_STREAM_INPUT_OK\n")),
+			},
+		},
+	})
+
+	var streamBody bytes.Buffer
+	streamBody.Write(makeConnectFrame(f1, false))
+	streamBody.Write(makeConnectFrame(f2, false))
+	streamBody.Write(makeConnectFrame([]byte("{}"), true))
+
+	siReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/StreamInput", &streamBody)
+	siReq.Header.Set("Content-Type", "application/connect+json")
+	siReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+
+	siResp, err := http.DefaultClient.Do(siReq)
+	if err != nil {
+		t.Fatalf("StreamInput failed: %v", err)
+	}
+	siResp.Body.Close()
+	if siResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected StreamInput 200 OK, got %d", siResp.StatusCode)
+	}
+
+	out, err := waitForPtyOutput(resp.Body, func(s string) bool {
+		return strings.Contains(s, "GW_STREAM_INPUT_OK")
+	}, 10*time.Second)
+	if err != nil {
+		t.Fatalf("failed waiting for GW_STREAM_INPUT_OK: %v", err)
+	}
+	if !strings.Contains(out, "GW_STREAM_INPUT_OK") {
+		t.Fatalf("GW_STREAM_INPUT_OK not found in output: %q", out)
+	}
+
+	// Cleanup
+	killPayload, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{"pid": pid},
+		"signal":  9,
+	})
+	sigReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendSignal", bytes.NewReader(killPayload))
+	sigReq.Header.Set("Content-Type", "application/json")
+	sigReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	sigResp, _ := http.DefaultClient.Do(sigReq)
+	sigResp.Body.Close()
+}
+
+func TestConnectRPC_PTY_SandboxIsolation_And_EnvSanitization(t *testing.T) {
+	t.Setenv("CUBEPOD_TEST_GATEWAY_SECRET", "top-secret-value")
+
+	srv, ts, recA := setupTestServerWithSandbox(t)
+	recB := &SandboxRecord{
+		SandboxID:    "sb-other-isolation",
+		TemplateID:   "base",
+		State:        "running",
+		WorkspaceDir: t.TempDir(),
+	}
+	srv.mu.Lock()
+	srv.sandboxes[recB.SandboxID] = recB
+	srv.mu.Unlock()
+
+	// Start a PTY in sandbox A with tag "pty-a"
+	startBody, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{
+			"cmd":  "/bin/sh",
+			"args": []string{"-c", "echo SECRET=${CUBEPOD_TEST_GATEWAY_SECRET:-unset}; sleep 5"},
+		},
+		"pty": map[string]interface{}{
+			"size": map[string]interface{}{"cols": 80, "rows": 24},
+		},
+		"tag": "pty-a",
+	})
+	reqA, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Start", bytes.NewReader(startBody))
+	reqA.Header.Set("Content-Type", "application/connect+json")
+	reqA.Header.Set("E2b-Sandbox-Id", recA.SandboxID)
+	respA, err := http.DefaultClient.Do(reqA)
+	if err != nil {
+		t.Fatalf("Start PTY A failed: %v", err)
+	}
+	defer respA.Body.Close()
+	if respA.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", respA.StatusCode)
+	}
+
+	var pid int
+	out, err := waitForPtyOutput(respA.Body, func(s string) bool {
+		if pid == 0 {
+			// parse start pid if needed via List
+		}
+		return strings.Contains(s, "SECRET=unset")
+	}, 5*time.Second)
+	if err != nil {
+		t.Fatalf("expected SECRET=unset (gateway env must not leak), got err=%v out=%q", err, out)
+	}
+	if strings.Contains(out, "top-secret-value") {
+		t.Fatalf("gateway secret leaked into PTY env: %q", out)
+	}
+
+	// List from A sees the process; List from B sees empty
+	listA := func(sbID string) []map[string]interface{} {
+		lReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/List", bytes.NewReader([]byte("{}")))
+		lReq.Header.Set("Content-Type", "application/json")
+		lReq.Header.Set("E2b-Sandbox-Id", sbID)
+		lResp, err := http.DefaultClient.Do(lReq)
+		if err != nil {
+			t.Fatalf("List failed: %v", err)
+		}
+		defer lResp.Body.Close()
+		var lr struct {
+			Processes []map[string]interface{} `json:"processes"`
+		}
+		_ = json.NewDecoder(lResp.Body).Decode(&lr)
+		return lr.Processes
+	}
+	procsA := listA(recA.SandboxID)
+	if len(procsA) != 1 {
+		t.Fatalf("expected 1 process in sandbox A, got %d", len(procsA))
+	}
+	pid = int(procsA[0]["pid"].(float64))
+	if procsB := listA(recB.SandboxID); len(procsB) != 0 {
+		t.Fatalf("sandbox B must not see sandbox A's processes, got %+v", procsB)
+	}
+
+	// Sandbox B cannot SendInput, Update, Connect, or SendSignal to sandbox A's pid or tag
+	for _, tc := range []struct {
+		path string
+		body map[string]interface{}
+	}{
+		{"/process.Process/SendInput", map[string]interface{}{"process": map[string]interface{}{"pid": pid}, "input": map[string]interface{}{"pty": base64.StdEncoding.EncodeToString([]byte("x"))}}},
+		{"/process.Process/Update", map[string]interface{}{"process": map[string]interface{}{"pid": pid}, "pty": map[string]interface{}{"size": map[string]interface{}{"cols": 100, "rows": 30}}}},
+		{"/process.Process/Connect", map[string]interface{}{"process": map[string]interface{}{"tag": "pty-a"}}},
+		{"/process.Process/SendSignal", map[string]interface{}{"process": map[string]interface{}{"pid": pid}, "signal": 9}},
+	} {
+		b, _ := json.Marshal(tc.body)
+		cReq, _ := http.NewRequest(http.MethodPost, ts.URL+tc.path, bytes.NewReader(b))
+		cReq.Header.Set("Content-Type", "application/json")
+		cReq.Header.Set("E2b-Sandbox-Id", recB.SandboxID)
+		cResp, err := http.DefaultClient.Do(cReq)
+		if err != nil {
+			t.Fatalf("%s failed: %v", tc.path, err)
+		}
+		cResp.Body.Close()
+		if cResp.StatusCode != http.StatusNotFound {
+			t.Errorf("cross-sandbox %s: expected 404, got %d", tc.path, cResp.StatusCode)
+		}
+	}
+
+	// Cleanup A
+	killB, _ := json.Marshal(map[string]interface{}{"process": map[string]interface{}{"pid": pid}, "signal": 9})
+	kReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendSignal", bytes.NewReader(killB))
+	kReq.Header.Set("Content-Type", "application/json")
+	kReq.Header.Set("E2b-Sandbox-Id", recA.SandboxID)
+	kResp, _ := http.DefaultClient.Do(kReq)
+	kResp.Body.Close()
+}
+
+func TestConnectRPC_PTY_ConcurrentSendInputAndKill_NoRace(t *testing.T) {
+	_, ts, rec := setupTestServerWithSandbox(t)
+	startBody, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{"cmd": "/bin/cat"},
+		"pty":     map[string]interface{}{"size": map[string]interface{}{"cols": 80, "rows": 24}},
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Start", bytes.NewReader(startBody))
+	req.Header.Set("Content-Type", "application/connect+json")
+	req.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read start frame for pid
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(resp.Body, hdr); err != nil {
+		t.Fatalf("read start hdr: %v", err)
+	}
+	n := int(hdr[1])<<24 | int(hdr[2])<<16 | int(hdr[3])<<8 | int(hdr[4])
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(resp.Body, payload); err != nil {
+		t.Fatalf("read start payload: %v", err)
+	}
+	var startEv struct {
+		Event struct {
+			Start struct {
+				Pid int `json:"pid"`
+			} `json:"start"`
+		} `json:"event"`
+	}
+	_ = json.Unmarshal(payload, &startEv)
+	pid := startEv.Event.Start.Pid
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		inBody, _ := json.Marshal(map[string]interface{}{
+			"process": map[string]interface{}{"pid": pid},
+			"input":   map[string]interface{}{"pty": base64.StdEncoding.EncodeToString([]byte("ping\n"))},
+		})
+		for i := 0; i < 20; i++ {
+			r, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendInput", bytes.NewReader(inBody))
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+			resp, err := http.DefaultClient.Do(r)
+			if err == nil {
+				resp.Body.Close()
+			}
+		}
+	}()
+
+	time.Sleep(15 * time.Millisecond)
+	killBody, _ := json.Marshal(map[string]interface{}{"process": map[string]interface{}{"pid": pid}, "signal": 9})
+	kReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendSignal", bytes.NewReader(killBody))
+	kReq.Header.Set("Content-Type", "application/json")
+	kReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	kResp, err := http.DefaultClient.Do(kReq)
+	if err != nil {
+		t.Fatalf("SendSignal failed: %v", err)
+	}
+	kResp.Body.Close()
+	wg.Wait()
+}
+
+func TestConnectRPC_Process_ConnectRunningNonPTY_WaitsForExit(t *testing.T) {
+	_, ts, rec := setupTestServerWithSandbox(t)
+	startBody, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{
+			"cmd":  "/bin/sh",
+			"args": []string{"-c", "sleep 0.2; echo NON_PTY_DONE; exit 4"},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Start", bytes.NewReader(startBody))
+	req.Header.Set("Content-Type", "application/connect+json")
+	req.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(resp.Body, hdr); err != nil {
+		t.Fatalf("read start hdr: %v", err)
+	}
+	n := int(hdr[1])<<24 | int(hdr[2])<<16 | int(hdr[3])<<8 | int(hdr[4])
+	payload := make([]byte, n)
+	_, _ = io.ReadFull(resp.Body, payload)
+	var startEv struct {
+		Event struct {
+			Start struct {
+				Pid int `json:"pid"`
+			} `json:"start"`
+		} `json:"event"`
+	}
+	_ = json.Unmarshal(payload, &startEv)
+	pid := startEv.Event.Start.Pid
+
+	connBody, _ := json.Marshal(map[string]interface{}{"process": map[string]interface{}{"pid": pid}})
+	cReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Connect", bytes.NewReader(connBody))
+	cReq.Header.Set("Content-Type", "application/connect+json")
+	cReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	cResp, err := http.DefaultClient.Do(cReq)
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer cResp.Body.Close()
+
+	all, _ := io.ReadAll(cResp.Body)
+	frames, err := parseConnectFrames(all)
+	if err != nil {
+		t.Fatalf("parseConnectFrames: %v", err)
+	}
+	var gotExitCode *int
+	for _, f := range frames {
+		var ev struct {
+			Event struct {
+				End *struct {
+					ExitCode int  `json:"exitCode"`
+					Exited   bool `json:"exited"`
+				} `json:"end"`
+			} `json:"event"`
+		}
+		if json.Unmarshal(f.Payload, &ev) == nil && ev.Event.End != nil {
+			c := ev.Event.End.ExitCode
+			gotExitCode = &c
+		}
+	}
+	if gotExitCode == nil || *gotExitCode != 4 {
+		t.Fatalf("expected exitCode 4 from Connect on running non-PTY, got %v", gotExitCode)
 	}
 }
