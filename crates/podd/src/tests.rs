@@ -4542,3 +4542,186 @@ fn test_watch_stream_errors_are_end_frames_and_ring_overflow_is_unary() {
 }
 
 // Stream overflow framing is covered by watch::tests::watch_dir_pump_emits_resource_exhausted.
+
+#[test]
+fn test_connectrpc_filesystem_list_stat_and_remove() {
+    let root = std::env::temp_dir().join(format!(
+        "podd-fs-rpc-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("sub/nested")).unwrap();
+    std::fs::write(root.join("alpha.txt"), b"hello").unwrap();
+    std::fs::write(root.join("sub/beta.txt"), b"world!").unwrap();
+    std::fs::write(root.join("sub/nested/deep.txt"), b"deep").unwrap();
+    std::os::unix::fs::symlink(root.join("alpha.txt"), root.join("link_to_alpha")).unwrap();
+
+    let (addr, _) = start_test_server(root.to_str().unwrap());
+
+    // 1. ListDir with default path (/workspace) and default depth (1)
+    let (status, _, body) = post_json(&addr, "/filesystem.Filesystem/ListDir", r#"{}"#);
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let parsed = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    let entries = parsed.get("entries").and_then(|v| v.as_array()).unwrap();
+    let names: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| e.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(names, vec!["alpha.txt", "link_to_alpha", "sub"]);
+    let alpha = entries
+        .iter()
+        .find(|e| e.get("name").and_then(|v| v.as_str()) == Some("alpha.txt"))
+        .unwrap();
+    assert_eq!(
+        alpha.get("path").and_then(|v| v.as_str()),
+        Some("/workspace/alpha.txt")
+    );
+    assert_eq!(
+        alpha.get("type").and_then(|v| v.as_str()),
+        Some("FILE_TYPE_FILE")
+    );
+    assert_eq!(alpha.get("size").and_then(|v| v.as_u64()), Some(5));
+    assert_eq!(alpha.get("isDir").and_then(|v| v.as_bool()), Some(false));
+    assert_eq!(alpha.get("is_dir").and_then(|v| v.as_bool()), Some(false));
+
+    let sub = entries
+        .iter()
+        .find(|e| e.get("name").and_then(|v| v.as_str()) == Some("sub"))
+        .unwrap();
+    assert_eq!(
+        sub.get("type").and_then(|v| v.as_str()),
+        Some("FILE_TYPE_DIRECTORY")
+    );
+    assert_eq!(sub.get("isDir").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(sub.get("is_dir").and_then(|v| v.as_bool()), Some(true));
+
+    // 2. List alias with depth=2 recurses into sub, not nested (depth=3)
+    let (status, _, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/List",
+        r#"{"path":"/workspace","depth":2}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let parsed = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    let paths: Vec<&str> = parsed
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.get("path").and_then(|v| v.as_str()))
+        .collect();
+    assert!(paths.contains(&"/workspace/sub/beta.txt"), "{paths:?}");
+    assert!(paths.contains(&"/workspace/sub/nested"), "{paths:?}");
+    assert!(
+        !paths.contains(&"/workspace/sub/nested/deep.txt"),
+        "{paths:?}"
+    );
+
+    // 3. ListDir with application/connect+json framing
+    let framed = crate::make_connect_frame(br#"{"path":"/workspace/sub","depth":1}"#, false);
+    let (status, headers, body) = post_raw(
+        &addr,
+        "/filesystem.Filesystem/ListDir",
+        "application/connect+json",
+        &framed,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(headers
+        .get("content-type")
+        .unwrap()
+        .starts_with("application/connect+json"));
+    let unpacked = crate::unpack_connect_payload(&body).unwrap();
+    let framed_parsed = JsonValue::parse(std::str::from_utf8(&unpacked).unwrap()).unwrap();
+    let sub_names: Vec<&str> = framed_parsed
+        .get("entries")
+        .and_then(|v| v.as_array())
+        .unwrap()
+        .iter()
+        .filter_map(|e| e.get("name").and_then(|v| v.as_str()))
+        .collect();
+    assert_eq!(sub_names, vec!["beta.txt", "nested"]);
+
+    // 4. ListDir errors: not_found on missing dir, invalid_argument on file
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/ListDir",
+        r#"{"path":"/workspace/does-not-exist"}"#,
+    );
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(parsed_unary_code(status, &headers, &body), "not_found");
+
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/ListDir",
+        r#"{"path":"/workspace/alpha.txt"}"#,
+    );
+    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        parsed_unary_code(status, &headers, &body),
+        "invalid_argument"
+    );
+
+    // 5. Stat on file, dir, and missing path
+    let (status, _, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/Stat",
+        r#"{"path":"/workspace/sub/beta.txt"}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let stat_parsed = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    let entry = stat_parsed.get("entry").unwrap();
+    assert_eq!(entry.get("name").and_then(|v| v.as_str()), Some("beta.txt"));
+    assert_eq!(
+        entry.get("path").and_then(|v| v.as_str()),
+        Some("/workspace/sub/beta.txt")
+    );
+    assert_eq!(entry.get("size").and_then(|v| v.as_u64()), Some(6));
+    assert_eq!(entry.get("isDir").and_then(|v| v.as_bool()), Some(false));
+
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/Stat",
+        r#"{"path":"/workspace/missing.txt"}"#,
+    );
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(parsed_unary_code(status, &headers, &body), "not_found");
+
+    // 6. Remove symlink does NOT follow symlink (alpha.txt must remain intact)
+    let (status, _, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/Remove",
+        r#"{"path":"/workspace/link_to_alpha"}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        std::fs::symlink_metadata(root.join("link_to_alpha")).is_err(),
+        "symlink itself must be removed"
+    );
+    assert!(
+        root.join("alpha.txt").exists(),
+        "symlink target must NOT be removed"
+    );
+
+    // 7. Remove directory recursively and missing path returns not_found
+    let (status, _, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/Remove",
+        r#"{"path":"/workspace/sub"}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(!root.join("sub").exists());
+
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/Remove",
+        r#"{"path":"/workspace/sub"}"#,
+    );
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(parsed_unary_code(status, &headers, &body), "not_found");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

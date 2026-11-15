@@ -1100,6 +1100,280 @@ pub fn handle_make_dir(stream: &mut TcpStream, req: &HttpRequest, config: &Daemo
     write_unary_connect_response(stream, req, "200 OK", &body);
 }
 
+const MAX_LIST_DEPTH: usize = 32;
+
+fn format_entry_json(name: &str, user_path: &str, meta: &std::fs::Metadata) -> String {
+    let is_dir = meta.is_dir();
+    let ftype = if is_dir {
+        "FILE_TYPE_DIRECTORY"
+    } else {
+        "FILE_TYPE_FILE"
+    };
+    let size = meta.len();
+    let mode = meta.permissions().mode() & 0o777;
+    let perm = mode_string(mode, is_dir);
+    let is_dir_str = if is_dir { "true" } else { "false" };
+    format!(
+        r#"{{"name":"{}","type":"{}","path":"{}","size":{},"mode":{},"permissions":"{}","isDir":{},"is_dir":{}}}"#,
+        escape_json(name),
+        ftype,
+        escape_json(user_path),
+        size,
+        mode,
+        perm,
+        is_dir_str,
+        is_dir_str,
+    )
+}
+
+fn collect_list_entries(
+    dir: &Path,
+    user_prefix: &str,
+    depth: usize,
+    out: &mut Vec<String>,
+) -> Result<(), WatchPathError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(WatchPathError::NotFound("directory not found".into()));
+        }
+        Err(e) => return Err(WatchPathError::Invalid(e.to_string())),
+    };
+
+    let mut children: Vec<(String, PathBuf, std::fs::Metadata, bool)> = Vec::new();
+    for ent in entries.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        let child_path = ent.path();
+        let sym_meta = match std::fs::symlink_metadata(&child_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let is_symlink = sym_meta.file_type().is_symlink();
+        let meta = std::fs::metadata(&child_path).unwrap_or(sym_meta);
+        children.push((name, child_path, meta, is_symlink));
+    }
+    children.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let prefix = user_prefix.trim_end_matches('/');
+    for (name, child_path, meta, is_symlink) in children {
+        let item_user_path = format!("{prefix}/{name}");
+        out.push(format_entry_json(&name, &item_user_path, &meta));
+        if depth > 1 && meta.is_dir() && !is_symlink {
+            collect_list_entries(&child_path, &item_user_path, depth - 1, out)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn handle_list_dir(stream: &mut TcpStream, req: &HttpRequest, config: &DaemonConfig) {
+    let json = match parse_watch_body(req) {
+        Ok(j) => j,
+        Err(e) => {
+            write_watch_error(stream, WatchPathError::Invalid(e));
+            return;
+        }
+    };
+    let user_path = json_str(&json, &["path"]).unwrap_or("/workspace");
+    let depth = match json.get("depth") {
+        None | Some(JsonValue::Null) => 1usize,
+        Some(v) => match v.as_i64() {
+            Some(n) if n < 0 => {
+                write_watch_error(
+                    stream,
+                    WatchPathError::Invalid("depth must be non-negative".into()),
+                );
+                return;
+            }
+            Some(0) => 1usize,
+            Some(n) => (n as usize).min(MAX_LIST_DEPTH),
+            None => {
+                write_watch_error(stream, WatchPathError::Invalid("invalid depth".into()));
+                return;
+            }
+        },
+    };
+    let full = match resolve_target_path(&config.workdir, user_path) {
+        Ok(p) => p,
+        Err(e) => {
+            write_watch_error(stream, e);
+            return;
+        }
+    };
+    match std::fs::metadata(&full) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            write_watch_error(
+                stream,
+                WatchPathError::Invalid("path is not a directory".into()),
+            );
+            return;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_watch_error(
+                stream,
+                WatchPathError::NotFound("directory not found".into()),
+            );
+            return;
+        }
+        Err(e) => {
+            write_watch_error(stream, WatchPathError::Invalid(e.to_string()));
+            return;
+        }
+    }
+    let mut entries = Vec::new();
+    if let Err(e) = collect_list_entries(&full, user_path.trim(), depth, &mut entries) {
+        write_watch_error(stream, e);
+        return;
+    }
+    let body = format!(r#"{{"entries":[{}]}}"#, entries.join(","));
+    write_unary_connect_response(stream, req, "200 OK", &body);
+}
+
+pub fn handle_stat(stream: &mut TcpStream, req: &HttpRequest, config: &DaemonConfig) {
+    let json = match parse_watch_body(req) {
+        Ok(j) => j,
+        Err(e) => {
+            write_watch_error(stream, WatchPathError::Invalid(e));
+            return;
+        }
+    };
+    let user_path = json_str(&json, &["path"]).unwrap_or("");
+    let full = match resolve_target_path(&config.workdir, user_path) {
+        Ok(p) => p,
+        Err(e) => {
+            write_watch_error(stream, e);
+            return;
+        }
+    };
+    let meta = match std::fs::metadata(&full) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_watch_error(
+                stream,
+                WatchPathError::NotFound("file or directory not found".into()),
+            );
+            return;
+        }
+        Err(e) => {
+            write_watch_error(stream, WatchPathError::Invalid(e.to_string()));
+            return;
+        }
+    };
+    let name = entry_name_from_user(user_path);
+    let entry_json = format_entry_json(&name, user_path.trim(), &meta);
+    let body = format!(r#"{{"entry":{entry_json}}}"#);
+    write_unary_connect_response(stream, req, "200 OK", &body);
+}
+
+fn resolve_remove_path(workdir: &str, user: &str) -> Result<PathBuf, WatchPathError> {
+    let user = user.trim();
+    if user.is_empty() {
+        return Err(WatchPathError::Invalid("path is required".into()));
+    }
+    if is_special_abs(user) || is_special_abs(&normalize_logical(user)) {
+        return Err(WatchPathError::Invalid(
+            "refusing to remove proc, dev, or sys".into(),
+        ));
+    }
+    let work = normalize_logical(workdir);
+    let (logical, confined) = if user == "/workspace" {
+        (work.clone(), true)
+    } else if let Some(rest) = user.strip_prefix("/workspace/") {
+        (format!("{}/{}", work.trim_end_matches('/'), rest), true)
+    } else if user.starts_with('/') {
+        (user.to_string(), false)
+    } else {
+        (format!("{}/{}", work.trim_end_matches('/'), user), true)
+    };
+    let clean = normalize_logical(&logical);
+    if confined {
+        if clean == work {
+            return Err(WatchPathError::Invalid(
+                "refusing to remove workspace root".into(),
+            ));
+        }
+        if !clean.starts_with(&(work.trim_end_matches('/').to_string() + "/")) {
+            return Err(WatchPathError::Invalid(
+                "path escapes sandbox work tree".into(),
+            ));
+        }
+    }
+    if is_special_abs(&clean) {
+        return Err(WatchPathError::Invalid(
+            "refusing to remove proc, dev, or sys".into(),
+        ));
+    }
+    let clean_path = Path::new(&clean);
+    let Some(file_name) = clean_path.file_name() else {
+        return Err(WatchPathError::Invalid("cannot remove root path".into()));
+    };
+    let parent = clean_path.parent().unwrap_or_else(|| Path::new("/"));
+    let real_parent = canonicalize_deepest_ancestor(parent)?;
+    if is_special_abs(&real_parent.to_string_lossy()) {
+        return Err(WatchPathError::Invalid(
+            "refusing to remove proc, dev, or sys".into(),
+        ));
+    }
+    if confined {
+        let real_work = std::fs::canonicalize(&work).unwrap_or_else(|_| PathBuf::from(&work));
+        if real_parent != real_work && !real_parent.starts_with(&real_work) {
+            return Err(WatchPathError::Invalid(
+                "path escapes sandbox work tree".into(),
+            ));
+        }
+    }
+    Ok(real_parent.join(file_name))
+}
+
+pub fn handle_remove(stream: &mut TcpStream, req: &HttpRequest, config: &DaemonConfig) {
+    let json = match parse_watch_body(req) {
+        Ok(j) => j,
+        Err(e) => {
+            write_watch_error(stream, WatchPathError::Invalid(e));
+            return;
+        }
+    };
+    let user_path = json_str(&json, &["path"]).unwrap_or("");
+    let target = match resolve_remove_path(&config.workdir, user_path) {
+        Ok(p) => p,
+        Err(e) => {
+            write_watch_error(stream, e);
+            return;
+        }
+    };
+    let meta = match std::fs::symlink_metadata(&target) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_watch_error(
+                stream,
+                WatchPathError::NotFound("file or directory not found".into()),
+            );
+            return;
+        }
+        Err(e) => {
+            write_watch_error(stream, WatchPathError::Invalid(e.to_string()));
+            return;
+        }
+    };
+    let res = if meta.file_type().is_symlink() || !meta.is_dir() {
+        std::fs::remove_file(&target)
+    } else {
+        std::fs::remove_dir_all(&target)
+    };
+    if let Err(e) = res {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            write_watch_error(
+                stream,
+                WatchPathError::NotFound("file or directory not found".into()),
+            );
+        } else {
+            write_watch_error(stream, WatchPathError::Invalid(e.to_string()));
+        }
+        return;
+    }
+    write_unary_connect_response(stream, req, "200 OK", "{}");
+}
+
 pub fn handle_create_watcher(
     stream: &mut TcpStream,
     req: &HttpRequest,
