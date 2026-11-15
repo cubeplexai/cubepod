@@ -798,8 +798,8 @@ pub fn handle_connectrpc_process_start(
     }
 
     let end_json = format!(
-        r#"{{"event":{{"end":{{"exitCode":{},"exit_code":{},"exited":true}}}}}}"#,
-        exit_code, exit_code
+        r#"{{"event":{{"end":{{"exitCode":{},"exited":true}}}}}}"#,
+        exit_code
     );
     let end_frame = make_connect_frame(end_json.as_bytes(), false);
     let _ = stream.write_all(&end_frame);

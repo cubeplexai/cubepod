@@ -2,12 +2,14 @@ package gateway
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -637,5 +639,182 @@ func TestConnectRPC_DirectRESTFiles_Compatibility(t *testing.T) {
 	defer listResp.Body.Close()
 	if listResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK for GET /files/list, got %d", listResp.StatusCode)
+	}
+}
+
+func TestFiles_OfficialSDK_POSTFiles_MultipartAndOctetStream(t *testing.T) {
+	_, ts, rec := setupTestServerWithSandbox(t)
+
+	// 1. Official-style multipart upload (single file with path query parameter)
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "/workspace/compat-smoke.txt")
+	if err != nil {
+		t.Fatalf("failed to create form file: %v", err)
+	}
+	_, _ = part.Write([]byte("hello-from-compat-smoke"))
+	writer.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/files?path=/workspace/compat-smoke.txt", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /files multipart failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for multipart POST /files, got %d", resp.StatusCode)
+	}
+
+	var writeRes []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&writeRes); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if len(writeRes) != 1 || writeRes[0]["name"] != "compat-smoke.txt" || writeRes[0]["path"] != "/workspace/compat-smoke.txt" || writeRes[0]["type"] != "file" {
+		t.Fatalf("unexpected write response: %+v", writeRes)
+	}
+
+	// Read back to verify
+	getReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/files?path=/workspace/compat-smoke.txt", nil)
+	getReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	getResp, err := http.DefaultClient.Do(getReq)
+	if err != nil || getResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /files failed: status=%d err=%v", getResp.StatusCode, err)
+	}
+	content, _ := io.ReadAll(getResp.Body)
+	getResp.Body.Close()
+	if string(content) != "hello-from-compat-smoke" {
+		t.Fatalf("expected 'hello-from-compat-smoke', got %q", string(content))
+	}
+
+	// 2. Official-style multipart upload with multiple files
+	bodyMulti := &bytes.Buffer{}
+	writerMulti := multipart.NewWriter(bodyMulti)
+	p1, _ := writerMulti.CreateFormFile("file", "/workspace/multi1.txt")
+	_, _ = p1.Write([]byte("file1-content"))
+	p2, _ := writerMulti.CreateFormFile("file", "/workspace/multi2.txt")
+	_, _ = p2.Write([]byte("file2-content"))
+	writerMulti.Close()
+
+	reqMulti, _ := http.NewRequest(http.MethodPost, ts.URL+"/files", bodyMulti)
+	reqMulti.Header.Set("Content-Type", writerMulti.FormDataContentType())
+	reqMulti.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+
+	respMulti, err := http.DefaultClient.Do(reqMulti)
+	if err != nil {
+		t.Fatalf("POST /files multi failed: %v", err)
+	}
+	defer respMulti.Body.Close()
+	if respMulti.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for multi POST /files, got %d", respMulti.StatusCode)
+	}
+	var multiRes []map[string]interface{}
+	if err := json.NewDecoder(respMulti.Body).Decode(&multiRes); err != nil {
+		t.Fatalf("failed to decode multi response: %v", err)
+	}
+	if len(multiRes) != 2 {
+		t.Fatalf("expected 2 written files, got %+v", multiRes)
+	}
+
+	// 3. Octet-stream upload with gzip compression
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	_, _ = gw.Write([]byte("streamed-gzipped-content"))
+	gw.Close()
+
+	reqGz, _ := http.NewRequest(http.MethodPost, ts.URL+"/files?path=/workspace/gzipped.txt", &gzBuf)
+	reqGz.Header.Set("Content-Type", "application/octet-stream")
+	reqGz.Header.Set("Content-Encoding", "gzip")
+	reqGz.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+
+	respGz, err := http.DefaultClient.Do(reqGz)
+	if err != nil {
+		t.Fatalf("POST /files gzip failed: %v", err)
+	}
+	defer respGz.Body.Close()
+	if respGz.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK for gzip POST /files, got %d", respGz.StatusCode)
+	}
+	var gzRes []map[string]interface{}
+	if err := json.NewDecoder(respGz.Body).Decode(&gzRes); err != nil {
+		t.Fatalf("failed to decode gzip response: %v", err)
+	}
+	if len(gzRes) != 1 || gzRes[0]["name"] != "gzipped.txt" || gzRes[0]["type"] != "file" {
+		t.Fatalf("unexpected gzip write response: %+v", gzRes)
+	}
+
+	// Read back to verify decompressed file
+	getGzReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/files?path=/workspace/gzipped.txt", nil)
+	getGzReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	getGzResp, err := http.DefaultClient.Do(getGzReq)
+	if err != nil || getGzResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /files gzipped failed: status=%d err=%v", getGzResp.StatusCode, err)
+	}
+	gzContent, _ := io.ReadAll(getGzResp.Body)
+	getGzResp.Body.Close()
+	if string(gzContent) != "streamed-gzipped-content" {
+		t.Fatalf("expected 'streamed-gzipped-content', got %q", string(gzContent))
+	}
+}
+
+func TestFiles_MockPoddForwarding(t *testing.T) {
+	srv, ts, rec := setupTestServerWithSandbox(t)
+
+	var (
+		poddPostHit  bool
+		receivedPath string
+	)
+	mockPodd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/files" {
+			poddPostHit = true
+			receivedPath = r.URL.Query().Get("path")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]map[string]interface{}{
+				{
+					"name": filepath.Base(receivedPath),
+					"path": receivedPath,
+					"type": "file",
+				},
+			})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer mockPodd.Close()
+
+	srv.SetPoddURL(rec.SandboxID, mockPodd.URL)
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, _ := writer.CreateFormFile("file", "/workspace/forward-smoke.txt")
+	_, _ = part.Write([]byte("forwarded content"))
+	writer.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/files?path=/workspace/forward-smoke.txt", body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /files forward failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from forwarded podd, got %d", resp.StatusCode)
+	}
+	if !poddPostHit {
+		t.Fatalf("expected mock podd to receive POST /v1/files")
+	}
+	if receivedPath != "/workspace/forward-smoke.txt" {
+		t.Fatalf("expected path /workspace/forward-smoke.txt, got %s", receivedPath)
+	}
+	var fwdRes []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&fwdRes); err != nil {
+		t.Fatalf("failed to decode forwarded response: %v", err)
+	}
+	if len(fwdRes) != 1 || fwdRes[0]["name"] != "forward-smoke.txt" {
+		t.Fatalf("unexpected forwarded response: %+v", fwdRes)
 	}
 }

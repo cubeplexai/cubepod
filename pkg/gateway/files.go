@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path"
@@ -85,6 +87,112 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 	var bodyBytes []byte
 	if r.Body != nil {
 		bodyBytes, _ = io.ReadAll(r.Body)
+	}
+
+	ct := r.Header.Get("Content-Type")
+	mediaType, params, _ := mime.ParseMediaType(ct)
+	if strings.HasPrefix(mediaType, "multipart/") {
+		mr := multipart.NewReader(bytes.NewReader(bodyBytes), params["boundary"])
+		var written []struct {
+			name string
+			path string
+		}
+		for {
+			part, err := mr.NextPart()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				http.Error(w, "invalid multipart form: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			partBytes, err := io.ReadAll(part)
+			if err != nil {
+				http.Error(w, "failed to read multipart part: "+err.Error(), http.StatusBadRequest)
+				return
+			}
+			if part.Header.Get("Content-Encoding") == "gzip" || (len(partBytes) >= 2 && partBytes[0] == 0x1f && partBytes[1] == 0x8b) {
+				if gz, err := gzip.NewReader(bytes.NewReader(partBytes)); err == nil {
+					if decompressed, err := io.ReadAll(gz); err == nil {
+						partBytes = decompressed
+					}
+					gz.Close()
+				}
+			}
+			partFilename := part.FileName()
+			destPath := targetPath
+			if partFilename != "" {
+				if filepath.IsAbs(partFilename) || strings.HasPrefix(partFilename, "/") {
+					destPath = partFilename
+				} else if targetPath != "" {
+					if strings.HasSuffix(targetPath, "/") {
+						destPath = path.Join(targetPath, partFilename)
+					} else if filepath.Base(targetPath) == partFilename {
+						destPath = targetPath
+					} else {
+						destPath = path.Join(targetPath, partFilename)
+					}
+				} else {
+					destPath = path.Join("/workspace", partFilename)
+				}
+			}
+			if destPath == "" {
+				continue
+			}
+			fullPath, err := s.resolveFilePath(rec, destPath)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if err := os.WriteFile(fullPath, partBytes, 0644); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			written = append(written, struct {
+				name string
+				path string
+			}{
+				name: filepath.Base(destPath),
+				path: destPath,
+			})
+		}
+		if len(written) == 0 {
+			http.Error(w, "no file parts found in multipart request", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/files" {
+			var resp []map[string]interface{}
+			for _, f := range written {
+				resp = append(resp, map[string]interface{}{
+					"name":     f.name,
+					"type":     "file",
+					"path":     f.path,
+					"metadata": map[string]string{},
+				})
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ok",
+			"path":   written[0].path,
+			"size":   len(written),
+		})
+		return
+	}
+
+	if r.Header.Get("Content-Encoding") == "gzip" || (len(bodyBytes) >= 2 && bodyBytes[0] == 0x1f && bodyBytes[1] == 0x8b && (strings.Contains(ct, "octet-stream") || r.Header.Get("Content-Encoding") == "gzip")) {
+		if gz, err := gzip.NewReader(bytes.NewReader(bodyBytes)); err == nil {
+			if decompressed, err := io.ReadAll(gz); err == nil {
+				bodyBytes = decompressed
+			}
+			gz.Close()
+		}
 	}
 
 	var contentBytes []byte
