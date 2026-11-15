@@ -82,8 +82,27 @@ func (s *Server) ConfigureE2BVolumes(cfg E2BVolumeConfig) error {
 	for id := range s.sandboxes {
 		active[id] = struct{}{}
 	}
+	reconciler := s.reconciler
 	s.mu.Unlock()
-	st.ReconcileMounts(active)
+
+	shouldReconcile := true
+	if reconciler != nil && reconciler.KubeClient() != nil {
+		boxes, listErr := reconciler.KubeClient().ListPodBoxes(context.Background(), reconciler.Namespace())
+		if listErr != nil {
+			// Avoid wiping persisted mounts.json if the API server is temporarily unreachable on boot.
+			slog.Warn("skipping e2b mount reconciliation: failed to list PodBoxes", "err", listErr)
+			shouldReconcile = false
+		} else {
+			for _, box := range boxes {
+				if box.Metadata.Name != "" {
+					active[box.Metadata.Name] = struct{}{}
+				}
+			}
+		}
+	}
+	if shouldReconcile {
+		st.ReconcileMounts(active)
+	}
 	s.e2b.Store(st)
 	return nil
 }
@@ -303,6 +322,21 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("volumeID")
+	if s.reconciler != nil && s.reconciler.KubeClient() != nil {
+		boxes, listErr := s.reconciler.KubeClient().ListPodBoxes(r.Context(), s.reconciler.Namespace())
+		if listErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to verify active PodBox mounts")
+			return
+		}
+		for _, box := range boxes {
+			for _, m := range box.Spec.E2BVolumeMounts {
+				if m.VolumeID == id {
+					writeError(w, http.StatusConflict, "volume is mounted by a sandbox")
+					return
+				}
+			}
+		}
+	}
 	vol, err := st.Delete(key, id)
 	if err != nil {
 		writeVolumeMgmtError(w, err, "")

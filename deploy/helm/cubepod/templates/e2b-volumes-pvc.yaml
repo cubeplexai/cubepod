@@ -4,6 +4,8 @@ kind: PersistentVolumeClaim
 metadata:
   name: {{ .Values.e2bVolumes.pvcName }}
   namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/resource-policy": keep
   labels:
     {{- include "cubepod.labels" . | nindent 4 }}
     app.kubernetes.io/component: e2b-volumes

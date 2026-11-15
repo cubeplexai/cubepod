@@ -1011,3 +1011,67 @@ func TestE2BVolumeUploadSizeLimitTenantCapAndSetuidMask(t *testing.T) {
 		t.Fatalf("on-disk file has special mode bits: %v", fi.Mode())
 	}
 }
+
+func TestE2BVolume_RestartPreservesPodBoxMountsAndBlocksDelete(t *testing.T) {
+	dir := t.TempDir()
+	mem := controller.NewMemoryKubeClient()
+	rec := controller.NewReconciler(controller.WithKubeClient(mem), controller.WithNamespace("cubepod-workloads"))
+	srv := gateway.NewServer(rec)
+	srv.SetLivePodRouting(true)
+	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+		Dir:                dir,
+		K8sE2BVolumeMounts: true,
+		SharedPVCName:      "cubepod-e2b-volumes",
+	}); err != nil {
+		t.Fatalf("configure volumes: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Create volume (NotePVC should record cubepod-e2b-volumes) and attach via sandbox create.
+	vol := createVol(t, ts, "key-r", "persist-vol")
+	volID := vol.VolumeID
+
+	sbxBody, _ := json.Marshal(map[string]any{
+		"templateID":   "base",
+		"volumeMounts": []map[string]string{{"name": "persist-vol", "path": "/mnt/ds"}},
+	})
+	sbxResp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", "key-r", sbxBody, "application/json")
+	var sbx map[string]any
+	readJSON(t, sbxResp, &sbx)
+	if sbxResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %+v", sbxResp.StatusCode, sbx)
+	}
+	sbxID, _ := sbx["sandboxID"].(string)
+
+	// Simulate gateway restart: new Server sharing mem (PodBox CRs) and dir (volumes store).
+	rec2 := controller.NewReconciler(controller.WithKubeClient(mem), controller.WithNamespace("cubepod-workloads"))
+	srv2 := gateway.NewServer(rec2)
+	srv2.SetLivePodRouting(true)
+	if err := srv2.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+		Dir:                dir,
+		K8sE2BVolumeMounts: true,
+		SharedPVCName:      "cubepod-e2b-volumes",
+	}); err != nil {
+		t.Fatalf("reconfigure volumes after restart: %v", err)
+	}
+	ts2 := httptest.NewServer(srv2.Handler())
+	defer ts2.Close()
+
+	// Mounts must survive restart.
+	if mounts := srv2.E2BVolumeMounts(sbxID); len(mounts) != 1 || mounts[0].VolumeID != volID {
+		t.Fatalf("expected mounts preserved across gateway restart, got %+v", mounts)
+	}
+
+	// DELETE /volumes/{id} must return 409 Conflict because PodBox CR still references it.
+	delResp := volReq(t, http.MethodDelete, ts2.URL+"/volumes/"+volID, "key-r", nil, "")
+	delResp.Body.Close()
+	if delResp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when deleting mounted volume after restart, got %d", delResp.StatusCode)
+	}
+
+	// Verify PodBox CR still exists.
+	if _, err := mem.GetPodBox(context.Background(), "cubepod-workloads", sbxID); err != nil {
+		t.Fatalf("expected PodBox %s to exist: %v", sbxID, err)
+	}
+}

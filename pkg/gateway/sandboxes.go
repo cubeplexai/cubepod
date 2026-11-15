@@ -840,6 +840,11 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: parentID},
 		NetworkPolicy:    cloneNetworkPolicy(parent.NetworkPolicy),
 	}, parentID)
+	if len(spec.E2BVolumeMounts) == 0 && s.reconciler != nil && s.reconciler.KubeClient() != nil {
+		if parentBox, getErr := s.reconciler.KubeClient().GetPodBox(r.Context(), s.reconciler.Namespace(), parentID); getErr == nil && parentBox != nil && len(parentBox.Spec.E2BVolumeMounts) > 0 {
+			spec.E2BVolumeMounts = append([]v1alpha1.E2BVolumeMount(nil), parentBox.Spec.E2BVolumeMounts...)
+		}
+	}
 	if len(spec.E2BVolumeMounts) > 0 && s.livePodRouting && s.runtime == nil {
 		sharedPVC := s.sharedE2BPVC()
 		for _, m := range spec.E2BVolumeMounts {

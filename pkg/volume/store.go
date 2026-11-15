@@ -444,9 +444,10 @@ func (s *Store) Delete(apiKey, id string) (Volume, error) {
 	return cp, nil
 }
 
-// NotePVC records the filesystem PVC created for this volume.
+// NotePVC records the filesystem PVC (per-volume or shared RWX) for this volume.
 func (s *Store) NotePVC(id, pvcName, namespace string) error {
-	if !volumeIDRe.MatchString(id) || !strings.HasPrefix(pvcName, "e2bvol-") {
+	cleanPVC := strings.TrimSpace(pvcName)
+	if !volumeIDRe.MatchString(id) || cleanPVC == "" || len(cleanPVC) > 253 || strings.ContainsAny(cleanPVC, "/ \t\r\n") {
 		return ErrInvalidName
 	}
 	s.mu.Lock()
@@ -455,7 +456,7 @@ func (s *Store) NotePVC(id, pvcName, namespace string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	rec.meta.PVCName = pvcName
+	rec.meta.PVCName = cleanPVC
 	rec.meta.PVCNamespace = namespace
 	return s.saveMeta(rec)
 }

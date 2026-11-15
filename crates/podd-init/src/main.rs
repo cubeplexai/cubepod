@@ -409,7 +409,13 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
             cfg.default_uid,
             cfg.default_gid,
         )?;
-        unmount_lazy_ignore_missing(&cfg.merged_root_path.join("run/cubepod/volumes"));
+        for m in &e2b_mounts {
+            unmount_lazy_ignore_missing(
+                &cfg.merged_root_path
+                    .join("run/cubepod/volumes")
+                    .join(&m.volume_id),
+            );
+        }
     }
 
     // 6. Perform pivot_root(2) into the merged root.
@@ -668,7 +674,7 @@ pub fn parse_and_validate_e2b_mounts(
     let norm_workspace = normalize_abs_path(workspace_dir, "workspace_dir")?;
 
     let mut seen_targets = HashSet::new();
-    let mut specs = Vec::with_capacity(items.len());
+    let mut specs: Vec<E2BMountSpec> = Vec::with_capacity(items.len());
 
     for (idx, item) in items.into_iter().enumerate() {
         let JsonValue::Object(fields) = item else {
@@ -728,9 +734,18 @@ pub fn parse_and_validate_e2b_mounts(
                 ));
             }
         }
-        if !seen_targets.insert(norm_target.clone()) {
-            return Err(format!("duplicate e2b mount target_path {norm_target:?}"));
+        for prev in &specs {
+            if prev.target_path == norm_target {
+                return Err(format!("duplicate e2b mount target_path {norm_target:?}"));
+            }
+            if paths_overlap(&norm_target, &prev.target_path) {
+                return Err(format!(
+                    "e2b mount target_path {norm_target:?} overlaps mount {:?}",
+                    prev.target_path
+                ));
+            }
         }
+        seen_targets.insert(norm_target.clone());
 
         specs.push(E2BMountSpec {
             volume_id,
@@ -1467,6 +1482,16 @@ mod tests {
         );
         let err = parse_and_validate_e2b_mounts(&dup_raw, "/workspace").unwrap_err();
         assert!(err.contains("duplicate"), "unexpected error: {err}");
+
+        // Overlapping nested target_path between two E2B mounts
+        let nested_raw = format!(
+            r#"[
+                {{"volume_id":"{vid1}","staging_path":"/run/cubepod/volumes/{vid1}","target_path":"/mnt/ds"}},
+                {{"volume_id":"{vid2}","staging_path":"/run/cubepod/volumes/{vid2}","target_path":"/mnt/ds/sub"}}
+            ]"#
+        );
+        let err = parse_and_validate_e2b_mounts(&nested_raw, "/workspace").unwrap_err();
+        assert!(err.contains("overlaps mount"), "unexpected error: {err}");
     }
 
     #[test]
