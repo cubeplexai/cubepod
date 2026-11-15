@@ -339,6 +339,29 @@ func (s *Server) handleConnectRPCDispatch(w http.ResponseWriter, r *http.Request
 	}
 }
 
+func safeSandboxEnv(envs map[string]string, isPTY bool) []string {
+	pathVal := os.Getenv("PATH")
+	if pathVal == "" {
+		pathVal = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+	homeVal := os.Getenv("HOME")
+	if homeVal == "" {
+		homeVal = "/workspace"
+	}
+	out := []string{
+		"PATH=" + pathVal,
+		"HOME=" + homeVal,
+		"LANG=C.UTF-8",
+	}
+	if _, hasTerm := envs["TERM"]; isPTY && !hasTerm {
+		out = append(out, "TERM=xterm-256color")
+	}
+	for k, v := range envs {
+		out = append(out, k+"="+v)
+	}
+	return out
+}
+
 // handleConnectRPCProcessStart handles POST /process.Process/Start.
 func (s *Server) handleConnectRPCProcessStart(w http.ResponseWriter, r *http.Request) {
 	rec, err := s.resolveConnectRPCSandbox(r)
@@ -447,13 +470,7 @@ func (s *Server) handleConnectRPCProcessStart(w http.ResponseWriter, r *http.Req
 		ptyCtx, ptyCancel := context.WithCancel(context.Background())
 		execCmd := exec.CommandContext(ptyCtx, ptyCmdName, ptyCmdArgs...)
 		execCmd.Dir = workdir
-		execCmd.Env = os.Environ()
-		for k, v := range envs {
-			execCmd.Env = append(execCmd.Env, k+"="+v)
-		}
-		if _, hasTerm := envs["TERM"]; !hasTerm {
-			execCmd.Env = append(execCmd.Env, "TERM=xterm-256color")
-		}
+		execCmd.Env = safeSandboxEnv(envs, true)
 		execCmd.Stdin = slaveFile
 		execCmd.Stdout = slaveFile
 		execCmd.Stderr = slaveFile
@@ -496,6 +513,7 @@ func (s *Server) handleConnectRPCProcessStart(w http.ResponseWriter, r *http.Req
 			done:        make(chan struct{}),
 		}
 		s.mu.Lock()
+		s.pruneLocalCommandsLocked()
 		s.commands[cmdID] = entry
 		s.commands[strconv.Itoa(pid)] = entry
 		s.mu.Unlock()
@@ -543,6 +561,7 @@ func (s *Server) handleConnectRPCProcessStart(w http.ResponseWriter, r *http.Req
 			entry.mu.Lock()
 			entry.running = false
 			entry.exitCode = exitCode
+			entry.exitedAt = time.Now()
 			if entry.masterFile != nil {
 				_ = entry.masterFile.Close()
 				entry.masterFile = nil
@@ -591,10 +610,7 @@ func (s *Server) handleConnectRPCProcessStart(w http.ResponseWriter, r *http.Req
 
 	execCmd := exec.CommandContext(ctx, cmdName, cmdArgs...)
 	execCmd.Dir = workdir
-	execCmd.Env = os.Environ()
-	for k, v := range envs {
-		execCmd.Env = append(execCmd.Env, k+"="+v)
-	}
+	execCmd.Env = safeSandboxEnv(envs, false)
 
 	stdoutPipe, err := execCmd.StdoutPipe()
 	if err != nil {
@@ -629,8 +645,10 @@ func (s *Server) handleConnectRPCProcessStart(w http.ResponseWriter, r *http.Req
 		running: true,
 		buf:     &bytes.Buffer{},
 		cancel:  cancel,
+		done:    make(chan struct{}),
 	}
 	s.mu.Lock()
+	s.pruneLocalCommandsLocked()
 	s.commands[cmdID] = entry
 	s.commands[strconv.Itoa(pid)] = entry
 	s.mu.Unlock()
@@ -721,7 +739,11 @@ func (s *Server) handleConnectRPCProcessStart(w http.ResponseWriter, r *http.Req
 	entry.mu.Lock()
 	entry.running = false
 	entry.exitCode = exitCode
+	entry.exitedAt = time.Now()
 	entry.mu.Unlock()
+	if entry.done != nil {
+		close(entry.done)
+	}
 
 	// 3. Send end event
 	endPayload, _ := json.Marshal(map[string]interface{}{
@@ -788,22 +810,17 @@ func (s *Server) handleConnectRPCProcessSendSignal(w http.ResponseWriter, r *htt
 		tag = rpcReq.Process.Selector.Tag
 	}
 
-	s.mu.RLock()
-	var entry *commandEntry
-	if pid > 0 {
-		entry = s.commands[strconv.Itoa(pid)]
+	entry := s.findLocalCommandEntry(rec.SandboxID, pid, tag)
+	if entry == nil {
+		s.writeConnectError(w, http.StatusNotFound, "not_found", "process not found")
+		return
 	}
-	if entry == nil && tag != "" {
-		for _, e := range s.commands {
-			if e.tag == tag {
-				entry = e
-				break
-			}
-		}
-	}
-	s.mu.RUnlock()
 
-	if entry == nil || !entry.running {
+	entry.mu.RLock()
+	running := entry.running
+	entryPid := entry.pid
+	entry.mu.RUnlock()
+	if !running {
 		s.writeConnectError(w, http.StatusNotFound, "not_found", "process not found")
 		return
 	}
@@ -815,21 +832,9 @@ func (s *Server) handleConnectRPCProcessSendSignal(w http.ResponseWriter, r *htt
 		sig = syscall.SIGTERM
 	}
 
-	entry.mu.Lock()
-	entry.running = false
-	entry.exitCode = 128 + int(sig)
-	if entry.cancel != nil {
-		entry.cancel()
-	}
-	if entry.masterFile != nil {
-		_ = entry.masterFile.Close()
-		entry.masterFile = nil
-	}
-	entry.mu.Unlock()
-
-	if entry.pid > 0 {
-		_ = syscall.Kill(-entry.pid, sig)
-		if proc, findErr := os.FindProcess(entry.pid); findErr == nil {
+	if entryPid > 0 {
+		_ = syscall.Kill(-entryPid, sig)
+		if proc, findErr := os.FindProcess(entryPid); findErr == nil {
 			_ = proc.Signal(sig)
 		}
 	}
@@ -881,21 +886,7 @@ func (s *Server) handleConnectRPCProcessConnect(w http.ResponseWriter, r *http.R
 		tag = rpcReq.Process.Selector.Tag
 	}
 
-	s.mu.RLock()
-	var entry *commandEntry
-	if pid > 0 {
-		entry = s.commands[strconv.Itoa(pid)]
-	}
-	if entry == nil && tag != "" {
-		for _, e := range s.commands {
-			if e.tag == tag {
-				entry = e
-				break
-			}
-		}
-	}
-	s.mu.RUnlock()
-
+	entry := s.findLocalCommandEntry(rec.SandboxID, pid, tag)
 	if entry == nil {
 		s.writeConnectError(w, http.StatusNotFound, "not_found", "process not found")
 		return
@@ -916,9 +907,10 @@ func (s *Server) handleConnectRPCProcessConnect(w http.ResponseWriter, r *http.R
 	})
 	s.writeConnectFrameSafe(w, &writeMu, startPayload, false, flusher)
 
-	snap, _, exitCode, sub := entry.snapshotAndSubscribe()
+	snap, running, exitCode, sub := entry.snapshotAndSubscribe()
 	entry.mu.RLock()
 	isPTY := entry.isPTY
+	doneCh := entry.done
 	entry.mu.RUnlock()
 
 	if len(snap) > 0 {
@@ -940,6 +932,45 @@ func (s *Server) handleConnectRPCProcessConnect(w http.ResponseWriter, r *http.R
 		s.streamLocalPTY(w, r, entry, sub, flusher, &writeMu)
 		return
 	} else {
+		if running && doneCh != nil {
+			sentLen := len(snap)
+			ticker := time.NewTicker(25 * time.Millisecond)
+			defer ticker.Stop()
+		waitLoop:
+			for {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-doneCh:
+					entry.mu.RLock()
+					var tail []byte
+					if entry.buf != nil && entry.buf.Len() > sentLen {
+						b := entry.buf.Bytes()
+						tail = append([]byte(nil), b[sentLen:]...)
+					}
+					exitCode = entry.exitCode
+					entry.mu.RUnlock()
+					if len(tail) > 0 {
+						_ = s.writeStreamData(w, &writeMu, flusher, "stdout", tail)
+					}
+					break waitLoop
+				case <-ticker.C:
+					entry.mu.RLock()
+					var chunk []byte
+					if entry.buf != nil && entry.buf.Len() > sentLen {
+						b := entry.buf.Bytes()
+						chunk = append([]byte(nil), b[sentLen:]...)
+						sentLen += len(chunk)
+					}
+					entry.mu.RUnlock()
+					if len(chunk) > 0 {
+						if !s.writeStreamData(w, &writeMu, flusher, "stdout", chunk) {
+							return
+						}
+					}
+				}
+			}
+		}
 		endPayload, _ := json.Marshal(map[string]interface{}{
 			"event": map[string]interface{}{
 				"end": map[string]interface{}{
@@ -983,6 +1014,9 @@ func (s *Server) handleConnectRPCProcessList(w http.ResponseWriter, r *http.Requ
 	var procs []procInfo
 	seen := make(map[int]bool)
 	for _, cmd := range s.commands {
+		if cmd.sandboxID != rec.SandboxID {
+			continue
+		}
 		cmd.mu.RLock()
 		if cmd.running && cmd.pid > 0 && !seen[cmd.pid] {
 			seen[cmd.pid] = true
@@ -1067,22 +1101,17 @@ func (s *Server) handleConnectRPCProcessSendInput(w http.ResponseWriter, r *http
 		tag = rpcReq.Process.Selector.Tag
 	}
 
-	s.mu.RLock()
-	var entry *commandEntry
-	if pid > 0 {
-		entry = s.commands[strconv.Itoa(pid)]
+	entry := s.findLocalCommandEntry(rec.SandboxID, pid, tag)
+	if entry == nil {
+		s.writeConnectError(w, http.StatusNotFound, "not_found", "process not found")
+		return
 	}
-	if entry == nil && tag != "" {
-		for _, e := range s.commands {
-			if e.tag == tag {
-				entry = e
-				break
-			}
-		}
-	}
-	s.mu.RUnlock()
 
-	if entry == nil || !entry.running {
+	entry.mu.RLock()
+	running := entry.running
+	mf := entry.masterFile
+	entry.mu.RUnlock()
+	if !running {
 		s.writeConnectError(w, http.StatusNotFound, "not_found", "process not found")
 		return
 	}
@@ -1097,13 +1126,18 @@ func (s *Server) handleConnectRPCProcessSendInput(w http.ResponseWriter, r *http
 	if rawB64 == "" {
 		rawB64 = rpcReq.Stdin
 	}
-	data, _ := base64.StdEncoding.DecodeString(rawB64)
-
-	entry.mu.RLock()
-	if entry.masterFile != nil && len(data) > 0 {
-		_, _ = entry.masterFile.Write(data)
+	data, err := base64.StdEncoding.DecodeString(rawB64)
+	if err != nil {
+		s.writeConnectError(w, http.StatusBadRequest, "invalid_argument", "invalid base64 input: "+err.Error())
+		return
 	}
-	entry.mu.RUnlock()
+
+	if mf != nil && len(data) > 0 {
+		if _, err := mf.Write(data); err != nil {
+			s.writeConnectError(w, http.StatusInternalServerError, "internal", "failed to write pty input: "+err.Error())
+			return
+		}
+	}
 
 	s.writeUnaryResponse(w, r, map[string]interface{}{})
 }
@@ -1163,22 +1197,8 @@ func (s *Server) handleConnectRPCProcessUpdate(w http.ResponseWriter, r *http.Re
 		tag = rpcReq.Process.Selector.Tag
 	}
 
-	s.mu.RLock()
-	var entry *commandEntry
-	if pid > 0 {
-		entry = s.commands[strconv.Itoa(pid)]
-	}
-	if entry == nil && tag != "" {
-		for _, e := range s.commands {
-			if e.tag == tag {
-				entry = e
-				break
-			}
-		}
-	}
-	s.mu.RUnlock()
-
-	if entry == nil || !entry.running {
+	entry := s.findLocalCommandEntry(rec.SandboxID, pid, tag)
+	if entry == nil {
 		s.writeConnectError(w, http.StatusNotFound, "not_found", "process not found")
 		return
 	}
@@ -1193,18 +1213,26 @@ func (s *Server) handleConnectRPCProcessUpdate(w http.ResponseWriter, r *http.Re
 	}
 
 	entry.mu.RLock()
-	if entry.masterFile != nil {
+	running := entry.running
+	mf := entry.masterFile
+	entryPid := entry.pid
+	entry.mu.RUnlock()
+	if !running {
+		s.writeConnectError(w, http.StatusNotFound, "not_found", "process not found")
+		return
+	}
+
+	if mf != nil {
 		ws := &unix.Winsize{
 			Row: uint16(rows),
 			Col: uint16(cols),
 		}
-		_ = unix.IoctlSetWinsize(int(entry.masterFile.Fd()), unix.TIOCSWINSZ, ws)
+		_ = unix.IoctlSetWinsize(int(mf.Fd()), unix.TIOCSWINSZ, ws)
 	}
-	entry.mu.RUnlock()
 
-	if entry.pid > 0 {
-		_ = syscall.Kill(-entry.pid, syscall.SIGWINCH)
-		_ = syscall.Kill(entry.pid, syscall.SIGWINCH)
+	if entryPid > 0 {
+		_ = syscall.Kill(-entryPid, syscall.SIGWINCH)
+		_ = syscall.Kill(entryPid, syscall.SIGWINCH)
 	}
 
 	s.writeUnaryResponse(w, r, map[string]interface{}{})
@@ -1293,19 +1321,7 @@ func (s *Server) handleConnectRPCProcessStreamInput(w http.ResponseWriter, r *ht
 				if tag == "" {
 					tag = startObj.Process.Selector.Tag
 				}
-				s.mu.RLock()
-				if pid > 0 {
-					currentEntry = s.commands[strconv.Itoa(pid)]
-				}
-				if currentEntry == nil && tag != "" {
-					for _, e := range s.commands {
-						if e.tag == tag {
-							currentEntry = e
-							break
-						}
-					}
-				}
-				s.mu.RUnlock()
+				currentEntry = s.findLocalCommandEntry(rec.SandboxID, pid, tag)
 			} else if dataObj != nil && currentEntry != nil {
 				rawB64 := dataObj.Input.Pty
 				if rawB64 == "" {
@@ -1317,12 +1333,21 @@ func (s *Server) handleConnectRPCProcessStreamInput(w http.ResponseWriter, r *ht
 				if rawB64 == "" {
 					rawB64 = dataObj.Stdin
 				}
-				data, _ := base64.StdEncoding.DecodeString(rawB64)
-				currentEntry.mu.RLock()
-				if currentEntry.masterFile != nil && len(data) > 0 {
-					_, _ = currentEntry.masterFile.Write(data)
+				data, err := base64.StdEncoding.DecodeString(rawB64)
+				if err != nil {
+					s.writeConnectError(w, http.StatusBadRequest, "invalid_argument", "invalid base64 input: "+err.Error())
+					return
 				}
+				currentEntry.mu.RLock()
+				running := currentEntry.running
+				mf := currentEntry.masterFile
 				currentEntry.mu.RUnlock()
+				if running && mf != nil && len(data) > 0 {
+					if _, err := mf.Write(data); err != nil {
+						s.writeConnectError(w, http.StatusInternalServerError, "internal", "failed to write pty input: "+err.Error())
+						return
+					}
+				}
 			}
 		}
 	}
@@ -1341,7 +1366,7 @@ func (s *Server) handleConnectRPCProcessCloseStdin(w http.ResponseWriter, r *htt
 		s.forwardConnectRPCToPodd(w, r, poddURL)
 		return
 	}
-	s.writeUnaryResponse(w, r, map[string]interface{}{})
+	s.writeConnectError(w, http.StatusNotImplemented, "unimplemented", "close stdin is not supported")
 }
 
 // handleConnectRPCFilesystemRead handles POST /filesystem.Filesystem/Read.

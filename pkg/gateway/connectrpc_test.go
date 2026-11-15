@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -269,13 +270,14 @@ func TestConnectRPC_ProcessSendSignalAndConnect(t *testing.T) {
 	defer cancel()
 
 	cmdEntry := &commandEntry{
-		id:       cmdID,
-		cmdID:    cmdID,
-		pid:      9999,
-		running:  true,
-		buf:      bytes.NewBufferString("background output"),
-		cancel:   cancel,
-		exitCode: 0,
+		id:        cmdID,
+		cmdID:     cmdID,
+		pid:       9999,
+		sandboxID: rec.SandboxID,
+		running:   true,
+		buf:       bytes.NewBufferString("background output"),
+		cancel:    cancel,
+		exitCode:  0,
 	}
 	srv.mu.Lock()
 	srv.commands["9999"] = cmdEntry
@@ -335,11 +337,12 @@ func TestConnectRPC_ProcessList(t *testing.T) {
 
 	srv.mu.Lock()
 	srv.commands["1001"] = &commandEntry{
-		id:      "cmd-1001",
-		cmdID:   "cmd-1001",
-		pid:     1001,
-		running: true,
-		buf:     &bytes.Buffer{},
+		id:        "cmd-1001",
+		cmdID:     "cmd-1001",
+		pid:       1001,
+		sandboxID: rec.SandboxID,
+		running:   true,
+		buf:       &bytes.Buffer{},
 	}
 	srv.mu.Unlock()
 
@@ -1387,4 +1390,249 @@ func TestConnectRPC_PTY_StreamInput(t *testing.T) {
 	sigReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
 	sigResp, _ := http.DefaultClient.Do(sigReq)
 	sigResp.Body.Close()
+}
+
+func TestConnectRPC_PTY_SandboxIsolation_And_EnvSanitization(t *testing.T) {
+	t.Setenv("CUBEPOD_TEST_GATEWAY_SECRET", "top-secret-value")
+
+	srv, ts, recA := setupTestServerWithSandbox(t)
+	recB := &SandboxRecord{
+		SandboxID:    "sb-other-isolation",
+		TemplateID:   "base",
+		State:        "running",
+		WorkspaceDir: t.TempDir(),
+	}
+	srv.mu.Lock()
+	srv.sandboxes[recB.SandboxID] = recB
+	srv.mu.Unlock()
+
+	// Start a PTY in sandbox A with tag "pty-a"
+	startBody, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{
+			"cmd":  "/bin/sh",
+			"args": []string{"-c", "echo SECRET=${CUBEPOD_TEST_GATEWAY_SECRET:-unset}; sleep 5"},
+		},
+		"pty": map[string]interface{}{
+			"size": map[string]interface{}{"cols": 80, "rows": 24},
+		},
+		"tag": "pty-a",
+	})
+	reqA, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Start", bytes.NewReader(startBody))
+	reqA.Header.Set("Content-Type", "application/connect+json")
+	reqA.Header.Set("E2b-Sandbox-Id", recA.SandboxID)
+	respA, err := http.DefaultClient.Do(reqA)
+	if err != nil {
+		t.Fatalf("Start PTY A failed: %v", err)
+	}
+	defer respA.Body.Close()
+	if respA.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", respA.StatusCode)
+	}
+
+	var pid int
+	out, err := waitForPtyOutput(respA.Body, func(s string) bool {
+		if pid == 0 {
+			// parse start pid if needed via List
+		}
+		return strings.Contains(s, "SECRET=unset")
+	}, 5*time.Second)
+	if err != nil {
+		t.Fatalf("expected SECRET=unset (gateway env must not leak), got err=%v out=%q", err, out)
+	}
+	if strings.Contains(out, "top-secret-value") {
+		t.Fatalf("gateway secret leaked into PTY env: %q", out)
+	}
+
+	// List from A sees the process; List from B sees empty
+	listA := func(sbID string) []map[string]interface{} {
+		lReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/List", bytes.NewReader([]byte("{}")))
+		lReq.Header.Set("Content-Type", "application/json")
+		lReq.Header.Set("E2b-Sandbox-Id", sbID)
+		lResp, err := http.DefaultClient.Do(lReq)
+		if err != nil {
+			t.Fatalf("List failed: %v", err)
+		}
+		defer lResp.Body.Close()
+		var lr struct {
+			Processes []map[string]interface{} `json:"processes"`
+		}
+		_ = json.NewDecoder(lResp.Body).Decode(&lr)
+		return lr.Processes
+	}
+	procsA := listA(recA.SandboxID)
+	if len(procsA) != 1 {
+		t.Fatalf("expected 1 process in sandbox A, got %d", len(procsA))
+	}
+	pid = int(procsA[0]["pid"].(float64))
+	if procsB := listA(recB.SandboxID); len(procsB) != 0 {
+		t.Fatalf("sandbox B must not see sandbox A's processes, got %+v", procsB)
+	}
+
+	// Sandbox B cannot SendInput, Update, Connect, or SendSignal to sandbox A's pid or tag
+	for _, tc := range []struct {
+		path string
+		body map[string]interface{}
+	}{
+		{"/process.Process/SendInput", map[string]interface{}{"process": map[string]interface{}{"pid": pid}, "input": map[string]interface{}{"pty": base64.StdEncoding.EncodeToString([]byte("x"))}}},
+		{"/process.Process/Update", map[string]interface{}{"process": map[string]interface{}{"pid": pid}, "pty": map[string]interface{}{"size": map[string]interface{}{"cols": 100, "rows": 30}}}},
+		{"/process.Process/Connect", map[string]interface{}{"process": map[string]interface{}{"tag": "pty-a"}}},
+		{"/process.Process/SendSignal", map[string]interface{}{"process": map[string]interface{}{"pid": pid}, "signal": 9}},
+	} {
+		b, _ := json.Marshal(tc.body)
+		cReq, _ := http.NewRequest(http.MethodPost, ts.URL+tc.path, bytes.NewReader(b))
+		cReq.Header.Set("Content-Type", "application/json")
+		cReq.Header.Set("E2b-Sandbox-Id", recB.SandboxID)
+		cResp, err := http.DefaultClient.Do(cReq)
+		if err != nil {
+			t.Fatalf("%s failed: %v", tc.path, err)
+		}
+		cResp.Body.Close()
+		if cResp.StatusCode != http.StatusNotFound {
+			t.Errorf("cross-sandbox %s: expected 404, got %d", tc.path, cResp.StatusCode)
+		}
+	}
+
+	// Cleanup A
+	killB, _ := json.Marshal(map[string]interface{}{"process": map[string]interface{}{"pid": pid}, "signal": 9})
+	kReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendSignal", bytes.NewReader(killB))
+	kReq.Header.Set("Content-Type", "application/json")
+	kReq.Header.Set("E2b-Sandbox-Id", recA.SandboxID)
+	kResp, _ := http.DefaultClient.Do(kReq)
+	kResp.Body.Close()
+}
+
+func TestConnectRPC_PTY_ConcurrentSendInputAndKill_NoRace(t *testing.T) {
+	_, ts, rec := setupTestServerWithSandbox(t)
+	startBody, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{"cmd": "/bin/cat"},
+		"pty":     map[string]interface{}{"size": map[string]interface{}{"cols": 80, "rows": 24}},
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Start", bytes.NewReader(startBody))
+	req.Header.Set("Content-Type", "application/connect+json")
+	req.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read start frame for pid
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(resp.Body, hdr); err != nil {
+		t.Fatalf("read start hdr: %v", err)
+	}
+	n := int(hdr[1])<<24 | int(hdr[2])<<16 | int(hdr[3])<<8 | int(hdr[4])
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(resp.Body, payload); err != nil {
+		t.Fatalf("read start payload: %v", err)
+	}
+	var startEv struct {
+		Event struct {
+			Start struct {
+				Pid int `json:"pid"`
+			} `json:"start"`
+		} `json:"event"`
+	}
+	_ = json.Unmarshal(payload, &startEv)
+	pid := startEv.Event.Start.Pid
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		inBody, _ := json.Marshal(map[string]interface{}{
+			"process": map[string]interface{}{"pid": pid},
+			"input":   map[string]interface{}{"pty": base64.StdEncoding.EncodeToString([]byte("ping\n"))},
+		})
+		for i := 0; i < 20; i++ {
+			r, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendInput", bytes.NewReader(inBody))
+			r.Header.Set("Content-Type", "application/json")
+			r.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+			resp, err := http.DefaultClient.Do(r)
+			if err == nil {
+				resp.Body.Close()
+			}
+		}
+	}()
+
+	time.Sleep(15 * time.Millisecond)
+	killBody, _ := json.Marshal(map[string]interface{}{"process": map[string]interface{}{"pid": pid}, "signal": 9})
+	kReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/SendSignal", bytes.NewReader(killBody))
+	kReq.Header.Set("Content-Type", "application/json")
+	kReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	kResp, err := http.DefaultClient.Do(kReq)
+	if err != nil {
+		t.Fatalf("SendSignal failed: %v", err)
+	}
+	kResp.Body.Close()
+	wg.Wait()
+}
+
+func TestConnectRPC_Process_ConnectRunningNonPTY_WaitsForExit(t *testing.T) {
+	_, ts, rec := setupTestServerWithSandbox(t)
+	startBody, _ := json.Marshal(map[string]interface{}{
+		"process": map[string]interface{}{
+			"cmd":  "/bin/sh",
+			"args": []string{"-c", "sleep 0.2; echo NON_PTY_DONE; exit 4"},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Start", bytes.NewReader(startBody))
+	req.Header.Set("Content-Type", "application/connect+json")
+	req.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	hdr := make([]byte, 5)
+	if _, err := io.ReadFull(resp.Body, hdr); err != nil {
+		t.Fatalf("read start hdr: %v", err)
+	}
+	n := int(hdr[1])<<24 | int(hdr[2])<<16 | int(hdr[3])<<8 | int(hdr[4])
+	payload := make([]byte, n)
+	_, _ = io.ReadFull(resp.Body, payload)
+	var startEv struct {
+		Event struct {
+			Start struct {
+				Pid int `json:"pid"`
+			} `json:"start"`
+		} `json:"event"`
+	}
+	_ = json.Unmarshal(payload, &startEv)
+	pid := startEv.Event.Start.Pid
+
+	connBody, _ := json.Marshal(map[string]interface{}{"process": map[string]interface{}{"pid": pid}})
+	cReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/process.Process/Connect", bytes.NewReader(connBody))
+	cReq.Header.Set("Content-Type", "application/connect+json")
+	cReq.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+	cResp, err := http.DefaultClient.Do(cReq)
+	if err != nil {
+		t.Fatalf("Connect failed: %v", err)
+	}
+	defer cResp.Body.Close()
+
+	all, _ := io.ReadAll(cResp.Body)
+	frames, err := parseConnectFrames(all)
+	if err != nil {
+		t.Fatalf("parseConnectFrames: %v", err)
+	}
+	var gotExitCode *int
+	for _, f := range frames {
+		var ev struct {
+			Event struct {
+				End *struct {
+					ExitCode int  `json:"exitCode"`
+					Exited   bool `json:"exited"`
+				} `json:"end"`
+			} `json:"event"`
+		}
+		if json.Unmarshal(f.Payload, &ev) == nil && ev.Event.End != nil {
+			c := ev.Event.End.ExitCode
+			gotExitCode = &c
+		}
+	}
+	if gotExitCode == nil || *gotExitCode != 4 {
+		t.Fatalf("expected exitCode 4 from Connect on running non-PTY, got %v", gotExitCode)
+	}
 }

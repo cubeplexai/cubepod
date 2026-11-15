@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -92,6 +93,7 @@ type commandEntry struct {
 	config      map[string]interface{}
 	running     bool
 	exitCode    int
+	exitedAt    time.Time
 	buf         *bytes.Buffer
 	mu          sync.RWMutex
 	cancel      context.CancelFunc
@@ -99,6 +101,69 @@ type commandEntry struct {
 	isPTY       bool
 	subscribers map[*ptySubscriber]struct{}
 	done        chan struct{}
+}
+
+const (
+	localCommandMaxExited   = 256
+	localCommandExitedGrace = 5 * time.Minute
+)
+
+func (s *Server) findLocalCommandEntry(sandboxID string, pid int, tag string) *commandEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if pid > 0 {
+		if e := s.commands[strconv.Itoa(pid)]; e != nil && e.sandboxID == sandboxID {
+			return e
+		}
+	}
+	if tag != "" {
+		for _, e := range s.commands {
+			if e.sandboxID == sandboxID && e.tag == tag {
+				return e
+			}
+		}
+	}
+	return nil
+}
+
+// pruneLocalCommandsLocked evicts exited command entries past the grace period
+// or exceeding localCommandMaxExited. Caller must hold s.mu.Lock().
+func (s *Server) pruneLocalCommandsLocked() {
+	now := time.Now()
+	type exitedItem struct {
+		key string
+		at  time.Time
+	}
+	var kept []exitedItem
+	var toDelete []string
+	for k, e := range s.commands {
+		e.mu.RLock()
+		running := e.running
+		at := e.exitedAt
+		e.mu.RUnlock()
+		if running {
+			continue
+		}
+		if at.IsZero() {
+			at = now
+		}
+		if now.Sub(at) > localCommandExitedGrace {
+			toDelete = append(toDelete, k)
+		} else {
+			kept = append(kept, exitedItem{key: k, at: at})
+		}
+	}
+	if len(kept) > localCommandMaxExited {
+		sort.Slice(kept, func(i, j int) bool {
+			return kept[i].at.Before(kept[j].at)
+		})
+		for _, item := range kept[:len(kept)-localCommandMaxExited] {
+			toDelete = append(toDelete, item.key)
+		}
+	}
+	for _, k := range toDelete {
+		delete(s.commands, k)
+	}
 }
 
 func appendReplay(buf *bytes.Buffer, chunk []byte) {
