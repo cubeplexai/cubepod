@@ -783,3 +783,88 @@ func podNames(mem *controller.MemoryKubeClient) []string {
 	}
 	return names
 }
+
+func TestE2BVolumeLiveK8sGatedOff(t *testing.T) {
+	srv, ts, mem := newVolumeHarness(t, "")
+	srv.SetLivePodRouting(true)
+	keyA := "cpod_test_api_key"
+
+	vol := createVol(t, ts, keyA, "cpod-test-k8s-gated")
+	if _, ok := mem.GetPVC("cubepod-workloads", "e2bvol-"+vol.VolumeID); ok {
+		t.Fatalf("expected no PVC created on live K8s when volumeMounts are gated off")
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"templateID":   "base",
+		"volumeMounts": []map[string]string{{"name": vol.Name, "path": "/mnt/data"}},
+	})
+	resp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", keyA, body, "application/json")
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("expected 501 Not Implemented on live K8s, got %d %s", resp.StatusCode, b)
+	}
+}
+
+func TestE2BVolumeUploadSizeLimitTenantCapAndSetuidMask(t *testing.T) {
+	dir := t.TempDir()
+	mem := controller.NewMemoryKubeClient()
+	rec := controller.NewReconciler(controller.WithKubeClient(mem))
+	srv := gateway.NewServer(rec)
+	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+		Dir:                 dir,
+		MaxFileSizeBytes:    16,
+		MaxVolumesPerTenant: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	key := "cpod_test_api_key"
+	v1 := createVol(t, ts, key, "cpod-test-cap-1")
+	_ = createVol(t, ts, key, "cpod-test-cap-2")
+
+	// 3rd volume hits tenant cap (429).
+	b3, _ := json.Marshal(map[string]string{"name": "cpod-test-cap-3"})
+	resp3 := volReq(t, http.MethodPost, ts.URL+"/volumes", key, b3, "application/json")
+	resp3.Body.Close()
+	if resp3.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on 3rd volume, got %d", resp3.StatusCode)
+	}
+
+	// Upload > 16 bytes returns 413.
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/volumecontent/"+v1.VolumeID+"/file?path=/big", strings.NewReader(strings.Repeat("x", 32)))
+	req.Header.Set("Authorization", "Bearer "+v1.Token)
+	respBig, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respBig.Body.Close()
+	if respBig.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 on oversized upload, got %d", respBig.StatusCode)
+	}
+
+	// uid=0&mode=2541 (0o4755) masks setuid bit to 0o755 on disk and in response.
+	reqSU, _ := http.NewRequest(http.MethodPut, ts.URL+"/volumecontent/"+v1.VolumeID+"/file?path=/su&uid=0&mode=2541", strings.NewReader("hi"))
+	reqSU.Header.Set("Authorization", "Bearer "+v1.Token)
+	respSU, err := http.DefaultClient.Do(reqSU)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ent map[string]any
+	readJSON(t, respSU, &ent)
+	if respSU.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", respSU.StatusCode)
+	}
+	if mode, _ := ent["mode"].(float64); int(mode) != 0o755 {
+		t.Fatalf("expected masked mode 0755 (%d), got %v", 0o755, ent["mode"])
+	}
+	fi, err := os.Lstat(filepath.Join(srv.E2BVolumeDataDir(v1.VolumeID), "su"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
+		t.Fatalf("on-disk file has special mode bits: %v", fi.Mode())
+	}
+}

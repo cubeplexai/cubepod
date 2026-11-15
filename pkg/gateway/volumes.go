@@ -14,13 +14,14 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
-// e2bPVCPrefix is the only PVC name prefix this feature creates or deletes.
-// It is not the sandbox workspace PVC (that one still ends in -workspace-pvc).
-//
-// Live Kata does not mount this claim into the sandbox pod. MemoryKubeClient
-// tests record a volumeMode=Filesystem PVC. Compose/runc mounts the host data
-// directory (or the cpod-test-vol-<id> named volume) instead.
-const e2bPVCPrefix = "e2bvol-"
+// e2bPVCPrefix is the PVC name prefix reserved for E2B volume claims.
+// Official E2B volumeMounts are gated off on the live Kubernetes runtime in
+// Alpha (returning 501 Not Implemented) and no e2bvol-<id> PVCs are created on
+// live K8s; only the Docker runtime and MemoryKubeClient unit tests use them.
+const (
+	e2bPVCPrefix              = "e2bvol-"
+	defaultMaxVolumeFileBytes = 64 << 20 // 64 MiB
+)
 
 // E2BVolumeConfig points the gateway at a durable volume directory.
 type E2BVolumeConfig struct {
@@ -34,6 +35,10 @@ type E2BVolumeConfig struct {
 	DockerPrefix string
 	// DockerHost is DOCKER_HOST. Empty reads the environment inside the store.
 	DockerHost string
+	// MaxFileSizeBytes caps PUT /volumecontent/{id}/file uploads (default 64 MiB).
+	MaxFileSizeBytes int64
+	// MaxVolumesPerTenant caps volumes per API key tenant (default 64).
+	MaxVolumesPerTenant int
 }
 
 // E2BVolumeMount is the runtime attachment for one sandbox mount.
@@ -53,10 +58,11 @@ func (s *Server) ConfigureE2BVolumes(cfg E2BVolumeConfig) error {
 		return errors.New("e2b volume dir is required")
 	}
 	vcfg := volume.Config{
-		HostDir:       cfg.HostDir,
-		DockerVolumes: cfg.DockerVolumes,
-		DockerPrefix:  cfg.DockerPrefix,
-		DockerHost:    cfg.DockerHost,
+		HostDir:             cfg.HostDir,
+		DockerVolumes:       cfg.DockerVolumes,
+		DockerPrefix:        cfg.DockerPrefix,
+		DockerHost:          cfg.DockerHost,
+		MaxVolumesPerTenant: cfg.MaxVolumesPerTenant,
 	}
 	st, err := volume.Open(cfg.Dir, vcfg)
 	if err != nil {
@@ -65,9 +71,29 @@ func (s *Server) ConfigureE2BVolumes(cfg E2BVolumeConfig) error {
 	s.mu.Lock()
 	s.e2bDir = cfg.Dir
 	s.e2bCfg = vcfg
+	s.e2bMaxFileBytes = cfg.MaxFileSizeBytes
+	active := make(map[string]struct{}, len(s.sandboxes))
+	for id := range s.sandboxes {
+		active[id] = struct{}{}
+	}
 	s.mu.Unlock()
+	st.ReconcileMounts(active)
 	s.e2b.Store(st)
 	return nil
+}
+
+func (s *Server) maxVolumeFileBytes() int64 {
+	s.mu.RLock()
+	n := s.e2bMaxFileBytes
+	s.mu.RUnlock()
+	if n <= 0 {
+		return defaultMaxVolumeFileBytes
+	}
+	return n
+}
+
+func (s *Server) isKubeVolumeMountsUnsupported() bool {
+	return s.livePodRouting && s.runtime == nil
 }
 
 // E2BVolumeMounts returns the volumes attached to a sandbox. The compose
@@ -180,6 +206,7 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
 		Name string `json:"name"`
 	}
@@ -280,6 +307,8 @@ func writeVolumeMgmtError(w http.ResponseWriter, err error, name string) {
 		writeError(w, http.StatusConflict, "volume is mounted by a sandbox")
 	case errors.Is(err, volume.ErrUnauthorized):
 		writeError(w, http.StatusUnauthorized, "API key is required")
+	case errors.Is(err, volume.ErrLimitExceeded):
+		writeError(w, http.StatusTooManyRequests, "tenant volume limit exceeded")
 	default:
 		writeError(w, http.StatusInternalServerError, "volume operation failed")
 	}
@@ -347,6 +376,7 @@ func (s *Server) handlePutVolumeFile(w http.ResponseWriter, r *http.Request) {
 		writeContentError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxVolumeFileBytes())
 	ent, err := st.WriteFile(vol.VolumeID, p, r.Body, opts)
 	if err != nil {
 		writeVolumeContentError(w, err)
@@ -445,6 +475,7 @@ func (s *Server) handlePatchVolumePath(w http.ResponseWriter, r *http.Request) {
 		Mode *int `json:"mode"`
 	}
 	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		dec := json.NewDecoder(r.Body)
 		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 			writeContentError(w, http.StatusBadRequest, "invalid json")
@@ -479,7 +510,10 @@ func (s *Server) handleDeleteVolumePath(w http.ResponseWriter, r *http.Request) 
 }
 
 func writeVolumeContentError(w http.ResponseWriter, err error) {
+	var maxErr *http.MaxBytesError
 	switch {
+	case errors.As(err, &maxErr):
+		writeContentError(w, http.StatusRequestEntityTooLarge, "file exceeds maximum allowed size")
 	case errors.Is(err, volume.ErrNotExist):
 		writeContentError(w, http.StatusNotFound, "path not found")
 	case errors.Is(err, volume.ErrInvalidPath):
@@ -531,6 +565,9 @@ func queryBool(r *http.Request, key string) bool {
 }
 
 func (s *Server) ensureE2BVolumePVC(ctx context.Context, st *volume.Store, volumeID string) {
+	if s.isKubeVolumeMountsUnsupported() {
+		return
+	}
 	if s.reconciler == nil || s.reconciler.KubeClient() == nil || volumeID == "" {
 		return
 	}
@@ -582,6 +619,9 @@ func (s *Server) deleteE2BVolumePVC(ctx context.Context, namespace, pvcName, vol
 func (s *Server) planSandboxVolumeMounts(r *http.Request, mounts []sandboxVolumeMountReq) ([]volume.PlannedMount, int, string) {
 	if len(mounts) == 0 {
 		return nil, 0, ""
+	}
+	if s.isKubeVolumeMountsUnsupported() {
+		return nil, http.StatusNotImplemented, "official E2B volumeMounts are not supported on the Kubernetes runtime"
 	}
 	key := managementAPIKey(r)
 	if key == "" {

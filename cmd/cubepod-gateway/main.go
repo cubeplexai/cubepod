@@ -188,6 +188,11 @@ func main() {
 			Dir:     volDir,
 			HostDir: strings.TrimSpace(os.Getenv("CUBEPOD_E2B_VOLUME_HOST_DIR")),
 		}
+		if raw := strings.TrimSpace(os.Getenv("CUBEPOD_E2B_MAX_FILE_BYTES")); raw != "" {
+			if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+				vcfg.MaxFileSizeBytes = n
+			}
+		}
 		switch strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_E2B_DOCKER_VOLUMES"))) {
 		case "1", "true", "yes":
 			vcfg.DockerVolumes = true
@@ -211,13 +216,17 @@ func main() {
 			DefaultImage:        os.Getenv("CUBEPOD_DOCKER_IMAGE"),
 			ContainerNamePrefix: os.Getenv("CUBEPOD_DOCKER_CONTAINER_PREFIX"),
 		}
+		// Test-only overrides for local compose harnesses; production deployments must
+		// keep runtime binary injection (Invariant 2) and dual-volume binding (Invariant 1) enabled.
 		if v := strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_DOCKER_INJECT_BIN"))); v == "0" || v == "false" || v == "no" {
 			f := false
 			cfg.InjectPoddBin = &f
+			slog.Warn("test-only override: CUBEPOD_DOCKER_INJECT_BIN=0 disables runtime binary injection")
 		}
 		if v := strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_DOCKER_BIND_STORAGE"))); v == "0" || v == "false" || v == "no" {
 			f := false
 			cfg.BindSandboxStorage = &f
+			slog.Warn("test-only override: CUBEPOD_DOCKER_BIND_STORAGE=0 disables workspace/rootfs bind storage")
 		}
 		gw.SetRuntime(runtime.NewDockerBackend(cfg))
 		slog.Info("docker runtime enabled", "network", cfg.Network, "image", cfg.DefaultImage)

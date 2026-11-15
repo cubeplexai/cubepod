@@ -263,6 +263,7 @@ type Server struct {
 	e2b              atomic.Pointer[volume.Store]
 	e2bDir           string
 	e2bCfg           volume.Config
+	e2bMaxFileBytes  int64
 	runtime          runtime.Backend
 }
 
