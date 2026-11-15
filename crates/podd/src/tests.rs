@@ -2805,11 +2805,12 @@ fn pty_entry(
     std::sync::Mutex<crate::commands::ProcessEntry>,
 ) {
     use crate::commands::{ProcessEntry, PtyHandle};
-    use std::sync::atomic::AtomicI32;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
 
     let pty = PtyHandle {
-        master_fd: Arc::new(AtomicI32::new(-1)),
+        master: Arc::new(Mutex::new(None)),
+        closed: Arc::new(AtomicBool::new(false)),
         subscribers: Arc::new(Mutex::new(Vec::new())),
     };
     let entry = Mutex::new(ProcessEntry {
@@ -2818,6 +2819,7 @@ fn pty_entry(
         tag: None,
         running,
         exit_code: None,
+        exited_at: None,
         output: Vec::new(),
         cmd: "test".into(),
         args: Vec::new(),
@@ -3431,25 +3433,25 @@ fn test_pty_kill_all_managed() {
     assert!(killed >= 1);
 
     let entry = registry.get_by_pid(pid as u32).expect("pty entry");
-    let master_fd = {
-        let proc = entry.lock().unwrap();
-        proc.pty_handle
-            .as_ref()
-            .unwrap()
-            .master_fd
-            .load(std::sync::atomic::Ordering::SeqCst)
-    };
-    assert_eq!(master_fd, -1, "kill_all_managed must close the PTY master");
-
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     let mut alive = true;
+    let mut master_cleared = false;
     while std::time::Instant::now() < deadline {
         alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-        if !alive {
+        master_cleared = entry
+            .lock()
+            .unwrap()
+            .pty_handle
+            .as_ref()
+            .unwrap()
+            .acquire_master()
+            .is_none();
+        if !alive && master_cleared {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(master_cleared, "kill_all_managed must close the PTY master");
     assert!(!alive, "process must not be alive after kill_all_managed");
 }
 
@@ -3519,8 +3521,6 @@ fn test_pty_subscriber_overflow_sets_flag() {
 
 #[test]
 fn test_pty_start_disconnect_does_not_kill() {
-    use std::sync::atomic::Ordering;
-
     let (addr, registry) = start_test_server("/tmp");
     let (stream, pid) = start_pty(
         &addr,
@@ -3535,18 +3535,15 @@ fn test_pty_start_disconnect_does_not_kill() {
         "closing the Start stream must leave the PTY process running"
     );
     let entry = registry.get_by_pid(pid as u32).expect("entry");
-    let master_fd = entry
+    let has_master = entry
         .lock()
         .unwrap()
         .pty_handle
         .as_ref()
         .unwrap()
-        .master_fd
-        .load(Ordering::SeqCst);
-    assert!(
-        master_fd >= 0,
-        "master fd stays open after stream disconnect"
-    );
+        .acquire_master()
+        .is_some();
+    assert!(has_master, "master fd stays open after stream disconnect");
 
     let input = base64_encode(b"echo STILL_RUNNING\n");
     let send_req = format!(r#"{{"process":{{"pid":{pid}}},"input":{{"pty":"{input}"}}}}"#);
@@ -3586,25 +3583,25 @@ fn test_pty_start_disconnect_does_not_kill() {
         kill_req.as_bytes(),
     );
     assert_eq!(status, 200);
-    let master_fd = entry
-        .lock()
-        .unwrap()
-        .pty_handle
-        .as_ref()
-        .unwrap()
-        .master_fd
-        .load(Ordering::SeqCst);
-    assert_eq!(master_fd, -1, "explicit kill closes the master fd");
-
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     let mut still_alive = true;
+    let mut master_cleared = false;
     while std::time::Instant::now() < deadline {
         still_alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-        if !still_alive {
+        master_cleared = entry
+            .lock()
+            .unwrap()
+            .pty_handle
+            .as_ref()
+            .unwrap()
+            .acquire_master()
+            .is_none();
+        if !still_alive && master_cleared {
             break;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(master_cleared, "explicit kill closes the master fd");
     assert!(!still_alive, "explicit kill must reap the PTY process");
 }
 
@@ -3650,4 +3647,252 @@ fn test_pty_slow_start_consumer_ends_with_resource_exhausted() {
         !saw_end,
         "overflow must not finish as a successful end event"
     );
+}
+
+#[test]
+fn test_pty_background_child_holding_slave_publishes_end_and_reaps() {
+    let (addr, registry) = start_test_server("/tmp");
+    let body = r#"{"process":{"cmd":"/bin/sh","args":["-c","sleep 5 >/dev/null 2>&1 & exit 3"]},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let (mut stream, pid) = start_pty(&addr, body);
+
+    let mut exit_code = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        match read_connect_frame_from_stream(&mut stream) {
+            Ok(Some((0, data))) => {
+                if let Ok(s) = std::str::from_utf8(&data) {
+                    if let Ok(json) = JsonValue::parse(s) {
+                        if let Some(end) = json.get("event").and_then(|e| e.get("end")) {
+                            exit_code = end.get("exitCode").and_then(|v| v.as_i64());
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(Some((2, _))) | Ok(None) => break,
+            Ok(Some(_)) => {}
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        exit_code,
+        Some(3),
+        "End event must be published immediately when main child exits even if background job holds slave"
+    );
+
+    // Ensure child is reaped (not a zombie)
+    let entry = registry.get_by_pid(pid as u32).expect("entry");
+    assert!(!entry.lock().unwrap().running);
+    let _ = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+}
+
+#[test]
+fn test_pty_concurrent_send_input_and_kill_safe() {
+    let (addr, _registry) = start_test_server("/tmp");
+    let body = r#"{"process":{"cmd":"/bin/cat"},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let (_stream, pid) = start_pty(&addr, body);
+
+    let addr_in = addr.clone();
+    let input_handle = std::thread::spawn(move || {
+        let b64 = base64_encode(b"hello\n");
+        let send_req = format!(r#"{{"process":{{"pid":{pid}}},"input":{{"pty":"{b64}"}}}}"#);
+        for _ in 0..30 {
+            let (status, _, _) = post_raw(
+                &addr_in,
+                "/process.Process/SendInput",
+                "application/json",
+                send_req.as_bytes(),
+            );
+            assert!(
+                status == 200 || status == 404 || status == 500,
+                "unexpected status {status}"
+            );
+        }
+    });
+
+    std::thread::sleep(Duration::from_millis(20));
+    let kill_req = format!(r#"{{"process":{{"pid":{pid}}},"signal":"SIGKILL"}}"#);
+    let (status, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    input_handle.join().unwrap();
+}
+
+#[test]
+fn test_pty_send_signal_trapped_sigterm_stays_running() {
+    let (addr, registry) = start_test_server("/tmp");
+    let body = r#"{"process":{"cmd":"/bin/sh","args":["-c","trap '' TERM; sleep 5"]},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let (_stream, pid) = start_pty(&addr, body);
+
+    std::thread::sleep(Duration::from_millis(100));
+    let term_req = format!(r#"{{"process":{{"pid":{pid}}},"signal":"SIGTERM"}}"#);
+    let (status, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        term_req.as_bytes(),
+    );
+    assert_eq!(status, 200);
+
+    std::thread::sleep(Duration::from_millis(150));
+    let entry = registry.get_by_pid(pid as u32).expect("entry");
+    assert!(
+        entry.lock().unwrap().running,
+        "SIGTERM ignored by process must not mark entry dead"
+    );
+
+    let kill_req = format!(r#"{{"process":{{"pid":{pid}}},"signal":"SIGKILL"}}"#);
+    let (status, _, _) = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+    assert_eq!(status, 200);
+}
+
+#[test]
+fn test_process_connect_running_non_pty_waits_for_exit() {
+    let (addr, _registry) = start_test_server("/tmp");
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    let req_body =
+        r#"{"process":{"cmd":"/bin/sh","args":["-c","sleep 0.3; echo DONE_NON_PTY; exit 5"]}}"#;
+    let req = format!(
+        "POST /process.Process/Start HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{req_body}",
+        req_body.len()
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    skip_http_headers_from_stream(&mut stream).unwrap();
+
+    let (_, data0) = read_connect_frame_from_stream(&mut stream)
+        .unwrap()
+        .unwrap();
+    let start_json = JsonValue::parse(std::str::from_utf8(&data0).unwrap()).unwrap();
+    let pid = start_json
+        .get("event")
+        .unwrap()
+        .get("start")
+        .unwrap()
+        .get("pid")
+        .unwrap()
+        .as_u64()
+        .unwrap();
+
+    let mut conn = TcpStream::connect(&addr).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let conn_body = format!(r#"{{"process":{{"pid":{pid}}}}}"#);
+    let conn_req = format!(
+        "POST /process.Process/Connect HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{conn_body}",
+        conn_body.len()
+    );
+    conn.write_all(conn_req.as_bytes()).unwrap();
+    conn.flush().unwrap();
+    skip_http_headers_from_stream(&mut conn).unwrap();
+
+    let mut exit_code = None;
+    let mut out = String::new();
+    while let Ok(Some((flag, data))) = read_connect_frame_from_stream(&mut conn) {
+        if flag == 0 {
+            if let Ok(s) = std::str::from_utf8(&data) {
+                if let Ok(json) = JsonValue::parse(s) {
+                    if let Some(b64) = json
+                        .get("event")
+                        .and_then(|e| e.get("data"))
+                        .and_then(|d| d.get("stdout"))
+                        .and_then(|v| v.as_str())
+                    {
+                        out.push_str(&String::from_utf8_lossy(&base64_decode(b64)));
+                    }
+                    if let Some(end) = json.get("event").and_then(|e| e.get("end")) {
+                        exit_code = end.get("exitCode").and_then(|v| v.as_i64());
+                    }
+                }
+            }
+        } else if flag == 2 {
+            break;
+        }
+    }
+    assert!(out.contains("DONE_NON_PTY"), "got output: {out}");
+    assert_eq!(exit_code, Some(5));
+}
+
+#[test]
+fn test_pty_rejects_invalid_base64_and_duplicate_id() {
+    let (addr, _registry) = start_test_server("/tmp");
+    let body =
+        r#"{"id":"dup-pty-1","process":{"cmd":"/bin/cat"},"pty":{"size":{"cols":80,"rows":24}}}"#;
+    let (_stream, pid) = start_pty(&addr, body);
+
+    // Duplicate id rejected with 409
+    let (dup_status, _, dup_body) = post_raw(
+        &addr,
+        "/process.Process/Start",
+        "application/json",
+        body.as_bytes(),
+    );
+    assert_eq!(
+        dup_status,
+        409,
+        "dup body: {}",
+        String::from_utf8_lossy(&dup_body)
+    );
+
+    // Invalid base64 rejected with 400
+    let bad_req = format!(r#"{{"process":{{"pid":{pid}}},"input":{{"pty":"not!valid!b64"}}}}"#);
+    let (bad_status, _, bad_body) = post_raw(
+        &addr,
+        "/process.Process/SendInput",
+        "application/json",
+        bad_req.as_bytes(),
+    );
+    assert_eq!(
+        bad_status,
+        400,
+        "bad base64 body: {}",
+        String::from_utf8_lossy(&bad_body)
+    );
+
+    let kill_req = format!(r#"{{"process":{{"pid":{pid}}},"signal":"SIGKILL"}}"#);
+    let _ = post_raw(
+        &addr,
+        "/process.Process/SendSignal",
+        "application/json",
+        kill_req.as_bytes(),
+    );
+}
+
+#[test]
+fn test_unpack_all_connect_frames_no_gzip_sniff() {
+    use crate::commands::unpack_all_connect_frames;
+    // Raw bytes starting with 0x1f 0x8b (gzip magic) without Connect compression flag
+    // must NOT be treated as gzip.
+    let raw = [0x1fu8, 0x8b, 0x08, 0x00];
+    let frames = unpack_all_connect_frames(&raw).expect("unpack");
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].0, 0);
+    assert_eq!(frames[0].1, raw);
+}
+
+#[test]
+fn test_pty_close_stdin_returns_unimplemented() {
+    let (addr, _registry) = start_test_server("/tmp");
+    let (status, _, body) = post_raw(
+        &addr,
+        "/process.Process/CloseStdin",
+        "application/json",
+        b"{}",
+    );
+    let body_str = String::from_utf8_lossy(&body);
+    assert_eq!(status, 501);
+    assert!(body_str.contains("unimplemented"), "body: {body_str}");
 }

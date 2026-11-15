@@ -4,12 +4,13 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::os::unix::io::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::files::decompress_if_gzip;
 use crate::http::{write_json, write_response, HttpRequest};
@@ -106,8 +107,20 @@ pub struct PtySub {
 
 #[derive(Clone)]
 pub struct PtyHandle {
-    pub master_fd: Arc<AtomicI32>,
+    pub master: Arc<Mutex<Option<Arc<OwnedFd>>>>,
+    pub closed: Arc<AtomicBool>,
     pub subscribers: Arc<Mutex<Vec<PtySub>>>,
+}
+
+impl PtyHandle {
+    pub fn acquire_master(&self) -> Option<Arc<OwnedFd>> {
+        self.master.lock().unwrap().clone()
+    }
+
+    pub fn clear_master(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        *self.master.lock().unwrap() = None;
+    }
 }
 
 /// Keep the last `cap` bytes. Connect may replay only this tail.
@@ -151,6 +164,7 @@ pub fn publish_pty_end(pty: &PtyHandle, entry: &Mutex<ProcessEntry>, exit_code: 
     let mut proc = entry.lock().unwrap();
     proc.running = false;
     proc.exit_code = Some(exit_code);
+    proc.exited_at = Some(Instant::now());
     subs.retain(
         |sub| match sub.tx.try_send(PtyBroadcastEvent::End(exit_code)) {
             Ok(()) => true,
@@ -197,21 +211,13 @@ pub fn subscribe_pty(pty: &PtyHandle, entry: &Mutex<ProcessEntry>) -> PtySubscri
     }
 }
 
-pub fn close_pty_master(pty: &PtyHandle) {
-    let fd = pty.master_fd.swap(-1, Ordering::SeqCst);
-    if fd >= 0 {
-        unsafe {
-            libc::close(fd);
-        }
-    }
-}
-
 pub struct ProcessEntry {
     pub id: String,
     pub pid: u32,
     pub tag: Option<String>,
     pub running: bool,
     pub exit_code: Option<i32>,
+    pub exited_at: Option<Instant>,
     pub output: ProcessOutputBuffer,
     pub cmd: String,
     pub args: Vec<String>,
@@ -236,6 +242,9 @@ impl Default for ProcessRegistry {
     }
 }
 
+const REGISTRY_MAX_EXITED: usize = 256;
+const REGISTRY_EXITED_GRACE: Duration = Duration::from_secs(300);
+
 impl ProcessRegistry {
     pub fn new() -> Self {
         Self {
@@ -249,12 +258,56 @@ impl ProcessRegistry {
         format!("proc-{n}")
     }
 
+    fn prune_exited_locked(map: &mut HashMap<String, Arc<Mutex<ProcessEntry>>>) {
+        let now = Instant::now();
+        let mut exited: Vec<(String, Instant)> = Vec::new();
+        for (k, v) in map.iter() {
+            let proc = v.lock().unwrap();
+            if !proc.running {
+                let at = proc.exited_at.unwrap_or(now);
+                exited.push((k.clone(), at));
+            }
+        }
+        let mut to_remove = Vec::new();
+        let mut kept = Vec::new();
+        for (k, at) in exited {
+            if now.saturating_duration_since(at) > REGISTRY_EXITED_GRACE {
+                to_remove.push(k);
+            } else {
+                kept.push((k, at));
+            }
+        }
+        if kept.len() > REGISTRY_MAX_EXITED {
+            kept.sort_by_key(|(_, at)| *at);
+            let excess = kept.len() - REGISTRY_MAX_EXITED;
+            for (k, _) in kept.into_iter().take(excess) {
+                to_remove.push(k);
+            }
+        }
+        for k in to_remove {
+            map.remove(&k);
+        }
+    }
+
     pub fn insert(&self, entry: ProcessEntry) -> Arc<Mutex<ProcessEntry>> {
         let id = entry.id.clone();
         let arc = Arc::new(Mutex::new(entry));
         let mut map = self.entries.lock().unwrap();
+        Self::prune_exited_locked(&mut map);
         map.insert(id, Arc::clone(&arc));
         arc
+    }
+
+    pub fn insert_unique(&self, entry: ProcessEntry) -> Option<Arc<Mutex<ProcessEntry>>> {
+        let id = entry.id.clone();
+        let arc = Arc::new(Mutex::new(entry));
+        let mut map = self.entries.lock().unwrap();
+        Self::prune_exited_locked(&mut map);
+        if map.contains_key(&id) {
+            return None;
+        }
+        map.insert(id, Arc::clone(&arc));
+        Some(arc)
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Mutex<ProcessEntry>>> {
@@ -307,7 +360,7 @@ pub fn kill_all_managed(registry: &ProcessRegistry) -> usize {
                 libc::kill(proc.pid as i32, libc::SIGKILL);
             }
             if let Some(ref pty) = proc.pty_handle {
-                close_pty_master(pty);
+                pty.closed.store(true, Ordering::SeqCst);
             }
             killed += 1;
         }
@@ -441,6 +494,7 @@ pub fn handle_command_run(
             tag: None,
             running: true,
             exit_code: None,
+            exited_at: None,
             output: Vec::new(),
             cmd: shell.to_string(),
             args: vec!["-c".to_string(), command_str.clone()],
@@ -471,6 +525,7 @@ pub fn handle_command_run(
             let mut proc = entry_clone.lock().unwrap();
             proc.running = false;
             proc.exit_code = Some(exit_code);
+            proc.exited_at = Some(Instant::now());
         });
 
         let resp = format!(
@@ -504,6 +559,7 @@ pub fn handle_command_run(
             tag: None,
             running: false,
             exit_code: Some(exit_code),
+            exited_at: Some(Instant::now()),
             output,
             cmd: shell.to_string(),
             args: vec!["-c".to_string(), command_str.clone()],
@@ -577,13 +633,10 @@ pub fn handle_command_logs(
 
 pub fn handle_command_kill(stream: &mut TcpStream, id: &str, registry: &ProcessRegistry) {
     if let Some(entry) = registry.get(id) {
-        let (pid, pty) = {
+        let pid = {
             let proc = entry.lock().unwrap();
-            (proc.pid, proc.pty_handle.clone())
+            proc.pid
         };
-        if let Some(pty) = pty {
-            close_pty_master(&pty);
-        }
         if pid > 1 {
             unsafe {
                 libc::kill(-(pid as i32), libc::SIGKILL);
@@ -672,12 +725,29 @@ pub fn unpack_connect_payload(body: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-pub fn base64_decode(input: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    let clean: Vec<u8> = input
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
-        .collect();
+pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let mut clean = Vec::with_capacity(input.len());
+    let mut padding = 0usize;
+    for b in input.bytes() {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if b == b'=' {
+            padding += 1;
+            if padding > 2 {
+                return Err("invalid base64 padding".to_string());
+            }
+            continue;
+        }
+        if padding > 0 {
+            return Err("invalid base64 character after padding".to_string());
+        }
+        clean.push(b);
+    }
+    if clean.len() % 4 == 1 {
+        return Err("invalid base64 length".to_string());
+    }
+    let mut out = Vec::with_capacity((clean.len() * 3) / 4);
     for chunk in clean.chunks(4) {
         let mut val = 0u32;
         for (i, &b) in chunk.iter().enumerate() {
@@ -687,7 +757,7 @@ pub fn base64_decode(input: &str) -> Vec<u8> {
                 b'0'..=b'9' => b - b'0' + 52,
                 b'+' => 62,
                 b'/' => 63,
-                _ => 0,
+                _ => return Err(format!("invalid base64 byte: 0x{:02x}", b)),
             };
             val |= (v as u32) << (18 - i * 6);
         }
@@ -701,41 +771,38 @@ pub fn base64_decode(input: &str) -> Vec<u8> {
             out.push(val as u8);
         }
     }
-    out
+    Ok(out)
 }
 
-pub fn unpack_all_connect_frames(body: &[u8]) -> Vec<(u8, Vec<u8>)> {
+pub fn unpack_all_connect_frames(body: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, String> {
     if body.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let decompressed = if body.len() >= 2 && body[0] == 0x1f && body[1] == 0x8b {
-        decompress_if_gzip(body).unwrap_or_else(|_| body.to_vec())
-    } else {
-        body.to_vec()
-    };
 
     let mut frames = Vec::new();
     let mut idx = 0;
-    while idx + 5 <= decompressed.len() {
-        let flag = decompressed[idx];
-        let len = u32::from_be_bytes([
-            decompressed[idx + 1],
-            decompressed[idx + 2],
-            decompressed[idx + 3],
-            decompressed[idx + 4],
-        ]) as usize;
+    while idx + 5 <= body.len() {
+        let flag = body[idx];
+        let len = u32::from_be_bytes([body[idx + 1], body[idx + 2], body[idx + 3], body[idx + 4]])
+            as usize;
         let start = idx + 5;
-        let end = start + len;
-        if end > decompressed.len() {
+        let end = start.saturating_add(len);
+        if end > body.len() {
             break;
         }
-        frames.push((flag, decompressed[start..end].to_vec()));
+        let slice = &body[start..end];
+        let payload = if (flag & 0x01) != 0 {
+            decompress_if_gzip(slice)?
+        } else {
+            slice.to_vec()
+        };
+        frames.push((flag, payload));
         idx = end;
     }
-    if frames.is_empty() && !decompressed.is_empty() {
-        frames.push((0, decompressed));
+    if frames.is_empty() && !body.is_empty() {
+        frames.push((0, body.to_vec()));
     }
-    frames
+    Ok(frames)
 }
 
 pub fn extract_selector(json: &JsonValue) -> (Option<u32>, Option<String>) {
@@ -819,7 +886,7 @@ pub fn extract_pty_size(json: &JsonValue) -> (u16, u16) {
     (cols, rows)
 }
 
-pub fn extract_input_data(json: &JsonValue) -> Option<Vec<u8>> {
+pub fn extract_input_data(json: &JsonValue) -> Result<Option<Vec<u8>>, String> {
     let b64_str = json
         .get("pty")
         .or_else(|| json.get("stdin"))
@@ -833,7 +900,136 @@ pub fn extract_input_data(json: &JsonValue) -> Option<Vec<u8>> {
                 .and_then(|i| i.get("pty").or_else(|| i.get("stdin")))
         })
         .and_then(|v| v.as_str());
-    b64_str.map(base64_decode)
+    match b64_str {
+        Some(s) => base64_decode(s).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn write_all_nonblock(fd: libc::c_int, data: &[u8], timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut offset = 0usize;
+    while offset < data.len() {
+        let n = unsafe {
+            libc::write(
+                fd,
+                data[offset..].as_ptr() as *const libc::c_void,
+                data.len() - offset,
+            )
+        };
+        if n > 0 {
+            offset += n as usize;
+            continue;
+        }
+        if n == 0 {
+            return Err("pty write returned 0 bytes".to_string());
+        }
+        let err = std::io::Error::last_os_error();
+        let code = err.raw_os_error();
+        if code == Some(libc::EINTR) {
+            continue;
+        }
+        if code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK) {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err("pty write timed out".to_string());
+            }
+            let rem_ms = (deadline - now).as_millis().clamp(1, i32::MAX as u128) as i32;
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, rem_ms) };
+            if rc < 0 {
+                let perr = std::io::Error::last_os_error();
+                if perr.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err(format!("pty poll failed: {}", perr));
+            }
+            if rc == 0 {
+                return Err("pty write timed out".to_string());
+            }
+            if (pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0
+                && (pfd.revents & libc::POLLOUT) == 0
+            {
+                return Err("pty master closed".to_string());
+            }
+            continue;
+        }
+        return Err(format!("pty write failed: {}", err));
+    }
+    Ok(())
+}
+
+fn open_pty_cloexec(cols: u16, rows: u16) -> Result<(OwnedFd, OwnedFd), String> {
+    let master_raw = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    if master_raw < 0 {
+        return Err(format!(
+            "posix_openpt failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
+    if unsafe { libc::grantpt(master.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "grantpt failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { libc::unlockpt(master.as_raw_fd()) } != 0 {
+        return Err(format!(
+            "unlockpt failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut name_buf = [0 as libc::c_char; 128];
+    if unsafe { libc::ptsname_r(master.as_raw_fd(), name_buf.as_mut_ptr(), name_buf.len()) } != 0 {
+        return Err(format!(
+            "ptsname_r failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let slave_raw = unsafe {
+        libc::open(
+            name_buf.as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC,
+        )
+    };
+    if slave_raw < 0 {
+        return Err(format!(
+            "open slave pty failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+
+    unsafe {
+        let status = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+        if status != -1 {
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, status | libc::O_NONBLOCK);
+        }
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
+    }
+    Ok((master, slave))
+}
+
+fn dup_cloexec(fd: libc::c_int) -> Result<File, String> {
+    let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if new_fd < 0 {
+        return Err(format!(
+            "F_DUPFD_CLOEXEC failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(new_fd) })
 }
 
 fn write_pty_data(stream: &mut TcpStream, data: &[u8]) -> bool {
@@ -962,12 +1158,22 @@ pub fn handle_connectrpc_pty_start(
 
     let _ = std::fs::create_dir_all(&eff_workdir);
 
-    let id = json
+    let client_supplied_id = json
         .get("id")
         .or_else(|| proc_obj.get("id"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string());
+    let id = client_supplied_id
+        .clone()
         .unwrap_or_else(|| registry.next_id());
+    if client_supplied_id.is_some() && registry.get(&id).is_some() {
+        write_json(
+            stream,
+            "409 Conflict",
+            r#"{"code":"already_exists","message":"process id already exists"}"#,
+        );
+        return;
+    }
 
     let tag = json
         .get("tag")
@@ -1009,47 +1215,22 @@ pub fn handle_connectrpc_pty_start(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty());
 
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let ws = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let ret = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &ws,
-        )
-    };
-    if ret != 0 {
-        let err_msg = std::io::Error::last_os_error().to_string();
-        let err_json = format!(
-            r#"{{"code":"internal","message":"failed to openpty: {}"}}"#,
-            escape_json(&err_msg)
-        );
-        write_response(
-            stream,
-            "500 Internal Server Error",
-            "application/json",
-            err_json.as_bytes(),
-        );
-        return;
-    }
-    unsafe {
-        let flags = libc::fcntl(master, libc::F_GETFD);
-        if flags != -1 {
-            libc::fcntl(master, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+    let (master_owned, slave_owned) = match open_pty_cloexec(cols, rows) {
+        Ok(fds) => fds,
+        Err(err_msg) => {
+            let err_json = format!(
+                r#"{{"code":"internal","message":"failed to openpty: {}"}}"#,
+                escape_json(&err_msg)
+            );
+            write_response(
+                stream,
+                "500 Internal Server Error",
+                "application/json",
+                err_json.as_bytes(),
+            );
+            return;
         }
-        let status = libc::fcntl(master, libc::F_GETFL);
-        if status != -1 {
-            libc::fcntl(master, libc::F_SETFL, status | libc::O_NONBLOCK);
-        }
-    }
+    };
 
     let mut cmd = Command::new(&cmd_name);
     cmd.args(&cmd_args);
@@ -1058,10 +1239,6 @@ pub fn handle_connectrpc_pty_start(
         cmd.env(k, v);
     }
     if let Err(e) = configure_command_credentials(&mut cmd, uid, gid, req_user) {
-        unsafe {
-            libc::close(master);
-            libc::close(slave);
-        }
         let err_json = format!(
             r#"{{"code":"invalid_argument","message":"{}"}}"#,
             escape_json(&e)
@@ -1075,9 +1252,26 @@ pub fn handle_connectrpc_pty_start(
         return;
     }
 
-    let slave_in = unsafe { std::fs::File::from_raw_fd(libc::dup(slave)) };
-    let slave_out = unsafe { std::fs::File::from_raw_fd(libc::dup(slave)) };
-    let slave_err = unsafe { std::fs::File::from_raw_fd(libc::dup(slave)) };
+    let (slave_in, slave_out, slave_err) = match (
+        dup_cloexec(slave_owned.as_raw_fd()),
+        dup_cloexec(slave_owned.as_raw_fd()),
+        dup_cloexec(slave_owned.as_raw_fd()),
+    ) {
+        (Ok(i), Ok(o), Ok(e)) => (i, o, e),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+            let err_json = format!(
+                r#"{{"code":"internal","message":"failed to dup pty slave: {}"}}"#,
+                escape_json(&e)
+            );
+            write_response(
+                stream,
+                "500 Internal Server Error",
+                "application/json",
+                err_json.as_bytes(),
+            );
+            return;
+        }
+    };
     cmd.stdin(Stdio::from(slave_in));
     cmd.stdout(Stdio::from(slave_out));
     cmd.stderr(Stdio::from(slave_err));
@@ -1087,7 +1281,9 @@ pub fn handle_connectrpc_pty_start(
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            let _ = libc::ioctl(0, libc::TIOCSCTTY, 0);
+            if libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -1095,10 +1291,6 @@ pub fn handle_connectrpc_pty_start(
     let mut child = match spawn_tracked(&mut cmd) {
         Ok(c) => c,
         Err(e) => {
-            unsafe {
-                libc::close(master);
-                libc::close(slave);
-            }
             let err_json = format!(
                 r#"{{"code":"internal","message":"failed to spawn command: {}"}}"#,
                 escape_json(&e.to_string())
@@ -1113,87 +1305,124 @@ pub fn handle_connectrpc_pty_start(
         }
     };
     drop(cmd);
-    unsafe {
-        libc::close(slave);
-    }
+    drop(slave_owned);
     let pid = child.id();
 
-    let master_atomic = Arc::new(AtomicI32::new(master));
+    let master_arc = Arc::new(master_owned);
+    let closed_flag = Arc::new(AtomicBool::new(false));
     let subscribers = Arc::new(Mutex::new(Vec::new()));
 
     let pty_handle = PtyHandle {
-        master_fd: Arc::clone(&master_atomic),
+        master: Arc::new(Mutex::new(Some(Arc::clone(&master_arc)))),
+        closed: Arc::clone(&closed_flag),
         subscribers: Arc::clone(&subscribers),
     };
 
-    let entry = registry.insert(ProcessEntry {
+    let new_entry = ProcessEntry {
         id: id.clone(),
         pid,
         tag: tag.clone(),
         running: true,
         exit_code: None,
+        exited_at: None,
         output: Vec::new(),
         cmd: cmd_name.clone(),
         args: cmd_args.clone(),
         envs: envs.clone(),
         cwd: Some(eff_workdir.clone()),
         pty_handle: Some(pty_handle.clone()),
-    });
+    };
+    let entry = match registry.insert_unique(new_entry) {
+        Some(e) => e,
+        None => {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            write_json(
+                stream,
+                "409 Conflict",
+                r#"{"code":"already_exists","message":"process id already exists"}"#,
+            );
+            return;
+        }
+    };
 
     // Subscribe before the reader starts so the first bytes are queued, not dropped.
     let sub = subscribe_pty(&pty_handle, &entry);
 
-    let master_clone = Arc::clone(&master_atomic);
     let pty_reader = pty_handle.clone();
     let entry_clone = Arc::clone(&entry);
+    let exited_code = Arc::new(Mutex::new(None::<i32>));
+    let exited_code_waiter = Arc::clone(&exited_code);
+
+    let waiter_handle = std::thread::spawn(move || {
+        let code = match child.wait() {
+            Ok(status) => exit_code_from_status(&status),
+            Err(_) => -1,
+        };
+        *exited_code_waiter.lock().unwrap() = Some(code);
+        code
+    });
 
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        let fd = master_arc.as_raw_fd();
         loop {
-            let fd = master_clone.load(Ordering::SeqCst);
-            if fd < 0 {
+            if closed_flag.load(Ordering::SeqCst) {
                 break;
             }
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let rc = unsafe { libc::poll(&mut pfd, 1, 200) };
-            if master_clone.load(Ordering::SeqCst) != fd {
-                break;
-            }
-            if rc < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
+            let child_done = exited_code.lock().unwrap().is_some();
+            if !child_done {
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pfd, 1, 50) };
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
+                    break;
+                }
+                if rc == 0 {
                     continue;
                 }
-                break;
             }
-            if rc == 0 {
-                continue;
-            }
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n > 0 {
-                publish_pty_chunk(&pty_reader, &entry_clone, &buf[..n as usize]);
-            } else if n < 0 {
-                let err = std::io::Error::last_os_error();
-                let code = err.raw_os_error();
-                if code == Some(libc::EINTR) || code == Some(libc::EAGAIN) {
-                    continue;
+
+            let mut eof_or_err = false;
+            loop {
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                if n > 0 {
+                    publish_pty_chunk(&pty_reader, &entry_clone, &buf[..n as usize]);
+                } else if n < 0 {
+                    let err = std::io::Error::last_os_error();
+                    let code = err.raw_os_error();
+                    if code == Some(libc::EINTR) {
+                        continue;
+                    }
+                    if code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK) {
+                        break;
+                    }
+                    eof_or_err = true;
+                    break;
+                } else {
+                    eof_or_err = true;
+                    break;
                 }
-                break;
-            } else {
+            }
+            if eof_or_err || exited_code.lock().unwrap().is_some() {
                 break;
             }
         }
 
-        let exit_code = match child.wait() {
-            Ok(status) => exit_code_from_status(&status),
-            Err(_) => -1,
-        };
+        let exit_code = waiter_handle.join().unwrap_or(-1);
         publish_pty_end(&pty_reader, &entry_clone, exit_code);
-        close_pty_master(&pty_reader);
+        pty_reader.clear_master();
+        drop(master_arc);
     });
 
     let header =
@@ -1310,12 +1539,22 @@ pub fn handle_connectrpc_process_start(
         .map(|s| s.to_string())
         .unwrap_or_else(|| config.workdir.clone());
 
-    let id = json
+    let client_supplied_id = json
         .get("id")
         .or_else(|| proc_obj.get("id"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .map(|s| s.to_string());
+    let id = client_supplied_id
+        .clone()
         .unwrap_or_else(|| registry.next_id());
+    if client_supplied_id.is_some() && registry.get(&id).is_some() {
+        write_json(
+            stream,
+            "409 Conflict",
+            r#"{"code":"already_exists","message":"process id already exists"}"#,
+        );
+        return;
+    }
 
     let tag = json
         .get("tag")
@@ -1416,6 +1655,7 @@ pub fn handle_connectrpc_process_start(
         tag: tag.clone(),
         running: true,
         exit_code: None,
+        exited_at: None,
         output: Vec::new(),
         cmd: shell.to_string(),
         args: vec!["-c".to_string(), command_str.clone()],
@@ -1517,6 +1757,7 @@ pub fn handle_connectrpc_process_start(
         let mut proc = entry.lock().unwrap();
         proc.running = false;
         proc.exit_code = Some(exit_code);
+        proc.exited_at = Some(Instant::now());
     }
 
     let end_json = format!(
@@ -1587,17 +1828,18 @@ pub fn handle_connectrpc_send_signal(
     };
 
     if let Some(entry) = find_process_entry(registry, pid, tag.as_deref()) {
-        let (p, was_running, pty_opt) = {
-            let mut proc = entry.lock().unwrap();
-            let running = proc.running;
-            proc.running = false;
-            proc.exit_code = Some(128 + sig);
-            (proc.pid, running, proc.pty_handle.clone())
+        let (p, was_running) = {
+            let proc = entry.lock().unwrap();
+            (proc.pid, proc.running)
         };
 
-        if let Some(pty) = pty_opt {
-            // Closing the master wakes the reader; explicit SendSignal is what reaps the PTY.
-            close_pty_master(&pty);
+        if !was_running {
+            write_json(
+                stream,
+                "404 Not Found",
+                r#"{"code":"not_found","message":"process not found"}"#,
+            );
+            return;
         }
 
         if p > 1 {
@@ -1607,17 +1849,8 @@ pub fn handle_connectrpc_send_signal(
             }
         }
 
-        if was_running {
-            write_unary_connect_response(stream, req, "200 OK", "{}");
-            return;
-        } else {
-            write_json(
-                stream,
-                "404 Not Found",
-                r#"{"code":"not_found","message":"process not found"}"#,
-            );
-            return;
-        }
+        write_unary_connect_response(stream, req, "200 OK", "{}");
+        return;
     }
 
     if let Some(p) = pid {
@@ -1707,16 +1940,39 @@ pub fn handle_connectrpc_send_input(
     }
 
     if let Some(pty) = pty_handle {
-        if let Some(input_bytes) = extract_input_data(&json) {
-            let fd = pty.master_fd.load(Ordering::SeqCst);
-            if fd >= 0 && !input_bytes.is_empty() {
-                unsafe {
-                    libc::write(
-                        fd,
-                        input_bytes.as_ptr() as *const libc::c_void,
-                        input_bytes.len(),
+        let input_bytes = match extract_input_data(&json) {
+            Ok(Some(b)) => b,
+            Ok(None) => Vec::new(),
+            Err(e) => {
+                let err_json = format!(
+                    r#"{{"code":"invalid_argument","message":"invalid base64 input: {}"}}"#,
+                    escape_json(&e)
+                );
+                write_json(stream, "400 Bad Request", &err_json);
+                return;
+            }
+        };
+        if !input_bytes.is_empty() {
+            let master = match pty.acquire_master() {
+                Some(fd) => fd,
+                None => {
+                    write_json(
+                        stream,
+                        "404 Not Found",
+                        r#"{"code":"not_found","message":"pty master closed"}"#,
                     );
+                    return;
                 }
+            };
+            if let Err(e) =
+                write_all_nonblock(master.as_raw_fd(), &input_bytes, Duration::from_secs(5))
+            {
+                let err_json = format!(
+                    r#"{{"code":"internal","message":"failed to write pty input: {}"}}"#,
+                    escape_json(&e)
+                );
+                write_json(stream, "500 Internal Server Error", &err_json);
+                return;
             }
         }
     }
@@ -1794,8 +2050,7 @@ pub fn handle_connectrpc_process_update(
     }
 
     if let Some(pty) = pty_handle {
-        let fd = pty.master_fd.load(Ordering::SeqCst);
-        if fd >= 0 {
+        if let Some(master) = pty.acquire_master() {
             let ws = libc::winsize {
                 ws_row: rows,
                 ws_col: cols,
@@ -1803,7 +2058,7 @@ pub fn handle_connectrpc_process_update(
                 ws_ypixel: 0,
             };
             unsafe {
-                libc::ioctl(fd, libc::TIOCSWINSZ, &ws);
+                libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
             }
         }
         if proc_pid > 1 {
@@ -1822,11 +2077,40 @@ pub fn handle_connectrpc_stream_input(
     req: &HttpRequest,
     registry: &ProcessRegistry,
 ) {
-    let frames = unpack_all_connect_frames(&req.body);
+    let is_gzip = req.headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("content-encoding") && v.to_ascii_lowercase().contains("gzip")
+    });
+    let body_bytes = if is_gzip {
+        match decompress_if_gzip(&req.body) {
+            Ok(b) => b,
+            Err(e) => {
+                let err_json = format!(
+                    r#"{{"code":"invalid_argument","message":"failed to decompress body: {}"}}"#,
+                    escape_json(&e)
+                );
+                write_json(stream, "400 Bad Request", &err_json);
+                return;
+            }
+        }
+    } else {
+        req.body.clone()
+    };
+
+    let frames = match unpack_all_connect_frames(&body_bytes) {
+        Ok(f) => f,
+        Err(e) => {
+            let err_json = format!(
+                r#"{{"code":"invalid_argument","message":"failed to unpack frames: {}"}}"#,
+                escape_json(&e)
+            );
+            write_json(stream, "400 Bad Request", &err_json);
+            return;
+        }
+    };
     let mut current_entry: Option<Arc<Mutex<ProcessEntry>>> = None;
 
     for (flag, frame_data) in frames {
-        if flag == 2 {
+        if flag == 2 || flag == 3 {
             break;
         }
         if let Ok(s) = std::str::from_utf8(&frame_data) {
@@ -1843,17 +2127,37 @@ pub fn handle_connectrpc_stream_input(
                         };
                         if is_running {
                             if let Some(pty) = pty_handle {
-                                if let Some(input_bytes) =
-                                    extract_input_data(&JsonValue::Object(data_obj.clone()))
-                                {
-                                    let fd = pty.master_fd.load(Ordering::SeqCst);
-                                    if fd >= 0 && !input_bytes.is_empty() {
-                                        unsafe {
-                                            libc::write(
-                                                fd,
-                                                input_bytes.as_ptr() as *const libc::c_void,
-                                                input_bytes.len(),
+                                let input_bytes = match extract_input_data(&JsonValue::Object(
+                                    data_obj.clone(),
+                                )) {
+                                    Ok(Some(b)) => b,
+                                    Ok(None) => Vec::new(),
+                                    Err(e) => {
+                                        let err_json = format!(
+                                            r#"{{"code":"invalid_argument","message":"invalid base64 input: {}"}}"#,
+                                            escape_json(&e)
+                                        );
+                                        write_json(stream, "400 Bad Request", &err_json);
+                                        return;
+                                    }
+                                };
+                                if !input_bytes.is_empty() {
+                                    if let Some(master) = pty.acquire_master() {
+                                        if let Err(e) = write_all_nonblock(
+                                            master.as_raw_fd(),
+                                            &input_bytes,
+                                            Duration::from_secs(5),
+                                        ) {
+                                            let err_json = format!(
+                                                r#"{{"code":"internal","message":"failed to write pty input: {}"}}"#,
+                                                escape_json(&e)
                                             );
+                                            write_json(
+                                                stream,
+                                                "500 Internal Server Error",
+                                                &err_json,
+                                            );
+                                            return;
                                         }
                                     }
                                 }
@@ -1944,17 +2248,31 @@ pub fn handle_connectrpc_process_connect(
         let sub = subscribe_pty(&pty, &entry);
         pump_pty_subscription(stream, sub, true);
     } else {
-        let (output, exit_code) = {
-            let proc = entry.lock().unwrap();
-            (proc.output.clone(), proc.exit_code.unwrap_or(0))
+        let mut sent_len = 0usize;
+        let exit_code = loop {
+            let (chunk, running, code) = {
+                let proc = entry.lock().unwrap();
+                let chunk = if proc.output.len() > sent_len {
+                    proc.output[sent_len..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                (chunk, proc.running, proc.exit_code.unwrap_or(0))
+            };
+            if !chunk.is_empty() {
+                sent_len += chunk.len();
+                let b64 = base64_encode(&chunk);
+                let msg = format!(r#"{{"event":{{"data":{{"stdout":"{}"}}}}}}"#, b64);
+                let frame = make_connect_frame(msg.as_bytes(), false);
+                if stream.write_all(&frame).is_err() || stream.flush().is_err() {
+                    return;
+                }
+            }
+            if !running {
+                break code;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         };
-        if !output.is_empty() {
-            let b64 = base64_encode(&output);
-            let msg = format!(r#"{{"event":{{"data":{{"stdout":"{}"}}}}}}"#, b64);
-            let frame = make_connect_frame(msg.as_bytes(), false);
-            let _ = stream.write_all(&frame);
-            let _ = stream.flush();
-        }
         let end_json = format!(
             r#"{{"event":{{"end":{{"exitCode":{},"exited":true}}}}}}"#,
             exit_code
@@ -2010,8 +2328,12 @@ pub fn handle_connectrpc_process_list(
 
 pub fn handle_connectrpc_close_stdin(
     stream: &mut TcpStream,
-    req: &HttpRequest,
+    _req: &HttpRequest,
     _registry: &ProcessRegistry,
 ) {
-    write_unary_connect_response(stream, req, "200 OK", "{}");
+    write_json(
+        stream,
+        "501 Not Implemented",
+        r#"{"code":"unimplemented","message":"close stdin is not supported"}"#,
+    );
 }
