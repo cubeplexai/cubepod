@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -124,6 +125,24 @@ func (d *DockerBackend) BuildRunArgs(spec SandboxSpec) ([]string, error) {
 
 	if d.cfg.Network != "" {
 		args = append(args, "--network", d.cfg.Network)
+	}
+
+	for _, m := range spec.VolumeMounts {
+		if m.ContainerPath == "" || !filepath.IsAbs(m.ContainerPath) || strings.Contains(m.ContainerPath, "..") {
+			continue
+		}
+		src := m.HostPath
+		if m.DockerVolume != "" {
+			// Only the test-safe prefix is passed through to docker.
+			if !strings.HasPrefix(m.DockerVolume, "cpod-test-") {
+				continue
+			}
+			src = m.DockerVolume
+		}
+		if src == "" {
+			continue
+		}
+		args = append(args, "-v", fmt.Sprintf("%s:%s", src, m.ContainerPath))
 	}
 
 	args = append(args,

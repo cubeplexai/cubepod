@@ -330,6 +330,33 @@ func TestDockerBackend_CommandBuilder(t *testing.T) {
 	}
 }
 
+func TestDockerBackend_E2BVolumeMount(t *testing.T) {
+	docker := NewDockerBackend(DockerConfig{BaseDir: t.TempDir()})
+	spec := SandboxSpec{
+		SandboxID: "sb-vol",
+		VolumeMounts: []SandboxVolumeMount{
+			{HostPath: "/var/lib/cubepod/e2b/data", ContainerPath: "/mnt/data"},
+			{DockerVolume: "cpod-test-vol-abc", ContainerPath: "/mnt/named"},
+			{DockerVolume: "other-vol", ContainerPath: "/mnt/rejected"},
+		},
+	}
+	args, err := docker.BuildRunArgs(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(args, "/var/lib/cubepod/e2b/data:/mnt/data") {
+		t.Fatalf("missing host bind: %v", args)
+	}
+	if !slices.Contains(args, "cpod-test-vol-abc:/mnt/named") {
+		t.Fatalf("missing named volume: %v", args)
+	}
+	for _, a := range args {
+		if strings.Contains(a, "other-vol") {
+			t.Fatalf("rejected volume was mounted: %v", args)
+		}
+	}
+}
+
 func TestPoddProcessBackend_DeleteAndInspect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
