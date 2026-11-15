@@ -85,6 +85,7 @@ jobs:
           account_id = os.environ["CF_ACCOUNT_ID"]
           project = "cubepod-docs"
 
+          domains = []
           req = urllib.request.Request(
               f"https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects/{project}",
               headers={"Authorization": f"Bearer {token}"},
@@ -92,30 +93,48 @@ jobs:
           try:
               with urllib.request.urlopen(req, timeout=20) as resp:
                   data = json.loads(resp.read().decode("utf-8"))
-              print(f"Found Pages project '{project}' (domains: {data.get('result', {}).get('domains')})")
-              sys.exit(0)
+              domains = data.get("result", {}).get("domains") or []
+              print(f"Found Pages project '{project}' (domains: {domains})")
           except urllib.error.HTTPError as exc:
               if exc.code != 404:
                   print(f"Cloudflare API HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')}", file=sys.stderr)
                   sys.exit(1)
+              print(f"Creating Cloudflare Pages project '{project}'...")
+              create_req = urllib.request.Request(
+                  f"https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects",
+                  data=json.dumps({"name": project, "production_branch": "main"}).encode("utf-8"),
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                  },
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(create_req, timeout=20) as resp:
+                      created = json.loads(resp.read().decode("utf-8"))
+                  domains = created.get("result", {}).get("domains") or []
+                  print(f"Created Pages project '{project}' (subdomain: {created.get('result', {}).get('subdomain')})")
+              except urllib.error.HTTPError as create_exc:
+                  print(f"Failed to create Pages project HTTP {create_exc.code}: {create_exc.read().decode('utf-8', 'replace')}", file=sys.stderr)
+                  sys.exit(1)
 
-          print(f"Creating Cloudflare Pages project '{project}'...")
-          create_req = urllib.request.Request(
-              f"https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects",
-              data=json.dumps({"name": project, "production_branch": "main"}).encode("utf-8"),
-              headers={
-                  "Authorization": f"Bearer {token}",
-                  "Content-Type": "application/json",
-              },
-              method="POST",
-          )
-          try:
-              with urllib.request.urlopen(create_req, timeout=20) as resp:
-                  created = json.loads(resp.read().decode("utf-8"))
-              print(f"Created Pages project '{project}' (subdomain: {created.get('result', {}).get('subdomain')})")
-          except urllib.error.HTTPError as exc:
-              print(f"Failed to create Pages project HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')}", file=sys.stderr)
-              sys.exit(1)
+          custom_domain = "cubepod.cubeplex.ai"
+          if custom_domain not in domains:
+              dom_req = urllib.request.Request(
+                  f"https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects/{project}/domains",
+                  data=json.dumps({"name": custom_domain}).encode("utf-8"),
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json",
+                  },
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(dom_req, timeout=20) as resp:
+                      dom_res = json.loads(resp.read().decode("utf-8"))
+                  print(f"Added custom domain '{custom_domain}': {dom_res.get('result', {}).get('status')}")
+              except urllib.error.HTTPError as dom_exc:
+                  print(f"Custom domain bind skipped/failed HTTP {dom_exc.code}: {dom_exc.read().decode('utf-8', 'replace')}")
           PY
 
       - name: Deploy to Cloudflare Pages
