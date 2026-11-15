@@ -3,6 +3,7 @@ package gateway
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -37,6 +38,8 @@ import (
 const (
 	watchRingCap           = 4096
 	watchSubQueue          = 64
+	maxWatchersPerSandbox  = 16
+	pollWatcherIdleTTL     = 5 * time.Minute
 	watchKeepaliveInterval = 15 * time.Second
 
 	watchBufferOverflowMsg = "watch event buffer overflow: events were dropped"
@@ -55,7 +58,7 @@ const (
 	inotifyEvtBytes = 16
 )
 
-const watchMask = unix.IN_CREATE | unix.IN_MODIFY | unix.IN_CLOSE_WRITE |
+const watchMask = unix.IN_CREATE | unix.IN_MODIFY |
 	unix.IN_DELETE | unix.IN_DELETE_SELF | unix.IN_MOVED_FROM | unix.IN_MOVED_TO |
 	unix.IN_ATTRIB | unix.IN_ONLYDIR
 
@@ -120,6 +123,7 @@ type dirWatcher struct {
 	subs         map[*watchSub]struct{}
 	stopped      bool
 	overflowed   atomic.Bool
+	lastPoll     atomic.Int64
 	stopOnce     sync.Once
 	done         chan struct{}
 }
@@ -201,6 +205,7 @@ func (w *dirWatcher) publish(ev fsEvent) {
 }
 
 func (w *dirWatcher) drain() ([]fsEvent, error) {
+	w.lastPoll.Store(time.Now().UnixNano())
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.overflowed.Load() {
@@ -259,9 +264,16 @@ func (w *dirWatcher) arm() error {
 	return w.walk(w.root, "")
 }
 
+func isPermissionErr(err error) bool {
+	return os.IsPermission(err) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.EPERM)
+}
+
 func (w *dirWatcher) walk(dir, rel string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		if isPermissionErr(err) {
+			return nil
+		}
 		return err
 	}
 	for _, e := range entries {
@@ -272,6 +284,9 @@ func (w *dirWatcher) walk(dir, rel string) error {
 		childRel := joinRel(rel, e.Name())
 		full := filepath.Join(dir, e.Name())
 		if err := w.addWatch(full, childRel); err != nil {
+			if isPermissionErr(err) {
+				continue
+			}
 			return err
 		}
 		if err := w.walk(full, childRel); err != nil {
@@ -408,15 +423,15 @@ func (w *dirWatcher) onRaw(wd int, mask uint32, name string) {
 
 func mapInotify(mask uint32) (string, bool) {
 	switch {
-	case mask&unix.IN_CREATE != 0:
+	case mask&(unix.IN_CREATE|unix.IN_MOVED_TO) != 0:
 		return "EVENT_TYPE_CREATE", true
 	case mask&(unix.IN_DELETE|unix.IN_DELETE_SELF) != 0:
 		return "EVENT_TYPE_REMOVE", true
-	case mask&(unix.IN_MOVED_FROM|unix.IN_MOVED_TO) != 0:
+	case mask&unix.IN_MOVED_FROM != 0:
 		return "EVENT_TYPE_RENAME", true
 	case mask&unix.IN_ATTRIB != 0:
 		return "EVENT_TYPE_CHMOD", true
-	case mask&(unix.IN_MODIFY|unix.IN_CLOSE_WRITE) != 0:
+	case mask&unix.IN_MODIFY != 0:
 		return "EVENT_TYPE_WRITE", true
 	default:
 		return "", false
@@ -457,6 +472,29 @@ func watchEntryInfo(root, rel string) map[string]interface{} {
 	}
 }
 
+func canonicalizeDeepestAncestor(p string) (string, error) {
+	cur := filepath.Clean(p)
+	var tail []string
+	for {
+		realPath, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			for i := len(tail) - 1; i >= 0; i-- {
+				realPath = filepath.Join(realPath, tail[i])
+			}
+			return realPath, nil
+		}
+		if !os.IsNotExist(err) && !errors.Is(err, unix.ENOTDIR) {
+			return "", err
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return filepath.Clean(p), nil
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
+}
+
 func (s *Server) resolveWatchPath(rec *SandboxRecord, userPath string) (string, error) {
 	userPath = strings.TrimSpace(userPath)
 	if userPath == "" {
@@ -466,32 +504,52 @@ func (s *Server) resolveWatchPath(rec *SandboxRecord, userPath string) (string, 
 	if isSpecialAbs(logical) || isSpecialAbs(userPath) {
 		return "", fmt.Errorf("refusing to watch proc, dev, or sys")
 	}
+	s.mu.Lock()
 	base := rec.WorkspaceDir
 	if base == "" {
 		base = s.workspaceDirForSandbox(rec.SandboxID, rec.VolumeKey)
 		_ = os.MkdirAll(base, 0755)
 		rec.WorkspaceDir = base
 	}
+	s.mu.Unlock()
 	base = filepath.Clean(base)
-	var joined string
+	// Align with resolveFilePath: re-root non-/workspace absolute paths (e.g.
+	// /home/user) under the sandbox workspace directory in local fallback mode,
+	// while still rejecting explicit /workspace/.. or relative .. escapes.
+	var rel string
 	switch {
 	case logical == "/workspace":
-		joined = base
+		rel = ""
 	case strings.HasPrefix(logical, "/workspace/"):
-		joined = filepath.Join(base, filepath.FromSlash(strings.TrimPrefix(logical, "/workspace/")))
+		rel = strings.TrimPrefix(logical, "/workspace/")
+	case userPath == "/workspace" || strings.HasPrefix(userPath, "/workspace/"):
+		return "", fmt.Errorf("path escapes sandbox work tree")
+	case !strings.HasPrefix(userPath, "/") && (logical == ".." || strings.HasPrefix(logical, "../")):
+		return "", fmt.Errorf("path escapes sandbox work tree")
 	case strings.HasPrefix(logical, "/"):
-		joined = filepath.FromSlash(logical)
+		rel = strings.TrimPrefix(logical, "/")
 	default:
-		joined = filepath.Join(base, filepath.FromSlash(logical))
+		rel = logical
 	}
-	joined = filepath.Clean(joined)
+	joined := filepath.Clean(filepath.Join(base, filepath.FromSlash(rel)))
 	if joined != base && !strings.HasPrefix(joined, base+string(os.PathSeparator)) {
 		return "", fmt.Errorf("path escapes sandbox work tree")
 	}
-	if isSpecialAbs(filepath.ToSlash(joined)) {
+	realBase, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		realBase = base
+	}
+	realPath, err := canonicalizeDeepestAncestor(joined)
+	if err != nil {
+		return "", err
+	}
+	if realPath != realBase && !strings.HasPrefix(realPath, realBase+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes sandbox work tree")
+	}
+	if isSpecialAbs(filepath.ToSlash(realPath)) {
 		return "", fmt.Errorf("refusing to watch proc, dev, or sys")
 	}
-	return joined, nil
+	return realPath, nil
 }
 
 func isSpecialAbs(p string) bool {
@@ -539,7 +597,48 @@ func (r watchCreateReq) watcherID() string {
 	return r.WatcherIDSnake
 }
 
+func inotifyErr(prefix string, err error) error {
+	if errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EMFILE) ||
+		errors.Is(err, unix.ENFILE) || errors.Is(err, unix.ENOMEM) {
+		return statusErr("resource_exhausted", prefix+": "+err.Error())
+	}
+	return statusErr("internal", prefix+": "+err.Error())
+}
+
+func (s *Server) reapExpiredWatchers(ttl time.Duration) int {
+	now := time.Now()
+	var expired []*dirWatcher
+	s.mu.Lock()
+	for id, w := range s.watchers {
+		if w.poll && now.Sub(time.Unix(0, w.lastPoll.Load())) >= ttl {
+			expired = append(expired, w)
+			delete(s.watchers, id)
+		}
+	}
+	s.mu.Unlock()
+	for _, w := range expired {
+		w.stop()
+	}
+	return len(expired)
+}
+
 func (s *Server) startDirWatcher(rec *SandboxRecord, req watchCreateReq, poll bool) (*dirWatcher, error) {
+	return s.startDirWatcherWithCap(rec, req, poll, maxWatchersPerSandbox)
+}
+
+func (s *Server) startDirWatcherWithCap(rec *SandboxRecord, req watchCreateReq, poll bool, capPerSandbox int) (*dirWatcher, error) {
+	s.reapExpiredWatchers(pollWatcherIdleTTL)
+	s.mu.RLock()
+	activeForSandbox := 0
+	for _, w := range s.watchers {
+		if w.sandboxID == rec.SandboxID {
+			activeForSandbox++
+		}
+	}
+	s.mu.RUnlock()
+	if activeForSandbox >= capPerSandbox {
+		return nil, statusErr("resource_exhausted", "too many active watchers")
+	}
 	full, err := s.resolveWatchPath(rec, req.Path)
 	if err != nil {
 		return nil, statusErr("invalid_argument", err.Error())
@@ -561,12 +660,12 @@ func (s *Server) startDirWatcher(rec *SandboxRecord, req watchCreateReq, poll bo
 	}
 	fd, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
 	if err != nil {
-		return nil, statusErr("internal", "inotify_init1: "+err.Error())
+		return nil, inotifyErr("inotify_init1", err)
 	}
 	stopFD, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
 	if err != nil {
 		_ = unix.Close(fd)
-		return nil, statusErr("internal", "eventfd: "+err.Error())
+		return nil, inotifyErr("eventfd", err)
 	}
 	w := &dirWatcher{
 		id:           fmt.Sprintf("w%d", watcherSeq.Add(1)),
@@ -581,13 +680,14 @@ func (s *Server) startDirWatcher(rec *SandboxRecord, req watchCreateReq, poll bo
 		subs:         make(map[*watchSub]struct{}),
 		done:         make(chan struct{}),
 	}
+	w.lastPoll.Store(time.Now().UnixNano())
 	if err := w.arm(); err != nil {
 		w.stop()
 		_ = unix.Close(fd)
 		_ = unix.Close(stopFD)
 		w.fd = -1
 		w.stopFD = -1
-		return nil, statusErr("internal", "inotify_add_watch: "+err.Error())
+		return nil, inotifyErr("inotify_add_watch", err)
 	}
 	s.mu.Lock()
 	if s.watchers == nil {
@@ -600,6 +700,7 @@ func (s *Server) startDirWatcher(rec *SandboxRecord, req watchCreateReq, poll bo
 }
 
 func (s *Server) watcherByID(sandboxID, id string) *dirWatcher {
+	s.reapExpiredWatchers(pollWatcherIdleTTL)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	w := s.watchers[id]

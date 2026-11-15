@@ -4126,15 +4126,16 @@ fn test_watch_dir_events_recursive_rename_entry_and_errors() {
         &addr,
         &rid,
         |ev| {
-            let names = event_names_of_type(ev, "EVENT_TYPE_RENAME");
-            names.contains(&"old.txt") && names.contains(&"new.txt")
+            event_names_of_type(ev, "EVENT_TYPE_RENAME").contains(&"old.txt")
+                && event_names_of_type(ev, "EVENT_TYPE_CREATE").contains(&"new.txt")
         },
         Duration::from_secs(3),
     );
     let rename_names = event_names_of_type(&renamed, "EVENT_TYPE_RENAME");
+    let create_names = event_names_of_type(&renamed, "EVENT_TYPE_CREATE");
     assert!(
-        rename_names.contains(&"old.txt") && rename_names.contains(&"new.txt"),
-        "rename emits one RENAME per moved-from and moved-to name: {rename_names:?}"
+        rename_names.contains(&"old.txt") && create_names.contains(&"new.txt"),
+        "rename emits RENAME for moved-from and CREATE for moved-to: rename={rename_names:?} create={create_names:?}"
     );
 
     std::fs::write(root.join("r/mode.txt"), b"m").unwrap();

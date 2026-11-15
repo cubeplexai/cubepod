@@ -47,6 +47,8 @@ use crate::DaemonConfig;
 
 pub const WATCH_RING_CAP: usize = 4096;
 pub const WATCH_SUB_QUEUE: usize = 64;
+pub const MAX_WATCHERS_PER_SANDBOX: usize = 16;
+pub const POLL_WATCHER_IDLE_TTL: Duration = Duration::from_secs(300);
 const WATCH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub const WATCH_BUFFER_OVERFLOW_MSG: &str = "watch event buffer overflow: events were dropped";
 pub const WATCH_QUEUE_OVERFLOW_MSG: &str = "watch subscriber queue overflow";
@@ -64,7 +66,6 @@ const CEPH_MAGIC: u32 = 0x00c3_6400;
 
 const WATCH_MASK: u32 = libc::IN_CREATE
     | libc::IN_MODIFY
-    | libc::IN_CLOSE_WRITE
     | libc::IN_DELETE
     | libc::IN_DELETE_SELF
     | libc::IN_MOVED_FROM
@@ -120,6 +121,7 @@ pub(crate) struct DirWatcher {
     subscribers: Mutex<Vec<WatchSub>>,
     stopped: AtomicBool,
     overflowed: AtomicBool,
+    last_poll: Mutex<std::time::Instant>,
 }
 
 impl Drop for DirWatcher {
@@ -151,6 +153,7 @@ pub struct WatchSubHandle {
 pub struct WatchRegistry {
     inner: Arc<Mutex<HashMap<String, Arc<DirWatcher>>>>,
     counter: Arc<AtomicU64>,
+    max_watchers: usize,
 }
 
 #[derive(Debug)]
@@ -161,11 +164,32 @@ pub enum WatchPathError {
     Exhausted(String),
 }
 
+fn inotify_io_error(context: &str, err: std::io::Error) -> WatchPathError {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::ENOSPC | libc::EMFILE | libc::ENFILE | libc::ENOMEM)
+    ) {
+        WatchPathError::Exhausted(format!("{context}: {err}"))
+    } else {
+        WatchPathError::Invalid(format!("{context}: {err}"))
+    }
+}
+
 impl WatchRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             counter: Arc::new(AtomicU64::new(1)),
+            max_watchers: MAX_WATCHERS_PER_SANDBOX,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_max_watchers(max_watchers: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            counter: Arc::new(AtomicU64::new(1)),
+            max_watchers,
         }
     }
 
@@ -183,7 +207,31 @@ impl WatchRegistry {
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<Arc<DirWatcher>> {
+        self.reap_expired(POLL_WATCHER_IDLE_TTL);
         self.inner.lock().unwrap().get(id).cloned()
+    }
+
+    pub fn reap_expired(&self, ttl: Duration) -> usize {
+        let now = std::time::Instant::now();
+        let mut expired = Vec::new();
+        {
+            let mut map = self.inner.lock().unwrap();
+            map.retain(|_, w| {
+                if w.poll {
+                    let last = *w.last_poll.lock().unwrap();
+                    if now.duration_since(last) >= ttl {
+                        expired.push(Arc::clone(w));
+                        return false;
+                    }
+                }
+                true
+            });
+        }
+        let count = expired.len();
+        for w in expired {
+            w.stop();
+        }
+        count
     }
 
     pub fn remove(&self, id: &str) -> bool {
@@ -213,14 +261,18 @@ impl WatchRegistry {
         allow_network: bool,
         poll: bool,
     ) -> Result<Arc<DirWatcher>, WatchPathError> {
+        self.reap_expired(POLL_WATCHER_IDLE_TTL);
+        if self.inner.lock().unwrap().len() >= self.max_watchers {
+            return Err(WatchPathError::Exhausted("too many active watchers".into()));
+        }
         let root = resolve_watch_path(workdir, path)?;
         check_mount(&root, allow_network)?;
         let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         if fd < 0 {
-            return Err(WatchPathError::Invalid(format!(
-                "inotify_init1: {}",
-                std::io::Error::last_os_error()
-            )));
+            return Err(inotify_io_error(
+                "inotify_init1",
+                std::io::Error::last_os_error(),
+            ));
         }
         let stop_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if stop_fd < 0 {
@@ -228,7 +280,7 @@ impl WatchRegistry {
             unsafe {
                 libc::close(fd);
             }
-            return Err(WatchPathError::Invalid(format!("eventfd: {err}")));
+            return Err(inotify_io_error("eventfd", err));
         }
         let id = format!("w{}", self.counter.fetch_add(1, Ordering::SeqCst));
         let watcher = Arc::new(DirWatcher {
@@ -244,10 +296,11 @@ impl WatchRegistry {
             subscribers: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             overflowed: AtomicBool::new(false),
+            last_poll: Mutex::new(std::time::Instant::now()),
         });
         if let Err(e) = watcher.arm() {
             watcher.stop();
-            return Err(WatchPathError::Invalid(format!("inotify_add_watch: {e}")));
+            return Err(e);
         }
         self.inner.lock().unwrap().insert(id, Arc::clone(&watcher));
         let reader = Arc::clone(&watcher);
@@ -280,16 +333,21 @@ impl DirWatcher {
         self.subscribers.lock().unwrap().clear();
     }
 
-    fn arm(&self) -> Result<(), String> {
-        self.add_watch(&self.root, "")?;
+    fn arm(&self) -> Result<(), WatchPathError> {
+        self.add_watch(&self.root, "")
+            .map_err(|e| inotify_io_error("inotify_add_watch", e))?;
         if self.recursive {
             self.walk(&self.root, "")?;
         }
         Ok(())
     }
 
-    fn walk(&self, dir: &Path, rel: &str) -> Result<(), String> {
-        let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+    fn walk(&self, dir: &Path, rel: &str) -> Result<(), WatchPathError> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(e) => return Err(inotify_io_error("read_dir", e)),
+        };
         for ent in entries.flatten() {
             let meta = match std::fs::symlink_metadata(ent.path()) {
                 Ok(m) => m,
@@ -302,22 +360,27 @@ impl DirWatcher {
             let name = name.to_string_lossy();
             let child_rel = join_rel(rel, &name);
             let full = ent.path();
-            self.add_watch(&full, &child_rel)?;
+            match self.add_watch(&full, &child_rel) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                Err(e) => return Err(inotify_io_error("inotify_add_watch", e)),
+            }
             self.walk(&full, &child_rel)?;
         }
         Ok(())
     }
 
-    fn add_watch(&self, dir: &Path, rel: &str) -> Result<(), String> {
+    fn add_watch(&self, dir: &Path, rel: &str) -> Result<(), std::io::Error> {
         let fd = self.fd.load(Ordering::SeqCst);
         if fd < 0 {
-            return Err("watcher stopped".into());
+            return Err(std::io::Error::other("watcher stopped"));
         }
-        let c = CString::new(dir.as_os_str().as_bytes())
-            .map_err(|_| "path contains nul".to_string())?;
+        let c = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains nul")
+        })?;
         let wd = unsafe { libc::inotify_add_watch(fd, c.as_ptr(), WATCH_MASK) };
         if wd < 0 {
-            return Err(std::io::Error::last_os_error().to_string());
+            return Err(std::io::Error::last_os_error());
         }
         self.watches.lock().unwrap().insert(wd, rel.to_string());
         Ok(())
@@ -400,6 +463,7 @@ impl DirWatcher {
     /// Events since the last successful poll. `Err` means the ring or the
     /// kernel queue overflowed and the events that remain are incomplete.
     fn poll_events(&self) -> Result<Vec<FsEvent>, ()> {
+        *self.last_poll.lock().unwrap() = std::time::Instant::now();
         let mut pending = self.pending.lock().unwrap();
         if self.overflowed.load(Ordering::SeqCst) {
             return Err(());
@@ -553,15 +617,15 @@ impl DirWatcher {
 }
 
 fn map_mask(mask: u32) -> Option<&'static str> {
-    if mask & libc::IN_CREATE != 0 {
+    if mask & (libc::IN_CREATE | libc::IN_MOVED_TO) != 0 {
         Some("EVENT_TYPE_CREATE")
     } else if mask & (libc::IN_DELETE | libc::IN_DELETE_SELF) != 0 {
         Some("EVENT_TYPE_REMOVE")
-    } else if mask & (libc::IN_MOVED_FROM | libc::IN_MOVED_TO) != 0 {
+    } else if mask & libc::IN_MOVED_FROM != 0 {
         Some("EVENT_TYPE_RENAME")
     } else if mask & libc::IN_ATTRIB != 0 {
         Some("EVENT_TYPE_CHMOD")
-    } else if mask & (libc::IN_MODIFY | libc::IN_CLOSE_WRITE) != 0 {
+    } else if mask & libc::IN_MODIFY != 0 {
         Some("EVENT_TYPE_WRITE")
     } else {
         None
@@ -641,7 +705,32 @@ fn is_special_abs(path: &str) -> bool {
         || path.starts_with("/sys/")
 }
 
-fn logical_under_workdir(workdir: &str, user: &str) -> Result<PathBuf, WatchPathError> {
+fn canonicalize_deepest_ancestor(path: &Path) -> Result<PathBuf, WatchPathError> {
+    let mut cur = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match std::fs::canonicalize(&cur) {
+            Ok(mut real) => {
+                for seg in tail.into_iter().rev() {
+                    real.push(seg);
+                }
+                return Ok(real);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = cur.file_name().map(|s| s.to_os_string()) else {
+                    return Ok(path.to_path_buf());
+                };
+                tail.push(name);
+                if !cur.pop() {
+                    return Ok(path.to_path_buf());
+                }
+            }
+            Err(e) => return Err(WatchPathError::Invalid(e.to_string())),
+        }
+    }
+}
+
+fn resolve_target_path(workdir: &str, user: &str) -> Result<PathBuf, WatchPathError> {
     let user = user.trim();
     if user.is_empty() {
         return Err(WatchPathError::Invalid("path is required".into()));
@@ -652,17 +741,22 @@ fn logical_under_workdir(workdir: &str, user: &str) -> Result<PathBuf, WatchPath
         ));
     }
     let work = normalize_logical(workdir);
-    let logical = if user == "/workspace" {
-        work.clone()
+    let (logical, confined) = if user == "/workspace" {
+        (work.clone(), true)
     } else if let Some(rest) = user.strip_prefix("/workspace/") {
-        format!("{}/{}", work.trim_end_matches('/'), rest)
+        (format!("{}/{}", work.trim_end_matches('/'), rest), true)
     } else if user.starts_with('/') {
-        user.to_string()
+        // podd runs inside the sandbox trust boundary; explicit absolute paths
+        // (e.g. /home/user) are allowed just like files.write, except /proc,/dev,/sys.
+        (user.to_string(), false)
     } else {
-        format!("{}/{}", work.trim_end_matches('/'), user)
+        (format!("{}/{}", work.trim_end_matches('/'), user), true)
     };
     let clean = normalize_logical(&logical);
-    if clean != work && !clean.starts_with(&(work.trim_end_matches('/').to_string() + "/")) {
+    if confined
+        && clean != work
+        && !clean.starts_with(&(work.trim_end_matches('/').to_string() + "/"))
+    {
         return Err(WatchPathError::Invalid(
             "path escapes sandbox work tree".into(),
         ));
@@ -672,11 +766,26 @@ fn logical_under_workdir(workdir: &str, user: &str) -> Result<PathBuf, WatchPath
             "refusing to watch proc, dev, or sys".into(),
         ));
     }
-    Ok(PathBuf::from(clean))
+    let resolved = canonicalize_deepest_ancestor(Path::new(&clean))?;
+    let resolved_str = resolved.to_string_lossy();
+    if is_special_abs(&resolved_str) {
+        return Err(WatchPathError::Invalid(
+            "refusing to watch proc, dev, or sys".into(),
+        ));
+    }
+    if confined {
+        let real_work = std::fs::canonicalize(&work).unwrap_or_else(|_| PathBuf::from(&work));
+        if resolved != real_work && !resolved.starts_with(&real_work) {
+            return Err(WatchPathError::Invalid(
+                "path escapes sandbox work tree".into(),
+            ));
+        }
+    }
+    Ok(resolved)
 }
 
 pub fn resolve_watch_path(workdir: &str, user: &str) -> Result<PathBuf, WatchPathError> {
-    let path = logical_under_workdir(workdir, user)?;
+    let path = resolve_target_path(workdir, user)?;
     match std::fs::metadata(&path) {
         Ok(meta) if meta.is_dir() => Ok(path),
         Ok(_) => Err(WatchPathError::Invalid("path is not a directory".into())),
@@ -688,7 +797,7 @@ pub fn resolve_watch_path(workdir: &str, user: &str) -> Result<PathBuf, WatchPat
 }
 
 fn resolve_mkdir_path(workdir: &str, user: &str) -> Result<PathBuf, WatchPathError> {
-    logical_under_workdir(workdir, user)
+    resolve_target_path(workdir, user)
 }
 
 fn normalize_logical(path: &str) -> String {
@@ -859,9 +968,10 @@ fn mkdir_io_error(err: std::io::Error, last: bool) -> WatchPathError {
     WatchPathError::Invalid(err.to_string())
 }
 
-/// Create `path` and any missing parents. An existing directory is `already_exists`.
+/// Create `path` and any missing parents, chowning newly created directories
+/// to `(uid, gid)` when running as root. An existing directory is `already_exists`.
 /// An existing file, or a file used as a parent, is `invalid_argument`.
-fn mkdir_p(path: &Path) -> Result<(), WatchPathError> {
+fn mkdir_p(path: &Path, uid: u32, gid: u32) -> Result<(), WatchPathError> {
     let comps: Vec<Component> = path.components().collect();
     if comps.is_empty() {
         return Err(WatchPathError::Invalid("path is required".into()));
@@ -888,29 +998,29 @@ fn mkdir_p(path: &Path) -> Result<(), WatchPathError> {
                     "parent path is not a directory".into()
                 }));
             }
-            PathKind::Missing => {
-                if let Err(e) = std::fs::create_dir(&built) {
-                    if e.kind() == std::io::ErrorKind::AlreadyExists {
-                        match classify_path(&built).map_err(|err| mkdir_io_error(err, last))? {
-                            PathKind::Dir if last => {
-                                return Err(WatchPathError::AlreadyExists(
-                                    "directory already exists".into(),
-                                ));
-                            }
-                            PathKind::Dir => {}
-                            _ => {
-                                return Err(WatchPathError::Invalid(if last {
-                                    "path exists and is not a directory".into()
-                                } else {
-                                    "parent path is not a directory".into()
-                                }));
-                            }
+            PathKind::Missing => match std::fs::create_dir(&built) {
+                Ok(()) => {
+                    crate::files::chown_if_root(&built, uid, gid);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    match classify_path(&built).map_err(|err| mkdir_io_error(err, last))? {
+                        PathKind::Dir if last => {
+                            return Err(WatchPathError::AlreadyExists(
+                                "directory already exists".into(),
+                            ));
                         }
-                    } else {
-                        return Err(mkdir_io_error(e, last));
+                        PathKind::Dir => {}
+                        _ => {
+                            return Err(WatchPathError::Invalid(if last {
+                                "path exists and is not a directory".into()
+                            } else {
+                                "parent path is not a directory".into()
+                            }));
+                        }
                     }
                 }
-            }
+                Err(e) => return Err(mkdir_io_error(e, last)),
+            },
         }
     }
     Ok(())
@@ -944,6 +1054,21 @@ fn make_dir_success_body(user_path: &str, full: &Path) -> String {
     )
 }
 
+fn parse_query_map(req_path: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let Some((_, qs)) = req_path.split_once('?') else {
+        return map;
+    };
+    for pair in qs.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if !k.is_empty() {
+                map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    map
+}
+
 pub fn handle_make_dir(stream: &mut TcpStream, req: &HttpRequest, config: &DaemonConfig) {
     let json = match parse_watch_body(req) {
         Ok(j) => j,
@@ -960,7 +1085,14 @@ pub fn handle_make_dir(stream: &mut TcpStream, req: &HttpRequest, config: &Daemo
             return;
         }
     };
-    if let Err(e) = mkdir_p(&full) {
+    let mut ownership_params = parse_query_map(&req.target);
+    if !ownership_params.contains_key("user") && !ownership_params.contains_key("username") {
+        if let Some(u) = json_str(&json, &["user", "username"]) {
+            ownership_params.insert("user".to_string(), u.to_string());
+        }
+    }
+    let (uid, gid) = crate::files::resolve_file_ownership(&ownership_params);
+    if let Err(e) = mkdir_p(&full, uid, gid) {
         write_watch_error(stream, e);
         return;
     }
@@ -1480,6 +1612,7 @@ mod tests {
             subscribers: Mutex::new(Vec::new()),
             stopped: AtomicBool::new(false),
             overflowed: AtomicBool::new(false),
+            last_poll: Mutex::new(std::time::Instant::now()),
         };
         w.add_watch(&dir, "").unwrap();
         let child = dir.join("child");
@@ -1681,5 +1814,101 @@ mod tests {
             "server-side stop must emit a clean Connect end-stream frame"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_allows_explicit_abs_and_blocks_symlink_escape() {
+        let base = std::env::temp_dir().join(format!(
+            "podd-watch-sym-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work = base.join("work");
+        let outside = base.join("outside");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let work_str = work.to_str().unwrap();
+        // Explicit absolute path outside workdir is allowed in podd (trust boundary = sandbox).
+        assert!(resolve_watch_path(work_str, outside.to_str().unwrap()).is_ok());
+
+        // Symlink inside /workspace pointing outside /workspace is rejected.
+        let link = work.join("escape");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(matches!(
+            resolve_watch_path(work_str, "/workspace/escape"),
+            Err(WatchPathError::Invalid(_))
+        ));
+        assert!(matches!(
+            resolve_mkdir_path(work_str, "/workspace/escape/sub"),
+            Err(WatchPathError::Invalid(_))
+        ));
+
+        // Symlink pointing to /proc is rejected even for explicit absolute paths.
+        let proc_link = outside.join("to_proc");
+        std::os::unix::fs::symlink("/proc", &proc_link).unwrap();
+        assert!(matches!(
+            resolve_watch_path(work_str, proc_link.to_str().unwrap()),
+            Err(WatchPathError::Invalid(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn watcher_cap_and_idle_poll_ttl() {
+        let dir = std::env::temp_dir().join(format!(
+            "podd-watch-cap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = WatchRegistry::with_max_watchers(1);
+        reg.create(
+            dir.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        match reg.create(
+            dir.to_str().unwrap(),
+            dir.to_str().unwrap(),
+            false,
+            false,
+            false,
+            true,
+        ) {
+            Err(WatchPathError::Exhausted(msg)) => {
+                assert!(msg.contains("too many active watchers"), "got: {msg}");
+            }
+            Err(e) => panic!("expected Exhausted(too many active watchers), got {e:?}"),
+            Ok(_) => panic!("expected Exhausted(too many active watchers), got Ok"),
+        }
+        // Reaping with zero TTL expires idle poll watchers.
+        assert_eq!(reg.reap_expired(Duration::ZERO), 1);
+        assert_eq!(reg.active_count(), 0);
+        reg.stop_all();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn map_mask_matches_fsnotify_and_drops_close_write() {
+        assert_eq!(map_mask(libc::IN_CREATE), Some("EVENT_TYPE_CREATE"));
+        assert_eq!(map_mask(libc::IN_MOVED_TO), Some("EVENT_TYPE_CREATE"));
+        assert_eq!(map_mask(libc::IN_MOVED_FROM), Some("EVENT_TYPE_RENAME"));
+        assert_eq!(map_mask(libc::IN_MODIFY), Some("EVENT_TYPE_WRITE"));
+        assert_eq!(map_mask(libc::IN_CLOSE_WRITE), None);
+        assert_eq!(WATCH_MASK & libc::IN_CLOSE_WRITE, 0);
     }
 }

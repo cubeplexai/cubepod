@@ -265,12 +265,17 @@ func TestRecursiveArmDoesNotReplayFilesCreatedBeforeAddWatch(t *testing.T) {
 	w := &dirWatcher{
 		root:      dir,
 		recursive: true,
+		poll:      true,
 		fd:        fd,
+		stopFD:    -1,
 		watches:   map[int]string{},
 		subs:      map[*watchSub]struct{}{},
 		done:      make(chan struct{}),
 	}
-	t.Cleanup(w.stop)
+	t.Cleanup(func() {
+		w.stop()
+		_ = unix.Close(fd)
+	})
 	if err := w.addWatch(dir, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -621,10 +626,102 @@ func TestLocalSandboxDeleteCleansPTYAndWatch(t *testing.T) {
 	default:
 		t.Fatal("watcher was not stopped")
 	}
-	watcher.mu.Lock()
-	fd := watcher.fd
-	watcher.mu.Unlock()
-	if fd != -1 {
-		t.Fatalf("watcher fd %d", fd)
+	fdDeadline := time.Now().Add(2 * time.Second)
+	for {
+		watcher.mu.Lock()
+		fd := watcher.fd
+		watcher.mu.Unlock()
+		if fd == -1 {
+			break
+		}
+		if time.Now().After(fdDeadline) {
+			t.Fatalf("watcher fd %d did not close", fd)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestResolveWatchPathAllowsHomeUserAndBlocksSymlinkEscape(t *testing.T) {
+	base := t.TempDir()
+	work := filepath.Join(base, "work")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(work, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0755); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{}
+	rec := &SandboxRecord{SandboxID: "sbx-sym", WorkspaceDir: work}
+
+	// /home/user is re-rooted under the sandbox workspace directory in local mode,
+	// matching resolveFilePath.
+	got, err := srv.resolveWatchPath(rec, "/home/user/proj")
+	if err != nil {
+		t.Fatalf("resolve /home/user/proj: %v", err)
+	}
+	want := filepath.Join(work, "home", "user", "proj")
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+
+	// Symlink pointing outside the workspace must be rejected.
+	link := filepath.Join(work, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.resolveWatchPath(rec, "/workspace/escape"); err == nil {
+		t.Fatal("expected symlink escape to be rejected")
+	}
+	if _, err := srv.resolveWatchPath(rec, "/workspace/escape/sub"); err == nil {
+		t.Fatal("expected symlink ancestor escape to be rejected")
+	}
+}
+
+func TestWatchCapAndIdlePollTTL(t *testing.T) {
+	work := t.TempDir()
+	srv := &Server{watchers: make(map[string]*dirWatcher)}
+	rec := &SandboxRecord{SandboxID: "sbx-cap", WorkspaceDir: work}
+
+	for i := 0; i < 2; i++ {
+		if _, err := srv.startDirWatcherWithCap(rec, watchCreateReq{Path: "/workspace"}, true, 2); err != nil {
+			t.Fatalf("watcher %d failed: %v", i, err)
+		}
+	}
+	if _, err := srv.startDirWatcherWithCap(rec, watchCreateReq{Path: "/workspace"}, true, 2); err == nil {
+		t.Fatal("expected watcher cap error")
+	} else if st, ok := err.(*connectStatusError); !ok || st.code != "resource_exhausted" {
+		t.Fatalf("expected resource_exhausted, got %#v", err)
+	}
+
+	if reaped := srv.reapExpiredWatchers(0); reaped != 2 {
+		t.Fatalf("reaped %d want 2", reaped)
+	}
+	srv.mu.RLock()
+	remaining := len(srv.watchers)
+	srv.mu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("remaining watchers %d", remaining)
+	}
+}
+
+func TestMapInotifyMatchesFsnotifyAndDropsCloseWrite(t *testing.T) {
+	if typ, ok := mapInotify(unix.IN_CREATE); !ok || typ != "EVENT_TYPE_CREATE" {
+		t.Fatalf("IN_CREATE: %q %v", typ, ok)
+	}
+	if typ, ok := mapInotify(unix.IN_MOVED_TO); !ok || typ != "EVENT_TYPE_CREATE" {
+		t.Fatalf("IN_MOVED_TO: %q %v", typ, ok)
+	}
+	if typ, ok := mapInotify(unix.IN_MOVED_FROM); !ok || typ != "EVENT_TYPE_RENAME" {
+		t.Fatalf("IN_MOVED_FROM: %q %v", typ, ok)
+	}
+	if typ, ok := mapInotify(unix.IN_MODIFY); !ok || typ != "EVENT_TYPE_WRITE" {
+		t.Fatalf("IN_MODIFY: %q %v", typ, ok)
+	}
+	if typ, ok := mapInotify(unix.IN_CLOSE_WRITE); ok {
+		t.Fatalf("IN_CLOSE_WRITE must be ignored, got %q", typ)
+	}
+	if watchMask&unix.IN_CLOSE_WRITE != 0 {
+		t.Fatal("watchMask must not include IN_CLOSE_WRITE")
 	}
 }
