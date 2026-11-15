@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
 
 // dockerClient talks to the Docker Engine HTTP API. The compose gateway image
@@ -25,7 +27,7 @@ func (d dockerClient) ensureBindVolume(name, device string) error {
 	if !d.enabled {
 		return errors.New("docker volumes disabled")
 	}
-	if name == "" || device == "" || !strings.HasPrefix(name, dockerPrefixGuard) {
+	if name == "" || device == "" || !v1alpha1.AllowedDockerVolumeName(name) {
 		return errors.New("refusing docker volume create")
 	}
 	base, client, err := dockerAPI(d.host)
@@ -57,7 +59,7 @@ func (d dockerClient) removeVolume(name string) error {
 	if !d.enabled {
 		return nil
 	}
-	if !strings.HasPrefix(name, dockerPrefixGuard) {
+	if !v1alpha1.AllowedDockerVolumeName(name) {
 		return errors.New("refusing docker volume delete")
 	}
 	base, client, err := dockerAPI(d.host)

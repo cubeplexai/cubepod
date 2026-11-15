@@ -2,15 +2,15 @@
 // records and content filesystem.
 //
 // Data and metadata live on disk under a store directory so they survive a
-// gateway process restart. When Docker volume provisioning is enabled, each
-// volume is also exposed as a named volume cpod-test-vol-<id> whose local
-// driver bind-mounts that same data directory. The named volume is only
-// created or deleted when its name has the cpod-test- prefix and matches
-// this volume id.
+// gateway process restart. The store root and each {id} directory are mode
+// 0700. Only {id}/data is mounted into a sandbox. When Docker volume
+// provisioning is enabled, each volume is also exposed as a named volume
+// whose local driver bind-mounts that data directory. The name must start
+// with cubepod-e2bvol- (product) or cpod-test- (tests) and must match this
+// volume id.
 //
-// Kubernetes: callers may record a filesystem PersistentVolumeClaim per
-// volume (see the gateway). This package does not attach that claim to a
-// Kata pod. Live Kata / block-device mounting is not implemented here.
+// Callers attach the filesystem claim e2bvol-<id> on the sandbox pod. This
+// package records the claim. It does not talk to a live Kata cluster.
 package volume
 
 import (
@@ -30,14 +30,19 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
 
 const (
 	defaultDockerPrefix = "cpod-test-vol-"
-	dockerPrefixGuard   = "cpod-test-"
 	maxVolumeNameLen    = 128
 	maxMountsPerSandbox = 32
 	maxListDepth        = 64
+	// defaultDataUID is the sandbox user (ubuntu) that must be able to write
+	// the mounted data directory. The store root stays root-owned and 0700.
+	defaultDataUID = 1000
+	defaultDataGID = 1000
 )
 
 var (
@@ -74,7 +79,8 @@ type Config struct {
 	HostDir string
 	// DockerVolumes creates and deletes named volumes via the Docker API.
 	DockerVolumes bool
-	// DockerPrefix defaults to cpod-test-vol-. It must start with cpod-test-.
+	// DockerPrefix defaults to cpod-test-vol-. Product callers set cubepod-e2bvol-.
+	// The prefix must itself be an allowed Docker volume name.
 	DockerPrefix string
 	// DockerHost is DOCKER_HOST (tcp:// or unix://). Empty uses the environment.
 	DockerHost string
@@ -182,13 +188,16 @@ func Open(dir string, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(abs, 0o755); err != nil {
+	if err := os.MkdirAll(abs, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(abs, 0o700); err != nil {
 		return nil, err
 	}
 	if cfg.DockerPrefix == "" {
 		cfg.DockerPrefix = defaultDockerPrefix
 	}
-	if cfg.DockerVolumes && !strings.HasPrefix(cfg.DockerPrefix, dockerPrefixGuard) {
+	if cfg.DockerVolumes && !v1alpha1.AllowedDockerVolumeName(cfg.DockerPrefix) {
 		cfg.DockerVolumes = false
 	}
 	if cfg.DockerHost == "" {
@@ -266,13 +275,20 @@ func (s *Store) Create(apiKey, name string) (Volume, error) {
 		attrs: map[string]fileAttr{},
 	}
 	volDir := filepath.Join(s.dir, id)
-	// 0777 so a sandbox user (often uid 1000, not the gateway root) can
-	// write after the volume is mounted. umask is applied by MkdirAll, so
-	// chmod follows.
-	if err := os.MkdirAll(rec.meta.DataDir, 0o777); err != nil {
+	// Parent holds metadata and stays 0700 so a sandbox user cannot walk
+	// sibling volumes. Only data/ is mounted, and it is owned by uid 1000.
+	if err := os.MkdirAll(volDir, 0o700); err != nil {
 		return Volume{}, err
 	}
-	if err := os.Chmod(rec.meta.DataDir, 0o777); err != nil {
+	if err := os.Chmod(volDir, 0o700); err != nil {
+		_ = os.RemoveAll(volDir)
+		return Volume{}, err
+	}
+	if err := os.Mkdir(rec.meta.DataDir, 0o755); err != nil {
+		_ = os.RemoveAll(volDir)
+		return Volume{}, err
+	}
+	if err := ownPath(rec.meta.DataDir, WriteOpts{}, true); err != nil {
 		_ = os.RemoveAll(volDir)
 		return Volume{}, err
 	}
@@ -511,12 +527,18 @@ func (s *Store) MountsForSandbox(sandboxID string) []MountSpec {
 				_ = s.saveMeta(rec)
 			}
 		}
+		host := s.daemonDataPath(m.VolumeID)
+		local := filepath.Join(s.dir, m.VolumeID, "data")
+		// Mount only the data directory. The store root and {id} hold metadata.
+		if filepath.Base(host) != "data" || filepath.Base(local) != "data" {
+			continue
+		}
 		out = append(out, MountSpec{
 			VolumeName:    m.Name,
 			VolumeID:      m.VolumeID,
 			ContainerPath: m.Path,
-			HostPath:      s.daemonDataPath(m.VolumeID),
-			LocalPath:     filepath.Join(s.dir, m.VolumeID, "data"),
+			HostPath:      host,
+			LocalPath:     local,
 			DockerVolume:  rec.meta.DockerVolume,
 		})
 	}
@@ -645,13 +667,17 @@ func (s *Store) MakeDir(id, userPath string, opts WriteOpts) (Entry, error) {
 		if !fi.IsDir() {
 			return Entry{}, ErrConflict
 		}
+		if opts.Mode != nil || opts.UID != nil || opts.GID != nil {
+			if err := applyMeta(full, opts); err != nil {
+				return Entry{}, err
+			}
+		}
 	} else if !os.IsNotExist(err) {
 		return Entry{}, err
 	} else if opts.Force {
-		if err := os.MkdirAll(full, 0o777); err != nil {
+		if err := s.ensureDir(rec.meta.DataDir, full, opts); err != nil {
 			return Entry{}, err
 		}
-		_ = os.Chmod(full, 0o777)
 	} else {
 		parent := filepath.Dir(full)
 		pfi, err := os.Lstat(parent)
@@ -661,21 +687,18 @@ func (s *Store) MakeDir(id, userPath string, opts WriteOpts) (Entry, error) {
 			}
 			return Entry{}, err
 		}
-		if !pfi.IsDir() {
+		if pfi.Mode()&os.ModeSymlink != 0 || !pfi.IsDir() {
 			return Entry{}, ErrNotDir
 		}
-		if err := os.Mkdir(full, 0o777); err != nil {
+		if err := os.Mkdir(full, 0o755); err != nil {
 			if os.IsExist(err) {
 				return s.statFull(rec, abs, full)
 			}
 			return Entry{}, err
 		}
-		if err := os.Chmod(full, 0o777); err != nil {
+		if err := ownPath(full, opts, true); err != nil {
 			return Entry{}, err
 		}
-	}
-	if err := applyMeta(full, opts); err != nil {
-		return Entry{}, err
 	}
 	s.putAttr(rec, abs, opts)
 	if err := s.saveAttrs(rec); err != nil {
@@ -708,10 +731,11 @@ func (s *Store) WriteFile(id, userPath string, r io.Reader, opts WriteOpts) (Ent
 		if !opts.Force {
 			return Entry{}, ErrNotExist
 		}
-		if err := os.MkdirAll(parent, 0o777); err != nil {
+		parentOpts := opts
+		parentOpts.Mode = nil
+		if err := s.ensureDir(rec.meta.DataDir, parent, parentOpts); err != nil {
 			return Entry{}, err
 		}
-		_ = os.Chmod(parent, 0o777)
 	} else if pfi.Mode()&os.ModeSymlink != 0 || !pfi.IsDir() {
 		return Entry{}, ErrNotDir
 	}
@@ -722,13 +746,7 @@ func (s *Store) WriteFile(id, userPath string, r io.Reader, opts WriteOpts) (Ent
 	} else if !os.IsNotExist(err) {
 		return Entry{}, err
 	}
-	// Default 0666 (then chmod, to beat umask) so the mounted sandbox user
-	// can overwrite files the content API created as gateway root.
-	mode := 0o666
-	if opts.Mode != nil {
-		mode = *opts.Mode & 0o777
-	}
-	f, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, os.FileMode(mode))
+	f, err := os.OpenFile(full, os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
 	if err != nil {
 		return Entry{}, err
 	}
@@ -740,10 +758,7 @@ func (s *Store) WriteFile(id, userPath string, r io.Reader, opts WriteOpts) (Ent
 	if closeErr != nil {
 		return Entry{}, closeErr
 	}
-	if err := os.Chmod(full, os.FileMode(mode)); err != nil {
-		return Entry{}, err
-	}
-	if err := applyMeta(full, opts); err != nil {
+	if err := ownPath(full, opts, false); err != nil {
 		return Entry{}, err
 	}
 	s.putAttr(rec, abs, opts)
@@ -1012,9 +1027,18 @@ func (s *Store) load() error {
 		}
 		meta.DataDir = filepath.Join(s.dir, id, "data")
 		meta.DaemonDataDir = s.daemonDataPath(id)
+		volDir := filepath.Join(s.dir, id)
 		if err := os.MkdirAll(meta.DataDir, 0o755); err != nil {
 			return err
 		}
+		if err := os.Chmod(volDir, 0o700); err != nil {
+			return err
+		}
+		if err := ownPath(meta.DataDir, WriteOpts{}, true); err != nil {
+			return err
+		}
+		_ = os.Chmod(metaPath, 0o600)
+		_ = os.Chmod(filepath.Join(s.dir, id, "attrs.json"), 0o600)
 		rec := &volRec{meta: meta, attrs: map[string]fileAttr{}}
 		if ab, err := os.ReadFile(filepath.Join(s.dir, id, "attrs.json")); err == nil {
 			_ = json.Unmarshal(ab, &rec.attrs)
@@ -1044,6 +1068,10 @@ func (s *Store) load() error {
 				s.mounts[sb] = kept
 			}
 		}
+	}
+	_ = os.Chmod(mp, 0o600)
+	if err := os.Chmod(s.dir, 0o700); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1077,7 +1105,7 @@ func (s *Store) withinRoot(p string) bool {
 
 func (s *Store) ensureDockerVolume(id, device string) (string, error) {
 	name := s.cfg.DockerPrefix + id
-	if !strings.HasPrefix(name, dockerPrefixGuard) || !strings.HasSuffix(name, id) {
+	if !v1alpha1.AllowedDockerVolumeName(name) || !strings.HasSuffix(name, id) {
 		return "", errors.New("refusing docker volume name")
 	}
 	if err := s.docker.ensureBindVolume(name, device); err != nil {
@@ -1087,7 +1115,7 @@ func (s *Store) ensureDockerVolume(id, device string) (string, error) {
 }
 
 func (s *Store) removeDockerVolume(id, name string) error {
-	if !strings.HasPrefix(name, dockerPrefixGuard) || name != s.cfg.DockerPrefix+id {
+	if !v1alpha1.AllowedDockerVolumeName(name) || name != s.cfg.DockerPrefix+id {
 		return errors.New("refusing to delete docker volume")
 	}
 	return s.docker.removeVolume(name)
@@ -1103,10 +1131,14 @@ func atomicWriteJSON(path string, v any) error {
 }
 
 func atomicWrite(dest string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+	dir := filepath.Dir(dest)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(filepath.Dir(dest), ".tmp-*")
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
 		return err
 	}
@@ -1118,6 +1150,10 @@ func atomicWrite(dest string, data []byte) error {
 		}
 	}()
 	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Chmod(0o600); err != nil {
 		_ = f.Close()
 		return err
 	}
@@ -1178,7 +1214,7 @@ func cleanMountPath(p string) (string, error) {
 		}
 	}
 	c := path.Clean(p)
-	if c == "/" || c == "." || strings.HasPrefix(c, "../") {
+	if c == "/" || c == "." || strings.HasPrefix(c, "../") || !v1alpha1.ValidE2BContainerPath(c) {
 		return "", ErrInvalidPath
 	}
 	return c, nil
@@ -1327,6 +1363,66 @@ func validateModeOwner(opts WriteOpts) error {
 	}
 	if opts.GID != nil && *opts.GID < 0 {
 		return ErrInvalidPath
+	}
+	return nil
+}
+
+// ownPath chowns a data file or directory, then sets its mode.
+// The default owner is uid/gid 1000. An explicit write or mkdir uid/gid wins.
+// The default mode is 0644 for a file and 0755 for a directory.
+// Chown is best-effort so a non-root unit test can still chmod.
+func ownPath(full string, opts WriteOpts, isDir bool) error {
+	uid, gid := defaultDataUID, defaultDataGID
+	if opts.UID != nil {
+		uid = *opts.UID
+	}
+	if opts.GID != nil {
+		gid = *opts.GID
+	}
+	_ = os.Chown(full, uid, gid)
+	mode := os.FileMode(0o644)
+	if isDir {
+		mode = 0o755
+	}
+	if opts.Mode != nil {
+		mode = os.FileMode(*opts.Mode & 0o7777)
+	}
+	return os.Chmod(full, mode)
+}
+
+// ensureDir creates full and any missing parents inside the volume data root.
+// Parents use the default directory mode. full uses opts.Mode when set.
+func (s *Store) ensureDir(dataRoot, full string, opts WriteOpts) error {
+	rel, err := filepath.Rel(dataRoot, full)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return ErrInvalidPath
+	}
+	cur := dataRoot
+	parts := strings.Split(rel, string(filepath.Separator))
+	for i, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return ErrInvalidPath
+		}
+		next := filepath.Join(cur, part)
+		fi, err := os.Lstat(next)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return err
+			}
+			if err := os.Mkdir(next, 0o755); err != nil && !os.IsExist(err) {
+				return err
+			}
+			partOpts := opts
+			if i != len(parts)-1 {
+				partOpts.Mode = nil
+			}
+			if err := ownPath(next, partOpts, true); err != nil {
+				return err
+			}
+		} else if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
+			return ErrNotDir
+		}
+		cur = next
 	}
 	return nil
 }
