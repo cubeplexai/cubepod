@@ -1,0 +1,32 @@
+title: "Kubernetes Kata & CSI Block Integration for Official E2B Volumes"
+cep-number: "0026"
+authors:
+  - "@xfgong"
+owning-area: "storage"
+participating-areas:
+  - "controller"
+  - "gateway"
+  - "runtime"
+status: "provisional"
+creation-date: "2026-11-15"
+reviewers:
+  - "@xfgong"
+approvers:
+  - "@xfgong"
+stage: "alpha"
+latest-milestone: "v0.5"
+milestone:
+  alpha: "v0.5"
+  beta: "v0.6"
+  stable: "v1.0"
+feature-gates:
+  - name: "K8sE2BVolumeMounts"
+    components:
+      - "podd-init"
+      - "cubepod-controller"
+      - "cubepod-gateway"
+disable-supported: true
+metrics:
+  - "cubepod_e2b_volume_mounts_total"
+  - "cubepod_e2b_volume_mount_errors_total"
+  - "cubepod_podd_init_e2b_bind_duration_ms"
