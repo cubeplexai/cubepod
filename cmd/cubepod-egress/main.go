@@ -64,6 +64,7 @@ func main() {
 		caFile              = flag.String("ca-file", "", "Path to root CA certificate PEM for Vault mTLS")
 		mitmCACert          = flag.String("mitm-ca-cert", "", "Path to MITM CA certificate PEM")
 		mitmCAKey           = flag.String("mitm-ca-key", "", "Path to MITM CA private key PEM")
+		upstreamCAFile      = flag.String("upstream-ca-file", "", "Optional path to additional upstream root CA PEM")
 		enableMITM          = flag.Bool("enable-mitm", false, "Enable selective HTTPS MITM for SecretBindings")
 		policyFile          = flag.String("policy-file", "", "Path to JSON NetworkPolicySpec file (reloaded on SIGHUP)")
 		upstreamProxy       = flag.String("upstream-proxy", "", "Optional upstream HTTP CONNECT proxy URL")
@@ -81,6 +82,12 @@ func main() {
 	*caFile = envOrDefault(*caFile, "CUBEPOD_CA_FILE", "")
 	*mitmCACert = envOrDefault(*mitmCACert, "CUBEPOD_MITM_CA_CERT", "")
 	*mitmCAKey = envOrDefault(*mitmCAKey, "CUBEPOD_MITM_CA_KEY", "")
+	*upstreamCAFile = envOrDefault(*upstreamCAFile, "CUBEPOD_UPSTREAM_CA_FILE", "")
+	if *upstreamCAFile == "" {
+		if _, err := os.Stat("/etc/cubepod/certs/upstream-ca.crt"); err == nil {
+			*upstreamCAFile = "/etc/cubepod/certs/upstream-ca.crt"
+		}
+	}
 	*policyFile = envOrDefault(*policyFile, "CUBEPOD_POLICY_FILE", "")
 	*upstreamProxy = envOrDefault(*upstreamProxy, "CUBEPOD_UPSTREAM_PROXY", "")
 	*upstreamDNS = envOrDefault(*upstreamDNS, "CUBEPOD_UPSTREAM_DNS", "")
@@ -184,12 +191,31 @@ func main() {
 		}
 	}
 
+	var upstreamRootCAs *x509.CertPool
+	if *upstreamCAFile != "" {
+		upstreamPEM, err := os.ReadFile(*upstreamCAFile)
+		if err != nil {
+			slog.Error("failed to load upstream CA file", "path", *upstreamCAFile, "err", err)
+			os.Exit(1)
+		}
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(upstreamPEM) {
+			slog.Error("no certificates found in upstream CA file", "path", *upstreamCAFile)
+			os.Exit(1)
+		}
+		upstreamRootCAs = pool
+	}
+
 	proxy := egress.NewEgressProxy(egress.EgressProxyConfig{
 		SandboxID:       *sandboxID,
 		Policy:          policy,
 		ExchangeURL:     *exchangeURL,
 		ClientTLSConfig: tlsConfig,
 		MITMCA:          mitmCA,
+		UpstreamRootCAs: upstreamRootCAs,
 		UpstreamProxy:   *upstreamProxy,
 	})
 

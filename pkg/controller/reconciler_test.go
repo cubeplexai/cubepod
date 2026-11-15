@@ -2298,3 +2298,438 @@ func TestReconciler_VolumeKeyPersistenceAndWarmPoolSkip(t *testing.T) {
 		t.Fatalf("expected workspace PVC %q deleted on DeleteBox(..., true)", wantWSPVC)
 	}
 }
+
+type failingEnsurePodKubeClient struct {
+	*controller.MemoryKubeClient
+	cancelOnEnsure   context.CancelFunc
+	onEnsurePod      func(pod controller.PodManifest)
+	createdPVCs      []string
+	deletedPVCs      []string
+	createdPods      []string
+	deletedPods      []string
+	deleteCtxExpired bool
+}
+
+func (f *failingEnsurePodKubeClient) EnsurePVC(ctx context.Context, pvc controller.BlockPVCManifest) error {
+	f.createdPVCs = append(f.createdPVCs, pvc.Name)
+	return f.MemoryKubeClient.EnsurePVC(ctx, pvc)
+}
+
+func (f *failingEnsurePodKubeClient) DeletePVC(ctx context.Context, ns, name string) error {
+	if ctx.Err() != nil {
+		f.deleteCtxExpired = true
+	}
+	f.deletedPVCs = append(f.deletedPVCs, name)
+	return f.MemoryKubeClient.DeletePVC(ctx, ns, name)
+}
+
+func (f *failingEnsurePodKubeClient) DeletePod(ctx context.Context, ns, name string) error {
+	if ctx.Err() != nil {
+		f.deleteCtxExpired = true
+	}
+	f.deletedPods = append(f.deletedPods, name)
+	return f.MemoryKubeClient.DeletePod(ctx, ns, name)
+}
+
+func (f *failingEnsurePodKubeClient) EnsurePod(_ context.Context, pod controller.PodManifest) (string, error) {
+	_, _ = f.MemoryKubeClient.EnsurePod(context.Background(), pod)
+	f.createdPods = append(f.createdPods, pod.Name)
+	if f.onEnsurePod != nil {
+		f.onEnsurePod(pod)
+	}
+	if f.cancelOnEnsure != nil {
+		f.cancelOnEnsure()
+	}
+	return "", fmt.Errorf("injected EnsurePod timeout")
+}
+
+func TestReconciler_ColdCreateEnsurePodFailureRollback_PreservesVolumeKey(t *testing.T) {
+	t.Run("ephemeral deletes both PVCs with un-canceled cleanup context", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		memKube := controller.NewMemoryKubeClient()
+		fk := &failingEnsurePodKubeClient{
+			MemoryKubeClient: memKube,
+			cancelOnEnsure:   cancel,
+		}
+		r := controller.NewReconciler(
+			controller.WithKubeClient(fk),
+			controller.WithNamespace("cubepod-workloads"),
+		)
+
+		_, err := r.Reconcile(ctx, "fail-ephemeral", v1alpha1.PodBoxSpec{
+			DesiredState:     v1alpha1.DesiredStateRunning,
+			RootfsGeneration: 1,
+		})
+		if err == nil {
+			t.Fatal("expected Reconcile error when EnsurePod fails")
+		}
+		if fk.deleteCtxExpired {
+			t.Fatal("expected rollback DeletePVC to use context.WithoutCancel, got canceled ctx")
+		}
+		if _, ok := memKube.GetPVC("cubepod-workloads", "fail-ephemeral-rootfs-pvc"); ok {
+			t.Fatal("expected fail-ephemeral-rootfs-pvc cleaned up on cold-create failure")
+		}
+		if _, ok := memKube.GetPVC("cubepod-workloads", "fail-ephemeral-workspace-pvc"); ok {
+			t.Fatal("expected ephemeral fail-ephemeral-workspace-pvc cleaned up on cold-create failure")
+		}
+		if box, _ := memKube.GetPodBox(context.Background(), "cubepod-workloads", "fail-ephemeral"); box != nil {
+			t.Fatal("expected PodBox deleted on cold-create failure")
+		}
+	})
+
+	t.Run("persistent VolumeKey retains workspace PVC on failure", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		memKube := controller.NewMemoryKubeClient()
+		fk := &failingEnsurePodKubeClient{
+			MemoryKubeClient: memKube,
+			cancelOnEnsure:   cancel,
+		}
+		r := controller.NewReconciler(
+			controller.WithKubeClient(fk),
+			controller.WithNamespace("cubepod-workloads"),
+		)
+
+		spec := v1alpha1.PodBoxSpec{
+			DesiredState:     v1alpha1.DesiredStateRunning,
+			RootfsGeneration: 1,
+			VolumeKey:        "tenant-user-persist",
+		}
+		_, err := r.Reconcile(ctx, "fail-persist", spec)
+		if err == nil {
+			t.Fatal("expected Reconcile error when EnsurePod fails")
+		}
+		if fk.deleteCtxExpired {
+			t.Fatal("expected rollback DeletePVC to use context.WithoutCancel, got canceled ctx")
+		}
+		if _, ok := memKube.GetPVC("cubepod-workloads", "fail-persist-rootfs-pvc"); ok {
+			t.Fatal("expected fail-persist-rootfs-pvc cleaned up on cold-create failure")
+		}
+		wantWS := controller.WorkspacePVCName("fail-persist", spec)
+		if _, ok := memKube.GetPVC("cubepod-workloads", wantWS); !ok {
+			t.Fatalf("expected deterministic workspace PVC %q to survive cold-create failure", wantWS)
+		}
+	})
+}
+
+func TestReconciler_WarmPoolEnsurePodFailureCleansPVCs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	memKube := controller.NewMemoryKubeClient()
+	fk := &failingEnsurePodKubeClient{
+		MemoryKubeClient: memKube,
+		cancelOnEnsure:   cancel,
+	}
+	r := controller.NewReconciler(
+		controller.WithKubeClient(fk),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	r.RegisterTemplate("base-tpl", sampleTemplate())
+
+	_, err := r.ReconcileWarmPool(ctx, "warm-fail", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool returned unexpected error: %v", err)
+	}
+	if fk.deleteCtxExpired {
+		t.Fatal("expected rollback DeletePod/DeletePVC to use context.WithoutCancel, got canceled ctx")
+	}
+	if len(fk.createdPods) == 0 || len(fk.deletedPods) != len(fk.createdPods) {
+		t.Fatalf("expected all %d warm pods cleaned up after EnsurePod failure, got created=%v deleted=%v", len(fk.createdPods), fk.createdPods, fk.deletedPods)
+	}
+	pods, err := memKube.ListPods(context.Background(), "cubepod-workloads", "")
+	if err != nil {
+		t.Fatalf("ListPods failed: %v", err)
+	}
+	if len(pods) != 0 {
+		t.Fatalf("expected 0 remaining pods after EnsurePod failure cleanup, got %+v", pods)
+	}
+	if len(fk.createdPVCs) == 0 {
+		t.Fatal("expected warm pool PVCs created before EnsurePod failure")
+	}
+	if len(fk.deletedPVCs) != len(fk.createdPVCs) {
+		t.Fatalf("expected all %d warm PVCs cleaned up after EnsurePod failure, got created=%v deleted=%v", len(fk.createdPVCs), fk.createdPVCs, fk.deletedPVCs)
+	}
+	for _, pvcName := range fk.createdPVCs {
+		if _, ok := memKube.GetPVC("cubepod-workloads", pvcName); ok {
+			t.Fatalf("warm PVC %q leaked after EnsurePod failure", pvcName)
+		}
+	}
+}
+
+func TestReconciler_WarmPoolEnsurePodFailureStopsWhenPoolDeleted(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	poolSpec := v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    2,
+	}
+	if err := memKube.UpsertPodWarmPool(ctx, v1alpha1.PodWarmPool{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodWarmPool",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "warm-del-pool",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: poolSpec,
+	}); err != nil {
+		t.Fatalf("UpsertPodWarmPool failed: %v", err)
+	}
+
+	fk := &failingEnsurePodKubeClient{
+		MemoryKubeClient: memKube,
+		onEnsurePod: func(_ controller.PodManifest) {
+			_ = memKube.DeletePodWarmPool(context.Background(), "cubepod-workloads", "warm-del-pool")
+		},
+	}
+	r := controller.NewReconciler(
+		controller.WithKubeClient(fk),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	r.RegisterTemplate("base-tpl", sampleTemplate())
+	if _, err := r.SyncFromKube(ctx); err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+
+	if _, err := r.ReconcileWarmPool(ctx, "warm-del-pool", poolSpec); err != nil {
+		t.Fatalf("ReconcileWarmPool returned unexpected error: %v", err)
+	}
+	if len(fk.createdPods) != 1 {
+		t.Fatalf("expected ReconcileWarmPool to stop after pool deletion (1 EnsurePod attempt), got %d (%v)", len(fk.createdPods), fk.createdPods)
+	}
+	if len(fk.deletedPods) != 1 || len(fk.deletedPVCs) != len(fk.createdPVCs) {
+		t.Fatalf("expected failed attempt pod+PVCs deleted, got deletedPods=%v createdPVCs=%v deletedPVCs=%v", fk.deletedPods, fk.createdPVCs, fk.deletedPVCs)
+	}
+}
+
+func TestReconciler_WithEgressUpstreamCA(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	upstreamCA := []byte("-----BEGIN CERTIFICATE-----\nFAKE-UPSTREAM-CA\n-----END CERTIFICATE-----\n")
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+		controller.WithEgressUpstreamCA(upstreamCA),
+	)
+	tpl := sampleTemplate()
+	tpl.Egress = v1alpha1.EgressConfig{
+		Enabled:     true,
+		Image:       "egress:v1",
+		ExchangeURL: "https://192.168.1.215:9443/api/v1/internal/egress/exchange",
+	}
+	r.RegisterTemplate("egress-upstream-ca-tpl", tpl)
+
+	if _, err := r.Reconcile(ctx, "upstream-ca-box", v1alpha1.PodBoxSpec{
+		TemplateRef:      "egress-upstream-ca-tpl",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	sec, err := memKube.GetSecret(ctx, "cubepod-workloads", "upstream-ca-box-egress-mtls")
+	if err != nil {
+		t.Fatalf("GetSecret failed: %v", err)
+	}
+	if string(sec.Data["upstream-ca.crt"]) != string(upstreamCA) {
+		t.Fatalf("upstream-ca.crt = %q; want %q", string(sec.Data["upstream-ca.crt"]), string(upstreamCA))
+	}
+}
+
+type failOnSecondEnsurePodKubeClient struct {
+	*controller.MemoryKubeClient
+	ensureCalls int
+}
+
+func (f *failOnSecondEnsurePodKubeClient) EnsurePod(ctx context.Context, pod controller.PodManifest) (string, error) {
+	f.ensureCalls++
+	if f.ensureCalls >= 2 {
+		return "", fmt.Errorf("injected EnsurePod timeout")
+	}
+	return f.MemoryKubeClient.EnsurePod(ctx, pod)
+}
+
+func TestReconciler_ResetRootFS_EnsurePodFailure_PersistsNewGenInPodBox(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	fk := &failOnSecondEnsurePodKubeClient{MemoryKubeClient: memKube}
+	r := controller.NewReconciler(
+		controller.WithKubeClient(fk),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	r.RegisterTemplate("base-tpl", sampleTemplate())
+
+	spec1 := v1alpha1.PodBoxSpec{
+		TemplateRef:      "base-tpl",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		VolumeKey:        "ws-key-1",
+	}
+	if _, err := r.Reconcile(ctx, "reset-persist-box", spec1); err != nil {
+		t.Fatalf("initial Reconcile failed: %v", err)
+	}
+
+	spec2 := spec1
+	spec2.RootfsGeneration = 2
+	if _, err := r.Reconcile(ctx, "reset-persist-box", spec2); err == nil {
+		t.Fatal("expected Reconcile error on injected EnsurePod failure")
+	}
+
+	box, err := memKube.GetPodBox(ctx, "cubepod-workloads", "reset-persist-box")
+	if err != nil {
+		t.Fatalf("GetPodBox failed: %v", err)
+	}
+	if box.Spec.RootfsGeneration != 2 || box.Status.ObservedRootfsGen != 2 {
+		t.Fatalf("expected generation=2 persisted in PodBox, got spec=%d status=%d", box.Spec.RootfsGeneration, box.Status.ObservedRootfsGen)
+	}
+	wantPVC := "reset-persist-box-rootfs-gen2-pvc"
+	if box.Status.RootfsPVCName != wantPVC {
+		t.Fatalf("RootfsPVCName = %q; want %q", box.Status.RootfsPVCName, wantPVC)
+	}
+	if box.Status.Phase != v1alpha1.PodBoxPhaseProvisioning {
+		t.Fatalf("Phase = %q; want %q", box.Status.Phase, v1alpha1.PodBoxPhaseProvisioning)
+	}
+}
+
+type failOnToggleSecretKubeClient struct {
+	*controller.MemoryKubeClient
+	failCreateSecret bool
+}
+
+func (f *failOnToggleSecretKubeClient) CreateSecret(ctx context.Context, secret controller.KubeSecret) error {
+	if f.failCreateSecret {
+		return fmt.Errorf("injected CreateSecret error")
+	}
+	return f.MemoryKubeClient.CreateSecret(ctx, secret)
+}
+
+func TestReconciler_ForkFrom_RollbackOnEnsurePodFailure(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	fk := &failOnSecondEnsurePodKubeClient{MemoryKubeClient: memKube}
+	r := controller.NewReconciler(
+		controller.WithKubeClient(fk),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	r.RegisterTemplate("base-tpl", sampleTemplate())
+
+	if _, err := r.Reconcile(ctx, "fork-parent", v1alpha1.PodBoxSpec{
+		TemplateRef:      "base-tpl",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}); err != nil {
+		t.Fatalf("parent Reconcile failed: %v", err)
+	}
+
+	if _, err := r.Reconcile(ctx, "fork-child", v1alpha1.PodBoxSpec{
+		TemplateRef:      "base-tpl",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: "fork-parent"},
+	}); err == nil {
+		t.Fatal("expected child ForkFrom Reconcile to fail on EnsurePod error")
+	}
+
+	if _, ok := memKube.GetPVC("cubepod-workloads", "fork-child-rootfs-pvc"); ok {
+		t.Fatal("expected fork-child-rootfs-pvc rolled back after EnsurePod failure")
+	}
+	if _, ok := memKube.GetPVC("cubepod-workloads", "fork-child-workspace-pvc"); ok {
+		t.Fatal("expected fork-child-workspace-pvc rolled back after EnsurePod failure")
+	}
+	if box, _ := memKube.GetPodBox(ctx, "cubepod-workloads", "fork-child"); box != nil {
+		t.Fatal("expected fork-child PodBox deleted after EnsurePod failure")
+	}
+}
+
+func TestReconciler_ResetRootFS_EnsureEgressSecretsFailure_PersistsNewGen(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	sk := &failOnToggleSecretKubeClient{MemoryKubeClient: memKube}
+	r := controller.NewReconciler(
+		controller.WithKubeClient(sk),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	tpl := sampleTemplate()
+	tpl.Egress.Enabled = true
+	r.RegisterTemplate("egress-reset-tpl", tpl)
+
+	spec1 := v1alpha1.PodBoxSpec{
+		TemplateRef:      "egress-reset-tpl",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		VolumeKey:        "ws-egress-key-1",
+		NetworkPolicy: &v1alpha1.NetworkPolicySpec{
+			DefaultAction: v1alpha1.NetworkDefaultDeny,
+			AllowHosts:    []string{"api.github.com"},
+		},
+	}
+	if _, err := r.Reconcile(ctx, "reset-egress-box", spec1); err != nil {
+		t.Fatalf("initial Reconcile failed: %v", err)
+	}
+
+	sk.failCreateSecret = true
+	spec2 := spec1
+	spec2.RootfsGeneration = 2
+	spec2.NetworkPolicy = &v1alpha1.NetworkPolicySpec{
+		DefaultAction: v1alpha1.NetworkDefaultDeny,
+		AllowHosts:    []string{"api.github.com", "pypi.org"},
+	}
+	if _, err := r.Reconcile(ctx, "reset-egress-box", spec2); err == nil {
+		t.Fatal("expected Reconcile error on injected CreateSecret failure")
+	}
+
+	box, err := memKube.GetPodBox(ctx, "cubepod-workloads", "reset-egress-box")
+	if err != nil {
+		t.Fatalf("GetPodBox failed: %v", err)
+	}
+	if box.Spec.RootfsGeneration != 2 || box.Status.ObservedRootfsGen != 2 {
+		t.Fatalf("expected generation=2 persisted in PodBox, got spec=%d status=%d", box.Spec.RootfsGeneration, box.Status.ObservedRootfsGen)
+	}
+	wantPVC := "reset-egress-box-rootfs-gen2-pvc"
+	if box.Status.RootfsPVCName != wantPVC {
+		t.Fatalf("RootfsPVCName = %q; want %q", box.Status.RootfsPVCName, wantPVC)
+	}
+	if box.Status.Phase != v1alpha1.PodBoxPhaseProvisioning {
+		t.Fatalf("Phase = %q; want %q", box.Status.Phase, v1alpha1.PodBoxPhaseProvisioning)
+	}
+}
+
+func TestReconciler_SyncFromKube_WarmPoolDeletion_UnsanitizedPoolName(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	const poolName = "Delete_Pool_Upper"
+	if _, err := r.ReconcileWarmPool(ctx, poolName, v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "base-tpl",
+		Replicas:    1,
+	}); err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+
+	podsBefore, err := memKube.ListPods(ctx, "cubepod-workloads", "")
+	if err != nil || len(podsBefore) != 1 {
+		t.Fatalf("expected 1 standby warm pod before deletion, got %d (err=%v)", len(podsBefore), err)
+	}
+
+	if err := memKube.DeletePodWarmPool(ctx, "cubepod-workloads", poolName); err != nil {
+		t.Fatalf("DeletePodWarmPool failed: %v", err)
+	}
+	r.SetPoolCreatedAt(poolName, time.Now().Add(-15*time.Second))
+
+	if _, err := r.SyncFromKube(ctx); err != nil {
+		t.Fatalf("SyncFromKube failed: %v", err)
+	}
+
+	podsAfter, err := memKube.ListPods(ctx, "cubepod-workloads", "")
+	if err != nil {
+		t.Fatalf("ListPods after sync failed: %v", err)
+	}
+	if len(podsAfter) != 0 {
+		t.Fatalf("expected standby warm pod cleaned up after deletion, still found %d", len(podsAfter))
+	}
+}

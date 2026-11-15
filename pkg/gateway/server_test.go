@@ -2333,3 +2333,55 @@ func TestArchiveSyncEmptyBodyRemovePaths(t *testing.T) {
 		t.Fatalf("keep.txt mismatch: %q", string(keepData))
 	}
 }
+
+type emptyPhasePodBoxKubeClient struct {
+	*controller.MemoryKubeClient
+}
+
+func (c *emptyPhasePodBoxKubeClient) GetPodBox(ctx context.Context, namespace, name string) (*v1alpha1.PodBox, error) {
+	box, err := c.MemoryKubeClient.GetPodBox(ctx, namespace, name)
+	if err != nil || box == nil {
+		return box, err
+	}
+	cp := *box
+	cp.Status.Phase = ""
+	return &cp, nil
+}
+
+func TestGateway_ResolveSandbox_PreservesStateWhenPodBoxPhaseEmpty(t *testing.T) {
+	memKube := controller.NewMemoryKubeClient()
+	wrapKube := &emptyPhasePodBoxKubeClient{MemoryKubeClient: memKube}
+	reconciler := controller.NewReconciler(controller.WithKubeClient(wrapKube))
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	createResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"cubeplex-ubuntu24-desktop"}`))
+	if err != nil {
+		t.Fatalf("POST /sandboxes failed: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d", createResp.StatusCode)
+	}
+	var created gateway.SandboxRecord
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	getResp, err := http.Get(ts.URL + "/sandboxes/" + created.SandboxID)
+	if err != nil {
+		t.Fatalf("GET /sandboxes/%s failed: %v", created.SandboxID, err)
+	}
+	defer getResp.Body.Close()
+	if getResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", getResp.StatusCode)
+	}
+	var fetched gateway.SandboxRecord
+	if err := json.NewDecoder(getResp.Body).Decode(&fetched); err != nil {
+		t.Fatalf("decode get response: %v", err)
+	}
+	if fetched.State != string(v1alpha1.PodBoxPhaseRunning) {
+		t.Fatalf("expected state %q when PodBox.Status.Phase is empty, got %q", v1alpha1.PodBoxPhaseRunning, fetched.State)
+	}
+}

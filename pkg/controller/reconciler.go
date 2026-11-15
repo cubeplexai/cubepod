@@ -251,6 +251,17 @@ type Reconciler struct {
 	buildingPids            map[string]int
 	buildMetrics            templateBuildMetricsCollector
 	egressCA                *egress.CA
+	egressUpstreamCAPEM     []byte
+}
+
+// WithEgressUpstreamCA configures an optional upstream root CA PEM bundle distributed
+// to egress sidecar Secrets (<box>-egress-mtls key "upstream-ca.crt").
+func WithEgressUpstreamCA(pem []byte) ReconcilerOption {
+	return func(r *Reconciler) {
+		if len(pem) > 0 {
+			r.egressUpstreamCAPEM = append([]byte(nil), pem...)
+		}
+	}
 }
 
 // SetFailWarmPoolClaim sets whether warm pool claims should fail (used for testing fallback).
@@ -666,8 +677,8 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 			if podManifest.Labels == nil {
 				podManifest.Labels = make(map[string]string)
 			}
-			podManifest.Labels["cubepod.io/warmpool"] = poolName
-			podManifest.Labels["cubepod.io/template"] = spec.TemplateRef
+			podManifest.Labels["cubepod.io/warmpool"] = SanitizeLabelValue(poolName)
+			podManifest.Labels["cubepod.io/template"] = SanitizeLabelValue(spec.TemplateRef)
 			podManifest.Labels["cubepod.io/claimed"] = "false"
 
 			is409 := false
@@ -677,6 +688,29 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 					is409 = true
 				} else {
 					slog.Warn("failed to ensure warm pod", "pod", dummyStatus.PodName, "err", err)
+					cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+					if delErr := r.kubeClient.DeletePod(cleanupCtx, r.namespace, dummyStatus.PodName); delErr != nil {
+						slog.Warn("failed to clean up warm pod after EnsurePod error", "pod", dummyStatus.PodName, "err", delErr)
+					}
+					if delErr := r.kubeClient.DeletePVC(cleanupCtx, r.namespace, rootfsPVC.Name); delErr != nil {
+						slog.Warn("failed to clean up warm rootfs PVC after EnsurePod error", "pvc", rootfsPVC.Name, "err", delErr)
+					}
+					if delErr := r.kubeClient.DeletePVC(cleanupCtx, r.namespace, wsPVC.Name); delErr != nil {
+						slog.Warn("failed to clean up warm workspace PVC after EnsurePod error", "pvc", wsPVC.Name, "err", delErr)
+					}
+					stopPoolRetry := ctx.Err() != nil
+					if !stopPoolRetry && pool.persisted {
+						if _, getErr := r.kubeClient.GetPodWarmPool(cleanupCtx, r.namespace, poolName); getErr != nil && !errors.Is(getErr, ErrCRDNotInstalled) {
+							errLower := strings.ToLower(getErr.Error())
+							if strings.Contains(errLower, "not found") || strings.Contains(errLower, "404") {
+								stopPoolRetry = true
+							}
+						}
+					}
+					cancel()
+					if stopPoolRetry {
+						break
+					}
 					continue
 				}
 			}
@@ -945,6 +979,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		tpl.Storage.RootfsSize = fmt.Sprintf("%dMi", resolved.DiskSizeMB)
 	}
 
+	createdCold := false
 	if !exists {
 		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set, no ForkFrom, and no deterministic VolumeKey)
 		if spec.WarmPoolRef != "" && spec.ForkFrom == nil && spec.VolumeKey == "" {
@@ -964,13 +999,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			}
 		} else if spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != "" {
 			// 2. CoW Fork provisioning from parent sandbox
+			createdCold = true
 			parentRootfsPVC, parentWorkspacePVC := r.resolveForkParentPVCsLocked(ctx, spec.ForkFrom.PodBoxName)
 			rootfsName := fmt.Sprintf("%s-rootfs-pvc", name)
 			if spec.RootfsGeneration > 1 {
 				rootfsName = fmt.Sprintf("%s-rootfs-gen%d-pvc", name, spec.RootfsGeneration)
 			}
 			status = &v1alpha1.PodBoxStatus{
-				Phase:             v1alpha1.PodBoxPhaseRunning,
+				Phase:             v1alpha1.PodBoxPhaseProvisioning,
 				PodName:           fmt.Sprintf("%s-kata-pod", name),
 				RootfsPVCName:     rootfsName,
 				WorkspacePVCName:  WorkspacePVCName(name, spec),
@@ -986,6 +1022,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			_ = r.kubeClient.EnsurePVC(ctx, wsPVC)
 		} else {
 			// 3. Standard fresh sandbox provisioning
+			createdCold = true
 			rootfsName := fmt.Sprintf("%s-rootfs-pvc", name)
 			if spec.RootfsGeneration > 1 {
 				rootfsName = fmt.Sprintf("%s-rootfs-gen%d-pvc", name, spec.RootfsGeneration)
@@ -1009,7 +1046,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	}
 
 	// Handle independent RootFS reset while keeping Workspace PVC intact.
+	didResetRootFS := false
 	if spec.RootfsGeneration > status.ObservedRootfsGen {
+		didResetRootFS = true
 		slog.Info("resetting RootFS Upper PVC while preserving Workspace PVC",
 			"podBox", name,
 			"oldGen", status.ObservedRootfsGen,
@@ -1051,6 +1090,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	default:
 		if tpl.Egress.Enabled {
 			if err := r.ensureEgressSecretsLocked(ctx, name, spec); err != nil {
+				if createdCold {
+					r.rollbackColdCreateLocked(ctx, name, spec, status, "")
+				} else if didResetRootFS {
+					r.persistFailedTransitionLocked(ctx, name, spec, status, status.PodName, effectiveImage, now)
+				}
 				return nil, fmt.Errorf("failed to ensure egress secrets: %w", err)
 			}
 		}
@@ -1067,6 +1111,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			if strings.Contains(errStr, "409") || strings.Contains(errStr, "already exists") || strings.Contains(errStr, "conflict") {
 				err = nil
 			} else {
+				if createdCold {
+					r.rollbackColdCreateLocked(ctx, name, spec, status, podManifest.Name)
+				} else {
+					r.persistFailedTransitionLocked(ctx, name, spec, status, podManifest.Name, effectiveImage, now)
+				}
 				return nil, fmt.Errorf("failed to ensure Pod: %w", err)
 			}
 		}
@@ -1100,6 +1149,42 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	_ = r.kubeClient.UpsertPodBox(ctx, box)
 
 	return &cp, nil
+}
+
+func (r *Reconciler) persistFailedTransitionLocked(
+	ctx context.Context,
+	name string,
+	spec v1alpha1.PodBoxSpec,
+	status *v1alpha1.PodBoxStatus,
+	podName string,
+	effectiveImage string,
+	now time.Time,
+) {
+	// Persist in-progress state transitions (e.g. rootfsGeneration bump + new PVC)
+	// even when ensuring egress secrets or waiting for the replacement Pod fails.
+	status.Phase = v1alpha1.PodBoxPhaseProvisioning
+	status.PodName = podName
+	status.PodIP = ""
+	status.LastActivityAt = &now
+	r.specs[name] = spec
+	cpErr := *status
+	annsErr := r.podBoxAnnotationsLocked(name, effectiveImage)
+	if annsErr != nil {
+		r.boxAnnotations[name] = maps.Clone(annsErr)
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	_ = r.kubeClient.UpsertPodBox(persistCtx, v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:        name,
+			Namespace:   r.namespace,
+			Annotations: annsErr,
+		},
+		Spec:   spec,
+		Status: cpErr,
+	})
 }
 
 func (r *Reconciler) mergeBoxAnnotationsLocked(name string, incoming map[string]string) {
@@ -1310,9 +1395,21 @@ func (r *Reconciler) ensureEgressSecretsLocked(ctx context.Context, boxName stri
 		d := existingMtls.Data
 		if len(d["tls.crt"]) > 0 && len(d["tls.key"]) > 0 && len(d["mitm-ca.crt"]) > 0 && len(d["mitm-ca.key"]) > 0 &&
 			bytes.Equal(d["ca.crt"], r.egressCA.CACertPEM()) &&
-			bytes.Equal(existingCA.Data["mitm-ca.crt"], d["mitm-ca.crt"]) {
+			bytes.Equal(existingCA.Data["mitm-ca.crt"], d["mitm-ca.crt"]) &&
+			bytes.Equal(d["upstream-ca.crt"], r.egressUpstreamCAPEM) {
 			if bytes.Equal(d["policy.json"], policyJSON) {
 				return nil
+			}
+			updatedData := map[string][]byte{
+				"tls.crt":     d["tls.crt"],
+				"tls.key":     d["tls.key"],
+				"ca.crt":      d["ca.crt"],
+				"mitm-ca.crt": d["mitm-ca.crt"],
+				"mitm-ca.key": d["mitm-ca.key"],
+				"policy.json": policyJSON,
+			}
+			if len(r.egressUpstreamCAPEM) > 0 {
+				updatedData["upstream-ca.crt"] = r.egressUpstreamCAPEM
 			}
 			updatedMtls := KubeSecret{
 				APIVersion: "v1",
@@ -1323,14 +1420,7 @@ func (r *Reconciler) ensureEgressSecretsLocked(ctx context.Context, boxName stri
 					Labels:    labels,
 				},
 				Type: "Opaque",
-				Data: map[string][]byte{
-					"tls.crt":     d["tls.crt"],
-					"tls.key":     d["tls.key"],
-					"ca.crt":      d["ca.crt"],
-					"mitm-ca.crt": d["mitm-ca.crt"],
-					"mitm-ca.key": d["mitm-ca.key"],
-					"policy.json": policyJSON,
-				},
+				Data: updatedData,
 			}
 			return r.ensureSecret(ctx, updatedMtls)
 		}
@@ -1345,6 +1435,17 @@ func (r *Reconciler) ensureEgressSecretsLocked(ctx context.Context, boxName stri
 		return err
 	}
 
+	mtlsData := map[string][]byte{
+		"tls.crt":     tlsCertPEM,
+		"tls.key":     tlsKeyPEM,
+		"ca.crt":      r.egressCA.CACertPEM(),
+		"mitm-ca.crt": mitmCertPEM,
+		"mitm-ca.key": mitmKeyPEM,
+		"policy.json": policyJSON,
+	}
+	if len(r.egressUpstreamCAPEM) > 0 {
+		mtlsData["upstream-ca.crt"] = r.egressUpstreamCAPEM
+	}
 	mtlsSecret := KubeSecret{
 		APIVersion: "v1",
 		Kind:       "Secret",
@@ -1354,14 +1455,7 @@ func (r *Reconciler) ensureEgressSecretsLocked(ctx context.Context, boxName stri
 			Labels:    labels,
 		},
 		Type: "Opaque",
-		Data: map[string][]byte{
-			"tls.crt":     tlsCertPEM,
-			"tls.key":     tlsKeyPEM,
-			"ca.crt":      r.egressCA.CACertPEM(),
-			"mitm-ca.crt": mitmCertPEM,
-			"mitm-ca.key": mitmKeyPEM,
-			"policy.json": policyJSON,
-		},
+		Data: mtlsData,
 	}
 	if err := r.ensureSecret(ctx, mtlsSecret); err != nil {
 		return fmt.Errorf("failed to ensure egress mTLS secret %s: %w", mtlsSecretName, err)
@@ -1384,6 +1478,36 @@ func (r *Reconciler) ensureEgressSecretsLocked(ctx context.Context, boxName stri
 		return fmt.Errorf("failed to ensure egress CA secret %s: %w", caSecretName, err)
 	}
 	return nil
+}
+
+func (r *Reconciler) rollbackColdCreateLocked(ctx context.Context, name string, spec v1alpha1.PodBoxSpec, status *v1alpha1.PodBoxStatus, podName string) {
+	if r.kubeClient != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+		defer cancel()
+
+		targetPod := podName
+		if targetPod == "" && status != nil {
+			targetPod = status.PodName
+		}
+		if targetPod == "" {
+			targetPod = fmt.Sprintf("%s-kata-pod", name)
+		}
+		_ = r.kubeClient.DeletePod(cleanupCtx, r.namespace, targetPod)
+		if status != nil {
+			if status.RootfsPVCName != "" {
+				_ = r.kubeClient.DeletePVC(cleanupCtx, r.namespace, status.RootfsPVCName)
+			}
+			// Preserve deterministic user workspace PVC across failures.
+			if spec.VolumeKey == "" && status.WorkspacePVCName != "" {
+				_ = r.kubeClient.DeletePVC(cleanupCtx, r.namespace, status.WorkspacePVCName)
+			}
+		}
+		r.deleteEgressSecretsLocked(cleanupCtx, name)
+		_ = r.kubeClient.DeletePodBox(cleanupCtx, r.namespace, name)
+	}
+	delete(r.boxes, name)
+	delete(r.specs, name)
+	delete(r.resolvedImages, name)
 }
 
 func (r *Reconciler) deleteEgressSecretsLocked(ctx context.Context, boxName string) {
@@ -1542,7 +1666,7 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 			if pName == "" {
 				continue
 			}
-			pods, err := r.kubeClient.ListPods(ctx, r.namespace, "cubepod.io/warmpool="+pName)
+			pods, err := r.kubeClient.ListPods(ctx, r.namespace, "cubepod.io/warmpool="+SanitizeLabelValue(pName))
 			if err != nil {
 				return 0, fmt.Errorf("failed to list pods for warmpool %s: %w", pName, err)
 			}

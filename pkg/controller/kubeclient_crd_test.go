@@ -289,6 +289,8 @@ func newMockCRDServer() (*mockCRDServer, *httptest.Server) {
 					box.Metadata.ResourceVersion = "1"
 				}
 				box.Metadata.Namespace = ns
+				// Real K8s API server strips .status on POST when subresources.status is enabled.
+				box.Status = v1alpha1.PodBoxStatus{}
 				m.podBoxes[key] = box
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusCreated)
@@ -416,6 +418,9 @@ func TestRESTKubeClient_PodBox_CRUD(t *testing.T) {
 	mock.mu.RLock()
 	if mock.postCalls != 1 {
 		t.Errorf("expected 1 POST call, got %d", mock.postCalls)
+	}
+	if mock.putStatus != 1 {
+		t.Errorf("expected 1 PUT status call on create, got %d", mock.putStatus)
 	}
 	mock.mu.RUnlock()
 

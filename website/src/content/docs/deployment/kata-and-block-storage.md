@@ -70,10 +70,11 @@ What `prep-node.sh` and `install.sh` configure:
 1. **Kernel modules & loopback block backing (`prep-node.sh`)**:
    - Loads `nvme-tcp`, `nvme-fabrics`, `uio`, `uio_pci_generic`, and `vfio-pci`.
    - Creates a sparse backing file at `$CUBEPOD_LONGHORN_IMG` (default `/storage/cubepod/longhorn-v2.img`, size `80G`), attaches it via `losetup --direct-io=on`, symlinks `/dev/cubepod/longhorn-v2`, installs `cubepod-longhorn-loop.service`, and reserves `2Mi` hugepages (`CUBEPOD_HUGEPAGES`, default `1024`).
+   - Installs `/usr/local/sbin/cubepod-spdk-sched-idle` with `cubepod-spdk-sched-idle.timer` (`5s` interval) to keep `spdk_tgt` `reactor_*` threads at `SCHED_IDLE` (`policy=5`) with a `95%` per-reactor `cpu.max` guard so root-cgroup per-CPU kernel workers (`kworker`) are never starved under EEVDF.
 2. **Cluster preparation & Helm installation (`install.sh`)**:
    - Labels the target node `cubepod.io/longhorn-v2=true` and executes the `cubepod-longhorn-v2-prep` job (`node-prep-job.yaml`).
    - Optionally restarts `kubelet` if `CUBEPOD_RESTART_KUBELET=1` is set so kubelet recognizes hugepages immediately.
-   - Installs Helm chart `longhorn/longhorn` (`--version 1.8.2`) into namespace `longhorn-system` using `deploy/k8s/longhorn-v2/values.yaml` (`v1DataEngine: false`, `v2DataEngine: true`, `v2DataEngineCPUMask: "0x1"`, `v2DataEngineGuaranteedInstanceManagerCPU: 1000`).
+   - Installs Helm chart `longhorn/longhorn` (`--version 1.8.2`) into namespace `longhorn-system` using `deploy/k8s/longhorn-v2/values.yaml` (`v1DataEngine: false`, `v2DataEngine: true`, `v2DataEngineCPUMask: "0x2"`, `v2DataEngineGuaranteedInstanceManagerCPU: 1000`).
    - Patches `nodes.longhorn.io/<node>` with a `diskType: block` disk tagged `cubepod-v2` and applies `deploy/k8s/longhorn-v2/storageclass.yaml`:
 
 | Field | Value in `storageclass.yaml` |

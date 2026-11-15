@@ -23,18 +23,23 @@ import (
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
 
+// CubePlexPlaceholderPrefix is the prefix for opaque sandbox secret references minted by CubePlex.
+const CubePlexPlaceholderPrefix = "cbxref_"
+
 // ExchangeRequest represents the wire request to POST /internal/v1/egress/exchange.
 type ExchangeRequest struct {
 	SandboxID   string `json:"sandboxID"`
 	Placeholder string `json:"placeholder"`
+	Host        string `json:"host,omitempty"`
 	SNIHost     string `json:"sniHost"`
 	HeaderName  string `json:"headerName"`
 }
 
 // ExchangeResponse represents the wire response from POST /internal/v1/egress/exchange.
 type ExchangeResponse struct {
-	Secret string `json:"secret,omitempty"`
-	Error  string `json:"error,omitempty"`
+	Secret      string   `json:"secret,omitempty"`
+	HeaderNames []string `json:"header_names,omitempty"`
+	Error       string   `json:"error,omitempty"`
 }
 
 // VaultExchangeHandler returns an http.HandlerFunc implementing the mTLS secret exchange endpoint.
@@ -77,8 +82,13 @@ func VaultExchangeHandler(vault *Vault, ca *CA) http.HandlerFunc {
 			return
 		}
 
+		sniHost := req.SNIHost
+		if sniHost == "" {
+			sniHost = req.Host
+		}
+
 		// 2. Perform zero-trust exchange via Vault
-		secret, err := vault.Exchange(clientSandboxID, req.Placeholder, req.SNIHost, req.HeaderName)
+		secret, err := vault.Exchange(clientSandboxID, req.Placeholder, sniHost, req.HeaderName)
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
@@ -164,9 +174,16 @@ func NewEgressProxy(cfg EgressProxyConfig) *EgressProxy {
 	if cfg.Transport != nil {
 		p.transport = cfg.Transport
 	} else {
-		p.transport = &http.Transport{
+		tr := &http.Transport{
 			DialContext: p.dialUpstreamAddr,
 		}
+		if cfg.UpstreamRootCAs != nil {
+			tr.TLSClientConfig = &tls.Config{
+				RootCAs:    cfg.UpstreamRootCAs,
+				MinVersion: tls.VersionTLS12,
+			}
+		}
+		p.transport = tr
 	}
 
 	return p
@@ -196,6 +213,36 @@ func (p *EgressProxy) GetPolicy() v1alpha1.NetworkPolicySpec {
 	return p.policy
 }
 
+func headerNameAllowed(allowed []string, headerName string) bool {
+	if len(allowed) == 0 {
+		return true
+	}
+	if headerName == "" {
+		return false
+	}
+	for _, h := range allowed {
+		trimmed := strings.TrimSpace(h)
+		if trimmed == "*" || strings.EqualFold(trimmed, headerName) {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeAndValidateExchangeResponse(body io.Reader, headerName string) (string, error) {
+	var exResp ExchangeResponse
+	if err := json.NewDecoder(body).Decode(&exResp); err != nil {
+		return "", fmt.Errorf("failed to decode exchange response: %w", err)
+	}
+	if exResp.Secret == "" {
+		return "", errors.New("empty secret returned from exchange")
+	}
+	if !headerNameAllowed(exResp.HeaderNames, headerName) {
+		return "", fmt.Errorf("exchange rejected: header %q not allowed", headerName)
+	}
+	return exResp.Secret, nil
+}
+
 // exchangeSecret invokes the Vault exchange endpoint over mTLS (or in-memory handler).
 func (p *EgressProxy) exchangeSecret(ctx context.Context, placeholder, host, headerName string) (string, error) {
 	p.mu.RLock()
@@ -208,6 +255,7 @@ func (p *EgressProxy) exchangeSecret(ctx context.Context, placeholder, host, hea
 	reqPayload := ExchangeRequest{
 		SandboxID:   sandboxID,
 		Placeholder: placeholder,
+		Host:        host,
 		SNIHost:     host,
 		HeaderName:  headerName,
 	}
@@ -227,14 +275,7 @@ func (p *EgressProxy) exchangeSecret(ctx context.Context, placeholder, host, hea
 		if rec.Code != http.StatusOK {
 			return "", fmt.Errorf("exchange returned status %d: %s", rec.Code, strings.TrimSpace(rec.Body.String()))
 		}
-		var resp ExchangeResponse
-		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-			return "", err
-		}
-		if resp.Secret == "" {
-			return "", errors.New("empty secret returned from exchange")
-		}
-		return resp.Secret, nil
+		return decodeAndValidateExchangeResponse(rec.Body, headerName)
 	}
 
 	if exchangeURL == "" {
@@ -260,28 +301,62 @@ func (p *EgressProxy) exchangeSecret(ctx context.Context, placeholder, host, hea
 		return "", fmt.Errorf("exchange rejected (%d): %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
-	var exResp ExchangeResponse
-	if err := json.NewDecoder(resp.Body).Decode(&exResp); err != nil {
-		return "", fmt.Errorf("failed to decode exchange response: %w", err)
-	}
-	if exResp.Secret == "" {
-		return "", errors.New("empty secret returned from exchange")
-	}
-	return exResp.Secret, nil
+	return decodeAndValidateExchangeResponse(resp.Body, headerName)
 }
 
-// replaceHeaderPlaceholders clones src headers and replaces all cpodref_ placeholders via Vault exchange.
+func isBase32TokenChar(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= '2' && b <= '7')
+}
+
+func findNextPlaceholder(s string, start int) (int, int, bool) {
+	prefixes := []string{DefaultPlaceholderPrefix, CubePlexPlaceholderPrefix}
+	pos := start
+	for pos < len(s) {
+		bestIdx := -1
+		bestPrefixLen := 0
+		for _, pfx := range prefixes {
+			if rel := strings.Index(s[pos:], pfx); rel != -1 {
+				cand := pos + rel
+				if bestIdx == -1 || cand < bestIdx {
+					bestIdx = cand
+					bestPrefixLen = len(pfx)
+				}
+			}
+		}
+		if bestIdx == -1 {
+			return 0, 0, false
+		}
+		end := bestIdx + bestPrefixLen + 32
+		if end <= len(s) {
+			valid := true
+			for i := bestIdx + bestPrefixLen; i < end; i++ {
+				if !isBase32TokenChar(s[i]) {
+					valid = false
+					break
+				}
+			}
+			if valid {
+				return bestIdx, end, true
+			}
+		}
+		pos = bestIdx + bestPrefixLen
+	}
+	return 0, 0, false
+}
+
+// replaceHeaderPlaceholders clones src headers and replaces all cpodref_/cbxref_ placeholders via Vault exchange.
 func (p *EgressProxy) replaceHeaderPlaceholders(ctx context.Context, src http.Header, targetHost string) (http.Header, error) {
 	newHeaders := make(http.Header, len(src))
 	for key, values := range src {
 		for _, val := range values {
 			replacedVal := val
+			searchFrom := 0
 			for {
-				idx := strings.Index(replacedVal, DefaultPlaceholderPrefix)
-				if idx == -1 || idx+40 > len(replacedVal) {
+				idx, end, ok := findNextPlaceholder(replacedVal, searchFrom)
+				if !ok {
 					break
 				}
-				placeholder := replacedVal[idx : idx+40]
+				placeholder := replacedVal[idx:end]
 				realSecret, err := p.exchangeSecret(ctx, placeholder, targetHost, key)
 				if err != nil {
 					if strings.Contains(err.Error(), "rejected") || strings.Contains(err.Error(), "status 403") {
@@ -292,7 +367,8 @@ func (p *EgressProxy) replaceHeaderPlaceholders(ctx context.Context, src http.He
 					return nil, fmt.Errorf("header %q: %w", key, err)
 				}
 				p.metrics.IncSecretExchange("ok")
-				replacedVal = strings.Replace(replacedVal, placeholder, realSecret, 1)
+				replacedVal = replacedVal[:idx] + realSecret + replacedVal[end:]
+				searchFrom = idx + len(realSecret)
 			}
 			newHeaders.Add(key, replacedVal)
 		}
@@ -302,20 +378,86 @@ func (p *EgressProxy) replaceHeaderPlaceholders(ctx context.Context, src http.He
 
 // ServeHTTP handles outbound requests, enforcing AllowedHosts/DeniedHosts,
 // scanning headers for cpodref_ tokens, exchanging them over mTLS, and forwarding upstream.
+func sameHostPort(a, b, defaultPort string) bool {
+	na, nb := normalizeHost(a), normalizeHost(b)
+	if na == "" || nb == "" || na != nb {
+		return false
+	}
+	_, pa := splitHostPortDefault(a, defaultPort)
+	_, pb := splitHostPortDefault(b, defaultPort)
+	return pa == pb
+}
+
+func resolvePlainHTTPTarget(r *http.Request, preferHeader bool) (string, string, int, string) {
+	if r.URL.Scheme != "" && !strings.EqualFold(r.URL.Scheme, "http") {
+		return "", "", http.StatusBadRequest, fmt.Sprintf("unsupported URL scheme %q on HTTP proxy listener", r.URL.Scheme)
+	}
+	urlHost := r.URL.Host
+	headerHost := r.Host
+	if headerHost == "" {
+		headerHost = r.Header.Get("Host")
+	}
+	if urlHost != "" && headerHost != "" && !sameHostPort(urlHost, headerHost, "80") {
+		return "", "", http.StatusBadRequest, "mismatched request URL host and Host header"
+	}
+	rawHost := urlHost
+	if preferHeader {
+		rawHost = headerHost
+		if rawHost == "" {
+			rawHost = urlHost
+		}
+	} else if rawHost == "" {
+		rawHost = headerHost
+	}
+	if rawHost == "" {
+		if preferHeader {
+			return "", "", http.StatusBadRequest, "missing Host header"
+		}
+		return "", "", http.StatusBadRequest, "missing destination host"
+	}
+	targetHost := normalizeHost(rawHost)
+	if targetHost == "" {
+		return "", "", http.StatusBadRequest, "invalid destination host"
+	}
+	return rawHost, targetHost, 0, ""
+}
+
 func (p *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	rawHost := r.URL.Host
-	if rawHost == "" {
-		rawHost = r.Host
-	}
-	if rawHost == "" {
-		rawHost = r.Header.Get("Host")
-	}
-	if rawHost == "" {
-		http.Error(w, "missing destination host", http.StatusBadRequest)
-		return
+	var rawHost, targetHost string
+	if r.Method == http.MethodConnect {
+		if r.URL.Scheme != "" {
+			http.Error(w, "CONNECT target must not include URL scheme", http.StatusBadRequest)
+			return
+		}
+		urlHost := r.URL.Host
+		headerHost := r.Host
+		if headerHost == "" {
+			headerHost = r.Header.Get("Host")
+		}
+		if urlHost != "" && headerHost != "" && !sameHostPort(urlHost, headerHost, "443") {
+			http.Error(w, "mismatched CONNECT target and Host header", http.StatusBadRequest)
+			return
+		}
+		rawHost = urlHost
+		if rawHost == "" {
+			rawHost = headerHost
+		}
+		if rawHost == "" {
+			http.Error(w, "missing destination host", http.StatusBadRequest)
+			return
+		}
+		targetHost = normalizeHost(rawHost)
+		r.Host = rawHost
+	} else {
+		var status int
+		var errMsg string
+		rawHost, targetHost, status, errMsg = resolvePlainHTTPTarget(r, false)
+		if status != 0 {
+			http.Error(w, errMsg, status)
+			return
+		}
 	}
 
-	targetHost := normalizeHost(rawHost)
 	policy := p.GetPolicy()
 
 	if !CheckEgressAllowed(policy, targetHost) {
@@ -345,16 +487,12 @@ func (p *EgressProxy) TransparentHTTPHandler() http.Handler {
 			http.Error(w, "CONNECT not allowed on transparent HTTP listener", http.StatusMethodNotAllowed)
 			return
 		}
-		rawHost := r.Host
-		if rawHost == "" {
-			rawHost = r.URL.Host
-		}
-		if rawHost == "" {
-			http.Error(w, "missing Host header", http.StatusBadRequest)
+		rawHost, targetHost, status, errMsg := resolvePlainHTTPTarget(r, true)
+		if status != 0 {
+			http.Error(w, errMsg, status)
 			return
 		}
 
-		targetHost := normalizeHost(rawHost)
 		policy := p.GetPolicy()
 		if !CheckEgressAllowed(policy, targetHost) {
 			p.metrics.IncRequest("http", "deny")
@@ -376,12 +514,8 @@ func (p *EgressProxy) forwardPlainHTTP(w http.ResponseWriter, r *http.Request, r
 	}
 
 	outURL := *r.URL
-	if outURL.Scheme == "" {
-		outURL.Scheme = "http"
-	}
-	if outURL.Host == "" {
-		outURL.Host = rawHost
-	}
+	outURL.Scheme = "http"
+	outURL.Host = rawHost
 
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outURL.String(), r.Body)
 	if err != nil {
@@ -451,7 +585,7 @@ func (p *EgressProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if hostMatchesSecretBinding(policy, sniHost) && p.mitmCA != nil {
+	if p.shouldMITM(policy, sniHost) {
 		p.metrics.IncRequest("mitm", "allow")
 		p.serveMITMTLS(replayedConn, sniHost, targetPort)
 		return
@@ -503,7 +637,7 @@ func (p *EgressProxy) ServeTransparentTLS(conn net.Conn) {
 		return
 	}
 
-	if hostMatchesSecretBinding(policy, sniHost) && p.mitmCA != nil {
+	if p.shouldMITM(policy, sniHost) {
 		p.metrics.IncRequest("mitm", "allow")
 		p.serveMITMTLS(replayedConn, sniHost, "443")
 		return
@@ -579,7 +713,9 @@ func (p *EgressProxy) serveMITMTLS(clientConn net.Conn, sniHost, port string) {
 		}
 
 		// Enforce HTTP Host == TLS SNI to prevent domain fronting.
-		if req.Host == "" || normalizeHost(req.Host) != sniHost {
+		if req.Host == "" || normalizeHost(req.Host) != sniHost ||
+			(req.URL.Scheme != "" && !strings.EqualFold(req.URL.Scheme, "https")) ||
+			(req.URL.Host != "" && !sameHostPort(req.URL.Host, req.Host, "443")) {
 			p.metrics.IncBlockedHost(req.Host)
 			_ = req.Body.Close()
 			_ = writeMITMErrorResponse(tlsConn, http.StatusMisdirectedRequest, "421 Misdirected Request: Host header does not match TLS SNI\n")
@@ -595,9 +731,7 @@ func (p *EgressProxy) serveMITMTLS(clientConn net.Conn, sniHost, port string) {
 
 		outURL := *req.URL
 		outURL.Scheme = "https"
-		if outURL.Host == "" {
-			outURL.Host = req.Host
-		}
+		outURL.Host = req.Host
 
 		outReq, err := http.NewRequestWithContext(req.Context(), req.Method, outURL.String(), req.Body)
 		if err != nil {
@@ -740,6 +874,19 @@ func dialViaHTTPProxy(ctx context.Context, proxyURLStr, targetHostPort string) (
 		return newPrefixConn(conn, peeked), nil
 	}
 	return conn, nil
+}
+
+func (p *EgressProxy) shouldMITM(policy v1alpha1.NetworkPolicySpec, sniHost string) bool {
+	if p.mitmCA == nil {
+		return false
+	}
+	if hostMatchesSecretBinding(policy, sniHost) {
+		return true
+	}
+	p.mu.RLock()
+	hasExchange := p.exchangeURL != "" || p.exchangeHandler != nil
+	p.mu.RUnlock()
+	return hasExchange && len(policy.SecretBindings) == 0
 }
 
 func hostMatchesSecretBinding(policy v1alpha1.NetworkPolicySpec, host string) bool {

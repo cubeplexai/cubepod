@@ -328,7 +328,7 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
     // 5. Bind-mount virtual filesystems, the injected /opt/cubepod runtime volume,
     // and K8s networking configs into the merged root so podd remains accessible after pivot_root
     // without polluting the user's persistent RootFS upperdir.
-    for sys_dir in ["proc", "sys", "dev", "run", "opt/cubepod"] {
+    for sys_dir in ["proc", "sys", "dev", "run", "opt/cubepod", "etc/cubepod"] {
         let src = Path::new("/").join(sys_dir);
         if src.exists() {
             let dst = cfg.merged_root_path.join(sys_dir);
@@ -358,6 +358,36 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
                 .arg(&src)
                 .arg(&dst)
                 .status();
+        }
+    }
+
+    let extra_ca = Path::new("/etc/cubepod/ca/mitm-ca.crt");
+    let ca_bundle_dst = cfg
+        .merged_root_path
+        .join("etc/ssl/certs/ca-certificates.crt");
+    let base_bundle = ca_bundle_dst.exists().then_some(ca_bundle_dst.as_path());
+    let composed_ca = Path::new("/run/cubepod/ca-certificates.crt");
+    match compose_ca_bundle(base_bundle, extra_ca, composed_ca) {
+        Ok(true) => {
+            if !ca_bundle_dst.exists() {
+                if let Some(parent) = ca_bundle_dst.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(&ca_bundle_dst);
+            }
+            let _ = Command::new("mount")
+                .arg("--bind")
+                .arg(composed_ca)
+                .arg(&ca_bundle_dst)
+                .status();
+        }
+        Ok(false) => {}
+        Err(err) => {
+            eprintln!("[podd-init] warning: failed to compose CA bundle: {err}");
         }
     }
 
@@ -481,6 +511,45 @@ fn chroot(new_root: &Path) -> Result<(), String> {
         ));
     }
     env::set_current_dir("/").map_err(|e| format!("chdir / after chroot: {e}"))
+}
+
+fn compose_ca_bundle(
+    base_bundle: Option<&Path>,
+    extra_cert: &Path,
+    out_path: &Path,
+) -> Result<bool, String> {
+    if !extra_cert.exists() {
+        return Ok(false);
+    }
+    let extra_raw = fs::read_to_string(extra_cert)
+        .map_err(|e| format!("read {}: {e}", extra_cert.display()))?;
+    let extra_trimmed = extra_raw.trim();
+    if extra_trimmed.is_empty() {
+        return Ok(false);
+    }
+
+    let mut combined = String::new();
+    if let Some(base) = base_bundle {
+        if base.exists() {
+            let base_raw =
+                fs::read_to_string(base).map_err(|e| format!("read {}: {e}", base.display()))?;
+            combined.push_str(&base_raw);
+            if !combined.is_empty() && !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+        }
+    }
+    combined.push_str(extra_trimmed);
+    combined.push('\n');
+
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+    }
+    fs::write(out_path, combined.as_bytes())
+        .map_err(|e| format!("write {}: {e}", out_path.display()))?;
+    fs::set_permissions(out_path, fs::Permissions::from_mode(0o644))
+        .map_err(|e| format!("chmod {}: {e}", out_path.display()))?;
+    Ok(true)
 }
 
 fn unmount_lazy(target: &Path) -> Result<(), String> {
@@ -677,5 +746,36 @@ mod tests {
         let json = state.to_json();
         let expected = "{\n  \"pivoted\": true,\n  \"rootfs_device\": \"/dev/cubepod-rootfs\",\n  \"rootfs_action\": \"mounted\",\n  \"workspace_device\": \"/dev/cubepod-workspace\",\n  \"workspace_action\": \"mounted\",\n  \"duration_ms\": 42\n}\n";
         assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn compose_ca_bundle_appends_extra_cert_with_0644_mode() {
+        let base_path = unique_temp_path("test-ca-base", "crt");
+        let extra_path = unique_temp_path("test-ca-extra", "crt");
+        let out_path = unique_temp_path("test-ca-out", "crt");
+        let _g1 = TempFileGuard(base_path.clone());
+        let _g2 = TempFileGuard(extra_path.clone());
+        let _g3 = TempFileGuard(out_path.clone());
+
+        fs::write(&base_path, "BASE_CERT_DATA").expect("write base");
+        fs::write(&extra_path, "  EXTRA_MITM_CERT  \n").expect("write extra");
+
+        let wrote =
+            compose_ca_bundle(Some(&base_path), &extra_path, &out_path).expect("compose_ca_bundle");
+        assert!(wrote);
+
+        let content = fs::read_to_string(&out_path).expect("read composed bundle");
+        assert_eq!(content, "BASE_CERT_DATA\nEXTRA_MITM_CERT\n");
+        let mode = fs::metadata(&out_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+
+        let missing_extra = unique_temp_path("test-ca-missing", "crt");
+        let skipped = compose_ca_bundle(Some(&base_path), &missing_extra, &out_path)
+            .expect("missing extra should skip cleanly");
+        assert!(!skipped);
     }
 }

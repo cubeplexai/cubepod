@@ -51,7 +51,11 @@ func (c *RESTKubeClient) UpsertPodBox(ctx context.Context, box v1alpha1.PodBox) 
 	}
 
 	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-		return nil
+		var createdBox v1alpha1.PodBox
+		if err := json.NewDecoder(resp.Body).Decode(&createdBox); err == nil && createdBox.Metadata.ResourceVersion != "" {
+			box.Metadata.ResourceVersion = createdBox.Metadata.ResourceVersion
+		}
+		return c.putPodBoxStatus(ctx, ns, name, box)
 	}
 
 	if resp.StatusCode == http.StatusConflict {
@@ -86,29 +90,32 @@ func (c *RESTKubeClient) UpsertPodBox(ctx context.Context, box v1alpha1.PodBox) 
 			box.Metadata.ResourceVersion = updatedBox.Metadata.ResourceVersion
 		}
 
-		// PUT to .../status
-		statusURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podboxes/%s/status", c.baseURL, ns, name)
-		statusPayload, err := json.Marshal(box)
-		if err != nil {
-			return fmt.Errorf("failed to marshal PodBox JSON for status update: %w", err)
-		}
-
-		statusResp, err := c.doRequest(ctx, http.MethodPut, statusURL, bytes.NewReader(statusPayload))
-		if err != nil {
-			return fmt.Errorf("UpsertPodBox PUT status failed: %w", err)
-		}
-		defer statusResp.Body.Close()
-
-		if statusResp.StatusCode != http.StatusOK && statusResp.StatusCode != http.StatusCreated {
-			statusBody, _ := io.ReadAll(statusResp.Body)
-			return fmt.Errorf("UpsertPodBox PUT status failed: status %d (%s)", statusResp.StatusCode, string(statusBody))
-		}
-
-		return nil
+		return c.putPodBoxStatus(ctx, ns, name, box)
 	}
 
 	body, _ := io.ReadAll(resp.Body)
 	return fmt.Errorf("UpsertPodBox failed: status %d (%s)", resp.StatusCode, string(body))
+}
+
+func (c *RESTKubeClient) putPodBoxStatus(ctx context.Context, ns, name string, box v1alpha1.PodBox) error {
+	statusURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podboxes/%s/status", c.baseURL, ns, name)
+	statusPayload, err := json.Marshal(box)
+	if err != nil {
+		return fmt.Errorf("failed to marshal PodBox JSON for status update: %w", err)
+	}
+
+	statusResp, err := c.doRequest(ctx, http.MethodPut, statusURL, bytes.NewReader(statusPayload))
+	if err != nil {
+		return fmt.Errorf("UpsertPodBox PUT status failed: %w", err)
+	}
+	defer statusResp.Body.Close()
+
+	if statusResp.StatusCode != http.StatusOK && statusResp.StatusCode != http.StatusCreated {
+		statusBody, _ := io.ReadAll(statusResp.Body)
+		return fmt.Errorf("UpsertPodBox PUT status failed: status %d (%s)", statusResp.StatusCode, string(statusBody))
+	}
+
+	return nil
 }
 
 // GetPodBox retrieves a PodBox Custom Resource by namespace and name.

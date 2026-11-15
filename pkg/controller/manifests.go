@@ -49,6 +49,49 @@ func SanitizeVolumeKey(volumeKey string) string {
 	return prefix
 }
 
+func isLabelAlnum(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+func isLabelAllowedChar(b byte) bool {
+	return isLabelAlnum(b) || b == '-' || b == '_' || b == '.'
+}
+
+// SanitizeLabelValue normalizes v to a valid Kubernetes label value (max 63 chars,
+// [A-Za-z0-9-_.] interior, alphanumeric start and end).
+func SanitizeLabelValue(v string) string {
+	if v == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(v))
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if isLabelAllowedChar(c) {
+			b.WriteByte(c)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	s := b.String()
+	start := 0
+	for start < len(s) && !isLabelAlnum(s[start]) {
+		start++
+	}
+	end := len(s)
+	for end > start && !isLabelAlnum(s[end-1]) {
+		end--
+	}
+	s = s[start:end]
+	if len(s) > 63 {
+		s = s[:63]
+		for len(s) > 0 && !isLabelAlnum(s[len(s)-1]) {
+			s = s[:len(s)-1]
+		}
+	}
+	return s
+}
+
 // WorkspacePVCName returns the workspace PVC name for a PodBox. When
 // spec.VolumeKey is non-empty, it returns a deterministic DNS-1123 name based on
 // VolumeKey so workspace data persists across delete -> create cycles.
@@ -391,9 +434,15 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 		mainContainer.Env = append(mainContainer.Env,
 			EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: "/etc/cubepod/ca/mitm-ca.crt"},
 			EnvVar{Name: "CUBEPOD_EXTRA_CA_CERT", Value: "/etc/cubepod/ca/mitm-ca.crt"},
+			EnvVar{Name: "SSL_CERT_FILE", Value: "/etc/ssl/certs/ca-certificates.crt"},
+			EnvVar{Name: "REQUESTS_CA_BUNDLE", Value: "/etc/ssl/certs/ca-certificates.crt"},
+			EnvVar{Name: "CURL_CA_BUNDLE", Value: "/etc/ssl/certs/ca-certificates.crt"},
 			EnvVar{Name: "HTTP_PROXY", Value: "http://127.0.0.1:18080"},
 			EnvVar{Name: "HTTPS_PROXY", Value: "http://127.0.0.1:18080"},
 			EnvVar{Name: "NO_PROXY", Value: "127.0.0.1,localhost"},
+			EnvVar{Name: "http_proxy", Value: "http://127.0.0.1:18080"},
+			EnvVar{Name: "https_proxy", Value: "http://127.0.0.1:18080"},
+			EnvVar{Name: "no_proxy", Value: "127.0.0.1,localhost"},
 		)
 
 		egressImg := tpl.Egress.Image
@@ -443,8 +492,8 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 		"pod.cubeplex.ai/box":    boxName,
 	}
 	if spec.WarmPoolRef != "" {
-		labels["cubepod.io/warmpool"] = spec.WarmPoolRef
-		labels["cubepod.io/template"] = spec.TemplateRef
+		labels["cubepod.io/warmpool"] = SanitizeLabelValue(spec.WarmPoolRef)
+		labels["cubepod.io/template"] = SanitizeLabelValue(spec.TemplateRef)
 		if !strings.HasPrefix(boxName, spec.WarmPoolRef+"-warm-") || status.Reason == "WarmPoolClaimed" {
 			labels["cubepod.io/claimed"] = "true"
 			labels["cubepod.io/claimed-by"] = boxName

@@ -14,6 +14,7 @@ import (
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
+	"github.com/cubeplexai/cubepod/pkg/egress"
 	"github.com/cubeplexai/cubepod/pkg/version"
 )
 
@@ -61,6 +62,9 @@ func main() {
 		templatePullSecret   = flag.String("template-pull-secret", "", "Kubernetes imagePullSecret attached to sandbox and probe pods")
 		imagePullSecrets     = flag.String("image-pull-secrets", os.Getenv("CUBEPOD_IMAGE_PULL_SECRETS"), "Comma-separated Kubernetes imagePullSecrets attached to sandbox Pods")
 		templateProbeTimeout = flag.Duration("template-probe-timeout", 120*time.Second, "Timeout for template readyCmd probe")
+		egressCACert         = flag.String("egress-ca-cert", os.Getenv("CUBEPOD_EGRESS_CA_CERT"), "Path to egress mTLS root CA certificate PEM")
+		egressCAKey          = flag.String("egress-ca-key", os.Getenv("CUBEPOD_EGRESS_CA_KEY"), "Path to egress mTLS root CA private key PEM")
+		egressUpstreamCAFile = flag.String("egress-upstream-ca-file", os.Getenv("CUBEPOD_EGRESS_UPSTREAM_CA_FILE"), "Optional path to upstream CA PEM mounted into egress sidecars")
 	)
 	flag.Parse()
 
@@ -148,6 +152,26 @@ func main() {
 			controller.WithStateDir(effectiveStateDir),
 			controller.WithContextStore(controller.NewMemoryContextStore(contextDir)),
 		)
+	}
+	if *egressCACert != "" || *egressCAKey != "" {
+		if *egressCACert == "" || *egressCAKey == "" {
+			slog.Error("both egress-ca-cert and egress-ca-key must be set together")
+			os.Exit(1)
+		}
+		ca, err := egress.LoadCAFromFiles(*egressCACert, *egressCAKey)
+		if err != nil {
+			slog.Error("failed to load egress CA", "cert", *egressCACert, "err", err)
+			os.Exit(1)
+		}
+		opts = append(opts, controller.WithEgressCA(ca))
+	}
+	if *egressUpstreamCAFile != "" {
+		pemBytes, err := os.ReadFile(*egressUpstreamCAFile)
+		if err != nil {
+			slog.Error("failed to load egress upstream CA file", "path", *egressUpstreamCAFile, "err", err)
+			os.Exit(1)
+		}
+		opts = append(opts, controller.WithEgressUpstreamCA(pemBytes))
 	}
 
 	reconciler := controller.NewReconciler(opts...)

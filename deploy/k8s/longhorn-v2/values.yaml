@@ -48,6 +48,7 @@ defaultSettings:
   v1DataEngine: false
   v2DataEngine: true
   v2DataEngineGuaranteedInstanceManagerCPU: 1000
-  v2DataEngineCPUMask: "0x1"
+  # Pin SPDK reactor off CPU 0 so per-CPU kernel housekeeping (events/SRCU) on CPU 0 is never starved by 100% polling.
+  v2DataEngineCPUMask: "0x2"
   systemManagedComponentsNodeSelector: "cubepod.io/longhorn-v2:true"
   deletingConfirmationFlag: true
