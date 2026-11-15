@@ -173,6 +173,33 @@ func main() {
 		gw.SetLivePodRouting(true)
 	}
 
+	// Official E2B 2.64.0 Volume store. Routes are always registered; this
+	// opens the durable directory so management and content APIs work.
+	// CUBEPOD_E2B_VOLUME_DIR wins; otherwise stateDir/e2b-volumes is used
+	// when a state directory is set. Docker named volumes stay off unless
+	// CUBEPOD_E2B_DOCKER_VOLUMES is explicitly enabled (compose/runc tests).
+	volDir := strings.TrimSpace(os.Getenv("CUBEPOD_E2B_VOLUME_DIR"))
+	if volDir == "" && effectiveStateDir != "" {
+		volDir = filepath.Join(effectiveStateDir, "e2b-volumes")
+	}
+	if volDir != "" {
+		vcfg := gateway.E2BVolumeConfig{
+			Dir:     volDir,
+			HostDir: strings.TrimSpace(os.Getenv("CUBEPOD_E2B_VOLUME_HOST_DIR")),
+		}
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_E2B_DOCKER_VOLUMES"))) {
+		case "1", "true", "yes":
+			vcfg.DockerVolumes = true
+			vcfg.DockerPrefix = "cpod-test-vol-"
+			vcfg.DockerHost = os.Getenv("DOCKER_HOST")
+		}
+		if err := gw.ConfigureE2BVolumes(vcfg); err != nil {
+			slog.Error("failed to configure E2B volume store", "dir", volDir, "err", err)
+			os.Exit(1)
+		}
+		slog.Info("E2B volume store enabled", "dir", volDir, "dockerVolumes", vcfg.DockerVolumes)
+	}
+
 	httpSrv := &http.Server{
 		Addr:    *addr,
 		Handler: gw.Handler(),
