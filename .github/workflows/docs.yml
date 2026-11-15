@@ -118,7 +118,7 @@ jobs:
                   print(f"Failed to create Pages project HTTP {create_exc.code}: {create_exc.read().decode('utf-8', 'replace')}", file=sys.stderr)
                   sys.exit(1)
 
-          custom_domains = ["cubepod.cubeplex.ai", "cubepod.dev"]
+          custom_domains = ["cubepod.dev"]
           dom_list_req = urllib.request.Request(
               f"https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects/{project}/domains",
               headers={"Authorization": f"Bearer {token}"},
@@ -128,8 +128,6 @@ jobs:
               with urllib.request.urlopen(dom_list_req, timeout=20) as resp:
                   dom_list = json.loads(resp.read().decode("utf-8"))
               existing_doms = dom_list.get("result") or []
-              for d in existing_doms:
-                  print(f"Pages domain {d.get('name')}: status={d.get('status')}, validation={d.get('validation_data')}, verification={d.get('verification_data')}")
           except urllib.error.HTTPError as exc:
               print(f"List Pages domains HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')}")
 
@@ -150,30 +148,6 @@ jobs:
                       print(f"Added custom domain '{custom_domain}': {dom_res.get('result', {}).get('status')}")
                   except urllib.error.HTTPError as dom_exc:
                       print(f"Custom domain '{custom_domain}' bind skipped/failed HTTP {dom_exc.code}: {dom_exc.read().decode('utf-8', 'replace')}")
-
-          for zone_name in ("cubeplex.ai", "cubepod.dev"):
-              zone_req = urllib.request.Request(
-                  f"https://api.cloudflare.com/client/v4/zones?name={zone_name}",
-                  headers={"Authorization": f"Bearer {token}"},
-              )
-              try:
-                  with urllib.request.urlopen(zone_req, timeout=20) as resp:
-                      zdata = json.loads(resp.read().decode("utf-8"))
-                  zones = zdata.get("result") or []
-                  print(f"Zone lookup {zone_name} count={len(zones)}")
-                  if zones:
-                      zid = zones[0]["id"]
-                      rec_req = urllib.request.Request(
-                          f"https://api.cloudflare.com/client/v4/zones/{zid}/dns_records",
-                          headers={"Authorization": f"Bearer {token}"},
-                      )
-                      with urllib.request.urlopen(rec_req, timeout=20) as rresp:
-                          rdata = json.loads(rresp.read().decode("utf-8"))
-                      for r in (rdata.get("result") or []):
-                          if r.get("name") in ("cubepod.cubeplex.ai", "cubepod.dev", "www.cubepod.dev"):
-                              print(f"DNS record: id={r.get('id')} type={r.get('type')} name={r.get('name')} content={r.get('content')} proxied={r.get('proxied')}")
-              except urllib.error.HTTPError as zexc:
-                  print(f"Zone/DNS check {zone_name} HTTP {zexc.code}: {zexc.read().decode('utf-8', 'replace')}")
           PY
 
       - name: Deploy to Cloudflare Pages

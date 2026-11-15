@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from urllib.parse import urljoin
 
-SITE_BASE = "https://cubepod.cubeplex.ai"
+SITE_BASE = "https://cubepod.dev"
 
 
 def read_changelog(path: Path) -> str:

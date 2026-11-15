@@ -38,20 +38,20 @@ class RenderReleaseNotesTests(unittest.TestCase):
             out = release_notes.render_release_notes(root, "v0.4.2")
             self.assertNotIn("title: '0.4.2'", out)
             self.assertIn(
-                "[Helm guide](https://cubepod.cubeplex.ai/deployment/kubernetes-helm/)",
+                "[Helm guide](https://cubepod.dev/deployment/kubernetes-helm/)",
                 out,
             )
             self.assertIn(
-                "[API](https://cubepod.cubeplex.ai/reference/api-overview/#auth)",
+                "[API](https://cubepod.dev/reference/api-overview/#auth)",
                 out,
             )
             self.assertIn("[literal](/not-rewritten/)", out)
             self.assertIn(
-                "[English changelog](https://cubepod.cubeplex.ai/changelog/0.4.2/)",
+                "[English changelog](https://cubepod.dev/changelog/0.4.2/)",
                 out,
             )
             self.assertIn(
-                "[中文更新日志](https://cubepod.cubeplex.ai/zh/changelog/0.4.2/)",
+                "[中文更新日志](https://cubepod.dev/zh/changelog/0.4.2/)",
                 out,
             )
 

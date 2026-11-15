@@ -3,7 +3,7 @@ import starlight from '@astrojs/starlight';
 import { remarkMermaid } from './src/plugins/remark-mermaid.mjs';
 
 export default defineConfig({
-  site: 'https://cubepod.cubeplex.ai',
+  site: 'https://cubepod.dev',
   markdown: {
     remarkPlugins: [remarkMermaid],
   },
@@ -72,7 +72,7 @@ export default defineConfig({
           tag: 'meta',
           attrs: {
             property: 'og:image',
-            content: 'https://cubepod.cubeplex.ai/og-banner.svg',
+            content: 'https://cubepod.dev/og-banner.svg',
           },
         },
         {
@@ -231,7 +231,7 @@ export default defineConfig({
             {
               label: 'llms.txt (AI Index)',
               translations: { 'zh-CN': 'llms.txt (AI 文档索引)' },
-              link: 'https://cubepod.cubeplex.ai/llms.txt',
+              link: 'https://cubepod.dev/llms.txt',
             },
           ],
         },

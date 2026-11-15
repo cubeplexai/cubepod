@@ -44,5 +44,5 @@
   <text x="88" y="305" font-family="ui-sans-serif, system-ui, sans-serif" font-size="30" font-weight="600" fill="#cbd5e1">Persistent Writable RootFS MicroVM</text>
   <text x="88" y="348" font-family="ui-sans-serif, system-ui, sans-serif" font-size="30" font-weight="600" fill="#cbd5e1">Execution Platform for AI Agents</text>
   <text x="88" y="425" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#94a3b8">&lt;50ms WarmPool  ·  ~1s CoW Fork  ·  0 CPU Suspend  ·  Zero-Trust Egress</text>
-  <text x="88" y="510" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#22d3ee">https://cubepod.cubeplex.ai</text>
+  <text x="88" y="510" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#22d3ee">https://cubepod.dev</text>
 </svg>

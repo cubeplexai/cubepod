@@ -6,7 +6,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const websiteDir = path.resolve(__dirname, '..');
 const docsDir = path.join(websiteDir, 'src', 'content', 'docs');
 const distDir = path.join(websiteDir, 'dist');
-const SITE = 'https://cubepod.cubeplex.ai';
+const SITE = 'https://cubepod.dev';
 
 function parseFrontmatter(raw) {
   const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
