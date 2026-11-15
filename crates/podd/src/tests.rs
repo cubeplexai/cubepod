@@ -3429,6 +3429,21 @@ fn test_pty_kill_all_managed() {
         .as_u64()
         .unwrap();
 
+    let watch_dir = std::env::temp_dir().join(format!("podd-killall-watch-{pid}"));
+    let _ = std::fs::remove_dir_all(&watch_dir);
+    std::fs::create_dir_all(&watch_dir).unwrap();
+    registry
+        .watchers
+        .create(
+            "/tmp",
+            watch_dir.to_str().unwrap(),
+            false,
+            false,
+            false,
+            true,
+        )
+        .expect("watcher");
+    assert_eq!(registry.watchers.active_count(), 1);
     let killed = kill_all_managed(&registry);
     assert!(killed >= 1);
 

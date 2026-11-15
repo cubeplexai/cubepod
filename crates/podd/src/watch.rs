@@ -45,8 +45,9 @@ use crate::http::{write_json, HttpRequest};
 use crate::json::{escape_json, JsonValue};
 use crate::DaemonConfig;
 
-pub const WATCH_RING_CAP: usize = 256;
+pub const WATCH_RING_CAP: usize = 4096;
 pub const WATCH_SUB_QUEUE: usize = 64;
+const WATCH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub const WATCH_BUFFER_OVERFLOW_MSG: &str = "watch event buffer overflow: events were dropped";
 pub const WATCH_QUEUE_OVERFLOW_MSG: &str = "watch subscriber queue overflow";
 
@@ -111,12 +112,33 @@ pub(crate) struct DirWatcher {
     root: PathBuf,
     recursive: bool,
     include_entry: bool,
+    poll: bool,
     fd: AtomicI32,
+    stop_fd: AtomicI32,
     watches: Mutex<HashMap<i32, String>>,
     pending: Mutex<VecDeque<FsEvent>>,
     subscribers: Mutex<Vec<WatchSub>>,
     stopped: AtomicBool,
     overflowed: AtomicBool,
+}
+
+impl Drop for DirWatcher {
+    fn drop(&mut self) {
+        let stop_fd = self.stop_fd.swap(-1, Ordering::SeqCst);
+        if stop_fd >= 0 {
+            unsafe {
+                libc::close(stop_fd);
+            }
+        }
+        // Normally loop_events owns and closes fd; this covers early error paths
+        // before loop_events is spawned.
+        let fd = self.fd.swap(-1, Ordering::SeqCst);
+        if fd >= 0 {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+    }
 }
 
 pub struct WatchSubHandle {
@@ -189,6 +211,7 @@ impl WatchRegistry {
         recursive: bool,
         include_entry: bool,
         allow_network: bool,
+        poll: bool,
     ) -> Result<Arc<DirWatcher>, WatchPathError> {
         let root = resolve_watch_path(workdir, path)?;
         check_mount(&root, allow_network)?;
@@ -199,13 +222,23 @@ impl WatchRegistry {
                 std::io::Error::last_os_error()
             )));
         }
+        let stop_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if stop_fd < 0 {
+            let err = std::io::Error::last_os_error();
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(WatchPathError::Invalid(format!("eventfd: {err}")));
+        }
         let id = format!("w{}", self.counter.fetch_add(1, Ordering::SeqCst));
         let watcher = Arc::new(DirWatcher {
             id: id.clone(),
             root: root.clone(),
             recursive,
             include_entry,
+            poll,
             fd: AtomicI32::new(fd),
+            stop_fd: AtomicI32::new(stop_fd),
             watches: Mutex::new(HashMap::new()),
             pending: Mutex::new(VecDeque::new()),
             subscribers: Mutex::new(Vec::new()),
@@ -234,10 +267,14 @@ impl DirWatcher {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return;
         }
-        let fd = self.fd.swap(-1, Ordering::SeqCst);
-        if fd >= 0 {
+        // Wake loop_events via eventfd; loop_events owns and closes self.fd
+        // so it can never be closed while poll/read is using the fd number.
+        let stop_fd = self.stop_fd.load(Ordering::SeqCst);
+        if stop_fd >= 0 {
+            let val: u64 = 1;
+            let bytes = val.to_ne_bytes();
             unsafe {
-                libc::close(fd);
+                libc::write(stop_fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
             }
         }
         self.subscribers.lock().unwrap().clear();
@@ -325,23 +362,27 @@ impl DirWatcher {
         if self.stopped.load(Ordering::SeqCst) {
             return;
         }
-        let ring_overflow = {
-            let mut pending = self.pending.lock().unwrap();
-            if self.overflowed.load(Ordering::SeqCst) {
+        if self.poll {
+            let ring_overflow = {
+                let mut pending = self.pending.lock().unwrap();
+                if self.overflowed.load(Ordering::SeqCst) {
+                    return;
+                }
+                if pending.len() >= WATCH_RING_CAP {
+                    // Bound memory. The dropped event is not returned as success.
+                    pending.pop_front();
+                    self.overflowed.store(true, Ordering::SeqCst);
+                    true
+                } else {
+                    pending.push_back(ev.clone());
+                    false
+                }
+            };
+            if ring_overflow {
+                self.fail_subscribers(WATCH_BUFFER_OVERFLOW_MSG);
                 return;
             }
-            if pending.len() >= WATCH_RING_CAP {
-                // Bound memory. The dropped event is not returned as success.
-                pending.pop_front();
-                self.overflowed.store(true, Ordering::SeqCst);
-                true
-            } else {
-                pending.push_back(ev.clone());
-                false
-            }
-        };
-        if ring_overflow {
-            self.fail_subscribers(WATCH_BUFFER_OVERFLOW_MSG);
+        } else if self.overflowed.load(Ordering::SeqCst) {
             return;
         }
         let mut subs = self.subscribers.lock().unwrap();
@@ -382,18 +423,26 @@ impl DirWatcher {
 
     fn loop_events(self: Arc<Self>) {
         let mut buf = [0u8; 4096];
-        loop {
-            let fd = self.fd.load(Ordering::SeqCst);
-            if fd < 0 || self.stopped.load(Ordering::SeqCst) {
-                break;
-            }
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let rc = unsafe { libc::poll(&mut pfd, 1, 200) };
-            if self.fd.load(Ordering::SeqCst) != fd {
+        let fd = self.fd.load(Ordering::SeqCst);
+        let stop_fd = self.stop_fd.load(Ordering::SeqCst);
+        while fd >= 0 && !self.stopped.load(Ordering::SeqCst) {
+            let mut pfds = [
+                libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stop_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let nfds = if stop_fd >= 0 { 2 } else { 1 };
+            let rc = unsafe { libc::poll(pfds.as_mut_ptr(), nfds, 200) };
+            if self.stopped.load(Ordering::SeqCst)
+                || (stop_fd >= 0 && pfds[1].revents & libc::POLLIN != 0)
+            {
                 break;
             }
             if rc < 0 {
@@ -417,6 +466,13 @@ impl DirWatcher {
                 break;
             } else {
                 break;
+            }
+        }
+        // Reader thread owns the inotify fd and closes it only after the loop exits.
+        let closed = self.fd.swap(-1, Ordering::SeqCst);
+        if closed >= 0 {
+            unsafe {
+                libc::close(closed);
             }
         }
     }
@@ -935,6 +991,7 @@ pub fn handle_create_watcher(
         recursive,
         include_entry,
         allow_network,
+        true,
     ) {
         Ok(w) => {
             let body = format!(r#"{{"watcherId":"{}"}}"#, escape_json(&w.id));
@@ -1043,6 +1100,7 @@ pub fn handle_watch_dir(
         recursive,
         include_entry,
         allow_network,
+        false,
     ) {
         Ok(w) => w,
         Err(e) => {
@@ -1073,6 +1131,7 @@ fn pump_watch_subscription(
     id: &str,
     watchers: &WatchRegistry,
 ) {
+    let mut last_sent = std::time::Instant::now();
     loop {
         match sub.rx.recv_timeout(Duration::from_millis(200)) {
             Ok(WatchMsg::Event(ev)) => {
@@ -1081,10 +1140,18 @@ fn pump_watch_subscription(
                 if stream.write_all(&frame).is_err() || stream.flush().is_err() {
                     break;
                 }
+                last_sent = std::time::Instant::now();
             }
             Err(RecvTimeoutError::Timeout) => {
                 if client_gone(stream) {
                     break;
+                }
+                if last_sent.elapsed() >= WATCH_KEEPALIVE_INTERVAL {
+                    let frame = make_connect_frame(br#"{"keepalive":{}}"#, false);
+                    if stream.write_all(&frame).is_err() || stream.flush().is_err() {
+                        break;
+                    }
+                    last_sent = std::time::Instant::now();
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
@@ -1101,6 +1168,11 @@ fn pump_watch_subscription(
                     );
                     let frame = make_connect_frame(err.as_bytes(), true);
                     let _ = stream.write_all(&frame);
+                    let _ = stream.flush();
+                } else {
+                    // Server-side stop (RemoveWatcher, prepare_stop, stop_all): emit clean Connect end-stream frame.
+                    let end = make_connect_frame(b"{}", true);
+                    let _ = stream.write_all(&end);
                     let _ = stream.flush();
                 }
                 break;
@@ -1153,6 +1225,7 @@ mod tests {
             .create(
                 dir.to_str().unwrap(),
                 dir.to_str().unwrap(),
+                false,
                 false,
                 false,
                 false,
@@ -1238,6 +1311,7 @@ mod tests {
                 false,
                 false,
                 false,
+                true,
             )
             .unwrap();
         for i in 0..WATCH_RING_CAP {
@@ -1291,6 +1365,51 @@ mod tests {
     }
 
     #[test]
+    fn stream_watcher_does_not_overflow_past_ring_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "podd-watch-stream-cap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = WatchRegistry::new();
+        let w = reg
+            .create(
+                dir.to_str().unwrap(),
+                dir.to_str().unwrap(),
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let sub = w.subscribe();
+        let total = WATCH_RING_CAP + 100;
+        for i in 0..total {
+            w.publish(FsEvent {
+                name: format!("s{i}"),
+                kind: "EVENT_TYPE_WRITE".into(),
+                entry: None,
+            });
+            let got = sub
+                .rx
+                .try_recv()
+                .expect("stream subscriber must receive all events");
+            match got {
+                WatchMsg::Event(ev) => assert_eq!(ev.name, format!("s{i}")),
+            }
+        }
+        assert!(!w.is_overflowed());
+        assert!(!sub.overflow.load(Ordering::SeqCst));
+        reg.remove(&w.id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn kernel_overflow_fails_subscribers() {
         let dir = std::env::temp_dir().join(format!(
             "podd-watch-qovf-{}-{}",
@@ -1307,6 +1426,7 @@ mod tests {
             .create(
                 dir.to_str().unwrap(),
                 dir.to_str().unwrap(),
+                false,
                 false,
                 false,
                 false,
@@ -1352,7 +1472,9 @@ mod tests {
             root: dir.clone(),
             recursive: true,
             include_entry: false,
+            poll: true,
             fd: AtomicI32::new(fd),
+            stop_fd: AtomicI32::new(-1),
             watches: Mutex::new(HashMap::new()),
             pending: Mutex::new(VecDeque::new()),
             subscribers: Mutex::new(Vec::new()),
@@ -1403,6 +1525,7 @@ mod tests {
             .create(
                 dir.to_str().unwrap(),
                 dir.to_str().unwrap(),
+                false,
                 false,
                 false,
                 false,
@@ -1471,6 +1594,7 @@ mod tests {
                 false,
                 false,
                 false,
+                false,
             )
             .unwrap();
         let sub = w.subscribe();
@@ -1501,6 +1625,60 @@ mod tests {
                 .any(|w| w == expected.as_slice()),
             "kernel overflow must end the stream with resource_exhausted, got {}",
             String::from_utf8_lossy(&buf)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_dir_pump_emits_clean_end_frame_on_server_stop() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!(
+            "podd-watch-clean-end-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = WatchRegistry::new();
+        let w = reg
+            .create(
+                dir.to_str().unwrap(),
+                dir.to_str().unwrap(),
+                false,
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let sub = w.subscribe();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let id = w.id.clone();
+        let reg_thread = reg.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            pump_watch_subscription(&mut stream, sub, &id, &reg_thread);
+        });
+
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        reg.remove(&w.id);
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).unwrap();
+        server.join().unwrap();
+
+        let expected = make_connect_frame(b"{}", true);
+        assert_eq!(
+            buf, expected,
+            "server-side stop must emit a clean Connect end-stream frame"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

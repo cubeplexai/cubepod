@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -34,8 +35,9 @@ import (
 // Unknown types are treated as local. proc, sysfs, and devpts are always refused,
 // as are user paths under /proc, /dev, and /sys.
 const (
-	watchRingCap  = 256
-	watchSubQueue = 64
+	watchRingCap           = 4096
+	watchSubQueue          = 64
+	watchKeepaliveInterval = 15 * time.Second
 
 	watchBufferOverflowMsg = "watch event buffer overflow: events were dropped"
 	watchQueueOverflowMsg  = "watch subscriber queue overflow"
@@ -109,7 +111,9 @@ type dirWatcher struct {
 	root         string
 	recursive    bool
 	includeEntry bool
+	poll         bool
 	fd           int
+	stopFD       int
 	mu           sync.Mutex
 	watches      map[int]string
 	pending      []fsEvent
@@ -135,14 +139,16 @@ func (w *dirWatcher) stop() {
 	w.stopOnce.Do(func() {
 		w.mu.Lock()
 		w.stopped = true
-		fd := w.fd
-		w.fd = -1
+		stopFD := w.stopFD
 		// Drop subscribers without closing their failed channel. Cleanup is not
 		// an overflow; the WatchDir handler returns on done.
 		w.subs = map[*watchSub]struct{}{}
 		w.mu.Unlock()
-		if fd >= 0 {
-			_ = unix.Close(fd)
+		// Wake loop() via eventfd; loop() owns and closes w.fd and w.stopFD.
+		if stopFD >= 0 {
+			var one [8]byte
+			binary.NativeEndian.PutUint64(one[:], 1)
+			_, _ = unix.Write(stopFD, one[:])
 		}
 		close(w.done)
 	})
@@ -171,13 +177,15 @@ func (w *dirWatcher) publish(ev fsEvent) {
 	if w.stopped || w.overflowed.Load() {
 		return
 	}
-	if len(w.pending) >= watchRingCap {
-		// Bound memory. The dropped event is not returned as a successful poll.
-		w.pending = w.pending[1:]
-		w.failOverflowLocked(watchBufferOverflowMsg)
-		return
+	if w.poll {
+		if len(w.pending) >= watchRingCap {
+			// Bound memory. The dropped event is not returned as a successful poll.
+			w.pending = w.pending[1:]
+			w.failOverflowLocked(watchBufferOverflowMsg)
+			return
+		}
+		w.pending = append(w.pending, ev)
 	}
-	w.pending = append(w.pending, ev)
 	var drop []*watchSub
 	for sub := range w.subs {
 		select {
@@ -274,17 +282,42 @@ func (w *dirWatcher) walk(dir, rel string) error {
 }
 
 func (w *dirWatcher) loop() {
+	w.mu.Lock()
+	fd := w.fd
+	stopFD := w.stopFD
+	w.mu.Unlock()
+	defer func() {
+		// Reader goroutine owns and closes fd and stopFD after the loop exits.
+		w.mu.Lock()
+		if w.fd >= 0 {
+			_ = unix.Close(w.fd)
+			w.fd = -1
+		}
+		if w.stopFD >= 0 {
+			_ = unix.Close(w.stopFD)
+			w.stopFD = -1
+		}
+		w.mu.Unlock()
+	}()
 	buf := make([]byte, 4096)
 	for {
 		w.mu.Lock()
-		fd := w.fd
 		stopped := w.stopped
 		w.mu.Unlock()
 		if stopped || fd < 0 {
 			return
 		}
 		pollfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		if stopFD >= 0 {
+			pollfd = append(pollfd, unix.PollFd{Fd: int32(stopFD), Events: unix.POLLIN})
+		}
 		n, err := unix.Poll(pollfd, 200)
+		w.mu.Lock()
+		stopped = w.stopped
+		w.mu.Unlock()
+		if stopped || (len(pollfd) > 1 && pollfd[1].Revents&unix.POLLIN != 0) {
+			return
+		}
 		if err != nil {
 			if err == unix.EINTR {
 				continue
@@ -506,7 +539,7 @@ func (r watchCreateReq) watcherID() string {
 	return r.WatcherIDSnake
 }
 
-func (s *Server) startDirWatcher(rec *SandboxRecord, req watchCreateReq) (*dirWatcher, error) {
+func (s *Server) startDirWatcher(rec *SandboxRecord, req watchCreateReq, poll bool) (*dirWatcher, error) {
 	full, err := s.resolveWatchPath(rec, req.Path)
 	if err != nil {
 		return nil, statusErr("invalid_argument", err.Error())
@@ -530,19 +563,30 @@ func (s *Server) startDirWatcher(rec *SandboxRecord, req watchCreateReq) (*dirWa
 	if err != nil {
 		return nil, statusErr("internal", "inotify_init1: "+err.Error())
 	}
+	stopFD, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		_ = unix.Close(fd)
+		return nil, statusErr("internal", "eventfd: "+err.Error())
+	}
 	w := &dirWatcher{
 		id:           fmt.Sprintf("w%d", watcherSeq.Add(1)),
 		sandboxID:    rec.SandboxID,
 		root:         full,
 		recursive:    req.Recursive,
 		includeEntry: req.includeEntry(),
+		poll:         poll,
 		fd:           fd,
+		stopFD:       stopFD,
 		watches:      make(map[int]string),
 		subs:         make(map[*watchSub]struct{}),
 		done:         make(chan struct{}),
 	}
 	if err := w.arm(); err != nil {
 		w.stop()
+		_ = unix.Close(fd)
+		_ = unix.Close(stopFD)
+		w.fd = -1
+		w.stopFD = -1
 		return nil, statusErr("internal", "inotify_add_watch: "+err.Error())
 	}
 	s.mu.Lock()
@@ -631,7 +675,7 @@ func (s *Server) handleConnectRPCCreateWatcher(w http.ResponseWriter, r *http.Re
 		s.writeConnectError(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
-	watcher, err := s.startDirWatcher(rec, req)
+	watcher, err := s.startDirWatcher(rec, req, true)
 	if err != nil {
 		s.writeWatchStatus(w, err)
 		return
@@ -747,7 +791,7 @@ func (s *Server) handleConnectRPCWatchDir(w http.ResponseWriter, r *http.Request
 		s.writeConnectStreamError(w, "invalid_argument", err.Error())
 		return
 	}
-	watcher, err := s.startDirWatcher(rec, req)
+	watcher, err := s.startDirWatcher(rec, req, false)
 	if err != nil {
 		s.writeWatchStreamStatus(w, err)
 		return
@@ -766,6 +810,8 @@ func (s *Server) handleConnectRPCWatchDir(w http.ResponseWriter, r *http.Request
 	if s.writeConnectFrameSafe(w, &writeMu, start, false, flusher) != nil {
 		return
 	}
+	ticker := time.NewTicker(watchKeepaliveInterval)
+	defer ticker.Stop()
 	// timeoutMs is a client stream deadline. Disconnect stops the watch.
 	for {
 		select {
@@ -775,7 +821,13 @@ func (s *Server) handleConnectRPCWatchDir(w http.ResponseWriter, r *http.Request
 			s.writeStreamError(w, &writeMu, flusher, "resource_exhausted", sub.overflowReason())
 			return
 		case <-watcher.done:
+			// Server-side stop (RemoveWatcher, sandbox delete): emit clean Connect end-stream frame.
+			_ = s.writeConnectFrameSafe(w, &writeMu, []byte("{}"), true, flusher)
 			return
+		case <-ticker.C:
+			if s.writeConnectFrameSafe(w, &writeMu, []byte(`{"keepalive":{}}`), false, flusher) != nil {
+				return
+			}
 		case ev := <-sub.ch:
 			item := map[string]interface{}{
 				"name": ev.Name,
@@ -790,6 +842,7 @@ func (s *Server) handleConnectRPCWatchDir(w http.ResponseWriter, r *http.Request
 			if s.writeConnectFrameSafe(w, &writeMu, payload, false, flusher) != nil {
 				return
 			}
+			ticker.Reset(watchKeepaliveInterval)
 		}
 	}
 }

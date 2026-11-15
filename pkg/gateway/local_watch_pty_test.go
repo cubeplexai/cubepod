@@ -139,7 +139,9 @@ func TestPTYReplayIsBoundedAndSlowSubscriberIsFailed(t *testing.T) {
 
 func TestWatchQueueOverflowDoesNotTaintWatcher(t *testing.T) {
 	w := &dirWatcher{
+		poll:    true,
 		fd:      -1,
+		stopFD:  -1,
 		watches: map[int]string{},
 		subs:    map[*watchSub]struct{}{},
 		done:    make(chan struct{}),
@@ -175,19 +177,15 @@ func TestWatchQueueOverflowDoesNotTaintWatcher(t *testing.T) {
 
 func TestWatchRingAndKernelOverflowFailDrain(t *testing.T) {
 	w := &dirWatcher{
+		poll:    true,
 		fd:      -1,
+		stopFD:  -1,
 		watches: map[int]string{},
 		subs:    map[*watchSub]struct{}{},
 		done:    make(chan struct{}),
 	}
-	sub := w.subscribe()
 	for i := 0; i < watchRingCap; i++ {
 		w.publish(fsEvent{Name: fmt.Sprintf("f%d", i), Type: "EVENT_TYPE_WRITE"})
-		select {
-		case <-sub.ch:
-		default:
-			t.Fatal("subscriber queue filled before the ring")
-		}
 	}
 	if w.overflowed.Load() {
 		t.Fatal("a full ring is still a complete view")
@@ -199,18 +197,10 @@ func TestWatchRingAndKernelOverflowFailDrain(t *testing.T) {
 
 	for i := 0; i < watchRingCap; i++ {
 		w.publish(fsEvent{Name: fmt.Sprintf("g%d", i), Type: "EVENT_TYPE_WRITE"})
-		select {
-		case <-sub.ch:
-		default:
-			t.Fatal("subscriber queue filled before the ring")
-		}
 	}
 	w.publish(fsEvent{Name: "dropped", Type: "EVENT_TYPE_WRITE"})
 	if !w.overflowed.Load() {
 		t.Fatal("the event past the cap must taint the watcher")
-	}
-	if !sub.overflowed() || sub.overflowReason() != watchBufferOverflowMsg {
-		t.Fatalf("subscriber reason %q", sub.overflowReason())
 	}
 	if _, err := w.drain(); err == nil {
 		t.Fatal("GetWatcherEvents must not return a truncated ring")
@@ -219,7 +209,9 @@ func TestWatchRingAndKernelOverflowFailDrain(t *testing.T) {
 	}
 
 	kernel := &dirWatcher{
+		poll:    true,
 		fd:      -1,
+		stopFD:  -1,
 		watches: map[int]string{},
 		subs:    map[*watchSub]struct{}{},
 		done:    make(chan struct{}),
@@ -231,6 +223,33 @@ func TestWatchRingAndKernelOverflowFailDrain(t *testing.T) {
 	}
 	if _, err := kernel.drain(); err == nil {
 		t.Fatal("kernel overflow must fail the poll")
+	}
+}
+
+func TestWatchStreamDoesNotOverflowPastRingCap(t *testing.T) {
+	w := &dirWatcher{
+		poll:    false,
+		fd:      -1,
+		stopFD:  -1,
+		watches: map[int]string{},
+		subs:    map[*watchSub]struct{}{},
+		done:    make(chan struct{}),
+	}
+	sub := w.subscribe()
+	total := watchRingCap + 100
+	for i := 0; i < total; i++ {
+		w.publish(fsEvent{Name: fmt.Sprintf("s%d", i), Type: "EVENT_TYPE_WRITE"})
+		select {
+		case ev := <-sub.ch:
+			if ev.Name != fmt.Sprintf("s%d", i) {
+				t.Fatalf("unexpected event %q", ev.Name)
+			}
+		default:
+			t.Fatalf("stream subscriber missed event %d", i)
+		}
+	}
+	if w.overflowed.Load() || sub.overflowed() {
+		t.Fatal("stream watcher must not overflow past poll ring cap")
 	}
 }
 
