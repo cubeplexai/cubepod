@@ -162,6 +162,6 @@ print("Chromium CDP URL:", session.cdp_url)
 
 ## Next Steps
 
-- Run existing `e2b` / `e2b-code-interpreter` code unchanged via **[E2B Drop-in Compatibility](/getting-started/e2b-compatibility/)**.
+- Point existing `e2b` / `e2b-code-interpreter` clients at CubePod via **[E2B Compatibility Guide](/getting-started/e2b-compatibility/)** (see **[E2B Compatibility Reference](/reference/e2b-compatibility/)**).
 - Explore the internals in **[Platform Architecture](/concepts/architecture/)**.
 - Deploy CubePod on Kubernetes with Kata Containers and CSI raw block storage in **[Kubernetes & Helm Deployment](/deployment/kubernetes-helm/)**.

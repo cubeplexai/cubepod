@@ -162,6 +162,6 @@ print("Chromium CDP URL:", session.cdp_url)
 
 ## 下一步
 
-- 通过 **[E2B 无缝兼容指南](/zh/getting-started/e2b-compatibility/)** 零改造迁移现有 `e2b` / `e2b-code-interpreter` 代码。
+- 通过 **[E2B 快速兼容接入](/zh/getting-started/e2b-compatibility/)** 接入现有 `e2b` / `e2b-code-interpreter` 代码（详见 **[E2B 兼容性与差异参考](/zh/reference/e2b-compatibility/)**）。
 - 在 **[平台架构](/zh/concepts/architecture/)** 中深入内核与控制面实现细节。
 - 参考 **[Kubernetes 与 Helm 部署](/zh/deployment/kubernetes-helm/)** 在集群中启用 Kata Containers 与块存储。

@@ -122,8 +122,8 @@ export default defineConfig({
               slug: 'getting-started/quickstart',
             },
             {
-              label: 'E2B Drop-in Compatibility',
-              translations: { 'zh-CN': 'E2B 零改造兼容接入' },
+              label: 'E2B Compatibility Guide',
+              translations: { 'zh-CN': 'E2B 兼容接入' },
               slug: 'getting-started/e2b-compatibility',
             },
           ],
@@ -224,6 +224,11 @@ export default defineConfig({
               label: 'API Overview & Streaming',
               translations: { 'zh-CN': 'API 概览与流式协议' },
               slug: 'reference/api-overview',
+            },
+            {
+              label: 'E2B Compatibility',
+              translations: { 'zh-CN': 'E2B 兼容性与差异' },
+              slug: 'reference/e2b-compatibility',
             },
             {
               label: 'Interactive OpenAPI Explorer',

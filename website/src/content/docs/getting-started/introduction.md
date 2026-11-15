@@ -30,14 +30,14 @@ CubePod removes this compromise by booting **stock, unmodified OCI images** insi
 | **Compute Pause-to-Zero** | Deletes state on stop | Snapshot or ephemeral stop | `desiredState: Paused` tears down compute (`0 CPU / 0 RAM`), keeps dual PVCs |
 | **State Cloning (CoW Fork)** | Slow image commit | VM snapshot | **Crash-consistent CoW fork** (`FIFREEZE` -> CSI clone / reflink -> `FITHAW`) |
 | **Secret & Egress Safety** | Real env vars inside sandbox | Real env vars inside sandbox | **`cpodref_` placeholders** + selective MITM over per-pod mTLS |
-| **SDK & Protocol Ecosystem** | Custom APIs | E2B REST / Connect-RPC | **100% E2B drop-in compatible** + native Python, TS, Go, CLI, MCP |
+| **SDK & Protocol Ecosystem** | Custom APIs | E2B REST / Connect-RPC | **E2B protocol compatible (core REST & Connect-RPC)** + native Python, TS, Go, CLI, MCP |
 
 ## Core Architectural Pillars
 
 1. **[Dual-Volume Persistence](/concepts/dual-volume-persistence/)**: Isolates the writable OS RootFS (`<box>-rootfs-pvc` or `<box>-rootfs-gen<N>-pvc`) from user project files (`<box>-workspace-pvc` mounted at `/workspace`). Incrementing `rootfsGeneration` wipes or upgrades OS mutations without losing a byte in `/workspace`.
 2. **[Clean OCI Images via `podd-init` & `podd`](/concepts/in-guest-init-and-podd/)**: Runtime binaries are never baked into user images. An `initContainer` (`podd-installer`) or host bind-mount injects `/opt/cubepod/bin/{podd-init,podd}` at startup. A single-threaded Rust PID 1 (`podd-init`) checks/heals `ext4`, mounts `OverlayFS`, pivots root (`pivot_root`), and execs into `podd` (`:49983`).
 3. **[WarmPool, Pause-to-Zero, CoW Fork & Stateless HA](/concepts/lifecycle-warmpool-fork/)**: `PodWarmPool` pre-attaches standby MicroVMs claimed atomically in `< 50 ms`. `spec.forkFrom` performs crash-consistent cloning (`FIFREEZE`/`FITHAW` + CSI or `cp --reflink=auto`), and `cubepod-gateway` reconstructs state directly from Kubernetes `PodBox` CRDs for multi-replica HA.
-4. **[Drop-in E2B Compatibility](/getting-started/e2b-compatibility/)**: Point `E2B_DOMAIN` or `E2B_API_URL` at `cubepod-gateway` so existing `e2b`, `e2b-code-interpreter`, `@e2b/code-interpreter`, LangChain, LlamaIndex, and OpenHands workflows run unmodified.
+4. **[E2B Compatibility Guide](/getting-started/e2b-compatibility/)**: Point `E2B_DOMAIN` or `E2B_API_URL` at `cubepod-gateway` so existing `e2b` and `e2b-code-interpreter` workflows can target CubePod (see [E2B Compatibility Reference](/reference/e2b-compatibility/) for the full method matrix and behavioral differences).
 5. **[Zero-Trust Egress & Secret Vault](/concepts/zero-trust-egress/)**: Real API keys never enter sandbox memory or disk. Only `cpodref_` 32-character Base32 placeholders are injected; `cubepod-egress` intercepts outbound traffic (`nftables` + DNS proxy + selective HTTPS MITM) and swaps placeholders over per-pod mTLS against `cubepod-gateway`.
 6. **[Lazy Interactive Desktop & Signed Panel Proxy](/concepts/desktop-and-panel-proxy/)**: GUI images start with ~0 MiB desktop RAM overhead and launch `Xvfb`, `openbox`, Chromium CDP (`:9222`), `x11vnc`/`noVNC` (`:8080`), and `ttyd` (`:7681`) on demand, exposed securely via HMAC-SHA256 `/panel/{token}/` URLs.
 
@@ -51,6 +51,6 @@ Every CubePod subsystem runs with behavioral parity across two environments:
 ## Next Steps
 
 - Launch a local stack and run your first persistent sandbox in the **[Quickstart](/getting-started/quickstart/)**.
-- Connect existing E2B agents with **[E2B Drop-in Compatibility](/getting-started/e2b-compatibility/)**.
+- Connect existing E2B agents with the **[E2B Compatibility Guide](/getting-started/e2b-compatibility/)** or inspect the **[E2B Compatibility Reference](/reference/e2b-compatibility/)**.
 - Dive into the control and data plane in **[Platform Architecture](/concepts/architecture/)**.
 - Deploy to production clusters with **[Kubernetes & Helm Deployment](/deployment/kubernetes-helm/)**.

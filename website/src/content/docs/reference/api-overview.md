@@ -64,7 +64,7 @@ CubePod embeds stateful code interpreter execution directly inside `podd` (`crat
 
 - **Execute Code**: `POST /sandboxes/{id}/code/execute` (also `POST /sandboxes/{id}/execute` and `POST /execute`).
   - Streams `application/x-ndjson` lines containing `stdout`, `stderr`, `result` (supporting `text`, `png` base64 images, `html`, `json`), `error` (`name`, `value`, `traceback`), and `number_of_executions`.
-- **Stateful Context Management**: In-guest `podd` exposes `/contexts` and `/v1/code/contexts` (with Gateway paths at `/sandboxes/{id}/code/contexts` and `/sandboxes/{id}/code/contexts/{contextId}`) to create, inspect, restart, and delete persistent stateful language sessions.
+- **Stateful Context Management**: In-guest `podd` exposes `/contexts` and `/v1/code/contexts` internally (reachable directly via the subdomain port router on port `49983`) to create, inspect, restart, and delete persistent language sessions. When invoking code via the Gateway route `/sandboxes/{id}/code/execute`, clients pass `context_id` in the execution payload to target an existing context.
 
 ## Desktop & Signed Panel Proxy
 
@@ -82,7 +82,7 @@ See [Desktop & Panel Proxy](/concepts/desktop-and-panel-proxy/) for architecture
 
 ## E2B Connect-RPC Compatibility Endpoints
 
-For drop-in E2B SDK interoperability (`pkg/gateway/connectrpc.go`), the Gateway translates Connect-RPC service calls—whether rooted at `/` (resolved via `E2b-Sandbox-Id`, `X-Sandbox-ID`, query param, or subdomain host) or nested at `/sandboxes/{id}/`:
+For drop-in E2B SDK interoperability (`pkg/gateway/connectrpc.go`), the Gateway translates Connect-RPC service calls—whether rooted at `/` (resolved via `E2b-Sandbox-Id`, `X-Sandbox-ID`, query param, or subdomain host) or nested at `/sandboxes/{id}/` (see the [E2B Compatibility Reference](/reference/e2b-compatibility/) for the comprehensive per-method matrix):
 
 - **Process Service**:
   - `POST /process.Process/Start`
@@ -132,5 +132,6 @@ When `--e2b-template-api=true` is enabled on the Gateway and Controller, the ful
 
 ## Next Steps
 
+- Consult the **[E2B Compatibility Reference](/reference/e2b-compatibility/)** for the full official SDK method matrix, tested version constraints, and architectural differences.
 - Try the interactive Swagger/Scalar playground at [Interactive API Reference](/api/).
 - Explore the Python, TypeScript, and Go client implementations in [Python SDK](/sdks/python/), [TypeScript SDK](/sdks/typescript/), and [Go SDK & CLI](/sdks/go-and-cli/).

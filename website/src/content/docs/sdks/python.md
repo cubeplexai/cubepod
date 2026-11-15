@@ -16,7 +16,7 @@ pip install cubepod
 ```
 
 :::tip[Using the Official `e2b` Python SDK?]
-If you have existing agent code written against `e2b` or `e2b-code-interpreter`, CubePod supports drop-in protocol compatibility without rewriting your SDK calls. See [E2B Drop-in Compatibility](/getting-started/e2b-compatibility/).
+If you have existing agent code written against `e2b` or `e2b-code-interpreter`, CubePod implements core E2B protocol compatibility. See the [E2B Compatibility Guide](/getting-started/e2b-compatibility/) and the [E2B Compatibility Reference](/reference/e2b-compatibility/) for the per-method matrix.
 :::
 
 ## Quickstart (Async & Sync)

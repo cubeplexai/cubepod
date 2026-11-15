@@ -1,9 +1,13 @@
 ---
-title: E2B 无缝兼容指南
-description: 零改代码将官方 E2B Python / TypeScript SDK（e2b、e2b-code-interpreter、@e2b/code-interpreter）及 AI Agent 框架接入 CubePod。
+title: E2B 快速兼容接入
+description: 通过环境变量将官方 E2B Python 与 TypeScript SDK 接入 CubePod。
 ---
 
-依据 **[CEP-0018](/zh/ceps/)** 与 **[CEP-0019](/zh/ceps/)** 设计规范，CubePod 为官方 E2B SDK（`e2b`、`e2b-code-interpreter`、`@e2b/code-interpreter`）提供**协议级无缝兼容（Wire-Level Drop-in Compatibility）**。现有 LangChain、LlamaIndex、AutoGen、CrewAI、OpenHands 与 Smolagents 工作流无需改动业务代码，只需配置环境变量即可从托管 E2B 切换至自建持久化 Kata MicroVM 平台。
+依据 **[CEP-0018](/ceps/0018-e2b-protocol-compatibility/)** 与 **[CEP-0019](/ceps/0019-e2b-template-api/)** 设计规范，CubePod 实现了核心 E2B REST 与 Connect-RPC 接口。使用官方 E2B Python 或 TypeScript SDK 的工作流只需配置对应环境变量，即可将请求目标从托管 E2B 重定向至自建持久化 Kata 微虚拟机平台。
+
+:::tip[详细兼容矩阵与架构差异参考]
+本页为环境变量配置与极简调用代码的快速指引。关于按方法划分的详细兼容性矩阵、计算缩容至零 vs 物理内存快照等架构差异、实测版本约束及未测试边界，请参阅 **[E2B 兼容性与差异参考](/zh/reference/e2b-compatibility/)**。
+:::
 
 ## 将官方 E2B SDK 指向 CubePod
 
@@ -28,7 +32,7 @@ export E2B_SANDBOX_URL="http://127.0.0.1:8080"
 export E2B_API_KEY="cpod_test_api_key"
 ```
 
-## 零改代码的官方 E2B 示例
+## 官方 E2B 调用示例
 
 ### 官方 `e2b` Python SDK（Sync & Async）
 
@@ -44,7 +48,7 @@ with Sandbox.create("base", timeout=300) as sbx:
 
 ### 官方 `e2b-code-interpreter` SDK
 
-`podd` 内置支持 **6 种语言**（`python`、`bash`、`javascript`、`typescript`、`r`、`java`）的有状态执行上下文，通过 NDJSON 流式协议与 `e2b-code-interpreter` 完整互通：
+`podd` 内置支持 **6 种语言**（`python`、`bash`、`javascript`、`typescript`、`r`、`java`）的有状态执行上下文，通过 NDJSON 流式协议与 `e2b-code-interpreter` 互通：
 
 ```python
 from e2b_code_interpreter import Sandbox
@@ -55,19 +59,19 @@ with Sandbox.create() as sbx:
     print(execution.logs.stdout)
 ```
 
-## `cubepod-gateway` 协议兼容矩阵
+## `cubepod-gateway` 协议实现概览
 
-`cubepod-gateway`（`pkg/gateway/`）同时实现了 E2B 控制面与数据面（含基于 `:49983` 语义的 Connect-RPC 协议）：
+`cubepod-gateway`（`pkg/gateway/`）实现了核心 E2B 控制面与数据面（含基于 `:49983` 语义的 Connect-RPC 协议）：
 
 | 协议面 | 已实现端点 | CubePod 内部行为 |
 | :--- | :--- | :--- |
-| **控制面** | `POST /sandboxes`、`POST /v2/sandboxes`、`GET /sandboxes`、`GET /v2/sandboxes`、`GET /sandboxes/{id}`、`DELETE /sandboxes/{id}` | 创建或列举 `PodBox` 沙箱；响应体始终包含 E2B 必填字段（`sandboxID`、`templateID`、`clientID`、`envdVersion`、`state`、`startedAt`、`endAt`、`cpuCount`、`memoryMB`、`diskSizeMB`）。 |
+| **控制面** | `POST /sandboxes`、`POST /v2/sandboxes`、`GET /sandboxes`、`GET /sandboxes/{id}`、`DELETE /sandboxes/{id}` | 创建或列举 `PodBox` 沙箱；响应体包含 E2B 必填字段（`sandboxID`、`templateID`、`clientID`、`envdVersion`、`state`、`startedAt`、`endAt`、`cpuCount`、`memoryMB`、`diskSizeMB`）。注：网关未注册 `GET /v2/sandboxes`。 |
 | **生命周期与租约** | `POST /sandboxes/{id}/refreshes`、`POST /sandboxes/{id}/timeout`、`POST /sandboxes/{id}/pause`、`POST /sandboxes/{id}/connect` | 续期超时或租约时间；暂停时释放 Pod 算力并保留双 PVC；收到 `connect` 或数据面流量时透明自动唤醒。 |
 | **命令执行与流式日志** | `POST /sandboxes/{id}/commands`、`POST /sandboxes/{id}/commands/run`、`GET .../logs?cursor=N`、`POST .../kill`、Connect-RPC `/process.Process/{Start,SendSignal,Connect,List}` | 在 Guest 内默认以非特权 UID/GID `1000:1000`（`cubeplex`）运行命令，支持游标增量拉取日志及 PGID 进程组级清理。 |
 | **文件系统与归档同步** | `PUT/GET/DELETE /sandboxes/{id}/files`、`GET .../files/list`、`POST .../files/archive-sync`、Connect-RPC `/filesystem.Filesystem/{Read,Write,List,ListDir,Stat,Remove,MakeDir}` | 直接读写持久化 `/workspace` 或 RootFS 文件，并支持带路径穿越防护的 `.tar`/`.tar.gz` 批量目录同步。 |
-| **有状态代码解释器** | `POST /sandboxes/{id}/execute`、`POST /sandboxes/{id}/code/execute`、`/contexts` | 管理 `podd` 内部 6 种语言解释器上下文（`python`、`bash`、`javascript`、`typescript`、`r`、`java`）。 |
+| **有状态代码解释器** | `POST /sandboxes/{id}/execute`、`POST /sandboxes/{id}/code/execute`、`POST /execute` | 管理 `podd` 内部 6 种语言解释器上下文（`python`、`bash`、`javascript`、`typescript`、`r`、`java`）。上下文生命周期在沙箱内维护。 |
 | **子域名端口路由** | `Host: <port>-<sandboxID>.<domain>` 与 `GET/POST /sandboxes/{id}/endpoints/{port}` | 自动唤醒已暂停沙箱，将 `/envd/*` 路径转发至 `podd`（`:49983`），并反代应用端口或签发 `/panel/{token}/` 访问地址。 |
-| **模板目录与构建** | `/templates`、`/v2/templates`、`/v3/templates`、`/templates/{id}/builds/{buildID}/status`、`/templates/{id}/files/{hash}` | 启用 `--e2b-template-api=true`（或 `-feature-gate E2BTemplateAPI=true`）后即可兼容 `e2b template build` 等工作流。 |
+| **模板目录与构建** | `/templates`、`/v2/templates`、`/v3/templates`、`/templates/{id}/builds/{buildID}/status`、`/templates/{id}/files/{hash}` | 启用 `--e2b-template-api=true` 与 `--template-build=true` 后即可使用 BuildKit 或本地 Docker 执行镜像构建。 |
 
 ## 超越 E2B 的 CubePod 扩展能力
 
@@ -80,6 +84,7 @@ with Sandbox.create() as sbx:
 
 ## 下一步
 
+- 参阅 **[E2B 兼容性与差异参考](/zh/reference/e2b-compatibility/)** 了解完整接口矩阵、版本约束与暂停语义对比。
 - 查看 **[API 参考](/zh/api/)** 浏览完整 OpenAPI 3.1 契约。
 - 对比原生客户端特性：**[Python SDK](/zh/sdks/python/)** 与 **[TypeScript SDK](/zh/sdks/typescript/)**。
 - 查看 **[CRD 参考](/zh/reference/crds/)** 了解 `PodBox` 与 `PodTemplate` 的 Kubernetes Schema。

@@ -65,7 +65,7 @@ function main() {
   const llmsLines = [
     '# CubePod',
     '',
-    '> Persistent Writable RootFS MicroVM Execution Platform for AI Agents (100% E2B-compatible superset). Built with Kata Containers, CSI Raw Block dual volumes (`rootfs-pvc` + `workspace-pvc`), single-threaded Rust `podd-init` OverlayFS pivot, Zero-Export ~1s suspend/resume, `<50ms` `PodWarmPool`, `~1s` CoW `fork`, and Zero-Trust `cpodref_` mTLS egress.',
+    '> Persistent Writable RootFS MicroVM Execution Platform for AI Agents (E2B-compatible superset). Built with Kata Containers, CSI Raw Block dual volumes (`rootfs-pvc` + `workspace-pvc`), single-threaded Rust `podd-init` OverlayFS pivot, Zero-Export ~1s suspend/resume, `<50ms` `PodWarmPool`, `~1s` CoW `fork`, and Zero-Trust `cpodref_` mTLS egress.',
     '',
     '## Machine-Readable Specs & Resources',
     '',
