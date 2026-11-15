@@ -622,29 +622,64 @@ func TestReconciler_DeleteBox(t *testing.T) {
 	)
 	ctx := context.Background()
 
-	// 1. Reconcile running box
-	spec := v1alpha1.PodBoxSpec{
+	// 1. Ephemeral sandbox (VolumeKey == "") with deleteVolumes=false deletes both PVCs.
+	ephemeralSpec := v1alpha1.PodBoxSpec{
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: 1,
 	}
-	_, err := r.Reconcile(ctx, "box-keep-pvc", spec)
-	if err != nil {
+	if _, err := r.Reconcile(ctx, "box-ephemeral", ephemeralSpec); err != nil {
+		t.Fatalf("reconcile ephemeral failed: %v", err)
+	}
+	if err := r.DeleteBox(ctx, "box-ephemeral", false); err != nil {
+		t.Fatalf("DeleteBox(ephemeral, deleteVolumes=false) failed: %v", err)
+	}
+	if _, exists := r.GetBox("box-ephemeral"); exists {
+		t.Fatal("expected box-ephemeral to be removed from reconciler")
+	}
+
+	mock.mu.RLock()
+	var ephPodDeleted, ephRootDeleted, ephWsDeleted bool
+	for _, p := range mock.deletedPods {
+		if p == "box-ephemeral-kata-pod" {
+			ephPodDeleted = true
+		}
+	}
+	for _, p := range mock.deletedPVCs {
+		if p == "box-ephemeral-rootfs-pvc" {
+			ephRootDeleted = true
+		}
+		if p == "box-ephemeral-workspace-pvc" {
+			ephWsDeleted = true
+		}
+	}
+	mock.mu.RUnlock()
+	if !ephPodDeleted {
+		t.Fatal("expected box-ephemeral-kata-pod to be deleted")
+	}
+	if !ephRootDeleted || !ephWsDeleted {
+		t.Fatalf("expected both PVCs deleted for ephemeral sandbox with deleteVolumes=false, got deletedPVCs: %v", mock.deletedPVCs)
+	}
+
+	// 2. Persistent VolumeKey sandbox with deleteVolumes=false retains workspace-pvc and deletes rootfs-pvc.
+	persistSpec := v1alpha1.PodBoxSpec{
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		VolumeKey:        "persist-ws",
+	}
+	if _, err := r.Reconcile(ctx, "box-keep-pvc", persistSpec); err != nil {
 		t.Fatalf("reconcile failed: %v", err)
 	}
 
-	// 2. DeleteBox with deleteVolumes=false
 	if err := r.DeleteBox(ctx, "box-keep-pvc", false); err != nil {
 		t.Fatalf("DeleteBox(deleteVolumes=false) failed: %v", err)
 	}
 
-	// Box should be removed from reconciler
 	if _, exists := r.GetBox("box-keep-pvc"); exists {
 		t.Fatal("expected box-keep-pvc to be removed from reconciler")
 	}
 
-	// Pod should be deleted
 	mock.mu.RLock()
-	var podDeleted bool
+	var podDeleted, keepRootDeleted bool
 	for _, p := range mock.deletedPods {
 		if p == "box-keep-pvc-kata-pod" {
 			podDeleted = true
@@ -654,17 +689,21 @@ func TestReconciler_DeleteBox(t *testing.T) {
 	if !podDeleted {
 		t.Fatal("expected box-keep-pvc-kata-pod to be deleted")
 	}
-	// PVCs should NOT be deleted
 	for _, p := range mock.deletedPVCs {
-		if p == "box-keep-pvc-rootfs-pvc" || p == "box-keep-pvc-workspace-pvc" {
-			t.Fatalf("PVC %s should not have been deleted when deleteVolumes=false", p)
+		if p == "box-keep-pvc-rootfs-pvc" {
+			keepRootDeleted = true
+		}
+		if p == "persist-ws-workspace-pvc" || p == "box-keep-pvc-workspace-pvc" {
+			t.Fatalf("workspace PVC %s should not have been deleted when deleteVolumes=false", p)
 		}
 	}
 	mock.mu.RUnlock()
+	if !keepRootDeleted {
+		t.Fatalf("expected box-keep-pvc-rootfs-pvc to be deleted when deleteVolumes=false, got deletedPVCs: %v", mock.deletedPVCs)
+	}
 
-	// 3. Reconcile another box and DeleteBox with deleteVolumes=true
-	_, err = r.Reconcile(ctx, "box-delete-pvc", spec)
-	if err != nil {
+	// 3. Persistent VolumeKey sandbox with deleteVolumes=true deletes both PVCs.
+	if _, err := r.Reconcile(ctx, "box-delete-pvc", persistSpec); err != nil {
 		t.Fatalf("reconcile failed: %v", err)
 	}
 
@@ -678,7 +717,7 @@ func TestReconciler_DeleteBox(t *testing.T) {
 		if p == "box-delete-pvc-rootfs-pvc" {
 			rootPVCDeleted = true
 		}
-		if p == "box-delete-pvc-workspace-pvc" {
+		if p == "persist-ws-workspace-pvc" {
 			wsPVCDeleted = true
 		}
 	}

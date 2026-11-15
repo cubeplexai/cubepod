@@ -2026,6 +2026,54 @@ func TestStatelessGatewayMultiReplicaFailover(t *testing.T) {
 	}
 }
 
+func TestEphemeralSandboxDeleteReclaimsBothPVCs(t *testing.T) {
+	memKube := controller.NewMemoryKubeClient()
+	reconciler := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithVolumeMode("Filesystem"),
+	)
+	srv := gateway.NewServer(reconciler)
+	srv.SetWorkspaceBaseDir(t.TempDir())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	createBody := []byte(`{"templateID":"cubeplex-ubuntu24-desktop"}`)
+	resp, err := http.Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader(createBody))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create ephemeral sandbox failed: resp=%v err=%v", resp, err)
+	}
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(resp.Body).Decode(&rec)
+	_ = resp.Body.Close()
+
+	if rec.VolumeKey != "" {
+		t.Fatalf("expected empty VolumeKey for ephemeral sandbox, got %q", rec.VolumeKey)
+	}
+	rootfsPVC := rec.SandboxID + "-rootfs-pvc"
+	wsPVC := rec.SandboxID + "-workspace-pvc"
+	if _, ok := memKube.GetPVC("cubepod-workloads", rootfsPVC); !ok {
+		t.Fatalf("expected rootfs PVC %q after create", rootfsPVC)
+	}
+	if _, ok := memKube.GetPVC("cubepod-workloads", wsPVC); !ok {
+		t.Fatalf("expected workspace PVC %q after create", wsPVC)
+	}
+
+	// DELETE /sandboxes/{id} without ?deleteVolumes=true (what E2B Sandbox.kill() sends)
+	delReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+rec.SandboxID, nil)
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil || delResp.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete ephemeral sandbox failed: resp=%v err=%v", delResp, err)
+	}
+	_ = delResp.Body.Close()
+
+	if _, ok := memKube.GetPVC("cubepod-workloads", rootfsPVC); ok {
+		t.Fatalf("expected ephemeral rootfs PVC %q to be deleted", rootfsPVC)
+	}
+	if _, ok := memKube.GetPVC("cubepod-workloads", wsPVC); ok {
+		t.Fatalf("expected ephemeral workspace PVC %q to be deleted", wsPVC)
+	}
+}
+
 func TestVolumeKeyPersistenceAcrossDeleteAndRecreate(t *testing.T) {
 	memKube := controller.NewMemoryKubeClient()
 	reconciler := controller.NewReconciler(
