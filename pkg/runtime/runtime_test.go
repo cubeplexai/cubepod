@@ -337,7 +337,7 @@ func TestDockerBackend_E2BVolumeMount(t *testing.T) {
 		VolumeMounts: []SandboxVolumeMount{
 			{HostPath: "/var/lib/cubepod/e2b/data", ContainerPath: "/mnt/data"},
 			{DockerVolume: "cpod-test-vol-abc", ContainerPath: "/mnt/named"},
-			{DockerVolume: "other-vol", ContainerPath: "/mnt/rejected"},
+			{DockerVolume: "cubepod-e2bvol-abc", ContainerPath: "/mnt/cpod-test-vol"},
 		},
 	}
 	args, err := docker.BuildRunArgs(spec)
@@ -348,12 +348,127 @@ func TestDockerBackend_E2BVolumeMount(t *testing.T) {
 		t.Fatalf("missing host bind: %v", args)
 	}
 	if !slices.Contains(args, "cpod-test-vol-abc:/mnt/named") {
-		t.Fatalf("missing named volume: %v", args)
+		t.Fatalf("missing test named volume: %v", args)
 	}
-	for _, a := range args {
-		if strings.Contains(a, "other-vol") {
-			t.Fatalf("rejected volume was mounted: %v", args)
+	if !slices.Contains(args, "cubepod-e2bvol-abc:/mnt/cpod-test-vol") {
+		t.Fatalf("missing product named volume: %v", args)
+	}
+
+	bad := []SandboxVolumeMount{
+		{DockerVolume: "other-vol", ContainerPath: "/mnt/rejected"},
+		{HostPath: "/var/lib/cubepod/e2b", ContainerPath: "/mnt/not-data"},
+		{HostPath: "/var/lib/cubepod/e2b/data", ContainerPath: "/workspace"},
+		{HostPath: "/var/lib/cubepod/e2b/data", ContainerPath: "relative"},
+	}
+	for _, m := range bad {
+		_, err := docker.BuildRunArgs(SandboxSpec{SandboxID: "sb-vol", VolumeMounts: []SandboxVolumeMount{m}})
+		if err == nil {
+			t.Fatalf("expected error for %+v", m)
 		}
+	}
+}
+
+func TestDockerBackend_InjectBinOff(t *testing.T) {
+	inject := false
+	bind := false
+	docker := NewDockerBackend(DockerConfig{
+		BaseDir:            t.TempDir(),
+		Network:            "cubepod-compat-compose",
+		DefaultImage:       "cubepod-compat-compose-sandbox:local",
+		InjectPoddBin:      &inject,
+		BindSandboxStorage: &bind,
+	})
+	args, err := docker.BuildRunArgs(SandboxSpec{
+		SandboxID: "sb-image",
+		VolumeMounts: []SandboxVolumeMount{
+			{DockerVolume: "cubepod-e2bvol-abc", ContainerPath: "/mnt/data"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "/opt/cubepod/bin") || strings.Contains(joined, "podd-init") || strings.Contains(joined, ":/workspace") {
+		t.Fatalf("image-local sandbox still injected host paths: %v", args)
+	}
+	if !slices.Contains(args, "cubepod-e2bvol-abc:/mnt/data") {
+		t.Fatalf("missing volume: %v", args)
+	}
+	if !slices.Contains(args, "cubepod-compat-compose-sandbox:local") {
+		t.Fatalf("missing image: %v", args)
+	}
+	if !slices.Contains(args, "cubepod-compat-compose") {
+		t.Fatalf("missing network: %v", args)
+	}
+}
+
+func TestDockerBackend_EngineAPIVolumeMount(t *testing.T) {
+	var created map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/containers/create"):
+			_ = json.NewDecoder(r.Body).Decode(&created)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"Id":"cid-1"}`))
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/json"):
+			_, _ = w.Write([]byte(`{"Id":"cid-1","State":{"Running":true},"NetworkSettings":{"Networks":{"cubepod-compat-compose":{"IPAddress":"172.18.0.9"}}}}`))
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	inject := false
+	bind := false
+	docker := NewDockerBackend(DockerConfig{
+		BaseDir:            t.TempDir(),
+		Network:            "cubepod-compat-compose",
+		DockerHost:         srv.URL,
+		DefaultImage:       "cubepod-compat-compose-sandbox:local",
+		InjectPoddBin:      &inject,
+		BindSandboxStorage: &bind,
+		MemoryBytes:        256 * 1024 * 1024,
+		NanoCPUs:           250_000_000,
+	})
+	docker.healthCheck = func(context.Context, string) error { return nil }
+
+	info, err := docker.EnsureRunning(context.Background(), SandboxSpec{
+		SandboxID: "sb-api",
+		VolumeMounts: []SandboxVolumeMount{
+			{DockerVolume: "cpod-test-vol-abc", ContainerPath: "/mnt/cpod-test-vol"},
+			{HostPath: "/var/lib/docker/volumes/state/_data/e2b/id/data", ContainerPath: "/mnt/host"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.PoddURL != "http://cubepod-sb-api:49983" {
+		t.Fatalf("podd URL %s", info.PoddURL)
+	}
+	if created == nil {
+		t.Fatal("container was not created")
+	}
+	if created["Image"] != "cubepod-compat-compose-sandbox:local" {
+		t.Fatalf("image %#v", created["Image"])
+	}
+	if _, ok := created["Entrypoint"]; ok {
+		t.Fatalf("entrypoint injected: %#v", created["Entrypoint"])
+	}
+	host, _ := created["HostConfig"].(map[string]any)
+	raw, _ := json.Marshal(host)
+	text := string(raw)
+	if !strings.Contains(text, "cpod-test-vol-abc") || !strings.Contains(text, "/mnt/cpod-test-vol") {
+		t.Fatalf("named mount missing: %s", text)
+	}
+	if !strings.Contains(text, "/var/lib/docker/volumes/state/_data/e2b/id/data:/mnt/host") && !strings.Contains(text, "/var/lib/docker/volumes/state/_data/e2b/id/data") {
+		t.Fatalf("host bind missing: %s", text)
+	}
+	if strings.Contains(text, "/opt/cubepod/bin") {
+		t.Fatalf("bin injected: %s", text)
 	}
 }
 
