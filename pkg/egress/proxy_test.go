@@ -1,10 +1,12 @@
 package egress_test
 
 import (
+	"bufio"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -356,5 +358,119 @@ func TestEgressProxyCubePlexWireContractAndMITM(t *testing.T) {
 	}
 	if upstreamHits != hitsBefore {
 		t.Fatalf("upstream should not have been called on disallowed header (%d -> %d)", hitsBefore, upstreamHits)
+	}
+}
+
+func TestEgressProxy_RejectsHostAndURLMismatch(t *testing.T) {
+	deniedHits := 0
+	deniedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		deniedHits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("should-never-reach"))
+	}))
+	defer deniedUpstream.Close()
+
+	deniedURL, err := url.Parse(deniedUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse denied URL: %v", err)
+	}
+
+	mitmCA, err := egress.NewCA()
+	if err != nil {
+		t.Fatalf("NewCA mitm: %v", err)
+	}
+
+	proxy := egress.NewEgressProxy(egress.EgressProxyConfig{
+		SandboxID:   "cpod-ssrf-test",
+		ExchangeURL: "https://exchange.internal:8443",
+		MITMCA:      mitmCA,
+		Policy: v1alpha1.NetworkPolicySpec{
+			DefaultAction: v1alpha1.NetworkDefaultDeny,
+			AllowHosts:    []string{"allowed.example"},
+		},
+	})
+
+	// 1. TransparentHTTPHandler must reject mismatched Host vs URL.Host (400) before dialing.
+	mismatchURL, _ := url.Parse(deniedUpstream.URL + "/latest/meta-data")
+	reqTransparent := httptest.NewRequest(http.MethodGet, "http://allowed.example/latest/meta-data", nil)
+	reqTransparent.Host = "allowed.example"
+	reqTransparent.URL = mismatchURL
+	recTransparent := httptest.NewRecorder()
+	proxy.TransparentHTTPHandler().ServeHTTP(recTransparent, reqTransparent)
+	if recTransparent.Code != http.StatusBadRequest {
+		t.Fatalf("TransparentHTTPHandler mismatch status = %d; want 400", recTransparent.Code)
+	}
+
+	// 2. TransparentHTTPHandler must reject non-http schemes (e.g. https) on plain listener.
+	reqScheme := httptest.NewRequest(http.MethodGet, "https://allowed.example/secret", nil)
+	reqScheme.Host = "allowed.example"
+	recScheme := httptest.NewRecorder()
+	proxy.TransparentHTTPHandler().ServeHTTP(recScheme, reqScheme)
+	if recScheme.Code != http.StatusBadRequest {
+		t.Fatalf("TransparentHTTPHandler non-http scheme status = %d; want 400", recScheme.Code)
+	}
+
+	// 3. Explicit ServeHTTP must reject mismatched URL.Host vs Host header on GET and CONNECT.
+	reqProxyGet := httptest.NewRequest(http.MethodGet, "http://allowed.example/ok", nil)
+	reqProxyGet.Host = deniedURL.Host
+	recProxyGet := httptest.NewRecorder()
+	proxy.ServeHTTP(recProxyGet, reqProxyGet)
+	if recProxyGet.Code != http.StatusBadRequest {
+		t.Fatalf("ServeHTTP GET mismatch status = %d; want 400", recProxyGet.Code)
+	}
+
+	reqConnect := &http.Request{
+		Method: http.MethodConnect,
+		URL:    &url.URL{Host: "allowed.example:443"},
+		Host:   deniedURL.Host,
+		Header: make(http.Header),
+	}
+	recConnect := httptest.NewRecorder()
+	proxy.ServeHTTP(recConnect, reqConnect)
+	if recConnect.Code != http.StatusBadRequest {
+		t.Fatalf("ServeHTTP CONNECT mismatch status = %d; want 400", recConnect.Code)
+	}
+
+	// 4. MITM CONNECT must reject inner HTTP requests whose URL.Host disagrees with SNI/Host.
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+	proxyAddr := strings.TrimPrefix(proxySrv.URL, "http://")
+
+	rawConn, err := net.DialTimeout("tcp", proxyAddr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = rawConn.Close() }()
+
+	_, _ = fmt.Fprintf(rawConn, "CONNECT allowed.example:443 HTTP/1.1\r\nHost: allowed.example:443\r\n\r\n")
+	br := bufio.NewReader(rawConn)
+	connectResp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	if err != nil {
+		t.Fatalf("read CONNECT response: %v", err)
+	}
+	_ = connectResp.Body.Close()
+	if connectResp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status = %d; want 200", connectResp.StatusCode)
+	}
+
+	tlsConn := tls.Client(rawConn, &tls.Config{
+		ServerName: "allowed.example",
+		RootCAs:    mitmCA.CertPool(),
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("MITM TLS handshake: %v", err)
+	}
+	_, _ = fmt.Fprintf(tlsConn, "GET https://%s/steal HTTP/1.1\r\nHost: allowed.example\r\n\r\n", deniedURL.Host)
+	mitmResp, err := http.ReadResponse(bufio.NewReader(tlsConn), &http.Request{Method: http.MethodGet})
+	if err != nil {
+		t.Fatalf("read MITM response: %v", err)
+	}
+	_ = mitmResp.Body.Close()
+	if mitmResp.StatusCode != http.StatusMisdirectedRequest {
+		t.Fatalf("MITM mismatched inner URL.Host status = %d; want 421", mitmResp.StatusCode)
+	}
+
+	if deniedHits != 0 {
+		t.Fatalf("denied upstream received %d hits; want 0", deniedHits)
 	}
 }

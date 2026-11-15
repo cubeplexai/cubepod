@@ -378,20 +378,86 @@ func (p *EgressProxy) replaceHeaderPlaceholders(ctx context.Context, src http.He
 
 // ServeHTTP handles outbound requests, enforcing AllowedHosts/DeniedHosts,
 // scanning headers for cpodref_ tokens, exchanging them over mTLS, and forwarding upstream.
+func sameHostPort(a, b, defaultPort string) bool {
+	na, nb := normalizeHost(a), normalizeHost(b)
+	if na == "" || nb == "" || na != nb {
+		return false
+	}
+	_, pa := splitHostPortDefault(a, defaultPort)
+	_, pb := splitHostPortDefault(b, defaultPort)
+	return pa == pb
+}
+
+func resolvePlainHTTPTarget(r *http.Request, preferHeader bool) (string, string, int, string) {
+	if r.URL.Scheme != "" && !strings.EqualFold(r.URL.Scheme, "http") {
+		return "", "", http.StatusBadRequest, fmt.Sprintf("unsupported URL scheme %q on HTTP proxy listener", r.URL.Scheme)
+	}
+	urlHost := r.URL.Host
+	headerHost := r.Host
+	if headerHost == "" {
+		headerHost = r.Header.Get("Host")
+	}
+	if urlHost != "" && headerHost != "" && !sameHostPort(urlHost, headerHost, "80") {
+		return "", "", http.StatusBadRequest, "mismatched request URL host and Host header"
+	}
+	rawHost := urlHost
+	if preferHeader {
+		rawHost = headerHost
+		if rawHost == "" {
+			rawHost = urlHost
+		}
+	} else if rawHost == "" {
+		rawHost = headerHost
+	}
+	if rawHost == "" {
+		if preferHeader {
+			return "", "", http.StatusBadRequest, "missing Host header"
+		}
+		return "", "", http.StatusBadRequest, "missing destination host"
+	}
+	targetHost := normalizeHost(rawHost)
+	if targetHost == "" {
+		return "", "", http.StatusBadRequest, "invalid destination host"
+	}
+	return rawHost, targetHost, 0, ""
+}
+
 func (p *EgressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	rawHost := r.URL.Host
-	if rawHost == "" {
-		rawHost = r.Host
-	}
-	if rawHost == "" {
-		rawHost = r.Header.Get("Host")
-	}
-	if rawHost == "" {
-		http.Error(w, "missing destination host", http.StatusBadRequest)
-		return
+	var rawHost, targetHost string
+	if r.Method == http.MethodConnect {
+		if r.URL.Scheme != "" {
+			http.Error(w, "CONNECT target must not include URL scheme", http.StatusBadRequest)
+			return
+		}
+		urlHost := r.URL.Host
+		headerHost := r.Host
+		if headerHost == "" {
+			headerHost = r.Header.Get("Host")
+		}
+		if urlHost != "" && headerHost != "" && !sameHostPort(urlHost, headerHost, "443") {
+			http.Error(w, "mismatched CONNECT target and Host header", http.StatusBadRequest)
+			return
+		}
+		rawHost = urlHost
+		if rawHost == "" {
+			rawHost = headerHost
+		}
+		if rawHost == "" {
+			http.Error(w, "missing destination host", http.StatusBadRequest)
+			return
+		}
+		targetHost = normalizeHost(rawHost)
+		r.Host = rawHost
+	} else {
+		var status int
+		var errMsg string
+		rawHost, targetHost, status, errMsg = resolvePlainHTTPTarget(r, false)
+		if status != 0 {
+			http.Error(w, errMsg, status)
+			return
+		}
 	}
 
-	targetHost := normalizeHost(rawHost)
 	policy := p.GetPolicy()
 
 	if !CheckEgressAllowed(policy, targetHost) {
@@ -421,16 +487,12 @@ func (p *EgressProxy) TransparentHTTPHandler() http.Handler {
 			http.Error(w, "CONNECT not allowed on transparent HTTP listener", http.StatusMethodNotAllowed)
 			return
 		}
-		rawHost := r.Host
-		if rawHost == "" {
-			rawHost = r.URL.Host
-		}
-		if rawHost == "" {
-			http.Error(w, "missing Host header", http.StatusBadRequest)
+		rawHost, targetHost, status, errMsg := resolvePlainHTTPTarget(r, true)
+		if status != 0 {
+			http.Error(w, errMsg, status)
 			return
 		}
 
-		targetHost := normalizeHost(rawHost)
 		policy := p.GetPolicy()
 		if !CheckEgressAllowed(policy, targetHost) {
 			p.metrics.IncRequest("http", "deny")
@@ -452,12 +514,8 @@ func (p *EgressProxy) forwardPlainHTTP(w http.ResponseWriter, r *http.Request, r
 	}
 
 	outURL := *r.URL
-	if outURL.Scheme == "" {
-		outURL.Scheme = "http"
-	}
-	if outURL.Host == "" {
-		outURL.Host = rawHost
-	}
+	outURL.Scheme = "http"
+	outURL.Host = rawHost
 
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, outURL.String(), r.Body)
 	if err != nil {
@@ -655,7 +713,9 @@ func (p *EgressProxy) serveMITMTLS(clientConn net.Conn, sniHost, port string) {
 		}
 
 		// Enforce HTTP Host == TLS SNI to prevent domain fronting.
-		if req.Host == "" || normalizeHost(req.Host) != sniHost {
+		if req.Host == "" || normalizeHost(req.Host) != sniHost ||
+			(req.URL.Scheme != "" && !strings.EqualFold(req.URL.Scheme, "https")) ||
+			(req.URL.Host != "" && !sameHostPort(req.URL.Host, req.Host, "443")) {
 			p.metrics.IncBlockedHost(req.Host)
 			_ = req.Body.Close()
 			_ = writeMITMErrorResponse(tlsConn, http.StatusMisdirectedRequest, "421 Misdirected Request: Host header does not match TLS SNI\n")
@@ -671,9 +731,7 @@ func (p *EgressProxy) serveMITMTLS(clientConn net.Conn, sniHost, port string) {
 
 		outURL := *req.URL
 		outURL.Scheme = "https"
-		if outURL.Host == "" {
-			outURL.Host = req.Host
-		}
+		outURL.Host = req.Host
 
 		outReq, err := http.NewRequestWithContext(req.Context(), req.Method, outURL.String(), req.Body)
 		if err != nil {

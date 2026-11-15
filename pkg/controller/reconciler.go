@@ -999,13 +999,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			}
 		} else if spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != "" {
 			// 2. CoW Fork provisioning from parent sandbox
+			createdCold = true
 			parentRootfsPVC, parentWorkspacePVC := r.resolveForkParentPVCsLocked(ctx, spec.ForkFrom.PodBoxName)
 			rootfsName := fmt.Sprintf("%s-rootfs-pvc", name)
 			if spec.RootfsGeneration > 1 {
 				rootfsName = fmt.Sprintf("%s-rootfs-gen%d-pvc", name, spec.RootfsGeneration)
 			}
 			status = &v1alpha1.PodBoxStatus{
-				Phase:             v1alpha1.PodBoxPhaseRunning,
+				Phase:             v1alpha1.PodBoxPhaseProvisioning,
 				PodName:           fmt.Sprintf("%s-kata-pod", name),
 				RootfsPVCName:     rootfsName,
 				WorkspacePVCName:  WorkspacePVCName(name, spec),
@@ -1045,7 +1046,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	}
 
 	// Handle independent RootFS reset while keeping Workspace PVC intact.
+	didResetRootFS := false
 	if spec.RootfsGeneration > status.ObservedRootfsGen {
+		didResetRootFS = true
 		slog.Info("resetting RootFS Upper PVC while preserving Workspace PVC",
 			"podBox", name,
 			"oldGen", status.ObservedRootfsGen,
@@ -1089,6 +1092,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			if err := r.ensureEgressSecretsLocked(ctx, name, spec); err != nil {
 				if createdCold {
 					r.rollbackColdCreateLocked(ctx, name, spec, status, "")
+				} else if didResetRootFS {
+					r.persistFailedTransitionLocked(ctx, name, spec, status, status.PodName, effectiveImage, now)
 				}
 				return nil, fmt.Errorf("failed to ensure egress secrets: %w", err)
 			}
@@ -1109,29 +1114,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				if createdCold {
 					r.rollbackColdCreateLocked(ctx, name, spec, status, podManifest.Name)
 				} else {
-					// Persist in-progress state transitions (e.g. rootfsGeneration bump + new PVC)
-					// even when waiting for the replacement Pod fails or times out.
-					status.Phase = v1alpha1.PodBoxPhaseProvisioning
-					status.PodName = podManifest.Name
-					status.PodIP = ""
-					status.LastActivityAt = &now
-					r.specs[name] = spec
-					cpErr := *status
-					annsErr := r.podBoxAnnotationsLocked(name, effectiveImage)
-					if annsErr != nil {
-						r.boxAnnotations[name] = maps.Clone(annsErr)
-					}
-					_ = r.kubeClient.UpsertPodBox(context.WithoutCancel(ctx), v1alpha1.PodBox{
-						APIVersion: "cubepod.io/v1alpha1",
-						Kind:       "PodBox",
-						Metadata: v1alpha1.ObjectMeta{
-							Name:        name,
-							Namespace:   r.namespace,
-							Annotations: annsErr,
-						},
-						Spec:   spec,
-						Status: cpErr,
-					})
+					r.persistFailedTransitionLocked(ctx, name, spec, status, podManifest.Name, effectiveImage, now)
 				}
 				return nil, fmt.Errorf("failed to ensure Pod: %w", err)
 			}
@@ -1166,6 +1149,42 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	_ = r.kubeClient.UpsertPodBox(ctx, box)
 
 	return &cp, nil
+}
+
+func (r *Reconciler) persistFailedTransitionLocked(
+	ctx context.Context,
+	name string,
+	spec v1alpha1.PodBoxSpec,
+	status *v1alpha1.PodBoxStatus,
+	podName string,
+	effectiveImage string,
+	now time.Time,
+) {
+	// Persist in-progress state transitions (e.g. rootfsGeneration bump + new PVC)
+	// even when ensuring egress secrets or waiting for the replacement Pod fails.
+	status.Phase = v1alpha1.PodBoxPhaseProvisioning
+	status.PodName = podName
+	status.PodIP = ""
+	status.LastActivityAt = &now
+	r.specs[name] = spec
+	cpErr := *status
+	annsErr := r.podBoxAnnotationsLocked(name, effectiveImage)
+	if annsErr != nil {
+		r.boxAnnotations[name] = maps.Clone(annsErr)
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	_ = r.kubeClient.UpsertPodBox(persistCtx, v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:        name,
+			Namespace:   r.namespace,
+			Annotations: annsErr,
+		},
+		Spec:   spec,
+		Status: cpErr,
+	})
 }
 
 func (r *Reconciler) mergeBoxAnnotationsLocked(name string, incoming map[string]string) {
@@ -1647,7 +1666,7 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 			if pName == "" {
 				continue
 			}
-			pods, err := r.kubeClient.ListPods(ctx, r.namespace, "cubepod.io/warmpool="+pName)
+			pods, err := r.kubeClient.ListPods(ctx, r.namespace, "cubepod.io/warmpool="+SanitizeLabelValue(pName))
 			if err != nil {
 				return 0, fmt.Errorf("failed to list pods for warmpool %s: %w", pName, err)
 			}
