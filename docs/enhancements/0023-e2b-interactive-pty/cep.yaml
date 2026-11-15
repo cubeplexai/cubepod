@@ -1,0 +1,22 @@
+title: "E2B Interactive PTY Execution, Streaming I/O, Resize, and Reconnect"
+cep-number: "0023"
+authors:
+  - "@xfgong"
+owning-area: "runtime"
+participating-areas:
+  - "gateway"
+status: "implemented"
+creation-date: "2026-11-15"
+reviewers:
+  - "@cubepod-maintainers"
+approvers:
+  - "@cubepod-maintainers"
+stage: "alpha"
+latest-milestone: "v0.5"
+milestone:
+  alpha: "v0.5"
+  beta: "v0.6"
+  stable: "v1.0"
+feature-gates: []
+disable-supported: false
+metrics: []

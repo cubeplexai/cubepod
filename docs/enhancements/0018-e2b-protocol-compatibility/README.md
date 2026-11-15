@@ -264,6 +264,7 @@ Upstream E2B uses dual data-plane pathways: **Connect-RPC over HTTP JSON** on po
      - `{"event": {"start": {"pid": 1204}}}`
      - `{"event": {"data": {"stdout": "total 4\ndrwxr-xr-x 2 ...\n"}}}`
      - `{"event": {"end": {"exitCode": 0}}}`
+   - For interactive PTY sessions (`pty.size`), `SendInput`, `StreamInput`, `Update`, `Connect`, `List`, and `SendSignal`, see [CEP-0023](../0023-e2b-interactive-pty/README.md).
 
 2. **`POST /filesystem.Filesystem/Read`**:
    - **Request**: `{"path": "/workspace/data.json"}`
