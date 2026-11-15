@@ -3429,6 +3429,21 @@ fn test_pty_kill_all_managed() {
         .as_u64()
         .unwrap();
 
+    let watch_dir = std::env::temp_dir().join(format!("podd-killall-watch-{pid}"));
+    let _ = std::fs::remove_dir_all(&watch_dir);
+    std::fs::create_dir_all(&watch_dir).unwrap();
+    registry
+        .watchers
+        .create(
+            "/tmp",
+            watch_dir.to_str().unwrap(),
+            false,
+            false,
+            false,
+            true,
+        )
+        .expect("watcher");
+    assert_eq!(registry.watchers.active_count(), 1);
     let killed = kill_all_managed(&registry);
     assert!(killed >= 1);
 
@@ -3896,3 +3911,634 @@ fn test_pty_close_stdin_returns_unimplemented() {
     assert_eq!(status, 501);
     assert!(body_str.contains("unimplemented"), "body: {body_str}");
 }
+
+fn poll_watch_events(addr: &str, id: &str) -> Vec<JsonValue> {
+    let body = format!(r#"{{"watcherId":"{id}"}}"#);
+    let (status, _, resp) = post_json(addr, "/filesystem.Filesystem/GetWatcherEvents", &body);
+    assert_eq!(
+        status,
+        200,
+        "get events: {}",
+        String::from_utf8_lossy(&resp)
+    );
+    let json = JsonValue::parse(std::str::from_utf8(&resp).unwrap()).unwrap();
+    json.get("events")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn wait_watch_events(
+    addr: &str,
+    id: &str,
+    pred: impl Fn(&[JsonValue]) -> bool,
+    timeout: Duration,
+) -> Vec<JsonValue> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut all = Vec::new();
+    while std::time::Instant::now() < deadline {
+        all.extend(poll_watch_events(addr, id));
+        if pred(&all) {
+            return all;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    all
+}
+
+fn event_names_of_type<'a>(events: &'a [JsonValue], kind: &str) -> Vec<&'a str> {
+    events
+        .iter()
+        .filter(|ev| ev.get("type").and_then(|v| v.as_str()) == Some(kind))
+        .filter_map(|ev| ev.get("name").and_then(|v| v.as_str()))
+        .collect()
+}
+
+#[test]
+fn test_watch_dir_events_recursive_rename_entry_and_errors() {
+    let root = std::env::temp_dir().join(format!(
+        "podd-watch-it-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let work = root.to_str().unwrap().to_string();
+    let (addr, registry) = start_test_server(&work);
+
+    let (status, _, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/CreateWatcher",
+        r#"{"path":"/workspace/missing-dir"}"#,
+    );
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("not_found"));
+
+    std::fs::write(root.join("plain.txt"), b"x").unwrap();
+    let (status, _, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/CreateWatcher",
+        r#"{"path":"/workspace/plain.txt"}"#,
+    );
+    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
+    assert!(String::from_utf8_lossy(&body).contains("invalid_argument"));
+
+    for bad in ["/proc", "/dev", "/workspace/../../etc", "../etc"] {
+        let req = format!(r#"{{"path":"{bad}"}}"#);
+        let (status, _, body) = post_json(&addr, "/filesystem.Filesystem/CreateWatcher", &req);
+        assert_eq!(status, 400, "{bad}: {}", String::from_utf8_lossy(&body));
+    }
+
+    std::fs::create_dir_all(root.join("w")).unwrap();
+    let (status, _, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/CreateWatcher",
+        r#"{"path":"/workspace/w","recursive":false,"includeEntry":true}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let created = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    let wid = created
+        .get("watcherId")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    std::fs::write(root.join("w/a.txt"), b"raw").unwrap();
+    let cmd = format!(r#"{{"command":"echo from-cmd > {}/w/cmd.txt"}}"#, work);
+    let (status, _, body) = post_json(&addr, "/v1/commands/run", &cmd);
+    assert_eq!(status, 200, "command: {}", String::from_utf8_lossy(&body));
+    let (status, _, _) = put_raw(
+        &addr,
+        &format!("/v1/files?path={}/w/sdk.txt", work),
+        b"from-sdk",
+    );
+    assert_eq!(status, 200);
+
+    let events = wait_watch_events(
+        &addr,
+        &wid,
+        |ev| {
+            let names = event_names_of_type(ev, "EVENT_TYPE_CREATE");
+            names.contains(&"a.txt") && names.contains(&"cmd.txt") && names.contains(&"sdk.txt")
+        },
+        Duration::from_secs(5),
+    );
+    assert!(
+        event_names_of_type(&events, "EVENT_TYPE_CREATE").contains(&"a.txt"),
+        "raw create: {events:?}"
+    );
+    assert!(
+        event_names_of_type(&events, "EVENT_TYPE_WRITE").contains(&"a.txt"),
+        "raw write: {events:?}"
+    );
+    assert!(
+        event_names_of_type(&events, "EVENT_TYPE_CREATE").contains(&"cmd.txt"),
+        "command write: {events:?}"
+    );
+    assert!(
+        event_names_of_type(&events, "EVENT_TYPE_CREATE").contains(&"sdk.txt"),
+        "SDK put: {events:?}"
+    );
+    assert!(
+        events.iter().any(|ev| {
+            ev.get("name").and_then(|v| v.as_str()) == Some("a.txt")
+                && ev
+                    .get("entry")
+                    .and_then(|e| e.get("type"))
+                    .and_then(|v| v.as_str())
+                    == Some("FILE_TYPE_FILE")
+        }),
+        "include_entry: {events:?}"
+    );
+
+    std::fs::create_dir_all(root.join("w/sub")).unwrap();
+    std::fs::write(root.join("w/sub/deep.txt"), b"deep").unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let shallow = poll_watch_events(&addr, &wid);
+    assert!(
+        shallow.iter().all(|ev| {
+            ev.get("name")
+                .and_then(|v| v.as_str())
+                .map(|n| !n.contains("deep.txt"))
+                .unwrap_or(true)
+        }),
+        "non-recursive must not report deep descendants: {shallow:?}"
+    );
+
+    let (status, _, _) = post_json(
+        &addr,
+        "/filesystem.Filesystem/RemoveWatcher",
+        &format!(r#"{{"watcherId":"{wid}"}}"#),
+    );
+    assert_eq!(status, 200);
+    let (status, _, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/GetWatcherEvents",
+        &format!(r#"{{"watcherId":"{wid}"}}"#),
+    );
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(registry.watchers.active_count(), 0);
+
+    std::fs::create_dir_all(root.join("r/sub")).unwrap();
+    let (status, _, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/CreateWatcher",
+        r#"{"path":"/workspace/r","recursive":true,"includeEntry":false}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let created = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    let rid = created
+        .get("watcherId")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+    // Drain the directory-create noise, then add a nested file after the sub watch is armed.
+    let _ = wait_watch_events(
+        &addr,
+        &rid,
+        |ev| event_names_of_type(ev, "EVENT_TYPE_CREATE").contains(&"sub"),
+        Duration::from_secs(2),
+    );
+    std::fs::write(root.join("r/sub/nested.txt"), b"n").unwrap();
+    let nested = wait_watch_events(
+        &addr,
+        &rid,
+        |ev| event_names_of_type(ev, "EVENT_TYPE_CREATE").contains(&"sub/nested.txt"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        event_names_of_type(&nested, "EVENT_TYPE_CREATE").contains(&"sub/nested.txt"),
+        "recursive name: {nested:?}"
+    );
+
+    std::fs::write(root.join("r/old.txt"), b"o").unwrap();
+    let _ = wait_watch_events(
+        &addr,
+        &rid,
+        |ev| event_names_of_type(ev, "EVENT_TYPE_CREATE").contains(&"old.txt"),
+        Duration::from_secs(2),
+    );
+    std::fs::rename(root.join("r/old.txt"), root.join("r/new.txt")).unwrap();
+    let renamed = wait_watch_events(
+        &addr,
+        &rid,
+        |ev| {
+            event_names_of_type(ev, "EVENT_TYPE_RENAME").contains(&"old.txt")
+                && event_names_of_type(ev, "EVENT_TYPE_CREATE").contains(&"new.txt")
+        },
+        Duration::from_secs(3),
+    );
+    let rename_names = event_names_of_type(&renamed, "EVENT_TYPE_RENAME");
+    let create_names = event_names_of_type(&renamed, "EVENT_TYPE_CREATE");
+    assert!(
+        rename_names.contains(&"old.txt") && create_names.contains(&"new.txt"),
+        "rename emits RENAME for moved-from and CREATE for moved-to: rename={rename_names:?} create={create_names:?}"
+    );
+
+    std::fs::write(root.join("r/mode.txt"), b"m").unwrap();
+    let _ = wait_watch_events(
+        &addr,
+        &rid,
+        |ev| event_names_of_type(ev, "EVENT_TYPE_CREATE").contains(&"mode.txt"),
+        Duration::from_secs(2),
+    );
+    let mut perms = std::fs::metadata(root.join("r/mode.txt"))
+        .unwrap()
+        .permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o600);
+    std::fs::set_permissions(root.join("r/mode.txt"), perms).unwrap();
+    let chmod = wait_watch_events(
+        &addr,
+        &rid,
+        |ev| event_names_of_type(ev, "EVENT_TYPE_CHMOD").contains(&"mode.txt"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        event_names_of_type(&chmod, "EVENT_TYPE_CHMOD").contains(&"mode.txt"),
+        "chmod: {chmod:?}"
+    );
+
+    std::fs::remove_file(root.join("r/new.txt")).unwrap();
+    let removed = wait_watch_events(
+        &addr,
+        &rid,
+        |ev| event_names_of_type(ev, "EVENT_TYPE_REMOVE").contains(&"new.txt"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        event_names_of_type(&removed, "EVENT_TYPE_REMOVE").contains(&"new.txt"),
+        "remove: {removed:?}"
+    );
+    assert!(
+        removed.iter().any(|ev| {
+            ev.get("name").and_then(|v| v.as_str()) == Some("new.txt")
+                && ev.get("type").and_then(|v| v.as_str()) == Some("EVENT_TYPE_REMOVE")
+                && ev.get("entry").is_none()
+        }),
+        "include_entry is omitted for remove"
+    );
+
+    let _ = post_json(
+        &addr,
+        "/filesystem.Filesystem/RemoveWatcher",
+        &format!(r#"{{"watcherId":"{rid}"}}"#),
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_watch_dir_stream_start_cancel_and_prepare_stop() {
+    let root = std::env::temp_dir().join(format!(
+        "podd-watch-stream-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let work = root.to_str().unwrap().to_string();
+    let (addr, registry) = start_test_server(&work);
+
+    let mut stream = TcpStream::connect(&addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let body = r#"{"path":"/workspace","recursive":false}"#;
+    let req = format!(
+        "POST /filesystem.Filesystem/WatchDir HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/connect+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    skip_http_headers_from_stream(&mut stream).unwrap();
+    let (flag, data) = read_connect_frame_from_stream(&mut stream)
+        .unwrap()
+        .unwrap();
+    assert_eq!(flag, 0);
+    let start = JsonValue::parse(std::str::from_utf8(&data).unwrap()).unwrap();
+    assert!(
+        start.get("start").is_some(),
+        "WatchDir first frame must be start:{{}}, got {start:?}"
+    );
+    assert_eq!(registry.watchers.active_count(), 1);
+
+    std::fs::write(root.join("live.txt"), b"z").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut saw = false;
+    while std::time::Instant::now() < deadline {
+        let (flag, data) = read_connect_frame_from_stream(&mut stream)
+            .unwrap()
+            .unwrap();
+        if flag != 0 {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&data);
+        if text.contains("live.txt") && text.contains("EVENT_TYPE_CREATE") {
+            saw = true;
+            break;
+        }
+    }
+    assert!(saw, "WatchDir must stream filesystem events after start");
+
+    drop(stream);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline && registry.watchers.active_count() != 0 {
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(registry.watchers.active_count(), 0);
+    assert_eq!(registry.watchers.open_fd_count(), 0);
+
+    std::fs::create_dir_all(root.join("again")).unwrap();
+    let (status, _, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/CreateWatcher",
+        r#"{"path":"/workspace/again"}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(registry.watchers.active_count(), 1);
+    let (status, _, _) = post_json(&addr, "/v1/lifecycle/prepare-stop", "");
+    assert_eq!(status, 200);
+    assert_eq!(registry.watchers.active_count(), 0);
+    assert_eq!(registry.watchers.open_fd_count(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn code_from_http_status_fallback(status: u16) -> &'static str {
+    match status {
+        400 => "internal",
+        401 => "unauthenticated",
+        403 => "permission_denied",
+        404 => "unimplemented",
+        429 => "unavailable",
+        502..=504 => "unavailable",
+        _ => "unknown",
+    }
+}
+
+fn parsed_unary_code(status: u16, headers: &HashMap<String, String>, body: &[u8]) -> String {
+    let ct = headers
+        .get("content-type")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    if ct.starts_with("application/json") && !ct.contains("connect+") {
+        if let Ok(text) = std::str::from_utf8(body) {
+            if let Ok(v) = JsonValue::parse(text.trim()) {
+                if let Some(code) = v.get("code").and_then(|c| c.as_str()) {
+                    return code.to_string();
+                }
+            }
+        }
+    }
+    code_from_http_status_fallback(status).to_string()
+}
+
+fn parsed_stream_code(status: u16, headers: &HashMap<String, String>, body: &[u8]) -> String {
+    let ct = headers
+        .get("content-type")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    if status == 200
+        && ct.contains("application/connect+json")
+        && body.len() >= 5
+        && body[0] & 0b10 != 0
+    {
+        let len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+        if body.len() >= 5 + len {
+            if let Ok(text) = std::str::from_utf8(&body[5..5 + len]) {
+                if let Ok(v) = JsonValue::parse(text) {
+                    if let Some(code) = v
+                        .get("error")
+                        .and_then(|e| e.get("code"))
+                        .and_then(|c| c.as_str())
+                    {
+                        return code.to_string();
+                    }
+                }
+            }
+        }
+    }
+    format!("HTTP {status}")
+}
+
+#[test]
+fn test_make_dir_official_semantics_and_unary_errors() {
+    let root = std::env::temp_dir().join(format!(
+        "podd-mkdir-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let (addr, _) = start_test_server(root.to_str().unwrap());
+
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/MakeDir",
+        r#"{"path":"/workspace/a/b/c"}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(headers
+        .get("content-type")
+        .unwrap()
+        .starts_with("application/json"));
+    let created = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    let entry = created.get("entry").unwrap();
+    assert_eq!(entry.get("name").and_then(|v| v.as_str()), Some("c"));
+    assert_eq!(
+        entry.get("type").and_then(|v| v.as_str()),
+        Some("FILE_TYPE_DIRECTORY")
+    );
+    assert_eq!(
+        entry.get("path").and_then(|v| v.as_str()),
+        Some("/workspace/a/b/c")
+    );
+    assert!(
+        root.join("a/b/c").is_dir(),
+        "missing parents must be created"
+    );
+
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/MakeDir",
+        r#"{"path":"/workspace/a/b/c"}"#,
+    );
+    assert_eq!(parsed_unary_code(status, &headers, &body), "already_exists");
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    assert_ne!(
+        parsed_unary_code(status, &headers, &body),
+        code_from_http_status_fallback(status),
+        "JSON code must win over the HTTP status fallback"
+    );
+
+    let framed = crate::make_connect_frame(br#"{"path":"/workspace/a/b/c"}"#, false);
+    let (status, headers, body) = post_raw(
+        &addr,
+        "/filesystem.Filesystem/MakeDir",
+        "application/connect+json",
+        &framed,
+    );
+    assert_eq!(status, 409, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        body.first() == Some(&b'{'),
+        "connect+json unary error must stay unframed JSON, got {:?}",
+        &body[..body.len().min(32)]
+    );
+    assert_eq!(parsed_unary_code(status, &headers, &body), "already_exists");
+
+    std::fs::write(root.join("plain.txt"), b"x").unwrap();
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/MakeDir",
+        r#"{"path":"/workspace/plain.txt"}"#,
+    );
+    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        parsed_unary_code(status, &headers, &body),
+        "invalid_argument"
+    );
+    assert_ne!(parsed_unary_code(status, &headers, &body), "internal");
+
+    std::fs::write(root.join("notdir"), b"f").unwrap();
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/MakeDir",
+        r#"{"path":"/workspace/notdir/child"}"#,
+    );
+    assert_eq!(status, 400, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        parsed_unary_code(status, &headers, &body),
+        "invalid_argument"
+    );
+
+    for bad in ["", "/workspace/../../etc", "../etc"] {
+        let req = format!(r#"{{"path":"{bad}"}}"#);
+        let (status, headers, body) = post_json(&addr, "/filesystem.Filesystem/MakeDir", &req);
+        assert_eq!(status, 400, "{bad}: {}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            parsed_unary_code(status, &headers, &body),
+            "invalid_argument",
+            "{bad}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn test_watch_stream_errors_are_end_frames_and_ring_overflow_is_unary() {
+    let root = std::env::temp_dir().join(format!(
+        "podd-watch-enc-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let (addr, registry) = start_test_server(root.to_str().unwrap());
+
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/WatchDir",
+        r#"{"path":"/workspace/missing-dir"}"#,
+    );
+    assert_eq!(
+        status,
+        200,
+        "stream errors use HTTP 200, got {status} {}",
+        String::from_utf8_lossy(&body)
+    );
+    assert_eq!(parsed_stream_code(status, &headers, &body), "not_found");
+    assert_ne!(parsed_stream_code(status, &headers, &body), "unimplemented");
+    assert!(
+        String::from_utf8_lossy(&body).contains("directory not found"),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    std::fs::write(root.join("plain.txt"), b"x").unwrap();
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/WatchDir",
+        r#"{"path":"/workspace/plain.txt"}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        parsed_stream_code(status, &headers, &body),
+        "invalid_argument"
+    );
+    assert_ne!(parsed_stream_code(status, &headers, &body), "internal");
+    assert!(String::from_utf8_lossy(&body).contains("path is not a directory"));
+
+    let (status, headers, body) = post_raw(
+        &addr,
+        "/filesystem.Filesystem/CreateWatcher",
+        "application/connect+json",
+        &crate::make_connect_frame(br#"{"path":"/workspace/missing-dir"}"#, false),
+    );
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(parsed_unary_code(status, &headers, &body), "not_found");
+    assert_ne!(parsed_unary_code(status, &headers, &body), "unimplemented");
+    assert!(
+        body.first() == Some(&b'{'),
+        "CreateWatcher error must not be a connect data frame"
+    );
+
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/CreateWatcher",
+        r#"{"path":"/workspace/plain.txt"}"#,
+    );
+    assert_eq!(status, 400);
+    assert_eq!(
+        parsed_unary_code(status, &headers, &body),
+        "invalid_argument"
+    );
+    assert_ne!(parsed_unary_code(status, &headers, &body), "internal");
+
+    std::fs::create_dir_all(root.join("w")).unwrap();
+    let (status, _, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/CreateWatcher",
+        r#"{"path":"/workspace/w"}"#,
+    );
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let created = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    let id = created
+        .get("watcherId")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+    let watcher = registry.watchers.get(&id).unwrap();
+    for i in 0..=crate::watch::WATCH_RING_CAP {
+        watcher.publish_test_event(&format!("e{i}"));
+    }
+    assert!(watcher.is_overflowed());
+    let (status, headers, body) = post_json(
+        &addr,
+        "/filesystem.Filesystem/GetWatcherEvents",
+        &format!(r#"{{"watcherId":"{id}"}}"#),
+    );
+    assert_eq!(status, 429, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        parsed_unary_code(status, &headers, &body),
+        "resource_exhausted"
+    );
+    assert_ne!(parsed_unary_code(status, &headers, &body), "unavailable");
+    assert!(String::from_utf8_lossy(&body).contains("events were dropped"));
+    assert!(body.first() == Some(&b'{'));
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// Stream overflow framing is covered by watch::tests::watch_dir_pump_emits_resource_exhausted.

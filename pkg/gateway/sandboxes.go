@@ -868,7 +868,7 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// releaseLocalSandbox closes local PTY masters for a sandbox.
+// releaseLocalSandbox closes local PTY masters and stops directory watches for a sandbox.
 func (s *Server) releaseLocalSandbox(sandboxID string) {
 	s.mu.Lock()
 	seen := map[*commandEntry]struct{}{}
@@ -880,6 +880,13 @@ func (s *Server) releaseLocalSandbox(sandboxID string) {
 				entries = append(entries, e)
 			}
 			delete(s.commands, id)
+		}
+	}
+	var watchers []*dirWatcher
+	for id, w := range s.watchers {
+		if w.sandboxID == sandboxID {
+			watchers = append(watchers, w)
+			delete(s.watchers, id)
 		}
 	}
 	s.mu.Unlock()
@@ -900,6 +907,9 @@ func (s *Server) releaseLocalSandbox(sandboxID string) {
 			_ = syscall.Kill(-pid, syscall.SIGKILL)
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 		}
+	}
+	for _, w := range watchers {
+		w.stop()
 	}
 }
 

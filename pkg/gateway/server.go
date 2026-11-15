@@ -244,6 +244,7 @@ type Server struct {
 	mu               sync.RWMutex
 	sandboxes        map[string]*SandboxRecord
 	commands         map[string]*commandEntry
+	watchers         map[string]*dirWatcher
 	endpoints        map[string]map[int]string
 	workspaceBaseDir string
 	panelSecret      []byte
@@ -272,6 +273,7 @@ func NewServer(reconciler *controller.Reconciler) *Server {
 		reconciler:       reconciler,
 		sandboxes:        make(map[string]*SandboxRecord),
 		commands:         make(map[string]*commandEntry),
+		watchers:         make(map[string]*dirWatcher),
 		endpoints:        make(map[string]map[int]string),
 		workspaceBaseDir: filepath.Join(os.TempDir(), "cubepod-sandboxes"),
 		vault:            v,
@@ -480,6 +482,10 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /filesystem.Filesystem/Stat", s.handleConnectRPCFilesystemStat)
 	mux.HandleFunc("POST /filesystem.Filesystem/Remove", s.handleConnectRPCFilesystemRemove)
 	mux.HandleFunc("POST /filesystem.Filesystem/MakeDir", s.handleConnectRPCFilesystemMakeDir)
+	mux.HandleFunc("POST /filesystem.Filesystem/CreateWatcher", s.handleConnectRPCCreateWatcher)
+	mux.HandleFunc("POST /filesystem.Filesystem/GetWatcherEvents", s.handleConnectRPCGetWatcherEvents)
+	mux.HandleFunc("POST /filesystem.Filesystem/RemoveWatcher", s.handleConnectRPCRemoveWatcher)
+	mux.HandleFunc("POST /filesystem.Filesystem/WatchDir", s.handleConnectRPCWatchDir)
 
 	// Path-prefixed Connect-RPC routes for sandboxes
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/Start", s.handleConnectRPCProcessStart)
@@ -497,6 +503,10 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/Stat", s.handleConnectRPCFilesystemStat)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/Remove", s.handleConnectRPCFilesystemRemove)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/MakeDir", s.handleConnectRPCFilesystemMakeDir)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/CreateWatcher", s.handleConnectRPCCreateWatcher)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/GetWatcherEvents", s.handleConnectRPCGetWatcherEvents)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/RemoveWatcher", s.handleConnectRPCRemoveWatcher)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/WatchDir", s.handleConnectRPCWatchDir)
 
 	// WarmPool & OpenAPI routes
 	mux.HandleFunc("POST /warmpools", s.handleCreateWarmPool)
