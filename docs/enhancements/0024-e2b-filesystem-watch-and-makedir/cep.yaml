@@ -1,0 +1,26 @@
+title: "E2B Filesystem Directory Watching and MakeDir Compatibility"
+cep-number: "0024"
+authors:
+  - "@xfgong"
+owning-area: "gateway"
+participating-areas:
+  - "runtime"
+status: "implemented"
+creation-date: "2026-11-15"
+reviewers:
+  - "@cubepod-maintainers"
+approvers:
+  - "@cubepod-maintainers"
+stage: "alpha"
+latest-milestone: "v0.5"
+milestone:
+  alpha: "v0.5"
+  beta: "v0.6"
+  stable: "v1.0"
+feature-gates:
+  - name: "E2BFilesystemWatch"
+    components:
+      - "podd"
+      - "cubepod-gateway"
+disable-supported: false
+metrics: []

@@ -302,6 +302,8 @@ For standard HTTP client tooling, `cubepod-gateway` exposes the direct REST API:
 #### 4.3 Atomic Archive Sync Extension (`POST /sandboxes/{id}/files/archive-sync`)
 - Streamed in-memory `tar.gz` extraction into destination directory with atomic deletion list (`remove_paths`), compressing multi-file uploads from hundreds of HTTP roundtrips into a single `< 50ms` transaction.
 
+> For ConnectRPC directory watching (`WatchDir`, `CreateWatcher`, `GetWatcherEvents`, `RemoveWatcher`) and `MakeDir`, see [CEP-0024](../0024-e2b-filesystem-watch-and-makedir/README.md).
+
 ---
 
 ### 5. Code Interpreter Interoperability (`e2b-code-interpreter` on Port `:49999`)
