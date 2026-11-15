@@ -31,12 +31,12 @@ type DockerConfig struct {
 	// DefaultImage is used when SandboxSpec.Image and TemplateID are empty.
 	DefaultImage string `json:"defaultImage,omitempty"`
 	// InjectPoddBin bind-mounts BinDir and starts podd-init. Nil means true so
-	// existing callers keep injection. Set false for an image that already
-	// contains podd.
+	// existing callers keep injection. Setting false is test-only (violates
+	// AGENTS.md Invariant 2 if used in production).
 	InjectPoddBin *bool `json:"injectPoddBin,omitempty"`
 	// BindSandboxStorage bind-mounts per-sandbox workspace and rootfs directories.
-	// Nil means true. Set false when the image already has /workspace and the
-	// daemon cannot see BaseDir.
+	// Nil means true. Setting false is test-only (violates AGENTS.md Invariant 1
+	// if used in production).
 	BindSandboxStorage *bool `json:"bindSandboxStorage,omitempty"`
 	// MemoryBytes and NanoCPUs are optional container limits. Zero leaves them unset.
 	MemoryBytes int64 `json:"memoryBytes,omitempty"`
@@ -194,6 +194,9 @@ func (d *DockerBackend) BuildRunArgs(spec SandboxSpec) ([]string, error) {
 	if d.cfg.MemoryBytes > 0 {
 		args = append(args, "--memory", strconv.FormatInt(d.cfg.MemoryBytes, 10))
 	}
+	if d.cfg.NanoCPUs > 0 {
+		args = append(args, "--cpus", strconv.FormatFloat(float64(d.cfg.NanoCPUs)/1e9, 'f', -1, 64))
+	}
 	for _, e := range plan.Env {
 		args = append(args, "-e", e)
 	}
@@ -264,7 +267,7 @@ func (d *DockerBackend) planRun(spec SandboxSpec) (dockerRunPlan, error) {
 			plan.Mounts = append(plan.Mounts, dockerNamedMount{Source: m.DockerVolume, Target: path})
 			continue
 		}
-		if m.HostPath == "" || !filepath.IsAbs(m.HostPath) || strings.Contains(m.HostPath, "..") {
+		if m.HostPath == "" || !filepath.IsAbs(m.HostPath) || hasDotDotSegment(m.HostPath) {
 			return dockerRunPlan{}, fmt.Errorf("invalid volume host path for %s", path)
 		}
 		if filepath.Base(m.HostPath) != "data" {
@@ -276,6 +279,15 @@ func (d *DockerBackend) planRun(spec SandboxSpec) (dockerRunPlan, error) {
 		plan.Env = append(plan.Env, fmt.Sprintf("%s=%s", k, v))
 	}
 	return plan, nil
+}
+
+func hasDotDotSegment(p string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // EnsureRunning starts or resumes the Docker container for the sandbox.

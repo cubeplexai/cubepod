@@ -298,8 +298,8 @@ func TestBuildKataPod_OfficialMountsWithBlockWorkspace(t *testing.T) {
 }
 
 func TestValidE2BContainerPath(t *testing.T) {
-	allow := []string{"/mnt/cpod-test-vol", "/mnt/data", "/data"}
-	deny := []string{"/", "/workspace", "/workspace/sub", "/etc/passwd", "/proc", "/sys", "/dev/sda", "/opt/cubepod/bin", "/mnt/cubepod/rootfs", "/usr/bin", ""}
+	allow := []string{"/mnt/cpod-test-vol", "/mnt/data", "/data", "/mnt/a..b"}
+	deny := []string{"/", "/workspace", "/workspace/sub", "/rootfs-upper", "/rootfs-upper/x", "/etc/passwd", "/proc", "/sys", "/dev/sda", "/opt/cubepod/bin", "/mnt/cubepod/rootfs", "/usr/bin", "/sbin/init", "/mnt/../x", ""}
 	for _, p := range allow {
 		if !v1alpha1.ValidE2BContainerPath(p) {
 			t.Fatalf("expected allow %q", p)
@@ -308,6 +308,24 @@ func TestValidE2BContainerPath(t *testing.T) {
 	for _, p := range deny {
 		if v1alpha1.ValidE2BContainerPath(p) {
 			t.Fatalf("expected deny %q", p)
+		}
+	}
+}
+
+func TestValidateOfficialVolumeMounts_RejectsInvalid(t *testing.T) {
+	id := "0123456789abcdef0123456789abcdef"
+	cases := [][]v1alpha1.E2BVolumeMount{
+		{{VolumeID: "bad", PVCName: "e2bvol-bad", Path: "/mnt/data"}},
+		{{VolumeID: id, PVCName: "e2bvol-wrong", Path: "/mnt/data"}},
+		{{VolumeID: id, PVCName: "e2bvol-" + id, Path: "/rootfs-upper"}},
+		{
+			{VolumeID: id, PVCName: "e2bvol-" + id, Path: "/mnt/dup"},
+			{VolumeID: id, PVCName: "e2bvol-" + id, Path: "/mnt/dup"},
+		},
+	}
+	for _, tc := range cases {
+		if err := controller.ValidateOfficialVolumeMounts(tc); err == nil {
+			t.Fatalf("expected error for invalid mounts %+v", tc)
 		}
 	}
 }

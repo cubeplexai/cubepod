@@ -358,6 +358,7 @@ func TestDockerBackend_E2BVolumeMount(t *testing.T) {
 		{DockerVolume: "other-vol", ContainerPath: "/mnt/rejected"},
 		{HostPath: "/var/lib/cubepod/e2b", ContainerPath: "/mnt/not-data"},
 		{HostPath: "/var/lib/cubepod/e2b/data", ContainerPath: "/workspace"},
+		{HostPath: "/var/lib/cubepod/e2b/data", ContainerPath: "/rootfs-upper"},
 		{HostPath: "/var/lib/cubepod/e2b/data", ContainerPath: "relative"},
 	}
 	for _, m := range bad {
@@ -365,6 +366,15 @@ func TestDockerBackend_E2BVolumeMount(t *testing.T) {
 		if err == nil {
 			t.Fatalf("expected error for %+v", m)
 		}
+	}
+
+	cpuDocker := NewDockerBackend(DockerConfig{BaseDir: t.TempDir(), NanoCPUs: 500_000_000})
+	cpuArgs, err := cpuDocker.BuildRunArgs(SandboxSpec{SandboxID: "sb-cpu"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(cpuArgs, "--cpus") || !slices.Contains(cpuArgs, "0.5") {
+		t.Fatalf("expected --cpus 0.5 in BuildRunArgs: %v", cpuArgs)
 	}
 }
 

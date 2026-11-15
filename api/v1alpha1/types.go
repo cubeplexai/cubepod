@@ -226,6 +226,7 @@ type E2BVolumeMount struct {
 // "/" is rejected separately so every absolute path is not treated as reserved.
 var reservedE2BMounts = []string{
 	"/workspace",
+	"/rootfs-upper",
 	"/proc",
 	"/sys",
 	"/dev",
@@ -233,6 +234,7 @@ var reservedE2BMounts = []string{
 	"/opt/cubepod",
 	"/mnt/cubepod",
 	"/bin",
+	"/sbin",
 	"/usr",
 	"/lib",
 	"/lib64",
@@ -248,8 +250,13 @@ func ValidE2BContainerPath(p string) bool {
 	if p == "" || p == "/" || p == "." || !strings.HasPrefix(p, "/") {
 		return false
 	}
-	if strings.ContainsRune(p, 0) || strings.Contains(p, `\`) || strings.Contains(p, "..") {
+	if strings.ContainsRune(p, 0) || strings.Contains(p, `\`) {
 		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return false
+		}
 	}
 	for _, root := range reservedE2BMounts {
 		if p == root || strings.HasPrefix(p, root+"/") {

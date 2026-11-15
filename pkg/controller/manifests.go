@@ -265,26 +265,39 @@ func E2BPVCName(volumeID string) (string, bool) {
 	return "e2bvol-" + volumeID, true
 }
 
-// applyOfficialVolumeMounts adds one Filesystem PVC volume and container mount
-// per official E2B volume. Block workspace devices are left unchanged.
-func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest, mounts []v1alpha1.E2BVolumeMount) ([]VolumeManifest, ContainerManifest) {
-	seenPVC := map[string]struct{}{}
+// ValidateOfficialVolumeMounts verifies that all official E2B volume mounts
+// have a valid volume ID, matching PVC name, valid container path, and no
+// duplicate mount paths.
+func ValidateOfficialVolumeMounts(mounts []v1alpha1.E2BVolumeMount) error {
 	seenPath := map[string]struct{}{}
 	for _, m := range mounts {
 		pvc, ok := E2BPVCName(m.VolumeID)
 		if !ok {
-			continue
+			return fmt.Errorf("invalid official E2B volumeID %q", m.VolumeID)
 		}
 		if m.PVCName != "" && m.PVCName != pvc {
-			continue
+			return fmt.Errorf("mismatched official E2B pvcName %q for volume %s", m.PVCName, m.VolumeID)
 		}
 		if !v1alpha1.ValidE2BContainerPath(m.Path) {
-			continue
+			return fmt.Errorf("invalid official E2B mount path %q", m.Path)
 		}
 		if _, dup := seenPath[m.Path]; dup {
-			continue
+			return fmt.Errorf("duplicate official E2B mount path %q", m.Path)
 		}
 		seenPath[m.Path] = struct{}{}
+	}
+	return nil
+}
+
+// applyOfficialVolumeMounts adds one Filesystem PVC volume and container mount
+// per official E2B volume. Block workspace devices are left unchanged.
+func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest, mounts []v1alpha1.E2BVolumeMount) ([]VolumeManifest, ContainerManifest) {
+	if err := ValidateOfficialVolumeMounts(mounts); err != nil {
+		return volumes, main
+	}
+	seenPVC := map[string]struct{}{}
+	for _, m := range mounts {
+		pvc, _ := E2BPVCName(m.VolumeID)
 		if _, ok := seenPVC[pvc]; !ok {
 			seenPVC[pvc] = struct{}{}
 			volumes = append(volumes, VolumeManifest{

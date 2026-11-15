@@ -1123,6 +1123,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				return nil, fmt.Errorf("failed to ensure egress secrets: %w", err)
 			}
 		}
+		if err := ValidateOfficialVolumeMounts(spec.E2BVolumeMounts); err != nil {
+			if createdCold {
+				r.rollbackColdCreateLocked(ctx, name, spec, status, "")
+			} else if didResetRootFS {
+				r.persistFailedTransitionLocked(ctx, name, spec, status, status.PodName, effectiveImage, now)
+			}
+			return nil, fmt.Errorf("invalid official E2B volume mounts: %w", err)
+		}
 		status.Phase = v1alpha1.PodBoxPhaseRunning
 		if status.PodName == "" {
 			status.PodName = fmt.Sprintf("%s-kata-pod", name)
