@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
@@ -856,6 +857,7 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	delete(s.sandboxes, id)
 	delete(s.endpoints, id)
 	s.mu.Unlock()
+	s.releaseLocalSandbox(id)
 
 	// Revoke secrets associated with this sandbox
 	s.vault.RevokeSandbox(id)
@@ -864,6 +866,41 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 		_ = os.RemoveAll(filepath.Dir(rec.WorkspaceDir))
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// releaseLocalSandbox closes local PTY masters for a sandbox.
+func (s *Server) releaseLocalSandbox(sandboxID string) {
+	s.mu.Lock()
+	seen := map[*commandEntry]struct{}{}
+	var entries []*commandEntry
+	for id, e := range s.commands {
+		if e.sandboxID == sandboxID {
+			if _, ok := seen[e]; !ok {
+				seen[e] = struct{}{}
+				entries = append(entries, e)
+			}
+			delete(s.commands, id)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, e := range entries {
+		e.mu.Lock()
+		if e.cancel != nil {
+			e.cancel()
+		}
+		if e.masterFile != nil {
+			_ = e.masterFile.Close()
+			e.masterFile = nil
+		}
+		e.running = false
+		pid := e.pid
+		e.mu.Unlock()
+		if pid > 1 {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
 }
 
 // ensureRunning resumes a Paused sandbox to Running, incrementing AutoResumeCount.

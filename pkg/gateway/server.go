@@ -57,15 +57,110 @@ type SandboxRecord struct {
 	WorkspaceDir     string                      `json:"-"`
 }
 
+// ptyReplayCap is the Connect replay tail for a live PTY. Older bytes are dropped.
+const ptyReplayCap = 64 * 1024
+
+// ptySubscriberQueue bounds each Start/Connect consumer. A full queue fails that
+// subscriber with resource_exhausted; PTY bytes are not dropped silently.
+const ptySubscriberQueue = 128
+
+type ptySubscriber struct {
+	ch     chan []byte
+	failed chan struct{}
+	once   sync.Once
+}
+
+func (s *ptySubscriber) fail() {
+	s.once.Do(func() { close(s.failed) })
+}
+
+func (s *ptySubscriber) overflowed() bool {
+	select {
+	case <-s.failed:
+		return true
+	default:
+		return false
+	}
+}
+
 type commandEntry struct {
-	id       string
-	cmdID    string
-	pid      int
-	running  bool
-	exitCode int
-	buf      *bytes.Buffer
-	mu       sync.RWMutex
-	cancel   context.CancelFunc
+	id          string
+	cmdID       string
+	pid         int
+	sandboxID   string
+	tag         string
+	config      map[string]interface{}
+	running     bool
+	exitCode    int
+	buf         *bytes.Buffer
+	mu          sync.RWMutex
+	cancel      context.CancelFunc
+	masterFile  *os.File
+	isPTY       bool
+	subscribers map[*ptySubscriber]struct{}
+	done        chan struct{}
+}
+
+func appendReplay(buf *bytes.Buffer, chunk []byte) {
+	if buf == nil {
+		return
+	}
+	buf.Write(chunk)
+	if buf.Len() <= ptyReplayCap {
+		return
+	}
+	b := buf.Bytes()
+	tail := append([]byte(nil), b[len(b)-ptyReplayCap:]...)
+	buf.Reset()
+	buf.Write(tail)
+}
+
+// broadcastPTY appends to the bounded replay buffer and fans out under one lock
+// so a Connect snapshot neither gaps nor duplicates a live chunk.
+func (e *commandEntry) broadcastPTY(chunk []byte) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.buf == nil {
+		e.buf = &bytes.Buffer{}
+	}
+	appendReplay(e.buf, chunk)
+	if len(e.subscribers) == 0 {
+		return
+	}
+	var drop []*ptySubscriber
+	for sub := range e.subscribers {
+		select {
+		case sub.ch <- chunk:
+		default:
+			drop = append(drop, sub)
+		}
+	}
+	for _, sub := range drop {
+		delete(e.subscribers, sub)
+		sub.fail()
+	}
+}
+
+// snapshotAndSubscribe copies the replay tail and registers the subscriber atomically.
+func (e *commandEntry) snapshotAndSubscribe() (snap []byte, running bool, exitCode int, sub *ptySubscriber) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.buf != nil {
+		snap = append([]byte(nil), e.buf.Bytes()...)
+	}
+	running = e.running
+	exitCode = e.exitCode
+	if e.isPTY && running {
+		if e.subscribers == nil {
+			e.subscribers = make(map[*ptySubscriber]struct{})
+		}
+		sub = &ptySubscriber{
+			ch:     make(chan []byte, ptySubscriberQueue),
+			failed: make(chan struct{}),
+		}
+		e.subscribers[sub] = struct{}{}
+	}
+	return
 }
 
 type lockedWriter struct {
@@ -309,6 +404,10 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /process.Process/SendSignal", s.handleConnectRPCProcessSendSignal)
 	mux.HandleFunc("POST /process.Process/Connect", s.handleConnectRPCProcessConnect)
 	mux.HandleFunc("POST /process.Process/List", s.handleConnectRPCProcessList)
+	mux.HandleFunc("POST /process.Process/SendInput", s.handleConnectRPCProcessSendInput)
+	mux.HandleFunc("POST /process.Process/Update", s.handleConnectRPCProcessUpdate)
+	mux.HandleFunc("POST /process.Process/StreamInput", s.handleConnectRPCProcessStreamInput)
+	mux.HandleFunc("POST /process.Process/CloseStdin", s.handleConnectRPCProcessCloseStdin)
 	mux.HandleFunc("POST /filesystem.Filesystem/Read", s.handleConnectRPCFilesystemRead)
 	mux.HandleFunc("POST /filesystem.Filesystem/Write", s.handleConnectRPCFilesystemWrite)
 	mux.HandleFunc("POST /filesystem.Filesystem/List", s.handleConnectRPCFilesystemList)
@@ -322,6 +421,10 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/SendSignal", s.handleConnectRPCProcessSendSignal)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/Connect", s.handleConnectRPCProcessConnect)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/List", s.handleConnectRPCProcessList)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/SendInput", s.handleConnectRPCProcessSendInput)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/Update", s.handleConnectRPCProcessUpdate)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/StreamInput", s.handleConnectRPCProcessStreamInput)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/CloseStdin", s.handleConnectRPCProcessCloseStdin)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/Read", s.handleConnectRPCFilesystemRead)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/Write", s.handleConnectRPCFilesystemWrite)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/List", s.handleConnectRPCFilesystemList)

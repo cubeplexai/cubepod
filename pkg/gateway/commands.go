@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -84,11 +85,12 @@ func (s *Server) handleRunCommand(w http.ResponseWriter, r *http.Request) {
 		}
 
 		entry := &commandEntry{
-			id:      cmdID,
-			cmdID:   cmdID,
-			running: true,
-			buf:     &bytes.Buffer{},
-			cancel:  cancel,
+			id:        cmdID,
+			cmdID:     cmdID,
+			sandboxID: id,
+			running:   true,
+			buf:       &bytes.Buffer{},
+			cancel:    cancel,
 		}
 		writer := &lockedWriter{entry: entry}
 		execCmd.Stdout = writer
@@ -156,11 +158,12 @@ func (s *Server) handleRunCommand(w http.ResponseWriter, r *http.Request) {
 
 	combined := append(stdout.Bytes(), stderr.Bytes()...)
 	entry := &commandEntry{
-		id:       cmdID,
-		cmdID:    cmdID,
-		running:  false,
-		exitCode: exitCode,
-		buf:      bytes.NewBuffer(combined),
+		id:        cmdID,
+		cmdID:     cmdID,
+		sandboxID: id,
+		running:   false,
+		exitCode:  exitCode,
+		buf:       bytes.NewBuffer(combined),
 	}
 	s.mu.Lock()
 	s.commands[cmdID] = entry
@@ -452,6 +455,16 @@ func (s *Server) handleKillCommand(w http.ResponseWriter, r *http.Request) {
 	if entry.running {
 		if entry.cancel != nil {
 			entry.cancel()
+		}
+		if entry.masterFile != nil {
+			_ = entry.masterFile.Close()
+			entry.masterFile = nil
+		}
+		if entry.pid > 0 {
+			_ = syscall.Kill(-entry.pid, syscall.SIGKILL)
+			if proc, err := os.FindProcess(entry.pid); err == nil {
+				_ = proc.Signal(syscall.SIGKILL)
+			}
 		}
 		entry.running = false
 		entry.exitCode = -1

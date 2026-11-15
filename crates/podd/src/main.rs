@@ -26,9 +26,11 @@ use std::net::{TcpListener, TcpStream};
 
 pub use commands::{
     base64_encode, handle_command_kill, handle_command_logs, handle_command_run,
-    handle_command_status, handle_connectrpc_process_start, handle_connectrpc_send_signal,
-    kill_all_managed, make_connect_frame, unpack_connect_payload, ManagedProcess, ProcessEntry,
-    ProcessOutputBuffer, ProcessRegistry, ProcessTable,
+    handle_command_status, handle_connectrpc_close_stdin, handle_connectrpc_process_connect,
+    handle_connectrpc_process_list, handle_connectrpc_process_start,
+    handle_connectrpc_process_update, handle_connectrpc_send_input, handle_connectrpc_send_signal,
+    handle_connectrpc_stream_input, kill_all_managed, make_connect_frame, unpack_connect_payload,
+    ManagedProcess, ProcessEntry, ProcessOutputBuffer, ProcessRegistry, ProcessTable,
 };
 pub use files::{
     apply_permissions_and_ownership, chown_if_root, decompress_if_gzip, handle_archive_sync,
@@ -125,6 +127,24 @@ pub fn route_request_with_quiesce(
         }
         ("POST", "/process.Process/SendSignal") => {
             handle_connectrpc_send_signal(&mut stream, &req, registry);
+        }
+        ("POST", "/process.Process/SendInput") => {
+            handle_connectrpc_send_input(&mut stream, &req, registry);
+        }
+        ("POST", "/process.Process/Update") => {
+            handle_connectrpc_process_update(&mut stream, &req, registry);
+        }
+        ("POST", "/process.Process/StreamInput") => {
+            handle_connectrpc_stream_input(&mut stream, &req, registry);
+        }
+        ("POST", "/process.Process/Connect") => {
+            handle_connectrpc_process_connect(&mut stream, &req, registry);
+        }
+        ("POST", "/process.Process/List") => {
+            handle_connectrpc_process_list(&mut stream, &req, registry);
+        }
+        ("POST", "/process.Process/CloseStdin") => {
+            handle_connectrpc_close_stdin(&mut stream, &req, registry);
         }
         ("PUT", "/v1/files") | ("PUT", "/files") => {
             handle_file_put(&mut stream, &req, &query_params);
