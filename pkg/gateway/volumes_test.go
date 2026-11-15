@@ -2,6 +2,7 @@ package gateway_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -695,4 +696,90 @@ func TestE2BVolumeConcurrent(t *testing.T) {
 	if len(entries) != n {
 		t.Fatalf("expected %d files, got %#v", n, entries)
 	}
+}
+
+func TestE2BVolumeSandboxCreateMountsOnPod(t *testing.T) {
+	_, ts, mem := newVolumeHarness(t, "")
+	keyA := "cpod_test_api_key"
+	vol := createVol(t, ts, keyA, "cpod-test-pod-mount")
+	mountBody, _ := json.Marshal(map[string]any{
+		"templateID":   "base",
+		"volumeMounts": []map[string]string{{"name": vol.Name, "path": "/mnt/cpod-test-vol"}},
+	})
+	resp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", keyA, mountBody, "application/json")
+	var sb struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("create sandbox: %d %s", resp.StatusCode, b)
+	}
+	readJSON(t, resp, &sb)
+	if sb.SandboxID == "" {
+		t.Fatal("missing sandbox id")
+	}
+	pod, ok := mem.GetPod("cubepod-workloads", sb.SandboxID+"-kata-pod")
+	if !ok {
+		t.Fatalf("expected pod %s-kata-pod, pods=%v", sb.SandboxID, podNames(mem))
+	}
+	pvc := "e2bvol-" + vol.VolumeID
+	var sawVol, sawMount, sawWS bool
+	for _, v := range pod.Volumes {
+		if v.PersistentVolumeClaim == pvc {
+			sawVol = true
+		}
+		if v.Name == "workspace-volume" {
+			sawWS = true
+		}
+	}
+	for _, c := range pod.Containers {
+		if c.Name != "sandbox" {
+			continue
+		}
+		for _, m := range c.VolumeMounts {
+			if m.MountPath == "/mnt/cpod-test-vol" && (m.Name == pvc || m.Name == "e2bvol-"+vol.VolumeID) {
+				sawMount = true
+			}
+		}
+	}
+	if !sawVol || !sawMount || !sawWS {
+		t.Fatalf("pod missing official mount or workspace (vol=%v mount=%v ws=%v) volumes=%+v containers=%+v", sawVol, sawMount, sawWS, pod.Volumes, pod.Containers)
+	}
+	if box, err := mem.GetPodBox(context.Background(), "cubepod-workloads", sb.SandboxID); err != nil || box == nil || len(box.Spec.E2BVolumeMounts) != 1 {
+		t.Fatalf("expected PodBox spec to record official mounts: err=%v box=%+v", err, box)
+	}
+	del, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+sb.SandboxID, nil)
+	del.Header.Set("X-API-KEY", keyA)
+	resp, err := http.DefaultClient.Do(del)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+}
+
+func TestE2BVolumeReservedMountPathRejected(t *testing.T) {
+	_, ts, _ := newVolumeHarness(t, "")
+	keyA := "cpod_test_api_key"
+	vol := createVol(t, ts, keyA, "cpod-test-reserved-path")
+	for _, path := range []string{"/", "/workspace", "/etc", "/proc", "/opt/cubepod"} {
+		body, _ := json.Marshal(map[string]any{
+			"templateID":   "base",
+			"volumeMounts": []map[string]string{{"name": vol.Name, "path": path}},
+		})
+		resp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", keyA, body, "application/json")
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("path %s: expected 400, got %d %s", path, resp.StatusCode, b)
+		}
+	}
+}
+
+func podNames(mem *controller.MemoryKubeClient) []string {
+	var names []string
+	for _, p := range mem.AllPods() {
+		names = append(names, p.Name)
+	}
+	return names
 }

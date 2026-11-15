@@ -388,12 +388,19 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		RootfsGeneration: 1,
 		WarmPoolRef:      req.WarmPoolRef,
 		VolumeKey:        volumeKey,
+		E2BVolumeMounts:  plannedToPodBoxMounts(plannedMounts),
 		NetworkPolicy:    cloneNetworkPolicy(netPolicy),
+	}
+
+	// Official E2B volume mounts must be present on the pod at create time, so
+	// a pre-warmed standby (no official PVCs) cannot be claimed.
+	if len(plannedMounts) > 0 {
+		spec.WarmPoolRef = ""
 	}
 
 	// Automatic WarmPool Claim: skip when deterministic VolumeKey is requested
 	// because standby warm pods already mount an ephemeral workspace PVC.
-	if spec.WarmPoolRef == "" && volumeKey == "" {
+	if spec.WarmPoolRef == "" && volumeKey == "" && len(plannedMounts) == 0 {
 		warmPoolName := s.reconciler.FindAvailableWarmPool(req.TemplateID)
 		if warmPoolName == "" {
 			// Run a quick SyncFromKube to discover any newly added standby pods from the controller before falling back to cold start
@@ -403,6 +410,19 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		if warmPoolName != "" {
 			spec.WarmPoolRef = warmPoolName
 		}
+	}
+
+	if err := s.commitSandboxVolumeMounts(id, managementAPIKey(r), plannedMounts); err != nil {
+		if errors.Is(err, volume.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "volume not found")
+			return
+		}
+		if errors.Is(err, volume.ErrInvalidPath) {
+			writeError(w, http.StatusBadRequest, "invalid volume mount path")
+			return
+		}
+		writeError(w, http.StatusConflict, "volume mount failed")
+		return
 	}
 
 	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
@@ -428,6 +448,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err != nil {
+		s.rollbackCreatedSandbox(r.Context(), id)
 		if errors.Is(err, controller.ErrTemplateNotReady) {
 			writeError(w, http.StatusConflict, "template is not ready")
 			return
@@ -446,6 +467,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 
 	workspaceDir := s.workspaceDirForSandbox(id, volumeKey)
 	if err := os.MkdirAll(workspaceDir, 0755); err != nil {
+		s.rollbackCreatedSandbox(r.Context(), id)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -495,15 +517,9 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		_ = waitForPoddReady(r.Context(), rec.PoddURL, healthTimeout)
 	}
 
-	if err := s.commitSandboxVolumeMounts(id, managementAPIKey(r), plannedMounts); err != nil {
-		if s.reconciler != nil {
-			_ = s.reconciler.DeleteBox(r.Context(), id, false)
-		}
-		if errors.Is(err, volume.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "volume not found")
-			return
-		}
-		writeError(w, http.StatusConflict, "volume mount failed")
+	if err := s.startRuntimeSandbox(r.Context(), rec, "", mergeSandboxEnv(req)); err != nil {
+		s.rollbackCreatedSandbox(r.Context(), id)
+		writeError(w, http.StatusInternalServerError, "failed to start sandbox runtime")
 		return
 	}
 
@@ -603,16 +619,17 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	status, err := s.reconciler.Reconcile(r.Context(), id, v1alpha1.PodBoxSpec{
+	status, err := s.reconciler.Reconcile(r.Context(), id, s.withOfficialMounts(v1alpha1.PodBoxSpec{
 		TemplateRef:      rec.TemplateID,
 		DesiredState:     v1alpha1.DesiredStatePaused,
 		RootfsGeneration: rec.RootfsGeneration,
 		VolumeKey:        rec.VolumeKey,
 		NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
-	})
+	}, id))
 	if err == nil {
 		rec.State = string(status.Phase)
 		rec.PoddURL = ""
+		s.pauseRuntimeSandbox(r.Context(), id)
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -633,13 +650,13 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	wasPaused := rec.State == "Paused" || rec.State == string(v1alpha1.PodBoxPhasePaused)
 	// Auto-resume from Paused if needed (E2B connect semantics).
-	status, err := s.reconciler.Reconcile(r.Context(), id, v1alpha1.PodBoxSpec{
+	status, err := s.reconciler.Reconcile(r.Context(), id, s.withOfficialMounts(v1alpha1.PodBoxSpec{
 		TemplateRef:      rec.TemplateID,
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: rec.RootfsGeneration,
 		VolumeKey:        rec.VolumeKey,
 		NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
-	})
+	}, id))
 	if err == nil {
 		rec.State = string(status.Phase)
 		if wasPaused {
@@ -648,6 +665,11 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 		if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
 			rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
 			_ = waitForPoddReady(r.Context(), rec.PoddURL, 30*time.Second)
+		}
+		if err := s.startRuntimeSandbox(r.Context(), rec, "", nil); err != nil {
+			s.mu.Unlock()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		s.recordActivity(rec)
 	}
@@ -774,18 +796,23 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	rec.RootfsGeneration++
-	status, err := s.reconciler.Reconcile(r.Context(), id, v1alpha1.PodBoxSpec{
+	status, err := s.reconciler.Reconcile(r.Context(), id, s.withOfficialMounts(v1alpha1.PodBoxSpec{
 		TemplateRef:      rec.TemplateID,
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: rec.RootfsGeneration,
 		VolumeKey:        rec.VolumeKey,
 		NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
-	})
+	}, id))
 	if err == nil {
 		rec.State = string(status.Phase)
 		if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
 			rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
 			_ = waitForPoddReady(r.Context(), rec.PoddURL, 30*time.Second)
+		}
+		if err := s.startRuntimeSandbox(r.Context(), rec, "", nil); err != nil {
+			s.mu.Unlock()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 	}
 	s.mu.Unlock()
@@ -806,13 +833,13 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	childID := fmt.Sprintf("cpod-fork-%d", time.Now().UnixNano())
-	spec := v1alpha1.PodBoxSpec{
+	spec := s.withOfficialMounts(v1alpha1.PodBoxSpec{
 		TemplateRef:      parent.TemplateID,
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: 1,
 		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: parentID},
 		NetworkPolicy:    cloneNetworkPolicy(parent.NetworkPolicy),
-	}
+	}, parentID)
 	status, err := s.reconciler.Reconcile(r.Context(), childID, spec)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -861,6 +888,19 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	s.copySandboxVolumeMounts(parentID, childID)
 
+	if s.runtime != nil {
+		info, err := s.runtime.Fork(r.Context(), parentID, childID)
+		if err != nil {
+			if err2 := s.startRuntimeSandbox(r.Context(), child, "", nil); err2 != nil {
+				s.rollbackCreatedSandbox(r.Context(), childID)
+				http.Error(w, err2.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else if info != nil && info.PoddURL != "" {
+			child.PoddURL = info.PoddURL
+		}
+	}
+
 	s.mu.Lock()
 	s.sandboxes[childID] = child
 	s.mu.Unlock()
@@ -875,6 +915,7 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	deleteVolumes := r.URL.Query().Get("deleteVolumes") == "true"
 
 	rec, ok := s.resolveSandbox(r.Context(), id)
+	s.deleteRuntimeSandbox(r.Context(), id)
 	_ = s.reconciler.DeleteBox(r.Context(), id, deleteVolumes)
 
 	s.mu.Lock()
@@ -950,13 +991,13 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 	s.recordActivity(rec)
 
 	if rec.State == string(v1alpha1.PodBoxPhasePaused) || rec.State == "Paused" {
-		status, err := s.reconciler.Reconcile(ctx, rec.SandboxID, v1alpha1.PodBoxSpec{
+		status, err := s.reconciler.Reconcile(ctx, rec.SandboxID, s.withOfficialMounts(v1alpha1.PodBoxSpec{
 			TemplateRef:      rec.TemplateID,
 			DesiredState:     v1alpha1.DesiredStateRunning,
 			RootfsGeneration: rec.RootfsGeneration,
 			VolumeKey:        rec.VolumeKey,
 			NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
-		})
+		}, rec.SandboxID))
 		if err != nil {
 			return err
 		}
@@ -965,6 +1006,9 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 		if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
 			rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
 			_ = waitForPoddReady(ctx, rec.PoddURL, 45*time.Second)
+		}
+		if err := s.startRuntimeSandbox(ctx, rec, "", nil); err != nil {
+			return err
 		}
 	} else if s.livePodRouting && rec.PoddURL == "" {
 		if boxStatus, ok := s.reconciler.GetBox(rec.SandboxID); ok && boxStatus.PodIP != "" && boxStatus.PodIP != "10.244.0.42" {
@@ -1098,4 +1142,15 @@ func (s *Server) copyResolvedImageAnnotation(ctx context.Context, parentID, chil
 	}
 	childBox.Metadata.Annotations["cubepod.io/resolved-image"] = parentResolvedImage
 	_ = kc.UpsertPodBox(ctx, *childBox)
+}
+
+func mergeSandboxEnv(req createSandboxReq) map[string]string {
+	out := map[string]string{}
+	for k, v := range req.Env_Vars {
+		out[k] = v
+	}
+	for k, v := range req.EnvVars {
+		out[k] = v
+	}
+	return out
 }

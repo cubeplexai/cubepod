@@ -27,6 +27,7 @@ import (
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/egress"
+	"github.com/cubeplexai/cubepod/pkg/runtime"
 	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
@@ -262,6 +263,21 @@ type Server struct {
 	e2b              atomic.Pointer[volume.Store]
 	e2bDir           string
 	e2bCfg           volume.Config
+	runtime          runtime.Backend
+}
+
+// SetRuntime installs a product execution backend used during sandbox create,
+// pause, fork, and delete. When nil, the gateway only talks to the reconciler
+// (Kubernetes). Compose and local docker set this so official volume mounts
+// are attached at container create time, not by a post-create remount.
+func (s *Server) SetRuntime(b runtime.Backend) {
+	s.runtime = b
+}
+
+// Runtime returns the execution backend, or nil when this process is
+// Kubernetes-only.
+func (s *Server) Runtime() runtime.Backend {
+	return s.runtime
 }
 
 // NewServer constructs a new Gateway Server.

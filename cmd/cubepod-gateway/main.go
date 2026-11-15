@@ -16,6 +16,7 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/egress"
 	"github.com/cubeplexai/cubepod/pkg/gateway"
+	"github.com/cubeplexai/cubepod/pkg/runtime"
 	"github.com/cubeplexai/cubepod/pkg/version"
 )
 
@@ -190,7 +191,10 @@ func main() {
 		switch strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_E2B_DOCKER_VOLUMES"))) {
 		case "1", "true", "yes":
 			vcfg.DockerVolumes = true
-			vcfg.DockerPrefix = "cpod-test-vol-"
+			vcfg.DockerPrefix = "cubepod-e2bvol-"
+			if p := strings.TrimSpace(os.Getenv("CUBEPOD_E2B_DOCKER_PREFIX")); p != "" {
+				vcfg.DockerPrefix = p
+			}
 			vcfg.DockerHost = os.Getenv("DOCKER_HOST")
 		}
 		if err := gw.ConfigureE2BVolumes(vcfg); err != nil {
@@ -198,6 +202,25 @@ func main() {
 			os.Exit(1)
 		}
 		slog.Info("E2B volume store enabled", "dir", volDir, "dockerVolumes", vcfg.DockerVolumes)
+	}
+
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("CUBEPOD_RUNTIME")), "docker") {
+		cfg := runtime.DockerConfig{
+			DockerHost:          os.Getenv("DOCKER_HOST"),
+			Network:             os.Getenv("CUBEPOD_DOCKER_NETWORK"),
+			DefaultImage:        os.Getenv("CUBEPOD_DOCKER_IMAGE"),
+			ContainerNamePrefix: os.Getenv("CUBEPOD_DOCKER_CONTAINER_PREFIX"),
+		}
+		if v := strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_DOCKER_INJECT_BIN"))); v == "0" || v == "false" || v == "no" {
+			f := false
+			cfg.InjectPoddBin = &f
+		}
+		if v := strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_DOCKER_BIND_STORAGE"))); v == "0" || v == "false" || v == "no" {
+			f := false
+			cfg.BindSandboxStorage = &f
+		}
+		gw.SetRuntime(runtime.NewDockerBackend(cfg))
+		slog.Info("docker runtime enabled", "network", cfg.Network, "image", cfg.DefaultImage)
 	}
 
 	httpSrv := &http.Server{
