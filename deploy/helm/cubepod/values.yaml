@@ -88,3 +88,9 @@ templateBuild:
     pushSecret: "cubepod-buildkit-push"
     pullSecret: "cubepod-buildkit-pull"
     repositoryPrefix: "cubepod-templates"
+
+e2bVolumes:
+  enabled: false
+  pvcName: "cubepod-e2b-volumes"
+  rwxStorageClassName: ""
+  size: "20Gi"

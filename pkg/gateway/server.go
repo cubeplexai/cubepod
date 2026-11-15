@@ -264,6 +264,8 @@ type Server struct {
 	e2bDir           string
 	e2bCfg           volume.Config
 	e2bMaxFileBytes  int64
+	e2bK8sMounts     bool
+	e2bSharedPVC     string
 	runtime          runtime.Backend
 }
 

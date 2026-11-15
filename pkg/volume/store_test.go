@@ -503,3 +503,33 @@ func TestDockerClient_EnsureBindVolumeNosuidAnd409DeviceCheck(t *testing.T) {
 		t.Fatal("expected error on 409 device mismatch")
 	}
 }
+
+func TestStore_NotePVC_SharedRWX(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir, Config{})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	v, err := st.Create("key-1", "shared-vol")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := st.NotePVC(v.VolumeID, "cubepod-e2b-volumes", "cubepod-system"); err != nil {
+		t.Fatalf("NotePVC shared RWX failed: %v", err)
+	}
+	if err := st.NotePVC(v.VolumeID, "../bad", "cubepod-system"); err == nil {
+		t.Fatal("expected error for invalid PVC name")
+	}
+
+	reopened, err := Open(dir, Config{})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	got, err := reopened.Get("key-1", v.VolumeID)
+	if err != nil {
+		t.Fatalf("get after reopen: %v", err)
+	}
+	if got.PVCName != "cubepod-e2b-volumes" || got.PVCNamespace != "cubepod-system" {
+		t.Fatalf("unexpected persisted PVC metadata: %+v", got)
+	}
+}

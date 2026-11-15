@@ -35,6 +35,19 @@ spec:
             - name: CUBEPOD_PANEL_SECRET
               value: {{ .Values.gateway.panelSecret | quote }}
             {{- end }}
+            {{- if .Values.e2bVolumes.enabled }}
+            - name: CUBEPOD_E2B_VOLUME_DIR
+              value: "/var/lib/cubepod/e2b-volumes"
+            - name: CUBEPOD_K8S_E2B_VOLUME_MOUNTS
+              value: "1"
+            - name: CUBEPOD_E2B_SHARED_PVC
+              value: {{ .Values.e2bVolumes.pvcName | quote }}
+            {{- end }}
+          {{- if .Values.e2bVolumes.enabled }}
+          volumeMounts:
+            - name: e2b-volumes
+              mountPath: /var/lib/cubepod/e2b-volumes
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.gateway.port }}
@@ -53,3 +66,9 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
+      {{- if .Values.e2bVolumes.enabled }}
+      volumes:
+        - name: e2b-volumes
+          persistentVolumeClaim:
+            claimName: {{ .Values.e2bVolumes.pvcName }}
+      {{- end }}

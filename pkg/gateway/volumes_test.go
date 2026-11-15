@@ -738,7 +738,7 @@ func TestE2BVolumeSandboxCreateMountsOnPod(t *testing.T) {
 			continue
 		}
 		for _, m := range c.VolumeMounts {
-			if m.MountPath == "/mnt/cpod-test-vol" && (m.Name == pvc || m.Name == "e2bvol-"+vol.VolumeID) {
+			if m.MountPath == "/run/cubepod/volumes/"+vol.VolumeID && (m.Name == pvc || m.Name == "e2bvol-"+vol.VolumeID) {
 				sawMount = true
 			}
 		}
@@ -806,6 +806,149 @@ func TestE2BVolumeLiveK8sGatedOff(t *testing.T) {
 	}
 }
 
+func TestE2BVolumeLiveK8sEnabledWithoutSharedPVC_Returns501(t *testing.T) {
+	dir := t.TempDir()
+	mem := controller.NewMemoryKubeClient()
+	rec := controller.NewReconciler(controller.WithKubeClient(mem))
+	srv := gateway.NewServer(rec)
+	srv.SetLivePodRouting(true)
+	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+		Dir:                dir,
+		K8sE2BVolumeMounts: true,
+		SharedPVCName:      "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	keyA := "cpod_test_api_key"
+	vol := createVol(t, ts, keyA, "cpod-test-k8s-no-pvc")
+	body, _ := json.Marshal(map[string]any{
+		"templateID":   "base",
+		"volumeMounts": []map[string]string{{"name": vol.Name, "path": "/mnt/data"}},
+	})
+	resp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", keyA, body, "application/json")
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("expected 501 Not Implemented when SharedPVCName is empty, got %d %s", resp.StatusCode, b)
+	}
+}
+
+func TestE2BVolumeLiveK8sRWXEnabledAndFork(t *testing.T) {
+	dir := t.TempDir()
+	mem := controller.NewMemoryKubeClient()
+	rec := controller.NewReconciler(controller.WithKubeClient(mem))
+	srv := gateway.NewServer(rec)
+	srv.SetLivePodRouting(true)
+	sharedPVC := "cubepod-e2b-volumes"
+	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+		Dir:                dir,
+		K8sE2BVolumeMounts: true,
+		SharedPVCName:      sharedPVC,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	keyA := "cpod_test_api_key"
+	vol := createVol(t, ts, keyA, "cpod-test-k8s-rwx")
+	if _, ok := mem.GetPVC("cubepod-workloads", "e2bvol-"+vol.VolumeID); ok {
+		t.Fatalf("expected no per-volume e2bvol-* PVC created when SharedPVCName is set")
+	}
+
+	body, _ := json.Marshal(map[string]any{
+		"templateID":   "base",
+		"volumeMounts": []map[string]string{{"name": vol.Name, "path": "/mnt/dataset"}},
+	})
+	resp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", keyA, body, "application/json")
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		t.Fatalf("create sandbox: %d %s", resp.StatusCode, b)
+	}
+	var sb struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	readJSON(t, resp, &sb)
+
+	box, err := mem.GetPodBox(context.Background(), "cubepod-workloads", sb.SandboxID)
+	if err != nil || box == nil || len(box.Spec.E2BVolumeMounts) != 1 {
+		t.Fatalf("expected PodBox with 1 E2BVolumeMount, err=%v box=%+v", err, box)
+	}
+	gotMount := box.Spec.E2BVolumeMounts[0]
+	if gotMount.PVCName != sharedPVC || gotMount.SubPath != vol.VolumeID+"/data" || gotMount.Path != "/mnt/dataset" {
+		t.Fatalf("unexpected PodBox E2BVolumeMount: %+v", gotMount)
+	}
+
+	pod, ok := mem.GetPod("cubepod-workloads", sb.SandboxID+"-kata-pod")
+	if !ok {
+		t.Fatalf("expected pod %s-kata-pod", sb.SandboxID)
+	}
+	stagingPath := "/run/cubepod/volumes/" + vol.VolumeID
+	wantEnv := `[{"volume_id":"` + vol.VolumeID + `","staging_path":"` + stagingPath + `","target_path":"/mnt/dataset"}]`
+	var sawStaging, sawEnv bool
+	for _, c := range pod.Containers {
+		if c.Name != "sandbox" {
+			continue
+		}
+		for _, m := range c.VolumeMounts {
+			if m.Name == sharedPVC && m.MountPath == stagingPath && m.SubPath == vol.VolumeID+"/data" {
+				sawStaging = true
+			}
+		}
+		for _, e := range c.Env {
+			if e.Name == "CUBEPOD_E2B_MOUNTS" && e.Value == wantEnv {
+				sawEnv = true
+			}
+		}
+	}
+	if !sawStaging || !sawEnv {
+		t.Fatalf("pod missing staging mount or CUBEPOD_E2B_MOUNTS (staging=%v env=%v) containers=%+v", sawStaging, sawEnv, pod.Containers)
+	}
+
+	// Fork the sandbox and verify mount inheritance + DELETE /volumes/{id} tracking.
+	forkResp := volReq(t, http.MethodPost, ts.URL+"/sandboxes/"+sb.SandboxID+"/fork", keyA, nil, "application/json")
+	if forkResp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(forkResp.Body)
+		forkResp.Body.Close()
+		t.Fatalf("fork sandbox: %d %s", forkResp.StatusCode, b)
+	}
+	var child struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	readJSON(t, forkResp, &child)
+	childBox, err := mem.GetPodBox(context.Background(), "cubepod-workloads", child.SandboxID)
+	if err != nil || childBox == nil || len(childBox.Spec.E2BVolumeMounts) != 1 {
+		t.Fatalf("expected forked PodBox to inherit E2BVolumeMounts, err=%v box=%+v", err, childBox)
+	}
+	if childBox.Spec.E2BVolumeMounts[0].PVCName != sharedPVC || childBox.Spec.E2BVolumeMounts[0].SubPath != vol.VolumeID+"/data" {
+		t.Fatalf("unexpected forked PodBox mount: %+v", childBox.Spec.E2BVolumeMounts[0])
+	}
+
+	// Delete parent; volume must still be busy (409) because fork holds a reference.
+	delParent := volReq(t, http.MethodDelete, ts.URL+"/sandboxes/"+sb.SandboxID, keyA, nil, "")
+	delParent.Body.Close()
+
+	delVolBusy := volReq(t, http.MethodDelete, ts.URL+"/volumes/"+vol.VolumeID, keyA, nil, "")
+	delVolBusy.Body.Close()
+	if delVolBusy.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict deleting volume while fork is alive, got %d", delVolBusy.StatusCode)
+	}
+
+	// Delete fork; volume deletion now succeeds.
+	delChild := volReq(t, http.MethodDelete, ts.URL+"/sandboxes/"+child.SandboxID, keyA, nil, "")
+	delChild.Body.Close()
+
+	delVolOK := volReq(t, http.MethodDelete, ts.URL+"/volumes/"+vol.VolumeID, keyA, nil, "")
+	delVolOK.Body.Close()
+	if delVolOK.StatusCode != http.StatusNoContent && delVolOK.StatusCode != http.StatusOK {
+		t.Fatalf("expected volume delete to succeed after fork deleted, got %d", delVolOK.StatusCode)
+	}
+}
+
 func TestE2BVolumeUploadSizeLimitTenantCapAndSetuidMask(t *testing.T) {
 	dir := t.TempDir()
 	mem := controller.NewMemoryKubeClient()
@@ -866,5 +1009,69 @@ func TestE2BVolumeUploadSizeLimitTenantCapAndSetuidMask(t *testing.T) {
 	}
 	if fi.Mode()&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky) != 0 {
 		t.Fatalf("on-disk file has special mode bits: %v", fi.Mode())
+	}
+}
+
+func TestE2BVolume_RestartPreservesPodBoxMountsAndBlocksDelete(t *testing.T) {
+	dir := t.TempDir()
+	mem := controller.NewMemoryKubeClient()
+	rec := controller.NewReconciler(controller.WithKubeClient(mem), controller.WithNamespace("cubepod-workloads"))
+	srv := gateway.NewServer(rec)
+	srv.SetLivePodRouting(true)
+	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+		Dir:                dir,
+		K8sE2BVolumeMounts: true,
+		SharedPVCName:      "cubepod-e2b-volumes",
+	}); err != nil {
+		t.Fatalf("configure volumes: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// Create volume (NotePVC should record cubepod-e2b-volumes) and attach via sandbox create.
+	vol := createVol(t, ts, "key-r", "persist-vol")
+	volID := vol.VolumeID
+
+	sbxBody, _ := json.Marshal(map[string]any{
+		"templateID":   "base",
+		"volumeMounts": []map[string]string{{"name": "persist-vol", "path": "/mnt/ds"}},
+	})
+	sbxResp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", "key-r", sbxBody, "application/json")
+	var sbx map[string]any
+	readJSON(t, sbxResp, &sbx)
+	if sbxResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %+v", sbxResp.StatusCode, sbx)
+	}
+	sbxID, _ := sbx["sandboxID"].(string)
+
+	// Simulate gateway restart: new Server sharing mem (PodBox CRs) and dir (volumes store).
+	rec2 := controller.NewReconciler(controller.WithKubeClient(mem), controller.WithNamespace("cubepod-workloads"))
+	srv2 := gateway.NewServer(rec2)
+	srv2.SetLivePodRouting(true)
+	if err := srv2.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+		Dir:                dir,
+		K8sE2BVolumeMounts: true,
+		SharedPVCName:      "cubepod-e2b-volumes",
+	}); err != nil {
+		t.Fatalf("reconfigure volumes after restart: %v", err)
+	}
+	ts2 := httptest.NewServer(srv2.Handler())
+	defer ts2.Close()
+
+	// Mounts must survive restart.
+	if mounts := srv2.E2BVolumeMounts(sbxID); len(mounts) != 1 || mounts[0].VolumeID != volID {
+		t.Fatalf("expected mounts preserved across gateway restart, got %+v", mounts)
+	}
+
+	// DELETE /volumes/{id} must return 409 Conflict because PodBox CR still references it.
+	delResp := volReq(t, http.MethodDelete, ts2.URL+"/volumes/"+volID, "key-r", nil, "")
+	delResp.Body.Close()
+	if delResp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict when deleting mounted volume after restart, got %d", delResp.StatusCode)
+	}
+
+	// Verify PodBox CR still exists.
+	if _, err := mem.GetPodBox(context.Background(), "cubepod-workloads", sbxID); err != nil {
+		t.Fatalf("expected PodBox %s to exist: %v", sbxID, err)
 	}
 }

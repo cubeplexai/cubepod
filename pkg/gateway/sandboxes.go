@@ -388,7 +388,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		RootfsGeneration: 1,
 		WarmPoolRef:      req.WarmPoolRef,
 		VolumeKey:        volumeKey,
-		E2BVolumeMounts:  plannedToPodBoxMounts(plannedMounts),
+		E2BVolumeMounts:  s.plannedToPodBoxMounts(plannedMounts),
 		NetworkPolicy:    cloneNetworkPolicy(netPolicy),
 	}
 
@@ -840,8 +840,24 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: parentID},
 		NetworkPolicy:    cloneNetworkPolicy(parent.NetworkPolicy),
 	}, parentID)
+	if len(spec.E2BVolumeMounts) == 0 && s.reconciler != nil && s.reconciler.KubeClient() != nil {
+		if parentBox, getErr := s.reconciler.KubeClient().GetPodBox(r.Context(), s.reconciler.Namespace(), parentID); getErr == nil && parentBox != nil && len(parentBox.Spec.E2BVolumeMounts) > 0 {
+			spec.E2BVolumeMounts = append([]v1alpha1.E2BVolumeMount(nil), parentBox.Spec.E2BVolumeMounts...)
+		}
+	}
+	if len(spec.E2BVolumeMounts) > 0 && s.livePodRouting && s.runtime == nil {
+		sharedPVC := s.sharedE2BPVC()
+		for _, m := range spec.E2BVolumeMounts {
+			if sharedPVC == "" || m.PVCName != sharedPVC {
+				writeError(w, http.StatusConflict, "cannot fork sandbox with RWO per-volume E2B PVC on Kubernetes")
+				return
+			}
+		}
+	}
+	s.copySandboxVolumeMounts(parentID, childID)
 	status, err := s.reconciler.Reconcile(r.Context(), childID, spec)
 	if err != nil {
+		s.releaseSandboxVolumeMounts(childID)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -886,7 +902,6 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		TimeoutSeconds:   parent.TimeoutSeconds,
 		WorkspaceDir:     workspaceDir,
 	}
-	s.copySandboxVolumeMounts(parentID, childID)
 
 	if s.runtime != nil {
 		info, err := s.runtime.Fork(r.Context(), parentID, childID)

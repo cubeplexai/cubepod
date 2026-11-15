@@ -52,6 +52,7 @@ type coreV1PVC struct {
 type coreV1VolumeMount struct {
 	Name      string `json:"name"`
 	MountPath string `json:"mountPath"`
+	SubPath   string `json:"subPath,omitempty"`
 	ReadOnly  bool   `json:"readOnly,omitempty"`
 }
 
@@ -177,6 +178,7 @@ func toCoreV1Container(c ContainerManifest) coreV1Container {
 		res.VolumeMounts = append(res.VolumeMounts, coreV1VolumeMount{
 			Name:      vm.Name,
 			MountPath: vm.MountPath,
+			SubPath:   vm.SubPath,
 			ReadOnly:  vm.ReadOnly,
 		})
 	}

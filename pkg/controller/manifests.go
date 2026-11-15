@@ -2,6 +2,7 @@ package controller
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -119,6 +120,7 @@ type BlockPVCManifest struct {
 type VolumeMount struct {
 	Name      string `json:"name"`
 	MountPath string `json:"mountPath"`
+	SubPath   string `json:"subPath,omitempty"`
 	ReadOnly  bool   `json:"readOnly,omitempty"`
 }
 
@@ -265,9 +267,21 @@ func E2BPVCName(volumeID string) (string, bool) {
 	return "e2bvol-" + volumeID, true
 }
 
+func validE2BSubPath(subPath string) bool {
+	if subPath == "" || strings.HasPrefix(subPath, "/") || strings.Contains(subPath, "\\") {
+		return false
+	}
+	for _, seg := range strings.Split(subPath, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 // ValidateOfficialVolumeMounts verifies that all official E2B volume mounts
-// have a valid volume ID, matching PVC name, valid container path, and no
-// duplicate mount paths.
+// have a valid volume ID, matching PVC name (or a non-empty shared PVC name
+// when subPath is set), valid container path, and no duplicate mount paths.
 func ValidateOfficialVolumeMounts(mounts []v1alpha1.E2BVolumeMount) error {
 	seenPath := map[string]struct{}{}
 	for _, m := range mounts {
@@ -275,7 +289,14 @@ func ValidateOfficialVolumeMounts(mounts []v1alpha1.E2BVolumeMount) error {
 		if !ok {
 			return fmt.Errorf("invalid official E2B volumeID %q", m.VolumeID)
 		}
-		if m.PVCName != "" && m.PVCName != pvc {
+		if m.SubPath != "" {
+			if !validE2BSubPath(m.SubPath) {
+				return fmt.Errorf("invalid official E2B subPath %q", m.SubPath)
+			}
+			if strings.TrimSpace(m.PVCName) == "" {
+				return fmt.Errorf("missing official E2B pvcName for volume %s with subPath", m.VolumeID)
+			}
+		} else if m.PVCName != "" && m.PVCName != pvc {
 			return fmt.Errorf("mismatched official E2B pvcName %q for volume %s", m.PVCName, m.VolumeID)
 		}
 		if !v1alpha1.ValidE2BContainerPath(m.Path) {
@@ -289,15 +310,29 @@ func ValidateOfficialVolumeMounts(mounts []v1alpha1.E2BVolumeMount) error {
 	return nil
 }
 
-// applyOfficialVolumeMounts adds one Filesystem PVC volume and container mount
-// per official E2B volume. Block workspace devices are left unchanged.
+type e2bMountEnvEntry struct {
+	VolumeID    string `json:"volume_id"`
+	StagingPath string `json:"staging_path"`
+	TargetPath  string `json:"target_path"`
+}
+
+// applyOfficialVolumeMounts stages each official E2B volume at
+// /run/cubepod/volumes/<volumeID>, deduplicates shared PVCs in pod.Volumes,
+// and passes the staging->target mapping to podd-init via CUBEPOD_E2B_MOUNTS.
 func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest, mounts []v1alpha1.E2BVolumeMount) ([]VolumeManifest, ContainerManifest) {
+	if len(mounts) == 0 {
+		return volumes, main
+	}
 	if err := ValidateOfficialVolumeMounts(mounts); err != nil {
 		return volumes, main
 	}
 	seenPVC := map[string]struct{}{}
+	envEntries := make([]e2bMountEnvEntry, 0, len(mounts))
 	for _, m := range mounts {
-		pvc, _ := E2BPVCName(m.VolumeID)
+		pvc := m.PVCName
+		if pvc == "" {
+			pvc, _ = E2BPVCName(m.VolumeID)
+		}
 		if _, ok := seenPVC[pvc]; !ok {
 			seenPVC[pvc] = struct{}{}
 			volumes = append(volumes, VolumeManifest{
@@ -305,9 +340,22 @@ func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest,
 				PersistentVolumeClaim: pvc,
 			})
 		}
+		stagingPath := "/run/cubepod/volumes/" + m.VolumeID
 		main.VolumeMounts = append(main.VolumeMounts, VolumeMount{
 			Name:      pvc,
-			MountPath: m.Path,
+			MountPath: stagingPath,
+			SubPath:   m.SubPath,
+		})
+		envEntries = append(envEntries, e2bMountEnvEntry{
+			VolumeID:    m.VolumeID,
+			StagingPath: stagingPath,
+			TargetPath:  m.Path,
+		})
+	}
+	if raw, err := json.Marshal(envEntries); err == nil {
+		main.Env = append(main.Env, EnvVar{
+			Name:  "CUBEPOD_E2B_MOUNTS",
+			Value: string(raw),
 		})
 	}
 	return volumes, main

@@ -50,7 +50,9 @@ spec:
                         pattern: "^[a-f0-9]{32}$"
                       pvcName:
                         type: string
-                        pattern: "^e2bvol-[a-f0-9]{32}$"
+                        minLength: 1
+                      subPath:
+                        type: string
                       path:
                         type: string
                         pattern: "^/.+"
