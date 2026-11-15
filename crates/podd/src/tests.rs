@@ -2795,12 +2795,12 @@ fn wait_for_pty_output<R: std::io::Read>(
             Err(e) => return Err(e.to_string()),
         }
     }
-    Err(format!(
-        "timed out waiting for output; got={accumulated:?}"
-    ))
+    Err(format!("timed out waiting for output; got={accumulated:?}"))
 }
 
-fn pty_entry(running: bool) -> (
+fn pty_entry(
+    running: bool,
+) -> (
     crate::commands::PtyHandle,
     std::sync::Mutex<crate::commands::ProcessEntry>,
 ) {
@@ -2840,7 +2840,9 @@ fn start_pty(addr: &str, body: &str) -> (TcpStream, u64) {
     stream.write_all(req.as_bytes()).unwrap();
     stream.flush().unwrap();
     skip_http_headers_from_stream(&mut stream).unwrap();
-    let (flag, data) = read_connect_frame_from_stream(&mut stream).unwrap().unwrap();
+    let (flag, data) = read_connect_frame_from_stream(&mut stream)
+        .unwrap()
+        .unwrap();
     assert_eq!(flag, 0);
     let start_json = JsonValue::parse(std::str::from_utf8(&data).unwrap()).unwrap();
     let pid = start_json
@@ -3031,10 +3033,7 @@ fn test_pty_start_isatty_resize_bidirectional_and_kill() {
                         saw_end = true;
                         let exit_code = end.get("exitCode").and_then(|v| v.as_i64()).unwrap();
                         assert!(exit_code == 137 || exit_code == -1);
-                        assert_eq!(
-                            end.get("exited").and_then(|v| v.as_bool()),
-                            Some(true)
-                        );
+                        assert_eq!(end.get("exited").and_then(|v| v.as_bool()), Some(true));
                         assert!(
                             end.get("exit_code").is_none(),
                             "duplicate exit_code must not be present"
@@ -3248,10 +3247,7 @@ fn test_pty_exit_code_nonzero() {
                 if let Ok(json) = JsonValue::parse(json_str) {
                     if let Some(end) = json.get("event").and_then(|e| e.get("end")) {
                         exit_code = end.get("exitCode").and_then(|v| v.as_i64());
-                        assert_eq!(
-                            end.get("exited").and_then(|v| v.as_bool()),
-                            Some(true)
-                        );
+                        assert_eq!(end.get("exited").and_then(|v| v.as_bool()), Some(true));
                         assert!(end.get("exit_code").is_none());
                     }
                 }
@@ -3470,7 +3466,10 @@ fn test_pty_replay_bounded_snapshot_has_no_gap_or_dup() {
     }
     let sub = subscribe_pty(&pty, &entry);
     assert!(sub.running);
-    assert_eq!(sub.snapshot, before, "snapshot is the replay tail at subscribe time");
+    assert_eq!(
+        sub.snapshot, before,
+        "snapshot is the replay tail at subscribe time"
+    );
 
     let mut after = Vec::new();
     for i in 20..30u8 {
@@ -3487,7 +3486,10 @@ fn test_pty_replay_bounded_snapshot_has_no_gap_or_dup() {
     combined.extend_from_slice(&live);
     let mut expected = before.clone();
     expected.extend_from_slice(&after);
-    assert_eq!(combined, expected, "snapshot plus live must cover every published byte");
+    assert_eq!(
+        combined, expected,
+        "snapshot plus live must cover every published byte"
+    );
 
     publish_pty_chunk(&pty, &entry, &vec![0xAB; PTY_REPLAY_CAP + 80]);
     let buffered = entry.lock().unwrap().output.len();
@@ -3528,7 +3530,10 @@ fn test_pty_start_disconnect_does_not_kill() {
     std::thread::sleep(Duration::from_millis(200));
 
     let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-    assert!(alive, "closing the Start stream must leave the PTY process running");
+    assert!(
+        alive,
+        "closing the Start stream must leave the PTY process running"
+    );
     let entry = registry.get_by_pid(pid as u32).expect("entry");
     let master_fd = entry
         .lock()
@@ -3538,12 +3543,13 @@ fn test_pty_start_disconnect_does_not_kill() {
         .unwrap()
         .master_fd
         .load(Ordering::SeqCst);
-    assert!(master_fd >= 0, "master fd stays open after stream disconnect");
+    assert!(
+        master_fd >= 0,
+        "master fd stays open after stream disconnect"
+    );
 
     let input = base64_encode(b"echo STILL_RUNNING\n");
-    let send_req = format!(
-        r#"{{"process":{{"pid":{pid}}},"input":{{"pty":"{input}"}}}}"#
-    );
+    let send_req = format!(r#"{{"process":{{"pid":{pid}}},"input":{{"pty":"{input}"}}}}"#);
     let (status, _, _) = post_raw(
         &addr,
         "/process.Process/SendInput",
@@ -3630,12 +3636,18 @@ fn test_pty_slow_start_consumer_ends_with_resource_exhausted() {
                 }
             }
             Ok(None) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 break;
             }
             Err(e) => panic!("read frame: {e}"),
         }
     }
     assert!(saw_overflow, "slow consumer must see resource_exhausted");
-    assert!(!saw_end, "overflow must not finish as a successful end event");
+    assert!(
+        !saw_end,
+        "overflow must not finish as a successful end event"
+    );
 }

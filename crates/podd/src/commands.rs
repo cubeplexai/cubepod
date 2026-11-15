@@ -134,14 +134,16 @@ pub fn publish_pty_chunk(pty: &PtyHandle, entry: &Mutex<ProcessEntry>, chunk: &[
     let mut proc = entry.lock().unwrap();
     append_replay(&mut proc.output, chunk, PTY_REPLAY_CAP);
     let owned = chunk.to_vec();
-    subs.retain(|sub| match sub.tx.try_send(PtyBroadcastEvent::Data(owned.clone())) {
-        Ok(()) => true,
-        Err(std::sync::mpsc::TrySendError::Full(_)) => {
-            sub.overflow.store(true, Ordering::SeqCst);
-            false
-        }
-        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
-    });
+    subs.retain(
+        |sub| match sub.tx.try_send(PtyBroadcastEvent::Data(owned.clone())) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                sub.overflow.store(true, Ordering::SeqCst);
+                false
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        },
+    );
 }
 
 pub fn publish_pty_end(pty: &PtyHandle, entry: &Mutex<ProcessEntry>, exit_code: i32) {
@@ -149,14 +151,16 @@ pub fn publish_pty_end(pty: &PtyHandle, entry: &Mutex<ProcessEntry>, exit_code: 
     let mut proc = entry.lock().unwrap();
     proc.running = false;
     proc.exit_code = Some(exit_code);
-    subs.retain(|sub| match sub.tx.try_send(PtyBroadcastEvent::End(exit_code)) {
-        Ok(()) => true,
-        Err(std::sync::mpsc::TrySendError::Full(_)) => {
-            sub.overflow.store(true, Ordering::SeqCst);
-            false
-        }
-        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
-    });
+    subs.retain(
+        |sub| match sub.tx.try_send(PtyBroadcastEvent::End(exit_code)) {
+            Ok(()) => true,
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                sub.overflow.store(true, Ordering::SeqCst);
+                false
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+        },
+    );
     subs.clear();
 }
 
@@ -280,7 +284,10 @@ impl ProcessRegistry {
 
     pub fn list_running(&self) -> Vec<Arc<Mutex<ProcessEntry>>> {
         let map = self.entries.lock().unwrap();
-        map.values().filter(|e| e.lock().unwrap().running).cloned().collect()
+        map.values()
+            .filter(|e| e.lock().unwrap().running)
+            .cloned()
+            .collect()
     }
 
     pub fn active_count(&self) -> usize {
@@ -796,7 +803,9 @@ pub fn find_process_entry(
 
 pub fn extract_pty_size(json: &JsonValue) -> (u16, u16) {
     let pty_obj = json.get("pty").and_then(|v| v.as_object());
-    let size_obj = pty_obj.and_then(|p| p.get("size")).and_then(|v| v.as_object());
+    let size_obj = pty_obj
+        .and_then(|p| p.get("size"))
+        .and_then(|v| v.as_object());
     let cols = size_obj
         .and_then(|s| s.get("cols"))
         .and_then(|v| v.as_u64())
@@ -848,7 +857,8 @@ fn write_pty_end(stream: &mut TcpStream, exit_code: i32) {
 }
 
 fn write_pty_overflow(stream: &mut TcpStream) {
-    let err = br#"{"error":{"code":"resource_exhausted","message":"pty subscriber queue overflow"}}"#;
+    let err =
+        br#"{"error":{"code":"resource_exhausted","message":"pty subscriber queue overflow"}}"#;
     let frame = make_connect_frame(err, true);
     let _ = stream.write_all(&frame);
     let _ = stream.flush();
