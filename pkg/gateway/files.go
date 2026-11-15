@@ -59,6 +59,79 @@ func (s *Server) resolveSandboxFromRequest(r *http.Request) (*SandboxRecord, err
 	return s.resolveConnectRPCSandbox(r)
 }
 
+// sandboxWorkdir is the in-sandbox directory relative upload paths resolve
+// against. It matches podd's default CUBEPOD_WORKDIR.
+const sandboxWorkdir = "/workspace"
+
+// maxDecompressedUpload caps how much a declared-gzip upload may inflate to,
+// so a small gzip bomb cannot exhaust gateway memory.
+const maxDecompressedUpload = 1 << 30
+
+// isGzipEncoded reports whether a Content-Encoding header value declares gzip.
+func isGzipEncoded(contentEncoding string) bool {
+	return strings.Contains(strings.ToLower(contentEncoding), "gzip")
+}
+
+// gunzipDeclared decompresses a payload whose sender declared
+// Content-Encoding: gzip. Payloads that are not valid gzip are an error rather
+// than being written verbatim.
+func gunzipDeclared(data []byte) ([]byte, error) {
+	gz, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("content-encoding is gzip but payload is not gzip data: %w", err)
+	}
+	defer gz.Close()
+	out, err := io.ReadAll(io.LimitReader(gz, maxDecompressedUpload+1))
+	if err != nil {
+		return nil, fmt.Errorf("gzip decompression error: %w", err)
+	}
+	if len(out) > maxDecompressedUpload {
+		return nil, fmt.Errorf("decompressed upload exceeds %d bytes", maxDecompressedUpload)
+	}
+	return out, nil
+}
+
+// absUploadPath resolves a possibly-relative upload path against workdir.
+func absUploadPath(p, workdir string) string {
+	if strings.HasPrefix(p, "/") {
+		return p
+	}
+	return strings.TrimSuffix(workdir, "/") + "/" + p
+}
+
+// resolveUploadPath picks the in-sandbox destination for a multipart file
+// part. It mirrors podd's resolve_file_path so local-fallback and podd-backed
+// sandboxes agree:
+//   - single file: the path query parameter wins; a trailing "/" marks it as a
+//     directory and the part filename's basename is appended;
+//   - multiple files (or no query path): the part filename is the target, with
+//     relative names resolved under the query directory or workdir.
+func resolveUploadPath(partFilename, queryPath string, single bool, workdir string) (string, error) {
+	fn := strings.TrimSpace(partFilename)
+	qp := strings.TrimSpace(queryPath)
+
+	if single && qp != "" {
+		if strings.HasSuffix(qp, "/") && fn != "" {
+			return absUploadPath(qp+path.Base(fn), workdir), nil
+		}
+		return absUploadPath(qp, workdir), nil
+	}
+	if fn != "" {
+		if strings.HasPrefix(fn, "/") {
+			return fn, nil
+		}
+		base := workdir
+		if qp != "" {
+			base = absUploadPath(qp, workdir)
+		}
+		return strings.TrimSuffix(base, "/") + "/" + fn, nil
+	}
+	if qp != "" {
+		return absUploadPath(qp, workdir), nil
+	}
+	return "", fmt.Errorf("missing path for file upload")
+}
+
 func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 	rec, err := s.resolveSandboxFromRequest(r)
 	if err != nil {
@@ -92,11 +165,12 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 	ct := r.Header.Get("Content-Type")
 	mediaType, params, _ := mime.ParseMediaType(ct)
 	if strings.HasPrefix(mediaType, "multipart/") {
-		mr := multipart.NewReader(bytes.NewReader(bodyBytes), params["boundary"])
-		var written []struct {
-			name string
-			path string
+		type filePart struct {
+			filename string
+			data     []byte
 		}
+		var fileParts []filePart
+		mr := multipart.NewReader(bytes.NewReader(bodyBytes), params["boundary"])
 		for {
 			part, err := mr.NextPart()
 			if err == io.EOF {
@@ -106,38 +180,40 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "invalid multipart form: "+err.Error(), http.StatusBadRequest)
 				return
 			}
+			partFilename := part.FileName()
+			if partFilename == "" && part.FormName() != "file" {
+				continue
+			}
 			partBytes, err := io.ReadAll(part)
 			if err != nil {
 				http.Error(w, "failed to read multipart part: "+err.Error(), http.StatusBadRequest)
 				return
 			}
-			if part.Header.Get("Content-Encoding") == "gzip" || (len(partBytes) >= 2 && partBytes[0] == 0x1f && partBytes[1] == 0x8b) {
-				if gz, err := gzip.NewReader(bytes.NewReader(partBytes)); err == nil {
-					if decompressed, err := io.ReadAll(gz); err == nil {
-						partBytes = decompressed
-					}
-					gz.Close()
+			if isGzipEncoded(part.Header.Get("Content-Encoding")) {
+				partBytes, err = gunzipDeclared(partBytes)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
 				}
 			}
-			partFilename := part.FileName()
-			destPath := targetPath
-			if partFilename != "" {
-				if filepath.IsAbs(partFilename) || strings.HasPrefix(partFilename, "/") {
-					destPath = partFilename
-				} else if targetPath != "" {
-					if strings.HasSuffix(targetPath, "/") {
-						destPath = path.Join(targetPath, partFilename)
-					} else if filepath.Base(targetPath) == partFilename {
-						destPath = targetPath
-					} else {
-						destPath = path.Join(targetPath, partFilename)
-					}
-				} else {
-					destPath = path.Join("/workspace", partFilename)
-				}
-			}
-			if destPath == "" {
-				continue
+			fileParts = append(fileParts, filePart{filename: partFilename, data: partBytes})
+		}
+		if len(fileParts) == 0 {
+			http.Error(w, "no file parts found in multipart request", http.StatusBadRequest)
+			return
+		}
+
+		type writtenFile struct {
+			name string
+			path string
+		}
+		written := make([]writtenFile, 0, len(fileParts))
+		single := len(fileParts) == 1
+		for _, fp := range fileParts {
+			destPath, err := resolveUploadPath(fp.filename, targetPath, single, sandboxWorkdir)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
 			}
 			fullPath, err := s.resolveFilePath(rec, destPath)
 			if err != nil {
@@ -148,21 +224,11 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			if err := os.WriteFile(fullPath, partBytes, 0644); err != nil {
+			if err := os.WriteFile(fullPath, fp.data, 0644); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			written = append(written, struct {
-				name string
-				path string
-			}{
-				name: filepath.Base(destPath),
-				path: destPath,
-			})
-		}
-		if len(written) == 0 {
-			http.Error(w, "no file parts found in multipart request", http.StatusBadRequest)
-			return
+			written = append(written, writtenFile{name: path.Base(destPath), path: destPath})
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/files" {
@@ -186,13 +252,15 @@ func (s *Server) handlePutFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Header.Get("Content-Encoding") == "gzip" || (len(bodyBytes) >= 2 && bodyBytes[0] == 0x1f && bodyBytes[1] == 0x8b && (strings.Contains(ct, "octet-stream") || r.Header.Get("Content-Encoding") == "gzip")) {
-		if gz, err := gzip.NewReader(bytes.NewReader(bodyBytes)); err == nil {
-			if decompressed, err := io.ReadAll(gz); err == nil {
-				bodyBytes = decompressed
-			}
-			gz.Close()
+	// Only honor an explicit Content-Encoding header; never sniff magic bytes,
+	// or uploads of genuine .gz files would be silently inflated.
+	if isGzipEncoded(r.Header.Get("Content-Encoding")) {
+		decompressed, err := gunzipDeclared(bodyBytes)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
 		}
+		bodyBytes = decompressed
 	}
 
 	var contentBytes []byte

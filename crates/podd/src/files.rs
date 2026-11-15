@@ -199,17 +199,36 @@ pub fn parse_content_disposition(header_str: &str) -> (Option<String>, Option<St
     (part_name, part_filename)
 }
 
-fn is_part_gzip(header_str: &str, data: &[u8]) -> bool {
-    for line in header_str.lines() {
-        if let Some((k, v)) = line.trim().split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-encoding")
+/// Returns true only when the multipart part explicitly declares
+/// `Content-Encoding: gzip`. Payload bytes are never sniffed: a user uploading
+/// a real `.gz` file must get those exact bytes written to disk.
+fn is_part_gzip(header_str: &str) -> bool {
+    header_str.lines().any(|line| {
+        line.trim().split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("content-encoding")
                 && v.to_ascii_lowercase().contains("gzip")
-            {
-                return true;
-            }
-        }
+        })
+    })
+}
+
+/// Decompresses a payload whose sender declared `Content-Encoding: gzip`.
+/// Unlike [`decompress_if_gzip`], a payload that is not actually gzip is an
+/// error rather than being passed through unchanged.
+pub fn gunzip_declared(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
+        return Err("Content-Encoding is gzip but payload is not gzip data".to_string());
     }
-    data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b
+    decompress_if_gzip(data)
+}
+
+/// Resolves a possibly-relative upload path against the daemon workdir so the
+/// destination never depends on podd's own process working directory.
+fn absolutize_upload_path(p: &str, workdir: &str) -> String {
+    if p.starts_with('/') {
+        p.to_string()
+    } else {
+        format!("{}/{}", workdir.trim_end_matches('/'), p)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -291,8 +310,8 @@ pub fn parse_multipart_body(body: &[u8], boundary: &str) -> Result<Vec<Multipart
         let header_str = String::from_utf8_lossy(header_bytes);
         let (name, filename) = parse_content_disposition(&header_str);
 
-        let data = if is_part_gzip(&header_str, raw_part_data) {
-            decompress_if_gzip(raw_part_data)?
+        let data = if is_part_gzip(&header_str) {
+            gunzip_declared(raw_part_data)?
         } else {
             raw_part_data.to_vec()
         };
@@ -318,6 +337,9 @@ pub fn resolve_file_path(
     let clean_filename = part_filename.map(|s| s.trim()).filter(|s| !s.is_empty());
     let clean_query = query_path.map(|s| s.trim()).filter(|s| !s.is_empty());
 
+    // Single file: the `path` query parameter is authoritative. A trailing `/`
+    // marks it as a directory, in which case the part filename's basename is
+    // appended.
     if is_single_part {
         if let Some(qp) = clean_query {
             if qp.ends_with('/') {
@@ -326,24 +348,26 @@ pub fn resolve_file_path(
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or(fn_str);
-                    return Ok(format!("{}{}", qp, base));
+                    return Ok(absolutize_upload_path(&format!("{qp}{base}"), workdir));
                 }
             }
-            return Ok(qp.to_string());
+            return Ok(absolutize_upload_path(qp, workdir));
         }
     }
 
+    // Multiple files (or no query path): each part filename is the target,
+    // relative ones resolved under the query directory or the workdir.
     if let Some(fn_str) = clean_filename {
         if fn_str.starts_with('/') {
             return Ok(fn_str.to_string());
         }
-        let base_dir = clean_query.unwrap_or(workdir);
+        let base_dir = absolutize_upload_path(clean_query.unwrap_or(workdir), workdir);
         let trimmed = base_dir.trim_end_matches('/');
         return Ok(format!("{trimmed}/{fn_str}"));
     }
 
     if let Some(qp) = clean_query {
-        return Ok(qp.to_string());
+        return Ok(absolutize_upload_path(qp, workdir));
     }
 
     Err("missing path for file upload".to_string())
@@ -494,7 +518,7 @@ pub fn handle_file_post(
         }
 
         let raw_path = match target_path {
-            Some(p) if !p.is_empty() => p,
+            Some(p) if !p.trim().is_empty() => absolutize_upload_path(p.trim(), &config.workdir),
             _ => {
                 write_json(
                     stream,
@@ -505,17 +529,18 @@ pub fn handle_file_post(
             }
         };
 
+        // Only honor an explicit Content-Encoding header; never sniff magic
+        // bytes, or uploads of genuine .gz files would be silently inflated.
         let is_gzip = req
             .headers
             .get("content-encoding")
-            .map(|v| v.contains("gzip"))
-            .unwrap_or(false)
-            || (req.body.len() >= 2 && req.body[0] == 0x1f && req.body[1] == 0x8b);
+            .map(|v| v.to_ascii_lowercase().contains("gzip"))
+            .unwrap_or(false);
 
         let data = if let Some(fd) = final_data {
             fd
         } else if is_gzip {
-            match decompress_if_gzip(&req.body) {
+            match gunzip_declared(&req.body) {
                 Ok(decompressed) => decompressed,
                 Err(e) => {
                     let resp = format!(
