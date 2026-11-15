@@ -413,10 +413,7 @@ fn test_file_post_endpoints() {
         arr[0].get("name").unwrap().as_str().unwrap(),
         "compat-smoke.txt"
     );
-    assert_eq!(
-        arr[0].get("path").unwrap().as_str().unwrap(),
-        text_path_str
-    );
+    assert_eq!(arr[0].get("path").unwrap().as_str().unwrap(), text_path_str);
     assert_eq!(arr[0].get("type").unwrap().as_str().unwrap(), "file");
 
     // GET after POST

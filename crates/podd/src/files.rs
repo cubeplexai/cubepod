@@ -18,7 +18,9 @@ use crate::DaemonConfig;
 pub fn resolve_file_ownership(query_params: &HashMap<String, String>) -> (u32, u32) {
     let req_uid = query_params.get("uid").and_then(|u| u.parse::<u32>().ok());
     let req_gid = query_params.get("gid").and_then(|g| g.parse::<u32>().ok());
-    let user_name = query_params.get("username").or_else(|| query_params.get("user"));
+    let user_name = query_params
+        .get("username")
+        .or_else(|| query_params.get("user"));
     match (req_uid, req_gid) {
         (Some(u), Some(g)) => (u, g),
         (Some(u), None) => {
@@ -281,7 +283,7 @@ pub fn parse_multipart_body(body: &[u8], boundary: &str) -> Result<Vec<Multipart
         let mut content_end = next_delim_pos;
         if content_end >= content_start + 2 && &body[content_end - 2..content_end] == b"\r\n" {
             content_end -= 2;
-        } else if content_end >= content_start + 1 && body[content_end - 1] == b'\n' {
+        } else if content_end > content_start && body[content_end - 1] == b'\n' {
             content_end -= 1;
         }
 
@@ -316,18 +318,19 @@ pub fn resolve_file_path(
     let clean_filename = part_filename.map(|s| s.trim()).filter(|s| !s.is_empty());
     let clean_query = query_path.map(|s| s.trim()).filter(|s| !s.is_empty());
 
-    if is_single_part && clean_query.is_some() {
-        let qp = clean_query.unwrap();
-        if qp.ends_with('/') {
-            if let Some(fn_str) = clean_filename {
-                let base = Path::new(fn_str)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(fn_str);
-                return Ok(format!("{}{}", qp, base));
+    if is_single_part {
+        if let Some(qp) = clean_query {
+            if qp.ends_with('/') {
+                if let Some(fn_str) = clean_filename {
+                    let base = Path::new(fn_str)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(fn_str);
+                    return Ok(format!("{}{}", qp, base));
+                }
             }
+            return Ok(qp.to_string());
         }
-        return Ok(qp.to_string());
     }
 
     if let Some(fn_str) = clean_filename {
