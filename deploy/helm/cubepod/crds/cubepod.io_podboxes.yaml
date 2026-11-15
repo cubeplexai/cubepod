@@ -35,6 +35,17 @@ spec:
                   type: string
                 volumeKey:
                   type: string
+                e2bVolumeMounts:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      volumeID:
+                        type: string
+                      pvcName:
+                        type: string
+                      path:
+                        type: string
                 desiredState:
                   type: string
                   enum:
