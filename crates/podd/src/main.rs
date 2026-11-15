@@ -56,8 +56,8 @@ pub use startcmd::{
     TemplateUserCredentials, TrackedChild,
 };
 pub use watch::{
-    handle_create_watcher, handle_get_watcher_events, handle_make_dir, handle_remove_watcher,
-    handle_watch_dir,
+    handle_create_watcher, handle_get_watcher_events, handle_list_dir, handle_make_dir,
+    handle_remove, handle_remove_watcher, handle_stat, handle_watch_dir,
 };
 
 #[derive(Clone, Debug)]
@@ -153,6 +153,15 @@ pub fn route_request_with_quiesce(
         }
         ("POST", "/filesystem.Filesystem/MakeDir") => {
             handle_make_dir(&mut stream, &req, config);
+        }
+        ("POST", "/filesystem.Filesystem/ListDir") | ("POST", "/filesystem.Filesystem/List") => {
+            handle_list_dir(&mut stream, &req, config);
+        }
+        ("POST", "/filesystem.Filesystem/Stat") => {
+            handle_stat(&mut stream, &req, config);
+        }
+        ("POST", "/filesystem.Filesystem/Remove") => {
+            handle_remove(&mut stream, &req, config);
         }
         ("POST", "/filesystem.Filesystem/CreateWatcher") => {
             handle_create_watcher(&mut stream, &req, config, registry);

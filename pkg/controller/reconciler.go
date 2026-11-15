@@ -1625,14 +1625,15 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 	if status.PodName != "" {
 		_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
 	}
-	if deleteVolumes {
+	spec, hasSpec := r.specs[name]
+	if deleteVolumes || !hasSpec || spec.VolumeKey == "" {
 		if status.RootfsPVCName != "" {
 			_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.RootfsPVCName)
 		}
 		if status.WorkspacePVCName != "" {
 			_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.WorkspacePVCName)
 		}
-	} else if spec, ok := r.specs[name]; ok && spec.VolumeKey != "" {
+	} else {
 		// Reclaim ephemeral rootfs PVC while retaining the deterministic volumeKey workspace PVC.
 		if status.RootfsPVCName != "" {
 			_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.RootfsPVCName)
