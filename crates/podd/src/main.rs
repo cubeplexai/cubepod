@@ -32,8 +32,8 @@ pub use commands::{
 };
 pub use files::{
     apply_permissions_and_ownership, chown_if_root, decompress_if_gzip, handle_archive_sync,
-    handle_file_delete, handle_file_get, handle_file_list, handle_file_put, handle_prepare_stop,
-    is_invalid_tar_path, parse_octal, parse_tar, parse_tar_string, TarEntry,
+    handle_file_delete, handle_file_get, handle_file_list, handle_file_post, handle_file_put,
+    handle_prepare_stop, is_invalid_tar_path, parse_octal, parse_tar, parse_tar_string, TarEntry,
 };
 pub use http::{find_subsequence, read_http_request, write_json, write_response, HttpRequest};
 pub use interpreter::{
@@ -126,13 +126,16 @@ pub fn route_request_with_quiesce(
         ("POST", "/process.Process/SendSignal") => {
             handle_connectrpc_send_signal(&mut stream, &req, registry);
         }
-        ("PUT", "/v1/files") => {
+        ("PUT", "/v1/files") | ("PUT", "/files") => {
             handle_file_put(&mut stream, &req, &query_params);
         }
-        ("GET", "/v1/files") => {
+        ("POST", "/v1/files") | ("POST", "/files") => {
+            handle_file_post(&mut stream, &req, &query_params, config);
+        }
+        ("GET", "/v1/files") | ("GET", "/files") => {
             handle_file_get(&mut stream, &query_params);
         }
-        ("DELETE", "/v1/files") => {
+        ("DELETE", "/v1/files") | ("DELETE", "/files") => {
             handle_file_delete(&mut stream, &query_params);
         }
         ("POST", "/v1/files/archive-sync") => {

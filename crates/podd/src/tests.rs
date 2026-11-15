@@ -383,6 +383,315 @@ fn test_file_endpoints() {
 }
 
 #[test]
+fn test_file_post_endpoints() {
+    let dir = std::env::temp_dir().join(format!("podd-files-post-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let (addr, _) = start_test_server(&dir.to_string_lossy());
+
+    // 1. POST /v1/files multipart text
+    let text_path = dir.join("compat-smoke.txt");
+    let text_path_str = text_path.to_string_lossy().to_string();
+    let boundary = "---------------------------974767299852498929531610575";
+    let multipart_body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{text_path_str}\"\r\n\r\nhello-from-compat-smoke\r\n--{boundary}--\r\n"
+    );
+    let (status, _, resp) = post_raw(
+        &addr,
+        &format!("/v1/files?path={text_path_str}"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        multipart_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let json = JsonValue::parse(std::str::from_utf8(&resp).unwrap()).unwrap();
+    let arr = match json {
+        JsonValue::Array(a) => a,
+        _ => panic!("expected array response"),
+    };
+    assert_eq!(arr.len(), 1);
+    assert_eq!(
+        arr[0].get("name").unwrap().as_str().unwrap(),
+        "compat-smoke.txt"
+    );
+    assert_eq!(arr[0].get("path").unwrap().as_str().unwrap(), text_path_str);
+    assert_eq!(arr[0].get("type").unwrap().as_str().unwrap(), "file");
+
+    // GET after POST
+    let (get_status, _, get_body) = get(&addr, &format!("/v1/files?path={text_path_str}"));
+    assert_eq!(get_status, 200);
+    assert_eq!(get_body, b"hello-from-compat-smoke");
+
+    // 2. POST /v1/files octet-stream
+    let octet_path = dir.join("octet-file.txt");
+    let octet_path_str = octet_path.to_string_lossy().to_string();
+    let (status, _, resp) = post_raw(
+        &addr,
+        &format!("/v1/files?path={octet_path_str}"),
+        "application/octet-stream",
+        b"streamed octet content",
+    );
+    assert_eq!(status, 200);
+    let json = JsonValue::parse(std::str::from_utf8(&resp).unwrap()).unwrap();
+    let arr = match json {
+        JsonValue::Array(a) => a,
+        _ => panic!("expected array response"),
+    };
+    assert_eq!(
+        arr[0].get("name").unwrap().as_str().unwrap(),
+        "octet-file.txt"
+    );
+    assert_eq!(
+        arr[0].get("path").unwrap().as_str().unwrap(),
+        octet_path_str
+    );
+    assert_eq!(arr[0].get("type").unwrap().as_str().unwrap(), "file");
+
+    // GET after octet-stream
+    let (get_status, _, get_body) = get(&addr, &format!("/v1/files?path={octet_path_str}"));
+    assert_eq!(get_status, 200);
+    assert_eq!(get_body, b"streamed octet content");
+
+    // 3. Overwrite existing file
+    let (status, _, _) = post_raw(
+        &addr,
+        &format!("/v1/files?path={octet_path_str}"),
+        "application/octet-stream",
+        b"updated-content-overwritten",
+    );
+    assert_eq!(status, 200);
+    let (get_status, _, get_body) = get(&addr, &format!("/v1/files?path={octet_path_str}"));
+    assert_eq!(get_status, 200);
+    assert_eq!(get_body, b"updated-content-overwritten");
+
+    // 4. Nested path creation
+    let nested_path = dir.join("subdir/level2/deep.txt");
+    let nested_path_str = nested_path.to_string_lossy().to_string();
+    let (status, _, _resp) = post_raw(
+        &addr,
+        &format!("/v1/files?path={nested_path_str}"),
+        "application/octet-stream",
+        b"deep-nested-content",
+    );
+    assert_eq!(status, 200);
+    assert!(nested_path.exists());
+    let (get_status, _, get_body) = get(&addr, &format!("/v1/files?path={nested_path_str}"));
+    assert_eq!(get_status, 200);
+    assert_eq!(get_body, b"deep-nested-content");
+
+    // 5. Binary data
+    let bin_path = dir.join("binary.dat");
+    let bin_path_str = bin_path.to_string_lossy().to_string();
+    let binary_data = vec![0x00, 0xff, 0xfe, 0x01, 0x42, 0x00, 0x10, 0x7f, 0x80];
+    let (status, _, _resp) = post_raw(
+        &addr,
+        &format!("/v1/files?path={bin_path_str}"),
+        "application/octet-stream",
+        &binary_data,
+    );
+    assert_eq!(status, 200);
+    let (get_status, _, get_body) = get(&addr, &format!("/v1/files?path={bin_path_str}"));
+    assert_eq!(get_status, 200);
+    assert_eq!(get_body, binary_data);
+
+    // 6. Multipart with multiple files
+    let multi1 = dir.join("multi1.txt");
+    let multi2 = dir.join("multi2.txt");
+    let multi1_str = multi1.to_string_lossy().to_string();
+    let multi2_str = multi2.to_string_lossy().to_string();
+    let multi_body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{multi1_str}\"\r\n\r\nfirst multi file\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{multi2_str}\"\r\n\r\nsecond multi file\r\n--{boundary}--\r\n"
+    );
+    let (status, _, resp) = post_raw(
+        &addr,
+        "/v1/files",
+        &format!("multipart/form-data; boundary={boundary}"),
+        multi_body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let json = JsonValue::parse(std::str::from_utf8(&resp).unwrap()).unwrap();
+    let arr = match json {
+        JsonValue::Array(a) => a,
+        _ => panic!("expected array response"),
+    };
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0].get("name").unwrap().as_str().unwrap(), "multi1.txt");
+    assert_eq!(arr[0].get("path").unwrap().as_str().unwrap(), multi1_str);
+    assert_eq!(arr[1].get("name").unwrap().as_str().unwrap(), "multi2.txt");
+    assert_eq!(arr[1].get("path").unwrap().as_str().unwrap(), multi2_str);
+
+    let (get_status, _, get_body) = get(&addr, &format!("/v1/files?path={multi1_str}"));
+    assert_eq!(get_status, 200);
+    assert_eq!(get_body, b"first multi file");
+
+    let (get_status, _, get_body) = get(&addr, &format!("/v1/files?path={multi2_str}"));
+    assert_eq!(get_status, 200);
+    assert_eq!(get_body, b"second multi file");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn gzip_bytes(payload: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("gzip")
+        .arg("-c")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn gzip -c");
+    child.stdin.take().unwrap().write_all(payload).unwrap();
+    let out = child.wait_with_output().expect("gzip -c output");
+    assert!(out.status.success());
+    out.stdout
+}
+
+#[test]
+fn test_file_post_preserves_undeclared_gzip_bytes() {
+    let dir = std::env::temp_dir().join(format!("podd-files-post-gz-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (addr, _) = start_test_server(&dir.to_string_lossy());
+    let gz = gzip_bytes(b"inner-archive-content");
+    let boundary = "gzboundary1234";
+
+    // Octet-stream upload of a real .gz file without Content-Encoding.
+    let raw_path = dir.join("raw.tar.gz").to_string_lossy().to_string();
+    let (status, _, _) = post_raw(
+        &addr,
+        &format!("/files?path={raw_path}"),
+        "application/octet-stream",
+        &gz,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(std::fs::read(&raw_path).unwrap(), gz);
+
+    // Multipart upload of a real .gz file without a part Content-Encoding.
+    let mp_path = dir.join("mp.tar.gz").to_string_lossy().to_string();
+    let mut body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{mp_path}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+    )
+    .into_bytes();
+    body.extend_from_slice(&gz);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let (status, _, _) = post_raw(
+        &addr,
+        &format!("/files?path={mp_path}"),
+        &format!("multipart/form-data; boundary={boundary}"),
+        &body,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(std::fs::read(&mp_path).unwrap(), gz);
+
+    // Explicit Content-Encoding: gzip is still inflated.
+    let enc_path = dir.join("declared.txt").to_string_lossy().to_string();
+    let (status, _, _) = http_request(
+        &addr,
+        "POST",
+        &format!("/files?path={enc_path}"),
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Encoding", "gzip"),
+        ],
+        &gz,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(std::fs::read(&enc_path).unwrap(), b"inner-archive-content");
+
+    // Declared gzip that is not gzip data is rejected, not written verbatim.
+    let bad_path = dir.join("bad.txt").to_string_lossy().to_string();
+    let (status, _, _) = http_request(
+        &addr,
+        "POST",
+        &format!("/files?path={bad_path}"),
+        &[
+            ("Content-Type", "application/octet-stream"),
+            ("Content-Encoding", "gzip"),
+        ],
+        b"plain text",
+    );
+    assert_eq!(status, 400);
+    assert!(!std::path::Path::new(&bad_path).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_file_post_relative_paths_resolve_under_workdir() {
+    let dir = std::env::temp_dir().join(format!("podd-files-post-rel-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let workdir = dir.to_string_lossy().to_string();
+    let (addr, _) = start_test_server(&workdir);
+    let boundary = "relboundary5678";
+
+    // Single-part multipart: relative nested query path with matching filename.
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"sub/a.txt\"\r\n\r\nrel-multipart\r\n--{boundary}--\r\n"
+    );
+    let (status, _, resp) = post_raw(
+        &addr,
+        "/files?path=sub/a.txt",
+        &format!("multipart/form-data; boundary={boundary}"),
+        body.as_bytes(),
+    );
+    assert_eq!(status, 200);
+    let expected = format!("{workdir}/sub/a.txt");
+    assert_eq!(std::fs::read(&expected).unwrap(), b"rel-multipart");
+    let json = JsonValue::parse(std::str::from_utf8(&resp).unwrap()).unwrap();
+    let arr = match json {
+        JsonValue::Array(a) => a,
+        _ => panic!("expected array response"),
+    };
+    assert_eq!(arr[0].get("path").unwrap().as_str().unwrap(), expected);
+
+    // Octet-stream: relative query path.
+    let (status, _, _) = post_raw(
+        &addr,
+        "/files?path=sub/b.bin",
+        "application/octet-stream",
+        b"rel-octet",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        std::fs::read(format!("{workdir}/sub/b.bin")).unwrap(),
+        b"rel-octet"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_resolve_file_path_semantics() {
+    use crate::files::resolve_file_path;
+    let wd = "/workspace";
+    // Single file: query path wins, relative resolved against workdir.
+    assert_eq!(
+        resolve_file_path(Some("dir/a.txt"), Some("dir/a.txt"), true, wd).unwrap(),
+        "/workspace/dir/a.txt"
+    );
+    assert_eq!(
+        resolve_file_path(Some("other.txt"), Some("/tmp/x.txt"), true, wd).unwrap(),
+        "/tmp/x.txt"
+    );
+    // Trailing slash: query path is a directory.
+    assert_eq!(
+        resolve_file_path(Some("/a/b/c.txt"), Some("out/"), true, wd).unwrap(),
+        "/workspace/out/c.txt"
+    );
+    // Multiple files: filename is the target.
+    assert_eq!(
+        resolve_file_path(Some("/abs/f.txt"), None, false, wd).unwrap(),
+        "/abs/f.txt"
+    );
+    assert_eq!(
+        resolve_file_path(Some("f.txt"), None, false, wd).unwrap(),
+        "/workspace/f.txt"
+    );
+    assert_eq!(
+        resolve_file_path(Some("f.txt"), Some("d"), false, wd).unwrap(),
+        "/workspace/d/f.txt"
+    );
+    assert!(resolve_file_path(None, None, true, wd).is_err());
+}
+
+#[test]
 fn test_404_routing() {
     let (addr, _) = start_test_server("/tmp");
     let (status, _, _) = get(&addr, "/invalid/route");
@@ -1153,6 +1462,67 @@ fn test_connectrpc_start_stderr_separation() {
 
     assert!(saw_stdout, "expected stdout 'out line'");
     assert!(saw_stderr, "expected stderr 'err line'");
+}
+
+#[test]
+fn test_connectrpc_start_nonzero_exit_code_and_no_duplicate_field() {
+    let (addr, _) = start_test_server("/tmp");
+
+    let payload = r#"{"process":{"cmd":"sh -c 'echo err 1>&2; exit 7'"}}"#;
+    let (status, _, body) = http_request(
+        &addr,
+        "POST",
+        "/process.Process/Start",
+        &[("Content-Type", "application/json")],
+        payload.as_bytes(),
+    );
+    assert_eq!(status, 200);
+
+    let frames = parse_connect_frames(&body);
+    assert!(
+        frames.len() >= 3,
+        "expected at least 3 frames, got {}",
+        frames.len()
+    );
+
+    // Check data frame for stderr
+    let data_json: JsonValue =
+        JsonValue::parse(std::str::from_utf8(&frames[1].1).unwrap()).unwrap();
+    let b64_stderr = data_json
+        .get("event")
+        .unwrap()
+        .get("data")
+        .unwrap()
+        .get("stderr")
+        .unwrap()
+        .as_str()
+        .unwrap();
+    let stderr_bytes = base64_decode(b64_stderr);
+    let stderr_str = String::from_utf8_lossy(&stderr_bytes);
+    assert_eq!(stderr_str, "err\n");
+
+    // Frame len - 2: End Event with exitCode 7
+    let end_frame = &frames[frames.len() - 2];
+    assert_eq!(end_frame.0, 0);
+    let end_raw_str = std::str::from_utf8(&end_frame.1).unwrap();
+    let end_json: JsonValue = JsonValue::parse(end_raw_str).unwrap();
+
+    let end_obj = end_json.get("event").unwrap().get("end").unwrap();
+    let exit_code = end_obj.get("exitCode").unwrap().as_i64().unwrap();
+    assert_eq!(exit_code, 7);
+    assert_eq!(end_obj.get("exited").unwrap().as_bool(), Some(true));
+    assert!(
+        end_obj.get("exit_code").is_none(),
+        "duplicate exit_code field must not be present in ConnectRPC end frame"
+    );
+    assert!(
+        !end_raw_str.contains("\"exit_code\""),
+        "raw JSON must not contain exit_code: {end_raw_str}"
+    );
+
+    // Final Frame: EOS flag = 2
+    let eos_frame = frames.last().unwrap();
+    assert_eq!(eos_frame.0, 2);
 }
 
 #[test]

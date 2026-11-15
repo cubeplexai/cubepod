@@ -8,14 +8,19 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::commands::ProcessRegistry;
-use crate::http::{write_json, write_response, HttpRequest};
-use crate::json::escape_json;
-use crate::startcmd::{lookup_passwd_by_uid, resolve_default_credentials, spawn_tracked};
+use crate::http::{find_subsequence, write_json, write_response, HttpRequest};
+use crate::json::{escape_json, JsonValue};
+use crate::startcmd::{
+    lookup_passwd_by_name, lookup_passwd_by_uid, resolve_default_credentials, spawn_tracked,
+};
 use crate::DaemonConfig;
 
 pub fn resolve_file_ownership(query_params: &HashMap<String, String>) -> (u32, u32) {
     let req_uid = query_params.get("uid").and_then(|u| u.parse::<u32>().ok());
     let req_gid = query_params.get("gid").and_then(|g| g.parse::<u32>().ok());
+    let user_name = query_params
+        .get("username")
+        .or_else(|| query_params.get("user"));
     match (req_uid, req_gid) {
         (Some(u), Some(g)) => (u, g),
         (Some(u), None) => {
@@ -27,6 +32,20 @@ pub fn resolve_file_ownership(query_params: &HashMap<String, String>) -> (u32, u
             (u, g)
         }
         (None, req_gid_opt) => {
+            if let Some(uname) = user_name {
+                if let Ok(u) = uname.parse::<u32>() {
+                    let g = req_gid_opt.unwrap_or_else(|| {
+                        lookup_passwd_by_uid(u)
+                            .ok()
+                            .flatten()
+                            .map(|p| p.gid)
+                            .unwrap_or(u)
+                    });
+                    return (u, g);
+                } else if let Ok(Some(entry)) = lookup_passwd_by_name(uname) {
+                    return (entry.uid, req_gid_opt.unwrap_or(entry.gid));
+                }
+            }
             let (def_uid, def_gid) = resolve_default_credentials()
                 .ok()
                 .flatten()
@@ -102,6 +121,484 @@ pub fn handle_file_put(
         req.body.len()
     );
     write_json(stream, "200 OK", &resp);
+}
+
+pub fn extract_multipart_boundary(content_type: &str) -> Option<String> {
+    for part in content_type.split(';') {
+        let trimmed = part.trim();
+        if let Some(eq_idx) = trimmed.find('=') {
+            let key = trimmed[..eq_idx].trim();
+            if key.eq_ignore_ascii_case("boundary") {
+                let val = trimmed[eq_idx + 1..].trim().trim_matches('"');
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn split_header_params(s: &str) -> Vec<(String, String)> {
+    let mut result = Vec::new();
+    let mut in_quotes = false;
+    let mut cur_token = String::new();
+
+    for ch in s.chars() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            cur_token.push(ch);
+        } else if ch == ';' && !in_quotes {
+            if let Some((k, v)) = cur_token.split_once('=') {
+                let key = k.trim().to_string();
+                let val = v.trim().trim_matches('"').to_string();
+                result.push((key, val));
+            }
+            cur_token.clear();
+        } else {
+            cur_token.push(ch);
+        }
+    }
+
+    if let Some((k, v)) = cur_token.split_once('=') {
+        let key = k.trim().to_string();
+        let val = v.trim().trim_matches('"').to_string();
+        result.push((key, val));
+    }
+
+    result
+}
+
+pub fn parse_content_disposition(header_str: &str) -> (Option<String>, Option<String>) {
+    let mut part_name = None;
+    let mut part_filename = None;
+
+    for line in header_str.lines() {
+        let trimmed = line.trim();
+        if let Some((k, v)) = trimmed.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-disposition") {
+                let params = split_header_params(v);
+                for (param_key, param_val) in params {
+                    if param_key.eq_ignore_ascii_case("name") {
+                        part_name = Some(param_val);
+                    } else if param_key.eq_ignore_ascii_case("filename")
+                        || param_key.eq_ignore_ascii_case("filename*")
+                    {
+                        let clean = if let Some(stripped) = param_val.strip_prefix("UTF-8''") {
+                            stripped.to_string()
+                        } else {
+                            param_val
+                        };
+                        part_filename = Some(clean);
+                    }
+                }
+            }
+        }
+    }
+
+    (part_name, part_filename)
+}
+
+/// Returns true only when the multipart part explicitly declares
+/// `Content-Encoding: gzip`. Payload bytes are never sniffed: a user uploading
+/// a real `.gz` file must get those exact bytes written to disk.
+fn is_part_gzip(header_str: &str) -> bool {
+    header_str.lines().any(|line| {
+        line.trim().split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("content-encoding")
+                && v.to_ascii_lowercase().contains("gzip")
+        })
+    })
+}
+
+/// Decompresses a payload whose sender declared `Content-Encoding: gzip`.
+/// Unlike [`decompress_if_gzip`], a payload that is not actually gzip is an
+/// error rather than being passed through unchanged.
+pub fn gunzip_declared(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
+        return Err("Content-Encoding is gzip but payload is not gzip data".to_string());
+    }
+    decompress_if_gzip(data)
+}
+
+/// Resolves a possibly-relative upload path against the daemon workdir so the
+/// destination never depends on podd's own process working directory.
+fn absolutize_upload_path(p: &str, workdir: &str) -> String {
+    if p.starts_with('/') {
+        p.to_string()
+    } else {
+        format!("{}/{}", workdir.trim_end_matches('/'), p)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MultipartPart {
+    pub name: Option<String>,
+    pub filename: Option<String>,
+    pub data: Vec<u8>,
+}
+
+pub fn parse_multipart_body(body: &[u8], boundary: &str) -> Result<Vec<MultipartPart>, String> {
+    let delim = format!("--{boundary}").into_bytes();
+    let first_pos = match find_subsequence(body, &delim) {
+        Some(p) => p,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut cur = first_pos + delim.len();
+    let mut parts = Vec::new();
+
+    while cur < body.len() {
+        if body[cur..].starts_with(b"--") {
+            break;
+        }
+
+        if body[cur..].starts_with(b"\r\n") {
+            cur += 2;
+        } else if body[cur..].starts_with(b"\n") {
+            cur += 1;
+        } else {
+            let mut ws = 0;
+            while cur + ws < body.len() && (body[cur + ws] == b' ' || body[cur + ws] == b'\t') {
+                ws += 1;
+            }
+            if cur + ws < body.len() && body[cur + ws..].starts_with(b"\r\n") {
+                cur += ws + 2;
+            } else if cur + ws < body.len() && body[cur + ws..].starts_with(b"\n") {
+                cur += ws + 1;
+            } else {
+                break;
+            }
+        }
+
+        if cur >= body.len() {
+            break;
+        }
+
+        let crlf = find_subsequence(&body[cur..], b"\r\n\r\n").map(|p| (p, 4));
+        let lf = find_subsequence(&body[cur..], b"\n\n").map(|p| (p, 2));
+        let (header_len, sep_len) = match (crlf, lf) {
+            (Some((p1, l1)), Some((p2, l2))) => {
+                if p1 <= p2 {
+                    (p1, l1)
+                } else {
+                    (p2, l2)
+                }
+            }
+            (Some(p), None) => p,
+            (None, Some(p)) => p,
+            (None, None) => break,
+        };
+
+        let header_bytes = &body[cur..cur + header_len];
+        let content_start = cur + header_len + sep_len;
+
+        let next_rel = match find_subsequence(&body[content_start..], &delim) {
+            Some(p) => p,
+            None => break,
+        };
+
+        let next_delim_pos = content_start + next_rel;
+        let mut content_end = next_delim_pos;
+        if content_end >= content_start + 2 && &body[content_end - 2..content_end] == b"\r\n" {
+            content_end -= 2;
+        } else if content_end > content_start && body[content_end - 1] == b'\n' {
+            content_end -= 1;
+        }
+
+        let raw_part_data = &body[content_start..content_end];
+        let header_str = String::from_utf8_lossy(header_bytes);
+        let (name, filename) = parse_content_disposition(&header_str);
+
+        let data = if is_part_gzip(&header_str) {
+            gunzip_declared(raw_part_data)?
+        } else {
+            raw_part_data.to_vec()
+        };
+
+        parts.push(MultipartPart {
+            name,
+            filename,
+            data,
+        });
+
+        cur = next_delim_pos + delim.len();
+    }
+
+    Ok(parts)
+}
+
+pub fn resolve_file_path(
+    part_filename: Option<&str>,
+    query_path: Option<&str>,
+    is_single_part: bool,
+    workdir: &str,
+) -> Result<String, String> {
+    let clean_filename = part_filename.map(|s| s.trim()).filter(|s| !s.is_empty());
+    let clean_query = query_path.map(|s| s.trim()).filter(|s| !s.is_empty());
+
+    // Single file: the `path` query parameter is authoritative. A trailing `/`
+    // marks it as a directory, in which case the part filename's basename is
+    // appended.
+    if is_single_part {
+        if let Some(qp) = clean_query {
+            if qp.ends_with('/') {
+                if let Some(fn_str) = clean_filename {
+                    let base = Path::new(fn_str)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(fn_str);
+                    return Ok(absolutize_upload_path(&format!("{qp}{base}"), workdir));
+                }
+            }
+            return Ok(absolutize_upload_path(qp, workdir));
+        }
+    }
+
+    // Multiple files (or no query path): each part filename is the target,
+    // relative ones resolved under the query directory or the workdir.
+    if let Some(fn_str) = clean_filename {
+        if fn_str.starts_with('/') {
+            return Ok(fn_str.to_string());
+        }
+        let base_dir = absolutize_upload_path(clean_query.unwrap_or(workdir), workdir);
+        let trimmed = base_dir.trim_end_matches('/');
+        return Ok(format!("{trimmed}/{fn_str}"));
+    }
+
+    if let Some(qp) = clean_query {
+        return Ok(absolutize_upload_path(qp, workdir));
+    }
+
+    Err("missing path for file upload".to_string())
+}
+
+pub fn handle_file_post(
+    stream: &mut TcpStream,
+    req: &HttpRequest,
+    query_params: &HashMap<String, String>,
+    config: &DaemonConfig,
+) {
+    let content_type = req
+        .headers
+        .get("content-type")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+
+    let (uid, gid) = resolve_file_ownership(query_params);
+
+    let is_multipart = content_type
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("multipart/form-data");
+
+    if is_multipart {
+        let boundary = match extract_multipart_boundary(content_type) {
+            Some(b) => b,
+            None => {
+                write_json(
+                    stream,
+                    "400 Bad Request",
+                    r#"{"error":"missing_multipart_boundary"}"#,
+                );
+                return;
+            }
+        };
+
+        let parts = match parse_multipart_body(&req.body, &boundary) {
+            Ok(p) => p,
+            Err(e) => {
+                let resp = format!(
+                    r#"{{"error":"invalid_multipart_body","details":"{}"}}"#,
+                    escape_json(&e)
+                );
+                write_json(stream, "400 Bad Request", &resp);
+                return;
+            }
+        };
+
+        let file_parts: Vec<&MultipartPart> = parts
+            .iter()
+            .filter(|p| p.filename.is_some() || p.name.as_deref() == Some("file"))
+            .collect();
+
+        if file_parts.is_empty() {
+            write_json(stream, "400 Bad Request", r#"{"error":"no_files_found"}"#);
+            return;
+        }
+
+        let is_single = file_parts.len() == 1;
+        let query_path = query_params.get("path").map(|s| s.as_str());
+        let mut written_files = Vec::new();
+
+        for part in file_parts {
+            let target_path = match resolve_file_path(
+                part.filename.as_deref(),
+                query_path,
+                is_single,
+                &config.workdir,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    let resp = format!(
+                        r#"{{"error":"missing_file_path","details":"{}"}}"#,
+                        escape_json(&e)
+                    );
+                    write_json(stream, "400 Bad Request", &resp);
+                    return;
+                }
+            };
+
+            let path = Path::new(&target_path);
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        let resp = format!(
+                            r#"{{"error":"failed_to_create_parent_dir","details":"{}"}}"#,
+                            escape_json(&e.to_string())
+                        );
+                        write_json(stream, "500 Internal Server Error", &resp);
+                        return;
+                    }
+                }
+            }
+
+            if let Err(e) = std::fs::write(path, &part.data) {
+                let resp = format!(
+                    r#"{{"error":"failed_to_write_file","details":"{}"}}"#,
+                    escape_json(&e.to_string())
+                );
+                write_json(stream, "500 Internal Server Error", &resp);
+                return;
+            }
+
+            if let Some(mode_str) = query_params.get("mode") {
+                let clean = mode_str.trim_start_matches("0o").trim_start_matches('0');
+                let mode_val = u32::from_str_radix(clean, 8)
+                    .or_else(|_| mode_str.parse())
+                    .unwrap_or(0o644);
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode_val));
+            }
+
+            chown_if_root(path, uid, gid);
+
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(target_path.as_str());
+            written_files.push((name.to_string(), target_path));
+        }
+
+        let mut json_items = Vec::new();
+        for (name, fpath) in written_files {
+            json_items.push(format!(
+                r#"{{"name":"{}","path":"{}","type":"file"}}"#,
+                escape_json(&name),
+                escape_json(&fpath)
+            ));
+        }
+        let resp = format!("[{}]", json_items.join(","));
+        write_json(stream, "200 OK", &resp);
+    } else {
+        // Octet-stream or raw/JSON body upload
+        let mut target_path = query_params.get("path").cloned();
+        let mut final_data: Option<Vec<u8>> = None;
+
+        if target_path.is_none() && !req.body.is_empty() && req.body[0] == b'{' {
+            if let Ok(json_str) = std::str::from_utf8(&req.body) {
+                if let Ok(val) = JsonValue::parse(json_str) {
+                    if let Some(p) = val.get("path").and_then(|v| v.as_str()) {
+                        target_path = Some(p.to_string());
+                        if let Some(c) = val.get("content").and_then(|v| v.as_str()) {
+                            final_data = Some(c.as_bytes().to_vec());
+                        }
+                    }
+                }
+            }
+        }
+
+        let raw_path = match target_path {
+            Some(p) if !p.trim().is_empty() => absolutize_upload_path(p.trim(), &config.workdir),
+            _ => {
+                write_json(
+                    stream,
+                    "400 Bad Request",
+                    r#"{"error":"missing_path_parameter"}"#,
+                );
+                return;
+            }
+        };
+
+        // Only honor an explicit Content-Encoding header; never sniff magic
+        // bytes, or uploads of genuine .gz files would be silently inflated.
+        let is_gzip = req
+            .headers
+            .get("content-encoding")
+            .map(|v| v.to_ascii_lowercase().contains("gzip"))
+            .unwrap_or(false);
+
+        let data = if let Some(fd) = final_data {
+            fd
+        } else if is_gzip {
+            match gunzip_declared(&req.body) {
+                Ok(decompressed) => decompressed,
+                Err(e) => {
+                    let resp = format!(
+                        r#"{{"error":"gzip_decompression_error","details":"{}"}}"#,
+                        escape_json(&e)
+                    );
+                    write_json(stream, "400 Bad Request", &resp);
+                    return;
+                }
+            }
+        } else {
+            req.body.clone()
+        };
+
+        let path = Path::new(&raw_path);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    let resp = format!(
+                        r#"{{"error":"failed_to_create_parent_dir","details":"{}"}}"#,
+                        escape_json(&e.to_string())
+                    );
+                    write_json(stream, "500 Internal Server Error", &resp);
+                    return;
+                }
+            }
+        }
+
+        if let Err(e) = std::fs::write(path, &data) {
+            let resp = format!(
+                r#"{{"error":"failed_to_write_file","details":"{}"}}"#,
+                escape_json(&e.to_string())
+            );
+            write_json(stream, "500 Internal Server Error", &resp);
+            return;
+        }
+
+        if let Some(mode_str) = query_params.get("mode") {
+            let clean = mode_str.trim_start_matches("0o").trim_start_matches('0');
+            let mode_val = u32::from_str_radix(clean, 8)
+                .or_else(|_| mode_str.parse())
+                .unwrap_or(0o644);
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode_val));
+        }
+
+        chown_if_root(path, uid, gid);
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(raw_path.as_str());
+        let resp = format!(
+            r#"[{{"name":"{}","path":"{}","type":"file"}}]"#,
+            escape_json(name),
+            escape_json(&raw_path)
+        );
+        write_json(stream, "200 OK", &resp);
+    }
 }
 
 pub fn handle_file_get(stream: &mut TcpStream, query_params: &HashMap<String, String>) {
