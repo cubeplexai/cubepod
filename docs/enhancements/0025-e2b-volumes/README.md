@@ -45,7 +45,7 @@
 
 CEP-0025 adds support for the official E2B 2.64.0 Volume API (`POST/GET /volumes`, `GET/DELETE /volumes/{volumeID}`), the authenticated Volume Content API (`/volumecontent/{volumeID}/file|dir|path`), and sandbox creation `volumeMounts` attachment in `cubepod-gateway` and `pkg/runtime`. Volumes are stored in a durable gateway-local directory (`pkg/volume`) isolated per API-key tenant and mounted into Docker sandboxes at creation time.
 
-In **Alpha**, `volumeMounts` is active on the **Local Development (`Docker`)** runtime and explicitly **gated off (`501 Not Implemented`) on live Kubernetes (`Kata + CSI`)** until a shared-storage backend bridges the gateway content API and Kata microVM pods across `pivot_root`.
+In **Alpha**, `volumeMounts` is active on the **Local Development (`Docker`)** runtime and explicitly **gated off (`501 Not Implemented`) on live Kubernetes (`Kata + CSI`)** until a shared-storage backend bridges the gateway content API and Kata microVM pods across `pivot_root`. See **[CEP-0026](../0026-k8s-kata-e2b-volumes/README.md)** for the follow-up Kubernetes/Kata integration design.
 
 ---
 
