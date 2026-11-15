@@ -35,6 +35,25 @@ spec:
                   type: string
                 volumeKey:
                   type: string
+                e2bVolumeMounts:
+                  type: array
+                  maxItems: 32
+                  items:
+                    type: object
+                    required:
+                      - volumeID
+                      - pvcName
+                      - path
+                    properties:
+                      volumeID:
+                        type: string
+                        pattern: "^[a-f0-9]{32}$"
+                      pvcName:
+                        type: string
+                        pattern: "^e2bvol-[a-f0-9]{32}$"
+                      path:
+                        type: string
+                        pattern: "^/.+"
                 desiredState:
                   type: string
                   enum:

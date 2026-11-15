@@ -25,14 +25,24 @@ func LocalTemplateTag(slug, buildID string) string {
 	return fmt.Sprintf("cubepod-templates/%s:%s", slug, buildID)
 }
 
+// SandboxVolumeMount attaches an official E2B volume to a container path.
+// DockerVolume, when set, must start with cubepod-e2bvol- or cpod-test-.
+// Otherwise HostPath is bind-mounted. Invalid mounts are rejected.
+type SandboxVolumeMount struct {
+	HostPath      string `json:"hostPath,omitempty"`
+	ContainerPath string `json:"containerPath"`
+	DockerVolume  string `json:"dockerVolume,omitempty"`
+}
+
 // SandboxSpec describes the configuration and metadata for running a sandbox instance.
 type SandboxSpec struct {
-	SandboxID        string            `json:"sandboxID"`
-	TemplateID       string            `json:"templateID"`
-	VolumeKey        string            `json:"volumeKey,omitempty"`
-	RootfsGeneration int64             `json:"rootfsGeneration,omitempty"`
-	Image            string            `json:"image,omitempty"`
-	Env              map[string]string `json:"env,omitempty"`
+	SandboxID        string               `json:"sandboxID"`
+	TemplateID       string               `json:"templateID"`
+	VolumeKey        string               `json:"volumeKey,omitempty"`
+	RootfsGeneration int64                `json:"rootfsGeneration,omitempty"`
+	Image            string               `json:"image,omitempty"`
+	Env              map[string]string    `json:"env,omitempty"`
+	VolumeMounts     []SandboxVolumeMount `json:"volumeMounts,omitempty"`
 }
 
 // InstanceInfo represents the operational status and endpoints of a running/provisioned sandbox.

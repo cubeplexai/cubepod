@@ -8,18 +8,42 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
 
 // DockerConfig defines settings for the Docker-based MicroVM/container runtime.
 type DockerConfig struct {
 	BinDir           string        `json:"binDir"`           // Host path containing podd and podd-init, e.g. /opt/cubepod/bin
-	BaseDir          string        `json:"baseDir"`          // Host path for sandbox storage
+	BaseDir          string        `json:"baseDir"`          // Host path for sandbox storage, as seen by this process
+	HostBaseDir      string        `json:"hostBaseDir"`      // Docker daemon view of BaseDir when they differ
 	Network          string        `json:"network"`          // Docker network, e.g. "bridge"
 	EnableSparseExt4 bool          `json:"enableSparseExt4"` // Create and mount sparse ext4 images
 	SparseExt4Size   int64         `json:"sparseExt4Size"`
 	HealthTimeout    time.Duration `json:"healthTimeout"`
+	// DockerHost is DOCKER_HOST (tcp:// or unix://). When set, the Engine HTTP
+	// API is used so a gateway image without the docker CLI can still run.
+	DockerHost string `json:"dockerHost,omitempty"`
+	// DefaultImage is used when SandboxSpec.Image and TemplateID are empty.
+	DefaultImage string `json:"defaultImage,omitempty"`
+	// InjectPoddBin bind-mounts BinDir and starts podd-init. Nil means true so
+	// existing callers keep injection. Setting false is test-only (violates
+	// AGENTS.md Invariant 2 if used in production).
+	InjectPoddBin *bool `json:"injectPoddBin,omitempty"`
+	// BindSandboxStorage bind-mounts per-sandbox workspace and rootfs directories.
+	// Nil means true. Setting false is test-only (violates AGENTS.md Invariant 1
+	// if used in production).
+	BindSandboxStorage *bool `json:"bindSandboxStorage,omitempty"`
+	// MemoryBytes and NanoCPUs are optional container limits. Zero leaves them unset.
+	MemoryBytes int64 `json:"memoryBytes,omitempty"`
+	NanoCPUs    int64 `json:"nanoCPUs,omitempty"`
+	// ContainerNamePrefix defaults to "cubepod-". Compose may set
+	// "cubepod-compat-compose-sb-" so official tests can inspect the container.
+	ContainerNamePrefix string `json:"containerNamePrefix,omitempty"`
 }
 
 type dockerInstance struct {
@@ -32,11 +56,12 @@ type dockerInstance struct {
 
 // DockerBackend implements Backend using Docker containers with runtime binary injection.
 type DockerBackend struct {
-	cfg        DockerConfig
-	mu         sync.RWMutex
-	instances  map[string]*dockerInstance
-	runDocker  func(ctx context.Context, args []string) ([]byte, error)
-	httpClient *http.Client
+	cfg         DockerConfig
+	mu          sync.RWMutex
+	instances   map[string]*dockerInstance
+	runDocker   func(ctx context.Context, args []string) ([]byte, error)
+	httpClient  *http.Client
+	healthCheck func(ctx context.Context, poddURL string) error
 }
 
 func (d *DockerBackend) execDocker(ctx context.Context, args ...string) ([]byte, error) {
@@ -77,24 +102,125 @@ func (d *DockerBackend) getSandboxDir(sandboxID string) string {
 	return filepath.Join(d.cfg.BaseDir, sandboxID)
 }
 
-// BuildRunArgs generates the CLI arguments for "docker run" with binary injection and storage mounts.
-func (d *DockerBackend) BuildRunArgs(spec SandboxSpec) ([]string, error) {
-	if spec.SandboxID == "" {
-		return nil, errors.New("sandbox ID is required")
+func (d *DockerBackend) daemonSandboxDir(sandboxID string) string {
+	base := d.cfg.BaseDir
+	if d.cfg.HostBaseDir != "" {
+		base = d.cfg.HostBaseDir
 	}
+	return filepath.Join(base, sandboxID)
+}
 
-	sandboxDir := d.getSandboxDir(spec.SandboxID)
-	workspaceDir := filepath.Join(sandboxDir, "workspace")
-	rootfsDir := filepath.Join(sandboxDir, "rootfs")
+func (d *DockerBackend) injectBin() bool {
+	if d.cfg.InjectPoddBin == nil {
+		return true
+	}
+	return *d.cfg.InjectPoddBin
+}
+
+func (d *DockerBackend) bindSandboxStorage() bool {
+	if d.cfg.BindSandboxStorage == nil {
+		return true
+	}
+	return *d.cfg.BindSandboxStorage
+}
+
+func (d *DockerBackend) containerName(sandboxID string) string {
+	p := d.cfg.ContainerNamePrefix
+	if p == "" {
+		p = "cubepod-"
+	}
+	return p + sandboxID
+}
+
+func (d *DockerBackend) useEngineAPI() bool {
+	if d.runDocker != nil {
+		return false
+	}
+	if strings.TrimSpace(d.cfg.DockerHost) != "" {
+		return true
+	}
+	_, err := exec.LookPath("docker")
+	return err != nil
+}
+
+type dockerNamedMount struct {
+	Source string
+	Target string
+}
+
+type dockerRunPlan struct {
+	Name       string
+	Image      string
+	Env        []string
+	Binds      []string
+	Mounts     []dockerNamedMount
+	Entrypoint []string
+	Cmd        []string
+	Network    string
+}
+
+// BuildRunArgs generates the CLI arguments for "docker run" with binary injection and storage mounts.
+// A volume mount that is missing, relative, reserved, or an disallowed Docker volume name is an error.
+func (d *DockerBackend) BuildRunArgs(spec SandboxSpec) ([]string, error) {
+	plan, err := d.planRun(spec)
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"run", "-d", "--name", plan.Name}
+	if len(plan.Entrypoint) > 0 {
+		// Injection keeps the historical flag order: bin bind, then entrypoint.
+		if len(plan.Binds) > 0 && strings.Contains(plan.Binds[0], ":/opt/cubepod/bin:") {
+			args = append(args, "-v", plan.Binds[0], "--entrypoint", plan.Entrypoint[0])
+			for _, b := range plan.Binds[1:] {
+				args = append(args, "-v", b)
+			}
+		} else {
+			args = append(args, "--entrypoint", plan.Entrypoint[0])
+			for _, b := range plan.Binds {
+				args = append(args, "-v", b)
+			}
+		}
+	} else {
+		for _, b := range plan.Binds {
+			args = append(args, "-v", b)
+		}
+	}
+	for _, m := range plan.Mounts {
+		args = append(args, "-v", m.Source+":"+m.Target)
+	}
+	if plan.Network != "" {
+		args = append(args, "--network", plan.Network)
+	}
+	if d.cfg.MemoryBytes > 0 {
+		args = append(args, "--memory", strconv.FormatInt(d.cfg.MemoryBytes, 10))
+	}
+	if d.cfg.NanoCPUs > 0 {
+		args = append(args, "--cpus", strconv.FormatFloat(float64(d.cfg.NanoCPUs)/1e9, 'f', -1, 64))
+	}
+	for _, e := range plan.Env {
+		args = append(args, "-e", e)
+	}
+	args = append(args, plan.Image)
+	args = append(args, plan.Cmd...)
+	return args, nil
+}
+
+func (d *DockerBackend) planRun(spec SandboxSpec) (dockerRunPlan, error) {
+	if spec.SandboxID == "" {
+		return dockerRunPlan{}, errors.New("sandbox ID is required")
+	}
+	daemonDir := d.daemonSandboxDir(spec.SandboxID)
+	workspaceDir := filepath.Join(daemonDir, "workspace")
+	rootfsDir := filepath.Join(daemonDir, "rootfs")
 
 	binDir := d.cfg.BinDir
 	if binDir == "" {
 		binDir = "/opt/cubepod/bin"
 	}
-
-	containerName := fmt.Sprintf("cubepod-%s", spec.SandboxID)
-
 	image := spec.Image
+	if image == "" {
+		image = d.cfg.DefaultImage
+	}
 	if image == "" {
 		if spec.TemplateID != "" {
 			image = spec.TemplateID
@@ -103,41 +229,65 @@ func (d *DockerBackend) BuildRunArgs(spec SandboxSpec) ([]string, error) {
 		}
 	}
 
-	args := []string{
-		"run",
-		"-d",
-		"--name", containerName,
-		"-v", fmt.Sprintf("%s:/opt/cubepod/bin:ro", binDir),
-		"--entrypoint", "/opt/cubepod/bin/podd-init",
-		"-v", fmt.Sprintf("%s:/workspace", workspaceDir),
-		"-v", fmt.Sprintf("%s:/rootfs-upper", rootfsDir),
+	plan := dockerRunPlan{
+		Name:    d.containerName(spec.SandboxID),
+		Image:   image,
+		Network: d.cfg.Network,
+		Env: []string{
+			"CUBEPOD_ADDR=0.0.0.0:49983",
+			"CUBEPOD_WORKDIR=/workspace",
+		},
 	}
-
-	if d.cfg.EnableSparseExt4 {
-		rootfsExt4 := filepath.Join(sandboxDir, "rootfs.ext4")
-		workspaceExt4 := filepath.Join(sandboxDir, "workspace.ext4")
-		args = append(args,
-			"-v", fmt.Sprintf("%s:/opt/cubepod/disks/rootfs.ext4", rootfsExt4),
-			"-v", fmt.Sprintf("%s:/opt/cubepod/disks/workspace.ext4", workspaceExt4),
+	if d.injectBin() {
+		plan.Binds = append(plan.Binds, fmt.Sprintf("%s:/opt/cubepod/bin:ro", binDir))
+		plan.Entrypoint = []string{"/opt/cubepod/bin/podd-init"}
+		plan.Cmd = []string{"/opt/cubepod/bin/podd"}
+	}
+	if d.bindSandboxStorage() {
+		plan.Binds = append(plan.Binds,
+			fmt.Sprintf("%s:/workspace", workspaceDir),
+			fmt.Sprintf("%s:/rootfs-upper", rootfsDir),
 		)
+		if d.cfg.EnableSparseExt4 {
+			plan.Binds = append(plan.Binds,
+				fmt.Sprintf("%s:/opt/cubepod/disks/rootfs.ext4", filepath.Join(daemonDir, "rootfs.ext4")),
+				fmt.Sprintf("%s:/opt/cubepod/disks/workspace.ext4", filepath.Join(daemonDir, "workspace.ext4")),
+			)
+		}
 	}
-
-	if d.cfg.Network != "" {
-		args = append(args, "--network", d.cfg.Network)
+	for _, m := range spec.VolumeMounts {
+		path := filepath.Clean(m.ContainerPath)
+		if !v1alpha1.ValidE2BContainerPath(path) {
+			return dockerRunPlan{}, fmt.Errorf("invalid volume mount path %q", m.ContainerPath)
+		}
+		if m.DockerVolume != "" {
+			if !v1alpha1.AllowedDockerVolumeName(m.DockerVolume) {
+				return dockerRunPlan{}, fmt.Errorf("refusing docker volume %q", m.DockerVolume)
+			}
+			plan.Mounts = append(plan.Mounts, dockerNamedMount{Source: m.DockerVolume, Target: path})
+			continue
+		}
+		if m.HostPath == "" || !filepath.IsAbs(m.HostPath) || hasDotDotSegment(m.HostPath) {
+			return dockerRunPlan{}, fmt.Errorf("invalid volume host path for %s", path)
+		}
+		if filepath.Base(m.HostPath) != "data" {
+			return dockerRunPlan{}, fmt.Errorf("volume host path must be the data directory")
+		}
+		plan.Binds = append(plan.Binds, fmt.Sprintf("%s:%s", m.HostPath, path))
 	}
-
-	args = append(args,
-		"-e", "CUBEPOD_ADDR=0.0.0.0:49983",
-		"-e", "CUBEPOD_WORKDIR=/workspace",
-	)
-
 	for k, v := range spec.Env {
-		args = append(args, "-e", fmt.Sprintf("%s=%s", k, v))
+		plan.Env = append(plan.Env, fmt.Sprintf("%s=%s", k, v))
 	}
+	return plan, nil
+}
 
-	args = append(args, image, "/opt/cubepod/bin/podd")
-
-	return args, nil
+func hasDotDotSegment(p string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // EnsureRunning starts or resumes the Docker container for the sandbox.
@@ -153,14 +303,16 @@ func (d *DockerBackend) EnsureRunning(ctx context.Context, spec SandboxSpec) (*I
 	workspaceDir := filepath.Join(sandboxDir, "workspace")
 	rootfsDir := filepath.Join(sandboxDir, "rootfs")
 
-	if err := os.MkdirAll(workspaceDir, 0755); err != nil {
-		return nil, fmt.Errorf("create workspace dir: %w", err)
-	}
-	if err := os.MkdirAll(rootfsDir, 0755); err != nil {
-		return nil, fmt.Errorf("create rootfs dir: %w", err)
+	if d.bindSandboxStorage() {
+		if err := os.MkdirAll(workspaceDir, 0755); err != nil {
+			return nil, fmt.Errorf("create workspace dir: %w", err)
+		}
+		if err := os.MkdirAll(rootfsDir, 0755); err != nil {
+			return nil, fmt.Errorf("create rootfs dir: %w", err)
+		}
 	}
 
-	if d.cfg.EnableSparseExt4 {
+	if d.bindSandboxStorage() && d.cfg.EnableSparseExt4 {
 		rootfsExt4 := filepath.Join(sandboxDir, "rootfs.ext4")
 		workspaceExt4 := filepath.Join(sandboxDir, "workspace.ext4")
 		if _, err := os.Stat(rootfsExt4); os.IsNotExist(err) {
@@ -175,12 +327,16 @@ func (d *DockerBackend) EnsureRunning(ctx context.Context, spec SandboxSpec) (*I
 		}
 	}
 
-	containerName := fmt.Sprintf("cubepod-%s", spec.SandboxID)
+	containerName := d.containerName(spec.SandboxID)
 
 	inst, exists := d.instances[spec.SandboxID]
 	if exists && inst.running {
 		infoCopy := inst.info
 		return &infoCopy, nil
+	}
+
+	if d.useEngineAPI() {
+		return d.ensureRunningAPI(ctx, spec, sandboxDir, workspaceDir, rootfsDir)
 	}
 
 	args, err := d.BuildRunArgs(spec)
@@ -235,8 +391,12 @@ func (d *DockerBackend) Pause(ctx context.Context, sandboxID string) error {
 		}
 	}
 
-	containerName := fmt.Sprintf("cubepod-%s", sandboxID)
-	_, _ = d.execDocker(ctx, "stop", containerName)
+	containerName := d.containerName(sandboxID)
+	if d.useEngineAPI() {
+		_ = d.apiStop(ctx, containerName)
+	} else {
+		_, _ = d.execDocker(ctx, "stop", containerName)
+	}
 	inst.running = false
 
 	return nil
@@ -334,6 +494,7 @@ func (d *DockerBackend) Fork(ctx context.Context, sourceSandboxID, newSandboxID 
 		RootfsGeneration: sourceSpec.RootfsGeneration,
 		Image:            sourceSpec.Image,
 		Env:              env,
+		VolumeMounts:     append([]SandboxVolumeMount(nil), sourceSpec.VolumeMounts...),
 	}
 
 	return d.EnsureRunning(ctx, newSpec)
@@ -344,13 +505,21 @@ func (d *DockerBackend) Delete(ctx context.Context, sandboxID string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	containerName := d.containerName(sandboxID)
 	inst, ok := d.instances[sandboxID]
 	if !ok {
+		if d.useEngineAPI() {
+			_ = d.apiRemove(ctx, containerName)
+			return nil
+		}
 		return ErrSandboxNotFound
 	}
 
-	containerName := fmt.Sprintf("cubepod-%s", sandboxID)
-	_, _ = d.execDocker(ctx, "rm", "-f", containerName)
+	if d.useEngineAPI() {
+		_ = d.apiRemove(ctx, containerName)
+	} else {
+		_, _ = d.execDocker(ctx, "rm", "-f", containerName)
+	}
 	_ = os.RemoveAll(inst.sandboxDir)
 	delete(d.instances, sandboxID)
 
@@ -378,8 +547,12 @@ func (d *DockerBackend) Close() error {
 
 	for sandboxID, inst := range d.instances {
 		if inst.running {
-			containerName := fmt.Sprintf("cubepod-%s", sandboxID)
-			_, _ = d.execDocker(context.Background(), "stop", containerName)
+			containerName := d.containerName(sandboxID)
+			if d.useEngineAPI() {
+				_ = d.apiStop(context.Background(), containerName)
+			} else {
+				_, _ = d.execDocker(context.Background(), "stop", containerName)
+			}
 			inst.running = false
 		}
 	}

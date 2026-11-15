@@ -345,6 +345,29 @@ func (r *Reconciler) KubeClient() KubeClient {
 	return r.kubeClient
 }
 
+// Namespace returns the workload namespace used for Pods and PVCs.
+func (r *Reconciler) Namespace() string {
+	if r == nil {
+		return ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.namespace
+}
+
+// StorageClassName returns the default StorageClass for PVCs this reconciler creates.
+func (r *Reconciler) StorageClassName() string {
+	if r == nil {
+		return ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.defaultStorageClass == "" {
+		return "standard"
+	}
+	return r.defaultStorageClass
+}
+
 // ContextStore returns the currently configured build context and log store.
 func (r *Reconciler) ContextStore() ContextStore {
 	r.mu.RLock()
@@ -981,8 +1004,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 
 	createdCold := false
 	if !exists {
-		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set, no ForkFrom, and no deterministic VolumeKey)
-		if spec.WarmPoolRef != "" && spec.ForkFrom == nil && spec.VolumeKey == "" {
+		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set, no ForkFrom,
+		// no deterministic VolumeKey, and no official E2B volume mounts).
+		// Standby pods do not have those mounts, so a claim would drop them.
+		if spec.WarmPoolRef != "" && spec.ForkFrom == nil && spec.VolumeKey == "" && len(spec.E2BVolumeMounts) == 0 {
 			entry, err := r.claimWarmPodLocked(ctx, spec.WarmPoolRef, name)
 			if err != nil {
 				return nil, fmt.Errorf("failed to claim from warm pool %q for box %q: %w", spec.WarmPoolRef, name, err)
@@ -1097,6 +1122,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				}
 				return nil, fmt.Errorf("failed to ensure egress secrets: %w", err)
 			}
+		}
+		if err := ValidateOfficialVolumeMounts(spec.E2BVolumeMounts); err != nil {
+			if createdCold {
+				r.rollbackColdCreateLocked(ctx, name, spec, status, "")
+			} else if didResetRootFS {
+				r.persistFailedTransitionLocked(ctx, name, spec, status, status.PodName, effectiveImage, now)
+			}
+			return nil, fmt.Errorf("invalid official E2B volume mounts: %w", err)
 		}
 		status.Phase = v1alpha1.PodBoxPhaseRunning
 		if status.PodName == "" {

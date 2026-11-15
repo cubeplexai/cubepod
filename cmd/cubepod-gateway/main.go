@@ -16,6 +16,7 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/egress"
 	"github.com/cubeplexai/cubepod/pkg/gateway"
+	"github.com/cubeplexai/cubepod/pkg/runtime"
 	"github.com/cubeplexai/cubepod/pkg/version"
 )
 
@@ -171,6 +172,64 @@ func main() {
 	gateway.ApplyTemplateConfig(gw, e2bAPIEnabled, *templateBuild, *controllerURL, *templateProbeTimeout)
 	if *livePodRouting {
 		gw.SetLivePodRouting(true)
+	}
+
+	// Official E2B 2.64.0 Volume store. Routes are always registered; this
+	// opens the durable directory so management and content APIs work.
+	// CUBEPOD_E2B_VOLUME_DIR wins; otherwise stateDir/e2b-volumes is used
+	// when a state directory is set. Docker named volumes stay off unless
+	// CUBEPOD_E2B_DOCKER_VOLUMES is explicitly enabled (compose/runc tests).
+	volDir := strings.TrimSpace(os.Getenv("CUBEPOD_E2B_VOLUME_DIR"))
+	if volDir == "" && effectiveStateDir != "" {
+		volDir = filepath.Join(effectiveStateDir, "e2b-volumes")
+	}
+	if volDir != "" {
+		vcfg := gateway.E2BVolumeConfig{
+			Dir:     volDir,
+			HostDir: strings.TrimSpace(os.Getenv("CUBEPOD_E2B_VOLUME_HOST_DIR")),
+		}
+		if raw := strings.TrimSpace(os.Getenv("CUBEPOD_E2B_MAX_FILE_BYTES")); raw != "" {
+			if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
+				vcfg.MaxFileSizeBytes = n
+			}
+		}
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_E2B_DOCKER_VOLUMES"))) {
+		case "1", "true", "yes":
+			vcfg.DockerVolumes = true
+			vcfg.DockerPrefix = "cubepod-e2bvol-"
+			if p := strings.TrimSpace(os.Getenv("CUBEPOD_E2B_DOCKER_PREFIX")); p != "" {
+				vcfg.DockerPrefix = p
+			}
+			vcfg.DockerHost = os.Getenv("DOCKER_HOST")
+		}
+		if err := gw.ConfigureE2BVolumes(vcfg); err != nil {
+			slog.Error("failed to configure E2B volume store", "dir", volDir, "err", err)
+			os.Exit(1)
+		}
+		slog.Info("E2B volume store enabled", "dir", volDir, "dockerVolumes", vcfg.DockerVolumes)
+	}
+
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("CUBEPOD_RUNTIME")), "docker") {
+		cfg := runtime.DockerConfig{
+			DockerHost:          os.Getenv("DOCKER_HOST"),
+			Network:             os.Getenv("CUBEPOD_DOCKER_NETWORK"),
+			DefaultImage:        os.Getenv("CUBEPOD_DOCKER_IMAGE"),
+			ContainerNamePrefix: os.Getenv("CUBEPOD_DOCKER_CONTAINER_PREFIX"),
+		}
+		// Test-only overrides for local compose harnesses; production deployments must
+		// keep runtime binary injection (Invariant 2) and dual-volume binding (Invariant 1) enabled.
+		if v := strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_DOCKER_INJECT_BIN"))); v == "0" || v == "false" || v == "no" {
+			f := false
+			cfg.InjectPoddBin = &f
+			slog.Warn("test-only override: CUBEPOD_DOCKER_INJECT_BIN=0 disables runtime binary injection")
+		}
+		if v := strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_DOCKER_BIND_STORAGE"))); v == "0" || v == "false" || v == "no" {
+			f := false
+			cfg.BindSandboxStorage = &f
+			slog.Warn("test-only override: CUBEPOD_DOCKER_BIND_STORAGE=0 disables workspace/rootfs bind storage")
+		}
+		gw.SetRuntime(runtime.NewDockerBackend(cfg))
+		slog.Info("docker runtime enabled", "network", cfg.Network, "image", cfg.DefaultImage)
 	}
 
 	httpSrv := &http.Server{

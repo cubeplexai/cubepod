@@ -508,6 +508,7 @@ def test_code_interpreter_execution():
 ## Implementation History
 
 - **2026-11-11**: Initial CEP-0018 proposal drafted and designated `implementable`.
+- **2026-11-15**: Official E2B 2.64.0 Volume API and `volumeMounts` specified separately in [CEP-0025](../0025-e2b-volumes/README.md).
 
 ---
 

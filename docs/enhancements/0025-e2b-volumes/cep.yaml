@@ -1,0 +1,29 @@
+title: "Official E2B 2.64.0 Volume API, Durable Store, and Sandbox Mounts"
+cep-number: "0025"
+authors:
+  - "@xfgong"
+owning-area: "storage"
+participating-areas:
+  - "gateway"
+  - "runtime"
+  - "controller"
+status: "implemented"
+creation-date: "2026-11-15"
+reviewers:
+  - "@xfgong"
+approvers:
+  - "@xfgong"
+stage: "alpha"
+latest-milestone: "v0.4"
+milestone:
+  alpha: "v0.4"
+  beta: "v0.5"
+  stable: "v1.0"
+feature-gates:
+  - name: "E2BVolumes"
+    components:
+      - "cubepod-gateway"
+      - "pkg/volume"
+      - "pkg/runtime"
+disable-supported: true
+metrics: []

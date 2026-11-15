@@ -250,6 +250,69 @@ func BuildBlockPVCs(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.
 	return rootfsPVC, workspacePVC
 }
 
+// E2BPVCName is the filesystem claim for an official E2B volume: e2bvol-<id>.
+// It is never the workspace PVC.
+func E2BPVCName(volumeID string) (string, bool) {
+	if len(volumeID) != 32 {
+		return "", false
+	}
+	for i := 0; i < len(volumeID); i++ {
+		c := volumeID[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	return "e2bvol-" + volumeID, true
+}
+
+// ValidateOfficialVolumeMounts verifies that all official E2B volume mounts
+// have a valid volume ID, matching PVC name, valid container path, and no
+// duplicate mount paths.
+func ValidateOfficialVolumeMounts(mounts []v1alpha1.E2BVolumeMount) error {
+	seenPath := map[string]struct{}{}
+	for _, m := range mounts {
+		pvc, ok := E2BPVCName(m.VolumeID)
+		if !ok {
+			return fmt.Errorf("invalid official E2B volumeID %q", m.VolumeID)
+		}
+		if m.PVCName != "" && m.PVCName != pvc {
+			return fmt.Errorf("mismatched official E2B pvcName %q for volume %s", m.PVCName, m.VolumeID)
+		}
+		if !v1alpha1.ValidE2BContainerPath(m.Path) {
+			return fmt.Errorf("invalid official E2B mount path %q", m.Path)
+		}
+		if _, dup := seenPath[m.Path]; dup {
+			return fmt.Errorf("duplicate official E2B mount path %q", m.Path)
+		}
+		seenPath[m.Path] = struct{}{}
+	}
+	return nil
+}
+
+// applyOfficialVolumeMounts adds one Filesystem PVC volume and container mount
+// per official E2B volume. Block workspace devices are left unchanged.
+func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest, mounts []v1alpha1.E2BVolumeMount) ([]VolumeManifest, ContainerManifest) {
+	if err := ValidateOfficialVolumeMounts(mounts); err != nil {
+		return volumes, main
+	}
+	seenPVC := map[string]struct{}{}
+	for _, m := range mounts {
+		pvc, _ := E2BPVCName(m.VolumeID)
+		if _, ok := seenPVC[pvc]; !ok {
+			seenPVC[pvc] = struct{}{}
+			volumes = append(volumes, VolumeManifest{
+				Name:                  pvc,
+				PersistentVolumeClaim: pvc,
+			})
+		}
+		main.VolumeMounts = append(main.VolumeMounts, VolumeMount{
+			Name:      pvc,
+			MountPath: m.Path,
+		})
+	}
+	return volumes, main
+}
+
 // BuildKataPod synthesizes the complete Kubernetes Pod manifest for running a Kata or container sandbox.
 // In volumeMode: Block, it maps raw block devices /dev/cubepod-rootfs and /dev/cubepod-workspace.
 // In volumeMode: Filesystem, it mounts rootfs-pvc at /mnt/cubepod/rootfs and workspace-pvc at /workspace
@@ -411,6 +474,10 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 			Value: tpl.RunAsUsername,
 		})
 	}
+
+	// Official E2B volumes are filesystem mounts in addition to rootfs and
+	// workspace. They stay VolumeMounts when the workspace is a block device.
+	volumes, mainContainer = applyOfficialVolumeMounts(volumes, mainContainer, spec.E2BVolumeMounts)
 
 	var containers []ContainerManifest
 

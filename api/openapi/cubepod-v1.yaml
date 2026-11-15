@@ -1609,6 +1609,19 @@ components:
           description: E2B canonical alias for envVars
           additionalProperties:
             type: string
+        volumeMounts:
+          type: array
+          description: Official E2B 2.64.0 mounts. name is the volume name, not the volume ID.
+          items:
+            type: object
+            required:
+              - name
+              - path
+            properties:
+              name:
+                type: string
+              path:
+                type: string
         autoPause:
           type: boolean
           default: true

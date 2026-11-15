@@ -1,7 +1,10 @@
 // Package v1alpha1 contains API Schema definitions for the pod.cubeplex.ai v1alpha1 API group.
 package v1alpha1
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 const (
 	GroupName    = "pod.cubeplex.ai"
@@ -210,6 +213,68 @@ type NetworkPolicySpec struct {
 	SecretBindings []SecretBinding      `json:"secretBindings,omitempty"`
 }
 
+// E2BVolumeMount attaches one official E2B volume to the sandbox container.
+// It is not the workspace VolumeKey. The claim is a Filesystem PVC named
+// e2bvol-<volumeID>, even when the workspace volume is a block device.
+type E2BVolumeMount struct {
+	VolumeID string `json:"volumeID"`
+	PVCName  string `json:"pvcName"`
+	Path     string `json:"path"`
+}
+
+// reservedE2BMounts are container paths an official volume must not cover.
+// "/" is rejected separately so every absolute path is not treated as reserved.
+var reservedE2BMounts = []string{
+	"/workspace",
+	"/rootfs-upper",
+	"/proc",
+	"/sys",
+	"/dev",
+	"/etc",
+	"/opt/cubepod",
+	"/mnt/cubepod",
+	"/bin",
+	"/sbin",
+	"/usr",
+	"/lib",
+	"/lib64",
+	"/root",
+	"/boot",
+	"/run",
+}
+
+// ValidE2BContainerPath reports whether an absolute, cleaned container path may
+// hold an official E2B volume. Data paths such as /mnt/cpod-test-vol are allowed.
+// The path and anything under a reserved root are rejected.
+func ValidE2BContainerPath(p string) bool {
+	if p == "" || p == "/" || p == "." || !strings.HasPrefix(p, "/") {
+		return false
+	}
+	if strings.ContainsRune(p, 0) || strings.Contains(p, `\`) {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return false
+		}
+	}
+	for _, root := range reservedE2BMounts {
+		if p == root || strings.HasPrefix(p, root+"/") {
+			return false
+		}
+	}
+	return true
+}
+
+// AllowedDockerVolumeName reports whether a Docker named volume may be attached
+// to a sandbox. Product volumes use cubepod-e2bvol-. Tests use cpod-test-.
+func AllowedDockerVolumeName(name string) bool {
+	if name == "" || strings.Contains(name, "..") || strings.ContainsAny(name, "/\\\x00 ") {
+		return false
+	}
+	return strings.HasPrefix(name, "cubepod-e2bvol-") || strings.HasPrefix(name, "cpod-test-")
+}
+
 // PodBoxSpec defines the desired state of a single persistent agent execution pod.
 type PodBoxSpec struct {
 	// TemplateRef references a PodTemplate for default image, runtimeClass, and storage settings.
@@ -221,6 +286,10 @@ type PodBoxSpec struct {
 	// VolumeKey optionally specifies a deterministic workspace PVC prefix so workspace
 	// data persists across sandbox delete -> create cycles.
 	VolumeKey string `json:"volumeKey,omitempty"`
+
+	// E2BVolumeMounts are official E2B volumes mounted when the pod is created.
+	// They stay distinct from VolumeKey and are never raw block devices.
+	E2BVolumeMounts []E2BVolumeMount `json:"e2bVolumeMounts,omitempty"`
 
 	// DesiredState controls whether the MicroVM Pod is active ("Running") or suspended ("Paused").
 	// When Paused, the compute Pod is deleted (0 CPU/RAM) while RootFS and Workspace PVCs are retained.
