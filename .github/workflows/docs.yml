@@ -81,16 +81,20 @@ jobs:
         if: env.CF_API_TOKEN != '' && env.CF_ACCOUNT_ID != ''
         run: |
           python3 - <<'PY'
-          import json, os, sys, urllib.request
+          import json, os, sys, urllib.error, urllib.request
           token = os.environ["CF_API_TOKEN"]
           account_id = os.environ["CF_ACCOUNT_ID"]
           projects = []
           page = 1
           while True:
-              url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects?page={page}&per_page=50"
+              url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects?page={page}"
               req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-              with urllib.request.urlopen(req, timeout=20) as resp:
-                  payload = json.loads(resp.read().decode("utf-8"))
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      payload = json.loads(resp.read().decode("utf-8"))
+              except urllib.error.HTTPError as exc:
+                  print(f"Cloudflare API HTTP {exc.code}: {exc.read().decode('utf-8', 'replace')}", file=sys.stderr)
+                  sys.exit(1)
               if not payload.get("success"):
                   print("Cloudflare API error:", payload.get("errors"), file=sys.stderr)
                   sys.exit(1)
