@@ -21,11 +21,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/egress"
+	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
 var subdomainHostRegex = regexp.MustCompile(`^([0-9]+)-([a-zA-Z0-9_-]+)\.(.*)$`)
@@ -257,6 +259,9 @@ type Server struct {
 	controllerURL    string
 	probeTimeout     time.Duration
 	httpClient       *http.Client
+	e2b              atomic.Pointer[volume.Store]
+	e2bDir           string
+	e2bCfg           volume.Config
 }
 
 // NewServer constructs a new Gateway Server.
@@ -434,6 +439,19 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v2/sandboxes", s.handleCreateSandbox)
 	mux.HandleFunc("GET /sandboxes", s.handleListSandboxes)
 	mux.HandleFunc("GET /sandboxes/{sandboxID}", s.handleGetSandbox)
+
+	// Official E2B 2.64.0 Volume management (API key) and content (volume token).
+	mux.HandleFunc("POST /volumes", s.handleCreateVolume)
+	mux.HandleFunc("GET /volumes", s.handleListVolumes)
+	mux.HandleFunc("GET /volumes/{volumeID}", s.handleGetVolume)
+	mux.HandleFunc("DELETE /volumes/{volumeID}", s.handleDeleteVolume)
+	mux.HandleFunc("GET /volumecontent/{volumeID}/file", s.handleGetVolumeFile)
+	mux.HandleFunc("PUT /volumecontent/{volumeID}/file", s.handlePutVolumeFile)
+	mux.HandleFunc("GET /volumecontent/{volumeID}/dir", s.handleGetVolumeDir)
+	mux.HandleFunc("POST /volumecontent/{volumeID}/dir", s.handlePostVolumeDir)
+	mux.HandleFunc("GET /volumecontent/{volumeID}/path", s.handleGetVolumePath)
+	mux.HandleFunc("PATCH /volumecontent/{volumeID}/path", s.handlePatchVolumePath)
+	mux.HandleFunc("DELETE /volumecontent/{volumeID}/path", s.handleDeleteVolumePath)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/pause", s.handlePauseSandbox)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/connect", s.handleConnectSandbox)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/timeout", s.handleTimeoutSandbox)

@@ -21,6 +21,24 @@ func (s *Server) resolveFilePath(rec *SandboxRecord, userPath string) (string, e
 	if userPath == "" {
 		return "", fmt.Errorf("empty file path")
 	}
+	if rec != nil {
+		// Only paths under an official volume mount are redirected. Other paths,
+		// including ones the volume cleaner rejects, stay on the workspace resolver.
+		if mounted, ok, err := s.mapVolumeMountPath(rec.SandboxID, userPath); ok {
+			if err != nil {
+				return "", err
+			}
+			// Local sandbox file IO must not follow a symlink out of the volume.
+			fi, statErr := os.Lstat(mounted)
+			if statErr != nil && !os.IsNotExist(statErr) {
+				return "", statErr
+			}
+			if statErr == nil && fi.Mode()&os.ModeSymlink != 0 {
+				return "", fmt.Errorf("refusing to follow symlink")
+			}
+			return mounted, nil
+		}
+	}
 	baseDir := rec.WorkspaceDir
 	if baseDir == "" {
 		baseDir = s.workspaceDirForSandbox(rec.SandboxID, rec.VolumeKey)

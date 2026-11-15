@@ -345,6 +345,29 @@ func (r *Reconciler) KubeClient() KubeClient {
 	return r.kubeClient
 }
 
+// Namespace returns the workload namespace used for Pods and PVCs.
+func (r *Reconciler) Namespace() string {
+	if r == nil {
+		return ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.namespace
+}
+
+// StorageClassName returns the default StorageClass for PVCs this reconciler creates.
+func (r *Reconciler) StorageClassName() string {
+	if r == nil {
+		return ""
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.defaultStorageClass == "" {
+		return "standard"
+	}
+	return r.defaultStorageClass
+}
+
 // ContextStore returns the currently configured build context and log store.
 func (r *Reconciler) ContextStore() ContextStore {
 	r.mu.RLock()

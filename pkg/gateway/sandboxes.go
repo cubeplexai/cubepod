@@ -19,6 +19,7 @@ import (
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
+	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
 type createSandboxReq struct {
@@ -27,6 +28,7 @@ type createSandboxReq struct {
 	WarmPoolRef   string                      `json:"warmPoolRef,omitempty"`
 	Timeout       int                         `json:"timeout,omitempty"`
 	Metadata      map[string]string           `json:"metadata,omitempty"`
+	VolumeMounts  []sandboxVolumeMountReq     `json:"volumeMounts,omitempty"`
 	EnvVars       map[string]string           `json:"envVars,omitempty"`
 	Env_Vars      map[string]string           `json:"env_vars,omitempty"`
 	AutoPause     *bool                       `json:"autoPause,omitempty"`
@@ -42,6 +44,13 @@ type createSandboxReq struct {
 			AllowedHeaders []string `json:"allowedHeaders"`
 		} `json:"secretBindings,omitempty"`
 	} `json:"extension,omitempty"`
+}
+
+// sandboxVolumeMountReq is the official SandboxVolumeMount wire object.
+// name is the volume name, path is the absolute path inside the sandbox.
+type sandboxVolumeMountReq struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
 }
 
 func cloneNetworkPolicy(p *v1alpha1.NetworkPolicySpec) *v1alpha1.NetworkPolicySpec {
@@ -362,6 +371,11 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	volumeKey := req.Extension.VolumeKey
+	plannedMounts, mountStatus, mountMsg := s.planSandboxVolumeMounts(r, req.VolumeMounts)
+	if mountStatus != 0 {
+		writeError(w, mountStatus, mountMsg)
+		return
+	}
 	netPolicy := cloneNetworkPolicy(req.Extension.NetworkPolicy)
 	if netPolicy == nil {
 		netPolicy = cloneNetworkPolicy(req.NetworkPolicy)
@@ -479,6 +493,18 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 			healthTimeout = probeTimeout
 		}
 		_ = waitForPoddReady(r.Context(), rec.PoddURL, healthTimeout)
+	}
+
+	if err := s.commitSandboxVolumeMounts(id, managementAPIKey(r), plannedMounts); err != nil {
+		if s.reconciler != nil {
+			_ = s.reconciler.DeleteBox(r.Context(), id, false)
+		}
+		if errors.Is(err, volume.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "volume not found")
+			return
+		}
+		writeError(w, http.StatusConflict, "volume mount failed")
+		return
 	}
 
 	if s.E2BTemplateAPIEnabled() && resolvedReadyCmd != "" && status.Reason != "WarmPoolClaimed" && rec.PoddURL != "" {
@@ -833,6 +859,8 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		TimeoutSeconds:   parent.TimeoutSeconds,
 		WorkspaceDir:     workspaceDir,
 	}
+	s.copySandboxVolumeMounts(parentID, childID)
+
 	s.mu.Lock()
 	s.sandboxes[childID] = child
 	s.mu.Unlock()
@@ -857,6 +885,7 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	delete(s.sandboxes, id)
 	delete(s.endpoints, id)
 	s.mu.Unlock()
+	s.releaseSandboxVolumeMounts(id)
 	s.releaseLocalSandbox(id)
 
 	// Revoke secrets associated with this sandbox
