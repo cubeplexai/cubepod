@@ -1,0 +1,1507 @@
+//! Inotify directory watches for the official Filesystem watcher RPCs.
+//!
+//! `CreateWatcher` / `GetWatcherEvents` / `RemoveWatcher` is the unary poll API.
+//! `WatchDir` is the server stream. Both use the same inotify watcher.
+//!
+//! Limits:
+//! - Connect replays nothing. `GetWatcherEvents` keeps a ring of at most
+//!   [`WATCH_RING_CAP`] events. Overflow does not return that truncated ring as
+//!   success: the watcher is marked and both `GetWatcherEvents` and live
+//!   `WatchDir` consumers fail with `resource_exhausted`.
+//! - `WatchDir` subscribers use a bounded queue. A slow consumer is failed with
+//!   `resource_exhausted` and is not sent a silently truncated success stream.
+//! - `RENAME` is emitted separately for `MOVED_FROM` and `MOVED_TO` (the proto
+//!   event has no old path). Names are relative to the watched directory.
+//! - Recursive new-subdirectory race (Linux inotify, not closed): a directory
+//!   created under a recursive watch is armed only after that create event is
+//!   handled and `inotify_add_watch` returns. The kernel does not queue events
+//!   for a watch that is not installed yet, so a file that appears in the new
+//!   directory before `inotify_add_watch` returns is missed. A retry loop still
+//!   races. This code does not scan the new directory to invent those events.
+//! - Kernel `IN_Q_OVERFLOW` means events were dropped before userspace saw them.
+//!   The watcher is failed with `resource_exhausted` instead of ignoring the flag.
+//! - Symlink directories are not recursed into.
+//! - Network/FUSE detection uses `statfs` magic (nfs, cifs, smb, fuse, 9p, ceph).
+//!   Unknown types are treated as local. `proc`, `sysfs`, and `devpts` are always
+//!   refused, as are `/proc`, `/dev`, and `/sys`.
+
+use std::collections::{HashMap, VecDeque};
+use std::ffi::CString;
+use std::io::Write;
+use std::net::TcpStream;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use crate::commands::{
+    make_connect_frame, unpack_connect_payload, write_unary_connect_response, ProcessRegistry,
+};
+use crate::http::{write_json, HttpRequest};
+use crate::json::{escape_json, JsonValue};
+use crate::DaemonConfig;
+
+pub const WATCH_RING_CAP: usize = 256;
+pub const WATCH_SUB_QUEUE: usize = 64;
+pub const WATCH_BUFFER_OVERFLOW_MSG: &str = "watch event buffer overflow: events were dropped";
+pub const WATCH_QUEUE_OVERFLOW_MSG: &str = "watch subscriber queue overflow";
+
+const PROC_SUPER_MAGIC: u32 = 0x0000_9fa0;
+const SYSFS_MAGIC: u32 = 0x6265_6572;
+const DEVPTS_SUPER_MAGIC: u32 = 0x0000_1cd1;
+const NFS_SUPER_MAGIC: u32 = 0x0000_6969;
+const CIFS_MAGIC: u32 = 0xff53_4d42;
+const SMB_SUPER_MAGIC: u32 = 0x0000_0517b;
+const SMB2_MAGIC: u32 = 0xfe53_4d42;
+const FUSE_SUPER_MAGIC: u32 = 0x6573_5546;
+const NINEP_MAGIC: u32 = 0x0102_1997;
+const CEPH_MAGIC: u32 = 0x00c3_6400;
+
+const WATCH_MASK: u32 = libc::IN_CREATE
+    | libc::IN_MODIFY
+    | libc::IN_CLOSE_WRITE
+    | libc::IN_DELETE
+    | libc::IN_DELETE_SELF
+    | libc::IN_MOVED_FROM
+    | libc::IN_MOVED_TO
+    | libc::IN_ATTRIB
+    | libc::IN_ONLYDIR;
+
+#[derive(Clone, Debug)]
+struct FsEvent {
+    name: String,
+    kind: String,
+    entry: Option<String>,
+}
+
+impl FsEvent {
+    fn to_json(&self) -> String {
+        match &self.entry {
+            Some(entry) => format!(
+                r#"{{"name":"{}","type":"{}","entry":{}}}"#,
+                escape_json(&self.name),
+                escape_json(&self.kind),
+                entry
+            ),
+            None => format!(
+                r#"{{"name":"{}","type":"{}"}}"#,
+                escape_json(&self.name),
+                escape_json(&self.kind)
+            ),
+        }
+    }
+}
+
+enum WatchMsg {
+    Event(FsEvent),
+}
+
+struct WatchSub {
+    tx: SyncSender<WatchMsg>,
+    overflow: Arc<AtomicBool>,
+    message: Arc<Mutex<String>>,
+}
+
+pub(crate) struct DirWatcher {
+    id: String,
+    root: PathBuf,
+    recursive: bool,
+    include_entry: bool,
+    fd: AtomicI32,
+    watches: Mutex<HashMap<i32, String>>,
+    pending: Mutex<VecDeque<FsEvent>>,
+    subscribers: Mutex<Vec<WatchSub>>,
+    stopped: AtomicBool,
+    overflowed: AtomicBool,
+}
+
+pub struct WatchSubHandle {
+    rx: Receiver<WatchMsg>,
+    overflow: Arc<AtomicBool>,
+    message: Arc<Mutex<String>>,
+}
+
+#[derive(Clone)]
+pub struct WatchRegistry {
+    inner: Arc<Mutex<HashMap<String, Arc<DirWatcher>>>>,
+    counter: Arc<AtomicU64>,
+}
+
+#[derive(Debug)]
+pub enum WatchPathError {
+    NotFound(String),
+    Invalid(String),
+    AlreadyExists(String),
+    Exhausted(String),
+}
+
+impl WatchRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            counter: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    pub fn open_fd_count(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|w| w.fd.load(Ordering::SeqCst) >= 0)
+            .count()
+    }
+
+    pub(crate) fn get(&self, id: &str) -> Option<Arc<DirWatcher>> {
+        self.inner.lock().unwrap().get(id).cloned()
+    }
+
+    pub fn remove(&self, id: &str) -> bool {
+        let removed = self.inner.lock().unwrap().remove(id);
+        if let Some(w) = removed {
+            w.stop();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn stop_all(&self) {
+        let mut map = self.inner.lock().unwrap();
+        for w in map.values() {
+            w.stop();
+        }
+        map.clear();
+    }
+
+    pub(crate) fn create(
+        &self,
+        workdir: &str,
+        path: &str,
+        recursive: bool,
+        include_entry: bool,
+        allow_network: bool,
+    ) -> Result<Arc<DirWatcher>, WatchPathError> {
+        let root = resolve_watch_path(workdir, path)?;
+        check_mount(&root, allow_network)?;
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        if fd < 0 {
+            return Err(WatchPathError::Invalid(format!(
+                "inotify_init1: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let id = format!("w{}", self.counter.fetch_add(1, Ordering::SeqCst));
+        let watcher = Arc::new(DirWatcher {
+            id: id.clone(),
+            root: root.clone(),
+            recursive,
+            include_entry,
+            fd: AtomicI32::new(fd),
+            watches: Mutex::new(HashMap::new()),
+            pending: Mutex::new(VecDeque::new()),
+            subscribers: Mutex::new(Vec::new()),
+            stopped: AtomicBool::new(false),
+            overflowed: AtomicBool::new(false),
+        });
+        if let Err(e) = watcher.arm() {
+            watcher.stop();
+            return Err(WatchPathError::Invalid(format!("inotify_add_watch: {e}")));
+        }
+        self.inner.lock().unwrap().insert(id, Arc::clone(&watcher));
+        let reader = Arc::clone(&watcher);
+        std::thread::spawn(move || reader.loop_events());
+        Ok(watcher)
+    }
+}
+
+impl Default for WatchRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DirWatcher {
+    fn stop(&self) {
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let fd = self.fd.swap(-1, Ordering::SeqCst);
+        if fd >= 0 {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+        self.subscribers.lock().unwrap().clear();
+    }
+
+    fn arm(&self) -> Result<(), String> {
+        self.add_watch(&self.root, "")?;
+        if self.recursive {
+            self.walk(&self.root, "")?;
+        }
+        Ok(())
+    }
+
+    fn walk(&self, dir: &Path, rel: &str) -> Result<(), String> {
+        let entries = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
+        for ent in entries.flatten() {
+            let meta = match std::fs::symlink_metadata(ent.path()) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                continue;
+            }
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            let child_rel = join_rel(rel, &name);
+            let full = ent.path();
+            self.add_watch(&full, &child_rel)?;
+            self.walk(&full, &child_rel)?;
+        }
+        Ok(())
+    }
+
+    fn add_watch(&self, dir: &Path, rel: &str) -> Result<(), String> {
+        let fd = self.fd.load(Ordering::SeqCst);
+        if fd < 0 {
+            return Err("watcher stopped".into());
+        }
+        let c = CString::new(dir.as_os_str().as_bytes())
+            .map_err(|_| "path contains nul".to_string())?;
+        let wd = unsafe { libc::inotify_add_watch(fd, c.as_ptr(), WATCH_MASK) };
+        if wd < 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        self.watches.lock().unwrap().insert(wd, rel.to_string());
+        Ok(())
+    }
+
+    fn subscribe(&self) -> WatchSubHandle {
+        let (tx, rx) = sync_channel(WATCH_SUB_QUEUE);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let message = Arc::new(Mutex::new(String::new()));
+        self.subscribers.lock().unwrap().push(WatchSub {
+            tx,
+            overflow: Arc::clone(&overflow),
+            message: Arc::clone(&message),
+        });
+        WatchSubHandle {
+            rx,
+            overflow,
+            message,
+        }
+    }
+
+    fn fail_subscribers(&self, message: &str) {
+        let mut subs = self.subscribers.lock().unwrap();
+        for sub in subs.drain(..) {
+            sub.overflow.store(true, Ordering::SeqCst);
+            *sub.message.lock().unwrap() = message.to_string();
+        }
+    }
+
+    /// Mark the watcher tainted and fail every live WatchDir consumer.
+    /// Holds the ring lock while the flag is set so GetWatcherEvents cannot
+    /// observe a successful truncated drain.
+    fn mark_overflow(&self, message: &str) {
+        {
+            let _pending = self.pending.lock().unwrap();
+            self.overflowed.store(true, Ordering::SeqCst);
+        }
+        self.fail_subscribers(message);
+    }
+
+    fn publish(&self, ev: FsEvent) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        let ring_overflow = {
+            let mut pending = self.pending.lock().unwrap();
+            if self.overflowed.load(Ordering::SeqCst) {
+                return;
+            }
+            if pending.len() >= WATCH_RING_CAP {
+                // Bound memory. The dropped event is not returned as success.
+                pending.pop_front();
+                self.overflowed.store(true, Ordering::SeqCst);
+                true
+            } else {
+                pending.push_back(ev.clone());
+                false
+            }
+        };
+        if ring_overflow {
+            self.fail_subscribers(WATCH_BUFFER_OVERFLOW_MSG);
+            return;
+        }
+        let mut subs = self.subscribers.lock().unwrap();
+        subs.retain(|sub| match sub.tx.try_send(WatchMsg::Event(ev.clone())) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                sub.overflow.store(true, Ordering::SeqCst);
+                *sub.message.lock().unwrap() = WATCH_QUEUE_OVERFLOW_MSG.to_string();
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        });
+    }
+
+    /// Events since the last successful poll. `Err` means the ring or the
+    /// kernel queue overflowed and the events that remain are incomplete.
+    fn poll_events(&self) -> Result<Vec<FsEvent>, ()> {
+        let mut pending = self.pending.lock().unwrap();
+        if self.overflowed.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        Ok(pending.drain(..).collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_test_event(&self, name: &str) {
+        self.publish(FsEvent {
+            name: name.to_string(),
+            kind: "EVENT_TYPE_WRITE".into(),
+            entry: None,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::SeqCst)
+    }
+
+    fn loop_events(self: Arc<Self>) {
+        let mut buf = [0u8; 4096];
+        loop {
+            let fd = self.fd.load(Ordering::SeqCst);
+            if fd < 0 || self.stopped.load(Ordering::SeqCst) {
+                break;
+            }
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, 200) };
+            if self.fd.load(Ordering::SeqCst) != fd {
+                break;
+            }
+            if rc < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if rc == 0 {
+                continue;
+            }
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n > 0 {
+                self.parse_buf(&buf[..n as usize]);
+            } else if n < 0 {
+                let code = std::io::Error::last_os_error().raw_os_error();
+                if code == Some(libc::EINTR) || code == Some(libc::EAGAIN) {
+                    continue;
+                }
+                break;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn parse_buf(&self, buf: &[u8]) {
+        let mut off = 0;
+        while off + 16 <= buf.len() {
+            let wd = i32::from_ne_bytes(buf[off..off + 4].try_into().unwrap());
+            let mask = u32::from_ne_bytes(buf[off + 4..off + 8].try_into().unwrap());
+            let len = u32::from_ne_bytes(buf[off + 12..off + 16].try_into().unwrap()) as usize;
+            let name_off = off + 16;
+            if name_off + len > buf.len() {
+                break;
+            }
+            let name_bytes = &buf[name_off..name_off + len];
+            let name = name_bytes.split(|b| *b == 0).next().unwrap_or(&[]).to_vec();
+            let name = String::from_utf8_lossy(&name).to_string();
+            off = name_off + len;
+            self.on_raw(wd, mask, &name);
+        }
+    }
+
+    fn on_raw(&self, wd: i32, mask: u32, name: &str) {
+        if mask & libc::IN_Q_OVERFLOW != 0 {
+            // Events were dropped in the kernel queue. Do not skip the flag.
+            self.mark_overflow(WATCH_BUFFER_OVERFLOW_MSG);
+            return;
+        }
+        if self.overflowed.load(Ordering::SeqCst) {
+            return;
+        }
+        if mask & libc::IN_IGNORED != 0 {
+            self.watches.lock().unwrap().remove(&wd);
+            return;
+        }
+        let dir_rel = self
+            .watches
+            .lock()
+            .unwrap()
+            .get(&wd)
+            .cloned()
+            .unwrap_or_default();
+        if self.recursive
+            && mask & libc::IN_CREATE != 0
+            && mask & libc::IN_ISDIR != 0
+            && !name.is_empty()
+        {
+            let rel = join_rel(&dir_rel, name);
+            let full = self.root.join(&rel);
+            // Linux inotify limitation, not closed: the new directory is armed
+            // here, after the create is observed. Anything created in it before
+            // inotify_add_watch returns is not queued by the kernel and is not
+            // synthesized by a directory scan. A retry still races.
+            if let Ok(meta) = std::fs::symlink_metadata(&full) {
+                if meta.file_type().is_dir() && !meta.file_type().is_symlink() {
+                    let _ = self.add_watch(&full, &rel);
+                }
+            }
+        }
+        let Some(kind) = map_mask(mask) else {
+            return;
+        };
+        if name.is_empty() {
+            return;
+        }
+        let rel = join_rel(&dir_rel, name);
+        let entry = if self.include_entry && kind != "EVENT_TYPE_REMOVE" {
+            entry_json(&self.root, &rel)
+        } else {
+            None
+        };
+        self.publish(FsEvent {
+            name: rel,
+            kind: kind.to_string(),
+            entry,
+        });
+    }
+}
+
+fn map_mask(mask: u32) -> Option<&'static str> {
+    if mask & libc::IN_CREATE != 0 {
+        Some("EVENT_TYPE_CREATE")
+    } else if mask & (libc::IN_DELETE | libc::IN_DELETE_SELF) != 0 {
+        Some("EVENT_TYPE_REMOVE")
+    } else if mask & (libc::IN_MOVED_FROM | libc::IN_MOVED_TO) != 0 {
+        Some("EVENT_TYPE_RENAME")
+    } else if mask & libc::IN_ATTRIB != 0 {
+        Some("EVENT_TYPE_CHMOD")
+    } else if mask & (libc::IN_MODIFY | libc::IN_CLOSE_WRITE) != 0 {
+        Some("EVENT_TYPE_WRITE")
+    } else {
+        None
+    }
+}
+
+fn join_rel(dir: &str, name: &str) -> String {
+    if name.is_empty() {
+        return dir.to_string();
+    }
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+fn entry_json(root: &Path, rel: &str) -> Option<String> {
+    if rel.is_empty() {
+        return None;
+    }
+    let full = root.join(rel);
+    let meta = std::fs::symlink_metadata(&full).ok()?;
+    let is_dir = meta.is_dir();
+    let ftype = if is_dir {
+        "FILE_TYPE_DIRECTORY"
+    } else {
+        "FILE_TYPE_FILE"
+    };
+    let name = Path::new(rel)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| rel.to_string());
+    let mode = meta.permissions().mode() & 0o777;
+    let perm = mode_string(meta.permissions().mode(), is_dir);
+    Some(format!(
+        r#"{{"name":"{}","type":"{}","path":"{}","size":{},"mode":{},"permissions":"{}","isDir":{}}}"#,
+        escape_json(&name),
+        ftype,
+        escape_json(rel),
+        meta.len(),
+        mode,
+        perm,
+        if is_dir { "true" } else { "false" }
+    ))
+}
+
+fn mode_string(mode: u32, is_dir: bool) -> String {
+    let mut s = String::with_capacity(10);
+    s.push(if is_dir { 'd' } else { '-' });
+    for (bit, ch) in [
+        (0o400, 'r'),
+        (0o200, 'w'),
+        (0o100, 'x'),
+        (0o040, 'r'),
+        (0o020, 'w'),
+        (0o010, 'x'),
+        (0o004, 'r'),
+        (0o002, 'w'),
+        (0o001, 'x'),
+    ] {
+        if mode & bit != 0 {
+            s.push(ch);
+        } else {
+            s.push('-');
+        }
+    }
+    s
+}
+
+fn is_special_abs(path: &str) -> bool {
+    path == "/proc"
+        || path.starts_with("/proc/")
+        || path == "/dev"
+        || path.starts_with("/dev/")
+        || path == "/sys"
+        || path.starts_with("/sys/")
+}
+
+fn logical_under_workdir(workdir: &str, user: &str) -> Result<PathBuf, WatchPathError> {
+    let user = user.trim();
+    if user.is_empty() {
+        return Err(WatchPathError::Invalid("path is required".into()));
+    }
+    if is_special_abs(user) || is_special_abs(&normalize_logical(user)) {
+        return Err(WatchPathError::Invalid(
+            "refusing to watch proc, dev, or sys".into(),
+        ));
+    }
+    let work = normalize_logical(workdir);
+    let logical = if user == "/workspace" {
+        work.clone()
+    } else if let Some(rest) = user.strip_prefix("/workspace/") {
+        format!("{}/{}", work.trim_end_matches('/'), rest)
+    } else if user.starts_with('/') {
+        user.to_string()
+    } else {
+        format!("{}/{}", work.trim_end_matches('/'), user)
+    };
+    let clean = normalize_logical(&logical);
+    if clean != work && !clean.starts_with(&(work.trim_end_matches('/').to_string() + "/")) {
+        return Err(WatchPathError::Invalid(
+            "path escapes sandbox work tree".into(),
+        ));
+    }
+    if is_special_abs(&clean) {
+        return Err(WatchPathError::Invalid(
+            "refusing to watch proc, dev, or sys".into(),
+        ));
+    }
+    Ok(PathBuf::from(clean))
+}
+
+pub fn resolve_watch_path(workdir: &str, user: &str) -> Result<PathBuf, WatchPathError> {
+    let path = logical_under_workdir(workdir, user)?;
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_dir() => Ok(path),
+        Ok(_) => Err(WatchPathError::Invalid("path is not a directory".into())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(WatchPathError::NotFound("directory not found".into()))
+        }
+        Err(e) => Err(WatchPathError::Invalid(e.to_string())),
+    }
+}
+
+fn resolve_mkdir_path(workdir: &str, user: &str) -> Result<PathBuf, WatchPathError> {
+    logical_under_workdir(workdir, user)
+}
+
+fn normalize_logical(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let abs = path.starts_with('/');
+    for comp in Path::new(path).components() {
+        match comp {
+            Component::RootDir => {}
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.pop().is_none() && !abs {
+                    parts.push("..");
+                }
+            }
+            Component::Normal(s) => parts.push(s.to_str().unwrap_or("")),
+            Component::Prefix(_) => {}
+        }
+    }
+    if abs {
+        format!("/{}", parts.join("/"))
+    } else {
+        parts.join("/")
+    }
+}
+
+fn check_mount(path: &Path, allow_network: bool) -> Result<(), WatchPathError> {
+    let Some(magic) = statfs_magic(path) else {
+        return Ok(());
+    };
+    if matches!(magic, PROC_SUPER_MAGIC | SYSFS_MAGIC | DEVPTS_SUPER_MAGIC) {
+        return Err(WatchPathError::Invalid(
+            "refusing to watch proc, sysfs, or devpts".into(),
+        ));
+    }
+    let network = matches!(
+        magic,
+        NFS_SUPER_MAGIC
+            | CIFS_MAGIC
+            | SMB_SUPER_MAGIC
+            | SMB2_MAGIC
+            | FUSE_SUPER_MAGIC
+            | NINEP_MAGIC
+            | CEPH_MAGIC
+    );
+    if network && !allow_network {
+        return Err(WatchPathError::Invalid(
+            "network or fuse mount requires allowNetworkMounts".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn statfs_magic(path: &Path) -> Option<u32> {
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statfs(c.as_ptr(), &mut st) };
+    if rc != 0 {
+        return None;
+    }
+    Some(st.f_type as u32)
+}
+
+fn write_watch_error(stream: &mut TcpStream, err: WatchPathError) {
+    let (status, code, message) = match err {
+        WatchPathError::NotFound(m) => ("404 Not Found", "not_found", m),
+        WatchPathError::Invalid(m) => ("400 Bad Request", "invalid_argument", m),
+        WatchPathError::AlreadyExists(m) => ("409 Conflict", "already_exists", m),
+        WatchPathError::Exhausted(m) => ("429 Too Many Requests", "resource_exhausted", m),
+    };
+    // Unary Connect error: HTTP status + raw JSON. Never a successful data frame,
+    // even when the request Content-Type is application/connect+json.
+    let body = format!(
+        r#"{{"code":"{}","message":"{}"}}"#,
+        code,
+        escape_json(&message)
+    );
+    write_json(stream, status, &body);
+}
+
+fn connect_stream_code(err: WatchPathError) -> (String, String) {
+    match err {
+        WatchPathError::NotFound(m) => ("not_found".into(), m),
+        WatchPathError::Invalid(m) => ("invalid_argument".into(), m),
+        WatchPathError::AlreadyExists(m) => ("already_exists".into(), m),
+        WatchPathError::Exhausted(m) => ("resource_exhausted".into(), m),
+    }
+}
+
+/// Connect server-stream error. HTTP 200 + `application/connect+json` end-stream
+/// frame. A non-200 status is not parsed by the stream client (404 becomes
+/// unimplemented, 400 becomes internal, message `HTTP <status>`).
+fn write_connect_stream_error(stream: &mut TcpStream, code: &str, message: &str) {
+    let payload = format!(
+        r#"{{"error":{{"code":"{}","message":"{}"}}}}"#,
+        code,
+        escape_json(message)
+    );
+    let frame = make_connect_frame(payload.as_bytes(), true);
+    crate::http::write_response(stream, "200 OK", "application/connect+json", &frame);
+}
+
+fn write_watch_stream_error(stream: &mut TcpStream, err: WatchPathError) {
+    let (code, message) = connect_stream_code(err);
+    write_connect_stream_error(stream, &code, &message);
+}
+
+fn parse_watch_body(req: &HttpRequest) -> Result<JsonValue, String> {
+    let payload = unpack_connect_payload(&req.body)?;
+    if payload.is_empty() {
+        return Ok(JsonValue::Object(Default::default()));
+    }
+    let text = std::str::from_utf8(&payload).map_err(|_| "invalid utf8 payload".to_string())?;
+    JsonValue::parse(text).map_err(|e| format!("invalid json: {e}"))
+}
+
+fn json_bool(json: &JsonValue, keys: &[&str]) -> bool {
+    for key in keys {
+        if let Some(v) = json.get(key).and_then(|v| v.as_bool()) {
+            return v;
+        }
+    }
+    false
+}
+
+fn json_str<'a>(json: &'a JsonValue, keys: &[&str]) -> Option<&'a str> {
+    for key in keys {
+        if let Some(s) = json.get(key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+enum PathKind {
+    Missing,
+    Dir,
+    Other,
+}
+
+fn classify_path(path: &Path) -> Result<PathKind, std::io::Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::metadata(path) {
+            Ok(followed) if followed.is_dir() => Ok(PathKind::Dir),
+            Ok(_) => Ok(PathKind::Other),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PathKind::Other),
+            Err(e) => Err(e),
+        },
+        Ok(meta) if meta.is_dir() => Ok(PathKind::Dir),
+        Ok(_) => Ok(PathKind::Other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PathKind::Missing),
+        Err(e) => Err(e),
+    }
+}
+
+fn mkdir_io_error(err: std::io::Error, last: bool) -> WatchPathError {
+    if err.kind() == std::io::ErrorKind::AlreadyExists {
+        return if last {
+            WatchPathError::AlreadyExists("directory already exists".into())
+        } else {
+            WatchPathError::Invalid("parent path is not a directory".into())
+        };
+    }
+    if err.raw_os_error() == Some(libc::ENOTDIR) {
+        return WatchPathError::Invalid("parent path is not a directory".into());
+    }
+    WatchPathError::Invalid(err.to_string())
+}
+
+/// Create `path` and any missing parents. An existing directory is `already_exists`.
+/// An existing file, or a file used as a parent, is `invalid_argument`.
+fn mkdir_p(path: &Path) -> Result<(), WatchPathError> {
+    let comps: Vec<Component> = path.components().collect();
+    if comps.is_empty() {
+        return Err(WatchPathError::Invalid("path is required".into()));
+    }
+    let mut built = PathBuf::new();
+    for (i, comp) in comps.iter().enumerate() {
+        built.push(comp);
+        if matches!(comp, Component::RootDir | Component::Prefix(_)) {
+            continue;
+        }
+        let last = i + 1 == comps.len();
+        match classify_path(&built).map_err(|e| mkdir_io_error(e, last))? {
+            PathKind::Dir => {
+                if last {
+                    return Err(WatchPathError::AlreadyExists(
+                        "directory already exists".into(),
+                    ));
+                }
+            }
+            PathKind::Other => {
+                return Err(WatchPathError::Invalid(if last {
+                    "path exists and is not a directory".into()
+                } else {
+                    "parent path is not a directory".into()
+                }));
+            }
+            PathKind::Missing => {
+                if let Err(e) = std::fs::create_dir(&built) {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        match classify_path(&built).map_err(|err| mkdir_io_error(err, last))? {
+                            PathKind::Dir if last => {
+                                return Err(WatchPathError::AlreadyExists(
+                                    "directory already exists".into(),
+                                ));
+                            }
+                            PathKind::Dir => {}
+                            _ => {
+                                return Err(WatchPathError::Invalid(if last {
+                                    "path exists and is not a directory".into()
+                                } else {
+                                    "parent path is not a directory".into()
+                                }));
+                            }
+                        }
+                    } else {
+                        return Err(mkdir_io_error(e, last));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn entry_name_from_user(user: &str) -> String {
+    let trimmed = user.trim().trim_end_matches('/');
+    Path::new(trimmed)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn make_dir_success_body(user_path: &str, full: &Path) -> String {
+    let meta = std::fs::metadata(full).ok();
+    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mode = meta
+        .as_ref()
+        .map(|m| m.permissions().mode() & 0o777)
+        .unwrap_or(0o755);
+    let name = entry_name_from_user(user_path);
+    let perm = mode_string(mode, true);
+    format!(
+        r#"{{"entry":{{"name":"{}","type":"FILE_TYPE_DIRECTORY","path":"{}","size":{},"mode":{},"permissions":"{}","isDir":true,"is_dir":true}}}}"#,
+        escape_json(&name),
+        escape_json(user_path.trim()),
+        size,
+        mode,
+        perm,
+    )
+}
+
+pub fn handle_make_dir(stream: &mut TcpStream, req: &HttpRequest, config: &DaemonConfig) {
+    let json = match parse_watch_body(req) {
+        Ok(j) => j,
+        Err(e) => {
+            write_watch_error(stream, WatchPathError::Invalid(e));
+            return;
+        }
+    };
+    let path = json_str(&json, &["path"]).unwrap_or("");
+    let full = match resolve_mkdir_path(&config.workdir, path) {
+        Ok(p) => p,
+        Err(e) => {
+            write_watch_error(stream, e);
+            return;
+        }
+    };
+    if let Err(e) = mkdir_p(&full) {
+        write_watch_error(stream, e);
+        return;
+    }
+    let body = make_dir_success_body(path, &full);
+    write_unary_connect_response(stream, req, "200 OK", &body);
+}
+
+pub fn handle_create_watcher(
+    stream: &mut TcpStream,
+    req: &HttpRequest,
+    config: &DaemonConfig,
+    registry: &ProcessRegistry,
+) {
+    let json = match parse_watch_body(req) {
+        Ok(j) => j,
+        Err(e) => {
+            write_watch_error(stream, WatchPathError::Invalid(e));
+            return;
+        }
+    };
+    let path = json_str(&json, &["path"]).unwrap_or("");
+    let recursive = json_bool(&json, &["recursive"]);
+    let include_entry = json_bool(&json, &["includeEntry", "include_entry"]);
+    let allow_network = json_bool(&json, &["allowNetworkMounts", "allow_network_mounts"]);
+    match registry.watchers.create(
+        &config.workdir,
+        path,
+        recursive,
+        include_entry,
+        allow_network,
+    ) {
+        Ok(w) => {
+            let body = format!(r#"{{"watcherId":"{}"}}"#, escape_json(&w.id));
+            write_unary_connect_response(stream, req, "200 OK", &body);
+        }
+        Err(e) => write_watch_error(stream, e),
+    }
+}
+
+pub fn handle_get_watcher_events(
+    stream: &mut TcpStream,
+    req: &HttpRequest,
+    _config: &DaemonConfig,
+    registry: &ProcessRegistry,
+) {
+    let json = match parse_watch_body(req) {
+        Ok(j) => j,
+        Err(e) => {
+            write_watch_error(stream, WatchPathError::Invalid(e));
+            return;
+        }
+    };
+    let id = match json_str(&json, &["watcherId", "watcher_id"]) {
+        Some(id) => id,
+        None => {
+            write_watch_error(
+                stream,
+                WatchPathError::Invalid("watcherId is required".into()),
+            );
+            return;
+        }
+    };
+    let Some(w) = registry.watchers.get(id) else {
+        write_watch_error(stream, WatchPathError::NotFound("watcher not found".into()));
+        return;
+    };
+    if w.stopped.load(Ordering::SeqCst) {
+        write_watch_error(stream, WatchPathError::NotFound("watcher not found".into()));
+        return;
+    }
+    let events = match w.poll_events() {
+        Ok(evs) => evs,
+        Err(()) => {
+            write_watch_error(
+                stream,
+                WatchPathError::Exhausted(WATCH_BUFFER_OVERFLOW_MSG.into()),
+            );
+            return;
+        }
+    };
+    let rendered: Vec<String> = events.iter().map(FsEvent::to_json).collect();
+    let body = format!(r#"{{"events":[{}]}}"#, rendered.join(","));
+    write_unary_connect_response(stream, req, "200 OK", &body);
+}
+
+pub fn handle_remove_watcher(
+    stream: &mut TcpStream,
+    req: &HttpRequest,
+    _config: &DaemonConfig,
+    registry: &ProcessRegistry,
+) {
+    let json = match parse_watch_body(req) {
+        Ok(j) => j,
+        Err(e) => {
+            write_watch_error(stream, WatchPathError::Invalid(e));
+            return;
+        }
+    };
+    let id = match json_str(&json, &["watcherId", "watcher_id"]) {
+        Some(id) => id,
+        None => {
+            write_watch_error(
+                stream,
+                WatchPathError::Invalid("watcherId is required".into()),
+            );
+            return;
+        }
+    };
+    if registry.watchers.remove(id) {
+        write_unary_connect_response(stream, req, "200 OK", "{}");
+    } else {
+        write_watch_error(stream, WatchPathError::NotFound("watcher not found".into()));
+    }
+}
+
+pub fn handle_watch_dir(
+    stream: &mut TcpStream,
+    req: &HttpRequest,
+    config: &DaemonConfig,
+    registry: &ProcessRegistry,
+) {
+    let json = match parse_watch_body(req) {
+        Ok(j) => j,
+        Err(e) => {
+            write_watch_stream_error(stream, WatchPathError::Invalid(e));
+            return;
+        }
+    };
+    let path = json_str(&json, &["path"]).unwrap_or("");
+    let recursive = json_bool(&json, &["recursive"]);
+    let include_entry = json_bool(&json, &["includeEntry", "include_entry"]);
+    let allow_network = json_bool(&json, &["allowNetworkMounts", "allow_network_mounts"]);
+    let watcher = match registry.watchers.create(
+        &config.workdir,
+        path,
+        recursive,
+        include_entry,
+        allow_network,
+    ) {
+        Ok(w) => w,
+        Err(e) => {
+            write_watch_stream_error(stream, e);
+            return;
+        }
+    };
+    let id = watcher.id.clone();
+    let sub = watcher.subscribe();
+    let header =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/connect+json\r\nConnection: close\r\n\r\n";
+    if stream.write_all(header.as_bytes()).is_err() || stream.flush().is_err() {
+        registry.watchers.remove(&id);
+        return;
+    }
+    let start = make_connect_frame(br#"{"start":{}}"#, false);
+    if stream.write_all(&start).is_err() || stream.flush().is_err() {
+        registry.watchers.remove(&id);
+        return;
+    }
+    // Client timeoutMs is a stream deadline. Disconnect stops this watch.
+    pump_watch_subscription(stream, sub, &id, &registry.watchers);
+}
+
+fn pump_watch_subscription(
+    stream: &mut TcpStream,
+    sub: WatchSubHandle,
+    id: &str,
+    watchers: &WatchRegistry,
+) {
+    loop {
+        match sub.rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(WatchMsg::Event(ev)) => {
+                let payload = format!(r#"{{"filesystem":{}}}"#, ev.to_json());
+                let frame = make_connect_frame(payload.as_bytes(), false);
+                if stream.write_all(&frame).is_err() || stream.flush().is_err() {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if client_gone(stream) {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if sub.overflow.load(Ordering::SeqCst) {
+                    let message = sub.message.lock().unwrap().clone();
+                    let message = if message.is_empty() {
+                        WATCH_QUEUE_OVERFLOW_MSG.to_string()
+                    } else {
+                        message
+                    };
+                    let err = format!(
+                        r#"{{"error":{{"code":"resource_exhausted","message":"{}"}}}}"#,
+                        escape_json(&message)
+                    );
+                    let frame = make_connect_frame(err.as_bytes(), true);
+                    let _ = stream.write_all(&frame);
+                    let _ = stream.flush();
+                }
+                break;
+            }
+        }
+    }
+    watchers.remove(id);
+}
+
+fn client_gone(stream: &TcpStream) -> bool {
+    let fd = stream.as_raw_fd();
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if rc <= 0 {
+        return false;
+    }
+    if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return true;
+    }
+    if pfd.revents & libc::POLLIN != 0 {
+        let mut b = [0u8; 1];
+        let n = unsafe {
+            libc::recv(
+                fd,
+                b.as_mut_ptr() as *mut libc::c_void,
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        return n == 0;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscriber_overflow_fails_instead_of_dropping() {
+        let dir = std::env::temp_dir().join(format!("podd-watch-ovf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = WatchRegistry::new();
+        let w = reg
+            .create(
+                dir.to_str().unwrap(),
+                dir.to_str().unwrap(),
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let sub = w.subscribe();
+        for i in 0..(WATCH_SUB_QUEUE + 3) {
+            w.publish(FsEvent {
+                name: format!("n{i}"),
+                kind: "EVENT_TYPE_CREATE".into(),
+                entry: None,
+            });
+        }
+        assert!(
+            sub.overflow.load(Ordering::SeqCst),
+            "slow subscriber must be failed"
+        );
+        let mut n = 0;
+        while sub.rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert!(n <= WATCH_SUB_QUEUE);
+        assert!(sub.rx.try_recv().is_err());
+        reg.remove(&w.id);
+        assert_eq!(reg.active_count(), 0);
+        assert_eq!(reg.open_fd_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_rejects_escape_missing_and_file() {
+        let dir = std::env::temp_dir().join(format!("podd-watch-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let work = dir.to_str().unwrap();
+        assert!(resolve_watch_path(work, "/workspace").is_ok());
+        assert!(matches!(
+            resolve_watch_path(work, "/workspace/nope"),
+            Err(WatchPathError::NotFound(_))
+        ));
+        let file = dir.join("f.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(matches!(
+            resolve_watch_path(work, "/workspace/f.txt"),
+            Err(WatchPathError::Invalid(_))
+        ));
+        assert!(matches!(
+            resolve_watch_path(work, "/workspace/../../etc"),
+            Err(WatchPathError::Invalid(_))
+        ));
+        assert!(matches!(
+            resolve_watch_path(work, "../etc"),
+            Err(WatchPathError::Invalid(_))
+        ));
+        assert!(matches!(
+            resolve_watch_path(work, "/proc"),
+            Err(WatchPathError::Invalid(_))
+        ));
+        assert!(matches!(
+            resolve_watch_path(work, "/dev"),
+            Err(WatchPathError::Invalid(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ring_overflow_fails_poll_instead_of_truncating() {
+        let dir = std::env::temp_dir().join(format!(
+            "podd-watch-ring-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = WatchRegistry::new();
+        let w = reg
+            .create(
+                dir.to_str().unwrap(),
+                dir.to_str().unwrap(),
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        for i in 0..WATCH_RING_CAP {
+            w.publish(FsEvent {
+                name: format!("f{i}"),
+                kind: "EVENT_TYPE_WRITE".into(),
+                entry: None,
+            });
+        }
+        let evs = w.poll_events().expect("a full ring is still complete");
+        assert_eq!(evs.len(), WATCH_RING_CAP);
+        assert_eq!(evs[0].name, "f0");
+        assert!(
+            w.poll_events().unwrap().is_empty(),
+            "a successful poll clears the ring"
+        );
+
+        let sub = w.subscribe();
+        for i in 0..WATCH_RING_CAP {
+            w.publish(FsEvent {
+                name: format!("g{i}"),
+                kind: "EVENT_TYPE_WRITE".into(),
+                entry: None,
+            });
+            let _ = sub.rx.try_recv();
+        }
+        assert!(!w.is_overflowed());
+        w.publish(FsEvent {
+            name: "overflow".into(),
+            kind: "EVENT_TYPE_WRITE".into(),
+            entry: None,
+        });
+        assert!(
+            w.is_overflowed(),
+            "the event past the cap must taint the watcher"
+        );
+        assert!(
+            w.poll_events().is_err(),
+            "GetWatcherEvents must not return a truncated ring"
+        );
+        assert!(sub.overflow.load(Ordering::SeqCst));
+        assert_eq!(
+            sub.message.lock().unwrap().as_str(),
+            WATCH_BUFFER_OVERFLOW_MSG
+        );
+        assert!(sub.rx.try_recv().is_err());
+
+        reg.remove(&w.id);
+        assert_eq!(reg.open_fd_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kernel_overflow_fails_subscribers() {
+        let dir = std::env::temp_dir().join(format!(
+            "podd-watch-qovf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = WatchRegistry::new();
+        let w = reg
+            .create(
+                dir.to_str().unwrap(),
+                dir.to_str().unwrap(),
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let sub = w.subscribe();
+        w.on_raw(0, libc::IN_Q_OVERFLOW, "");
+        assert!(w.is_overflowed());
+        assert!(sub.overflow.load(Ordering::SeqCst));
+        assert_eq!(
+            sub.message.lock().unwrap().as_str(),
+            WATCH_BUFFER_OVERFLOW_MSG
+        );
+        assert!(w.poll_events().is_err());
+        assert!(matches!(
+            sub.rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ));
+        reg.remove(&w.id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recursive_arm_does_not_replay_files_created_before_add_watch() {
+        // Linux inotify limitation: a new subdirectory is armed only when the
+        // create event is handled. Files that already exist in that directory
+        // (the race window before inotify_add_watch returns) are not delivered
+        // and are not invented by a scan. This test does not try to close the race.
+        let dir = std::env::temp_dir().join(format!(
+            "podd-watch-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+        assert!(fd >= 0);
+        let w = DirWatcher {
+            id: "wrace".into(),
+            root: dir.clone(),
+            recursive: true,
+            include_entry: false,
+            fd: AtomicI32::new(fd),
+            watches: Mutex::new(HashMap::new()),
+            pending: Mutex::new(VecDeque::new()),
+            subscribers: Mutex::new(Vec::new()),
+            stopped: AtomicBool::new(false),
+            overflowed: AtomicBool::new(false),
+        };
+        w.add_watch(&dir, "").unwrap();
+        let child = dir.join("child");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::write(child.join("early.txt"), b"x").unwrap();
+        let root_wd = *w.watches.lock().unwrap().keys().next().unwrap();
+        w.on_raw(root_wd, libc::IN_CREATE | libc::IN_ISDIR, "child");
+        let evs = w.poll_events().unwrap();
+        assert!(
+            evs.iter().any(|e| e.name == "child"),
+            "the directory create itself is reported: {evs:?}"
+        );
+        assert!(
+            evs.iter().all(|e| e.name != "child/early.txt"),
+            "files created before add_watch are not synthesized: {evs:?}"
+        );
+        assert!(
+            w.watches.lock().unwrap().values().any(|rel| rel == "child"),
+            "the new directory is armed for later events only"
+        );
+        w.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn watch_dir_pump_emits_resource_exhausted() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!(
+            "podd-watch-pump-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = WatchRegistry::new();
+        let w = reg
+            .create(
+                dir.to_str().unwrap(),
+                dir.to_str().unwrap(),
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let sub = w.subscribe();
+        for i in 0..(WATCH_SUB_QUEUE + 3) {
+            w.publish(FsEvent {
+                name: format!("n{i}"),
+                kind: "EVENT_TYPE_WRITE".into(),
+                entry: None,
+            });
+        }
+        assert!(sub.overflow.load(Ordering::SeqCst));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let id = w.id.clone();
+        let reg_thread = reg.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            pump_watch_subscription(&mut stream, sub, &id, &reg_thread);
+        });
+
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).unwrap();
+        server.join().unwrap();
+
+        let err = br#"{"error":{"code":"resource_exhausted","message":"watch subscriber queue overflow"}}"#;
+        let expected = make_connect_frame(err, true);
+        assert!(
+            buf.windows(expected.len())
+                .any(|w| w == expected.as_slice()),
+            "pump must end the stream with resource_exhausted, got {} bytes",
+            buf.len()
+        );
+        assert_eq!(reg.active_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kernel_overflow_pump_emits_dropped_events_error() {
+        use std::io::Read;
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!(
+            "podd-watch-kpump-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = WatchRegistry::new();
+        let w = reg
+            .create(
+                dir.to_str().unwrap(),
+                dir.to_str().unwrap(),
+                false,
+                false,
+                false,
+            )
+            .unwrap();
+        let sub = w.subscribe();
+        w.on_raw(0, libc::IN_Q_OVERFLOW, "");
+        assert!(sub.overflow.load(Ordering::SeqCst));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let id = w.id.clone();
+        let reg_thread = reg.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            pump_watch_subscription(&mut stream, sub, &id, &reg_thread);
+        });
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = Vec::new();
+        client.read_to_end(&mut buf).unwrap();
+        server.join().unwrap();
+        let err = format!(
+            r#"{{"error":{{"code":"resource_exhausted","message":"{WATCH_BUFFER_OVERFLOW_MSG}"}}}}"#
+        );
+        let expected = make_connect_frame(err.as_bytes(), true);
+        assert!(
+            buf.windows(expected.len())
+                .any(|w| w == expected.as_slice()),
+            "kernel overflow must end the stream with resource_exhausted, got {}",
+            String::from_utf8_lossy(&buf)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

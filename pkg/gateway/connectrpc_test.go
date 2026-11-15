@@ -1636,3 +1636,113 @@ func TestConnectRPC_Process_ConnectRunningNonPTY_WaitsForExit(t *testing.T) {
 		t.Fatalf("expected exitCode 4 from Connect on running non-PTY, got %v", gotExitCode)
 	}
 }
+
+func TestConnectRPC_MakeDir_OfficialSemantics(t *testing.T) {
+	_, ts, rec := setupTestServerWithSandbox(t)
+
+	post := func(path string, payload []byte, contentType string) (int, string, []byte) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, ts.URL+path, bytes.NewReader(payload))
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		req.Header.Set("Content-Type", contentType)
+		req.Header.Set("E2b-Sandbox-Id", rec.SandboxID)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		return resp.StatusCode, resp.Header.Get("Content-Type"), body
+	}
+
+	status, ct, body := post("/filesystem.Filesystem/MakeDir", []byte(`{"path":"/workspace/a/b/c"}`), "application/json")
+	if status != http.StatusOK {
+		t.Fatalf("create nested dir: status %d body %s", status, body)
+	}
+	if !strings.HasPrefix(ct, "application/json") || strings.Contains(ct, "connect+") {
+		t.Fatalf("success content-type %q", ct)
+	}
+	var created struct {
+		Entry struct {
+			Name  string `json:"name"`
+			Type  string `json:"type"`
+			Path  string `json:"path"`
+			IsDir bool   `json:"isDir"`
+		} `json:"entry"`
+	}
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatalf("decode success: %v body %s", err, body)
+	}
+	if created.Entry.Name != "c" || created.Entry.Type != "FILE_TYPE_DIRECTORY" || created.Entry.Path != "/workspace/a/b/c" || !created.Entry.IsDir {
+		t.Fatalf("entry %+v", created.Entry)
+	}
+	if fi, err := os.Stat(filepath.Join(rec.WorkspaceDir, "a", "b", "c")); err != nil || !fi.IsDir() {
+		t.Fatalf("nested parents were not created: %v", err)
+	}
+
+	status, ct, body = post("/filesystem.Filesystem/MakeDir", []byte(`{"path":"/workspace/a/b/c"}`), "application/json")
+	code := parsedUnaryCode(status, ct, body)
+	if status != http.StatusConflict || code != "already_exists" {
+		t.Fatalf("existing dir: status %d code %q body %s", status, code, body)
+	}
+	if code == codeFromHTTPStatusFallback(status) {
+		t.Fatalf("JSON code must be used, fallback would be %q", code)
+	}
+	if !strings.Contains(string(body), "directory already exists") {
+		t.Fatalf("already_exists message: %s", body)
+	}
+
+	framed := makeConnectFrame([]byte(`{"path":"/workspace/a/b/c"}`), false)
+	status, ct, body = post("/filesystem.Filesystem/MakeDir", framed, "application/connect+json")
+	code = parsedUnaryCode(status, ct, body)
+	if status != http.StatusConflict || code != "already_exists" {
+		t.Fatalf("framed already_exists: status %d code %q ct %q body %s", status, code, ct, body)
+	}
+	if len(body) == 0 || body[0] != '{' {
+		t.Fatalf("unary error must be raw JSON, body %q", body)
+	}
+	if strings.Contains(ct, "connect+") {
+		t.Fatalf("unary error content-type %q", ct)
+	}
+
+	if err := os.WriteFile(filepath.Join(rec.WorkspaceDir, "plain.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	status, ct, body = post("/filesystem.Filesystem/MakeDir", []byte(`{"path":"/workspace/plain.txt"}`), "application/json")
+	code = parsedUnaryCode(status, ct, body)
+	if status != http.StatusBadRequest || code != "invalid_argument" || code == "internal" {
+		t.Fatalf("file at path: status %d code %q body %s", status, code, body)
+	}
+	if !strings.Contains(string(body), "path exists and is not a directory") {
+		t.Fatalf("file message: %s", body)
+	}
+
+	if err := os.WriteFile(filepath.Join(rec.WorkspaceDir, "notdir"), []byte("f"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	status, ct, body = post("/filesystem.Filesystem/MakeDir", []byte(`{"path":"/workspace/notdir/child"}`), "application/json")
+	code = parsedUnaryCode(status, ct, body)
+	if status != http.StatusBadRequest || code != "invalid_argument" {
+		t.Fatalf("parent file: status %d code %q body %s", status, code, body)
+	}
+	if !strings.Contains(string(body), "parent path is not a directory") {
+		t.Fatalf("parent message: %s", body)
+	}
+
+	for _, bad := range []string{"", "/workspace/../../etc", "../etc"} {
+		payload := []byte(`{"path":"` + bad + `"}`)
+		status, ct, body = post("/filesystem.Filesystem/MakeDir", payload, "application/json")
+		code = parsedUnaryCode(status, ct, body)
+		if status != http.StatusBadRequest || code != "invalid_argument" || code == "internal" {
+			t.Fatalf("path %q: status %d code %q body %s", bad, status, code, body)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(rec.WorkspaceDir), "etc")); err == nil {
+		t.Fatal("relative escape created a directory outside the workspace")
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -60,7 +61,31 @@ func unpackConnectRPCBody(r *http.Request) ([]byte, bool, error) {
 	return body, isFramed, nil
 }
 
-// writeConnectError serializes a standard Connect-RPC error JSON payload.
+// connectStatusHTTP is the Connect unary HTTP mapping.
+// A stream client that cannot parse a body falls back the other way
+// (404→unimplemented, 400→internal), so stream errors must not use these statuses.
+func connectStatusHTTP(code string) int {
+	switch code {
+	case "not_found":
+		return http.StatusNotFound
+	case "already_exists":
+		return http.StatusConflict
+	case "resource_exhausted":
+		return http.StatusTooManyRequests
+	case "unauthenticated":
+		return http.StatusUnauthorized
+	case "permission_denied":
+		return http.StatusForbidden
+	case "unavailable":
+		return http.StatusServiceUnavailable
+	case "internal":
+		return http.StatusInternalServerError
+	default:
+		return http.StatusBadRequest
+	}
+}
+
+// writeConnectError serializes a standard Connect-RPC unary error JSON payload.
 func (s *Server) writeConnectError(w http.ResponseWriter, statusCode int, code string, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
@@ -68,6 +93,34 @@ func (s *Server) writeConnectError(w http.ResponseWriter, statusCode int, code s
 		"code":    code,
 		"message": msg,
 	})
+}
+
+// writeConnectStreamError writes a Connect end-stream error on HTTP 200.
+// Server-stream clients ignore a non-200 body and report HTTP <status>.
+func (s *Server) writeConnectStreamError(w http.ResponseWriter, code, message string) {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"error": map[string]string{
+			"code":    code,
+			"message": message,
+		},
+	})
+	w.Header().Set("Content-Type", "application/connect+json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(makeConnectFrame(payload, true))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func connectRPCIsStream(path string) bool {
+	switch {
+	case strings.HasSuffix(path, "/filesystem.Filesystem/WatchDir"),
+		strings.HasSuffix(path, "/process.Process/Start"),
+		strings.HasSuffix(path, "/process.Process/Connect"):
+		return true
+	default:
+		return false
+	}
 }
 
 // writeUnaryResponse sends a unary Connect-RPC response, respecting requested framing/Content-Type.
@@ -295,7 +348,12 @@ func (s *Server) forwardConnectRPCToPodd(w http.ResponseWriter, r *http.Request,
 		FlushInterval: 10 * time.Millisecond,
 		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, proxyErr error) {
 			slog.Error("podd connectrpc reverse proxy failed", "target", poddURL, "err", proxyErr)
-			s.writeConnectError(rw, http.StatusBadGateway, "unavailable", "podd connectrpc proxy error: "+proxyErr.Error())
+			msg := "podd connectrpc proxy error: " + proxyErr.Error()
+			if connectRPCIsStream(req.URL.Path) {
+				s.writeConnectStreamError(rw, "unavailable", msg)
+				return
+			}
+			s.writeConnectError(rw, http.StatusBadGateway, "unavailable", msg)
 		},
 	}
 
@@ -334,6 +392,14 @@ func (s *Server) handleConnectRPCDispatch(w http.ResponseWriter, r *http.Request
 		s.handleConnectRPCFilesystemRemove(w, r)
 	case "/filesystem.Filesystem/MakeDir":
 		s.handleConnectRPCFilesystemMakeDir(w, r)
+	case "/filesystem.Filesystem/CreateWatcher":
+		s.handleConnectRPCCreateWatcher(w, r)
+	case "/filesystem.Filesystem/GetWatcherEvents":
+		s.handleConnectRPCGetWatcherEvents(w, r)
+	case "/filesystem.Filesystem/RemoveWatcher":
+		s.handleConnectRPCRemoveWatcher(w, r)
+	case "/filesystem.Filesystem/WatchDir":
+		s.handleConnectRPCWatchDir(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -1707,28 +1773,133 @@ func (s *Server) handleConnectRPCFilesystemMakeDir(w http.ResponseWriter, r *htt
 		return
 	}
 
-	fullPath, err := s.resolveFilePath(rec, targetPath)
+	fullPath, err := s.resolveWatchPath(rec, targetPath)
 	if err != nil {
 		s.writeConnectError(w, http.StatusBadRequest, "invalid_argument", err.Error())
 		return
 	}
 
-	if err := os.MkdirAll(fullPath, 0755); err != nil {
-		s.writeConnectError(w, http.StatusInternalServerError, "internal", "failed to make directory: "+err.Error())
+	if err := makeSandboxDir(fullPath); err != nil {
+		if st, ok := err.(*connectStatusError); ok {
+			s.writeConnectError(w, connectStatusHTTP(st.code), st.code, st.msg)
+			return
+		}
+		s.writeConnectError(w, http.StatusInternalServerError, "internal", err.Error())
 		return
 	}
 
+	fi, statErr := os.Stat(fullPath)
+	name := filepath.Base(path.Clean(targetPath))
+	if name == "." || name == string(filepath.Separator) {
+		name = filepath.Base(fullPath)
+	}
+	var size int64
+	var mode uint32
+	perm := "drwxr-xr-x"
+	if statErr == nil {
+		size = fi.Size()
+		mode = uint32(fi.Mode().Perm())
+		perm = fi.Mode().String()
+	}
 	resp := map[string]interface{}{
 		"entry": map[string]interface{}{
-			"name":        filepath.Base(targetPath),
+			"name":        name,
 			"type":        "FILE_TYPE_DIRECTORY",
 			"path":        targetPath,
+			"size":        size,
+			"mode":        mode,
+			"permissions": perm,
 			"isDir":       true,
 			"is_dir":      true,
-			"permissions": "drwxr-xr-x",
 		},
 	}
 	s.writeUnaryResponse(w, r, resp)
+}
+
+func pathIsDir(full string, info os.FileInfo) bool {
+	if info.IsDir() {
+		return true
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		fi, err := os.Stat(full)
+		return err == nil && fi.IsDir()
+	}
+	return false
+}
+
+func mkdirPathError(err error, last bool) error {
+	if os.IsExist(err) {
+		if last {
+			return statusErr("already_exists", "directory already exists")
+		}
+		return statusErr("invalid_argument", "parent path is not a directory")
+	}
+	if errors.Is(err, syscall.ENOTDIR) {
+		return statusErr("invalid_argument", "parent path is not a directory")
+	}
+	return statusErr("internal", "failed to make directory: "+err.Error())
+}
+
+// makeSandboxDir creates full and any missing parents.
+// An existing directory is already_exists. A file at the path, or a file used
+// as a parent, is invalid_argument. A missing parent is created.
+func makeSandboxDir(full string) error {
+	if full == "" || full == "." {
+		return statusErr("invalid_argument", "path is required")
+	}
+	info, err := os.Lstat(full)
+	if err == nil {
+		if pathIsDir(full, info) {
+			return statusErr("already_exists", "directory already exists")
+		}
+		return statusErr("invalid_argument", "path exists and is not a directory")
+	}
+	if !os.IsNotExist(err) {
+		return mkdirPathError(err, true)
+	}
+	if err := createMissingDirParents(full); err != nil {
+		return err
+	}
+	if err := os.Mkdir(full, 0o755); err != nil {
+		if os.IsExist(err) {
+			if fi, stErr := os.Stat(full); stErr == nil && fi.IsDir() {
+				return statusErr("already_exists", "directory already exists")
+			}
+			return statusErr("invalid_argument", "path exists and is not a directory")
+		}
+		return mkdirPathError(err, true)
+	}
+	return nil
+}
+
+func createMissingDirParents(full string) error {
+	parent := filepath.Dir(full)
+	if parent == full || parent == "." || parent == string(filepath.Separator) {
+		return nil
+	}
+	info, err := os.Lstat(parent)
+	if err == nil {
+		if pathIsDir(parent, info) {
+			return nil
+		}
+		return statusErr("invalid_argument", "parent path is not a directory")
+	}
+	if !os.IsNotExist(err) {
+		return mkdirPathError(err, false)
+	}
+	if err := createMissingDirParents(parent); err != nil {
+		return err
+	}
+	if err := os.Mkdir(parent, 0o755); err != nil {
+		if os.IsExist(err) {
+			if fi, stErr := os.Stat(parent); stErr == nil && fi.IsDir() {
+				return nil
+			}
+			return statusErr("invalid_argument", "parent path is not a directory")
+		}
+		return mkdirPathError(err, false)
+	}
+	return nil
 }
 
 // handleConnectRPCFilesystemRemove handles POST /filesystem.Filesystem/Remove.

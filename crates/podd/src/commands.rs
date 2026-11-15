@@ -232,6 +232,7 @@ pub type ManagedProcess = ProcessEntry;
 pub struct ProcessRegistry {
     pub(crate) entries: Arc<Mutex<HashMap<String, Arc<Mutex<ProcessEntry>>>>>,
     pub(crate) counter: Arc<AtomicU64>,
+    pub(crate) watchers: crate::watch::WatchRegistry,
 }
 
 pub type ProcessTable = ProcessRegistry;
@@ -250,6 +251,7 @@ impl ProcessRegistry {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
             counter: Arc::new(AtomicU64::new(1)),
+            watchers: crate::watch::WatchRegistry::new(),
         }
     }
 
@@ -350,6 +352,7 @@ impl ProcessRegistry {
 }
 
 pub fn kill_all_managed(registry: &ProcessRegistry) -> usize {
+    registry.watchers.stop_all();
     let map = registry.entries.lock().unwrap();
     let mut killed = 0;
     for entry in map.values() {

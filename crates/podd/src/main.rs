@@ -17,6 +17,7 @@ pub mod interpreter;
 pub mod json;
 pub mod lifecycle;
 pub mod startcmd;
+pub mod watch;
 
 #[cfg(test)]
 mod tests;
@@ -53,6 +54,10 @@ pub use startcmd::{
     spawn_start_cmd, spawn_start_cmd_if_configured, spawn_tracked, tracked_pid_count, PasswdEntry,
     ResolvedCredentials, StartCmdConfig, StartCmdCredentials, StartCmdRunner, StartCmdStatus,
     TemplateUserCredentials, TrackedChild,
+};
+pub use watch::{
+    handle_create_watcher, handle_get_watcher_events, handle_make_dir, handle_remove_watcher,
+    handle_watch_dir,
 };
 
 #[derive(Clone, Debug)]
@@ -145,6 +150,21 @@ pub fn route_request_with_quiesce(
         }
         ("POST", "/process.Process/CloseStdin") => {
             handle_connectrpc_close_stdin(&mut stream, &req, registry);
+        }
+        ("POST", "/filesystem.Filesystem/MakeDir") => {
+            handle_make_dir(&mut stream, &req, config);
+        }
+        ("POST", "/filesystem.Filesystem/CreateWatcher") => {
+            handle_create_watcher(&mut stream, &req, config, registry);
+        }
+        ("POST", "/filesystem.Filesystem/GetWatcherEvents") => {
+            handle_get_watcher_events(&mut stream, &req, config, registry);
+        }
+        ("POST", "/filesystem.Filesystem/RemoveWatcher") => {
+            handle_remove_watcher(&mut stream, &req, config, registry);
+        }
+        ("POST", "/filesystem.Filesystem/WatchDir") => {
+            handle_watch_dir(&mut stream, &req, config, registry);
         }
         ("PUT", "/v1/files") | ("PUT", "/files") => {
             handle_file_put(&mut stream, &req, &query_params);

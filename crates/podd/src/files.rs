@@ -56,6 +56,7 @@ pub fn resolve_file_ownership(query_params: &HashMap<String, String>) -> (u32, u
 }
 
 pub fn handle_prepare_stop(stream: &mut TcpStream, registry: &ProcessRegistry) {
+    registry.watchers.stop_all();
     unsafe {
         libc::sync();
     }
