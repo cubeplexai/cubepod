@@ -7,6 +7,8 @@
   --sl-font: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans SC', 'PingFang SC', sans-serif;
   --cp-font-display: 'Plus Jakarta Sans', 'Inter', ui-sans-serif, system-ui, 'Noto Sans SC', 'PingFang SC', sans-serif;
   --sl-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --sl-sidebar-width: 17.5rem;
+  --sl-content-width: 66rem;
 }
 
 /* DARK MODE — Oxide Copper: Bare-Metal Charcoal & Copper */
@@ -136,6 +138,44 @@ header.header {
 
 .right-sidebar {
   border-inline-start: 1px solid var(--cp-border) !important;
+}
+
+@media (min-width: 72rem) {
+  [data-has-sidebar][data-has-toc] .main-pane {
+    flex: 1 1 0%;
+    min-width: 0;
+    width: auto;
+    --sl-content-margin-inline: auto;
+  }
+
+  .right-sidebar-container {
+    flex: 0 0 16rem;
+    width: 16rem;
+  }
+
+  .right-sidebar {
+    width: 16rem;
+    inset-inline-end: 0;
+  }
+
+  .right-sidebar-panel {
+    padding: 1rem 0.9rem;
+  }
+
+  .right-sidebar-panel .sl-container {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .right-sidebar-panel :where(a) {
+    overflow-wrap: break-word;
+    line-height: 1.45;
+  }
+
+  .content-panel .sl-container {
+    max-width: min(var(--sl-content-width), 100%);
+    margin-inline: auto;
+  }
 }
 
 starlight-toc h2,
