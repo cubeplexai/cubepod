@@ -465,6 +465,7 @@ function syncCEPs() {
       '',
       `> **Source**: [\`docs/enhancements/${dirName}/README.md\`](https://github.com/cubeplexai/cubepod/blob/main/docs/enhancements/${dirName}/README.md) · **Status**: \`${status}\` · **Area**: \`${area}\` · **Milestone**: \`${milestone}\``,
       '',
+      '',
     ].join('\n');
 
     fs.writeFileSync(path.join(enCepsDir, `${dirName}.md`), frontmatter + body, 'utf8');

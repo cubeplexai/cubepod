@@ -92,6 +92,13 @@ function main() {
     assertFile(f);
   }
 
+  for (const cepDir of cepDirs) {
+    const cepHtml = fs.readFileSync(path.join(distDir, 'ceps', cepDir, 'index.html'), 'utf8');
+    if (cepHtml.includes('| Field | Value |')) {
+      throw new Error(`Unparsed markdown metadata table leaked into dist/ceps/${cepDir}/index.html`);
+    }
+  }
+
   for (const gaPage of ['index.html', 'zh/index.html', 'api/index.html', 'zh/api/index.html']) {
     const html = fs.readFileSync(path.join(distDir, gaPage), 'utf8');
     if (!html.includes(GA_MEASUREMENT_ID)) {
