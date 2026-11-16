@@ -196,6 +196,22 @@ def test_template_list(direct_gateway_url: str) -> None:
     assert len(templates) > 0
 
 
+def test_template_tags_crud(direct_gateway_url: str) -> None:
+    from e2b import Template
+
+    res = Template.assign_tags("base:default", ["prod", "stable"])
+    assert res.build_id
+    assert "prod" in res.tags and "stable" in res.tags
+
+    tags = Template.get_tags("base")
+    tag_names = [t.tag for t in tags]
+    assert "prod" in tag_names and "stable" in tag_names
+
+    Template.remove_tags("base", ["prod"])
+    tags_after = [t.tag for t in Template.get_tags("base")]
+    assert "prod" not in tags_after and "stable" in tags_after
+
+
 def test_official_volume_crud_and_content(direct_gateway_url: str) -> None:
     from e2b import Volume
 

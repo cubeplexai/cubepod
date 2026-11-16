@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -67,8 +68,9 @@ type E2BTemplateResponse struct {
 
 // TemplateTagInfo represents a single tag entry returned by GET /templates/{templateID}/tags.
 type TemplateTagInfo struct {
-	Tag     string `json:"tag"`
-	BuildID string `json:"buildID"`
+	Tag       string `json:"tag"`
+	BuildID   string `json:"buildID"`
+	CreatedAt string `json:"createdAt"`
 }
 
 type buildStatusResponse struct {
@@ -1109,12 +1111,32 @@ func (s *Server) handleAssignTemplateTags(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	buildID := tpl.Status.ReadyBuildID
+	if buildID == "" {
+		buildID = tpl.Status.LatestBuildID
+	}
+	if buildID == "" {
+		buildID = "bld_" + controller.Slugify(tpl.Metadata.Name)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"tags":  extractTagsFromTemplate(tpl),
-		"names": tpl.Spec.Names,
+		"buildID": buildIDToUUID(buildID),
+		"tags":    extractTagsFromTemplate(tpl),
+		"names":   tpl.Spec.Names,
 	})
+}
+
+func buildIDToUUID(raw string) string {
+	// Return as-is if already formatted as 8-4-4-4-12 hex UUID.
+	if len(raw) == 36 && raw[8] == '-' && raw[13] == '-' && raw[18] == '-' && raw[23] == '-' {
+		return raw
+	}
+	sum := sha256.Sum256([]byte(raw))
+	sum[6] = (sum[6] & 0x0f) | 0x40
+	sum[8] = (sum[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16])
 }
 
 func (s *Server) handleDeleteTemplateTags(w http.ResponseWriter, r *http.Request) {
@@ -1180,10 +1202,12 @@ func (s *Server) handleGetTemplateTags(w http.ResponseWriter, r *http.Request) {
 
 	tags := extractTagsFromTemplate(tpl)
 	out := make([]TemplateTagInfo, 0, len(tags))
+	uuidBuildID := buildIDToUUID(buildID)
 	for _, tag := range tags {
 		out = append(out, TemplateTagInfo{
-			Tag:     tag,
-			BuildID: buildID,
+			Tag:       tag,
+			BuildID:   uuidBuildID,
+			CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		})
 	}
 
