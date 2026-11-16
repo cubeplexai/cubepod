@@ -65,8 +65,8 @@ with Sandbox.create() as sbx:
 
 | 协议面 | 已实现端点 | CubePod 内部行为 |
 | :--- | :--- | :--- |
-| **控制面** | `POST /sandboxes`、`POST /v2/sandboxes`、`GET /sandboxes`、`GET /sandboxes/{id}`、`DELETE /sandboxes/{id}` | 创建或列举 `PodBox` 沙箱；响应体包含 E2B 必填字段（`sandboxID`、`templateID`、`clientID`、`envdVersion`、`state`、`startedAt`、`endAt`、`cpuCount`、`memoryMB`、`diskSizeMB`）。注：网关未注册 `GET /v2/sandboxes`。 |
-| **生命周期与租约** | `POST /sandboxes/{id}/refreshes`、`POST /sandboxes/{id}/timeout`、`POST /sandboxes/{id}/pause`、`POST /sandboxes/{id}/connect` | 续期超时或租约时间；暂停时释放 Pod 算力并保留双 PVC；收到 `connect` 或数据面流量时透明自动唤醒。 |
+| **控制面** | `POST /sandboxes`、`POST/GET /v2/sandboxes`、`GET /sandboxes`、`GET /sandboxes/{id}`、`DELETE /sandboxes/{id}` | 创建或列举 `PodBox` 沙箱；响应体包含 E2B 必填字段（`sandboxID`、`templateID`、`clientID`、`envdVersion`、`state`、`startedAt`、`endAt`、`cpuCount`、`memoryMB`、`diskSizeMB`）。 |
+| **生命周期与租约** | `POST /sandboxes/{id}/refreshes`、`POST /sandboxes/{id}/timeout`、`POST /sandboxes/{id}/pause`、`POST /sandboxes/{id}/connect`、`POST /v2/sandboxes/{id}/connect` | 续期超时或租约时间；暂停时释放 Pod 算力并保留双 PVC；收到 `connect` 或数据面流量时透明自动唤醒。 |
 | **命令执行与流式日志** | `POST /sandboxes/{id}/commands`、`POST /sandboxes/{id}/commands/run`、`GET .../logs?cursor=N`、`POST .../kill`、Connect-RPC `/process.Process/{Start,SendSignal,Connect,List,SendInput,StreamInput,Update}` | 在 Guest 内默认以非特权 UID/GID `1000:1000`（`cubeplex`）运行命令与交互式 PTY 会话，支持游标增量拉取、64 KiB PTY 重连回放、窗口 resize 及 PGID 进程组级清理。 |
 | **文件系统与归档同步** | `PUT/GET/DELETE /sandboxes/{id}/files`、`GET .../files/list`、`POST .../files/archive-sync`、Connect-RPC `/filesystem.Filesystem/{Read,Write,List,ListDir,Stat,Remove,MakeDir,WatchDir,CreateWatcher,GetWatcherEvents,RemoveWatcher}` | 直接读写持久化 `/workspace` 或 RootFS 文件、基于 `inotify` 的目录变更监听，并支持带路径穿越防护的 `.tar`/`.tar.gz` 批量目录同步。 |
 | **持久化卷与内容传输** | `POST/GET/DELETE /volumes`、`/volumecontent/{id}/{file,dir,path}`、`POST /sandboxes` 的 `volumeMounts` | 管理租户隔离的持久化 E2B 卷及文件内容上传下载，支持挂载至 Docker 与 K8s Kata 沙箱（K8s 需配置 `CUBEPOD_K8S_E2B_VOLUME_MOUNTS=1` 与 `CUBEPOD_E2B_SHARED_PVC`）。 |
