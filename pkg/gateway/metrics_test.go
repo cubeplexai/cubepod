@@ -318,3 +318,166 @@ func TestMetricsConcurrentRequests(t *testing.T) {
 		t.Fatalf("expected 21 http requests total, got %s", val)
 	}
 }
+
+func TestMetricsCEPAlignmentAndPanelGauge(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	if err := srv.ConfigureE2BSecrets(gateway.E2BSecretConfig{Dir: t.TempDir()}); err != nil {
+		t.Fatalf("ConfigureE2BSecrets failed: %v", err)
+	}
+	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{Dir: t.TempDir()}); err != nil {
+		t.Fatalf("ConfigureE2BVolumes failed: %v", err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Create a sandbox
+	createResp, err := ts.Client().Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader([]byte(`{"templateID":"cubeplex-ubuntu24-desktop"}`)))
+	if err != nil {
+		t.Fatalf("create sandbox failed: %v", err)
+	}
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(createResp.Body).Decode(&rec)
+	_ = createResp.Body.Close()
+
+	// 2. Fork the sandbox
+	forkResp, err := ts.Client().Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/fork", "application/json", nil)
+	if err != nil {
+		t.Fatalf("fork sandbox failed: %v", err)
+	}
+	_ = forkResp.Body.Close()
+	if forkResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from fork, got %d", forkResp.StatusCode)
+	}
+
+	// 3. Create an E2B secret
+	secReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/secrets", bytes.NewReader([]byte(`{"name":"API_KEY","value":"secret-123"}`)))
+	secReq.Header.Set("X-API-KEY", "test-tenant-key")
+	secReq.Header.Set("Content-Type", "application/json")
+	secResp, err := ts.Client().Do(secReq)
+	if err != nil {
+		t.Fatalf("POST /secrets failed: %v", err)
+	}
+	_ = secResp.Body.Close()
+	if secResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from /secrets, got %d", secResp.StatusCode)
+	}
+
+	// 4. Create an E2B volume and mount it on a new sandbox
+	volReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/volumes", bytes.NewReader([]byte(`{"name":"data-vol"}`)))
+	volReq.Header.Set("X-API-KEY", "test-tenant-key")
+	volReq.Header.Set("Content-Type", "application/json")
+	volResp, err := ts.Client().Do(volReq)
+	if err != nil {
+		t.Fatalf("POST /volumes failed: %v", err)
+	}
+	_ = volResp.Body.Close()
+	if volResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from /volumes, got %d", volResp.StatusCode)
+	}
+
+	mntReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/sandboxes", bytes.NewReader([]byte(`{"templateID":"cubeplex-ubuntu24-desktop","volumeMounts":[{"name":"data-vol","path":"/mnt/data"}]}`)))
+	mntReq.Header.Set("X-API-KEY", "test-tenant-key")
+	mntReq.Header.Set("Content-Type", "application/json")
+	mntResp, err := ts.Client().Do(mntReq)
+	if err != nil {
+		t.Fatalf("POST /sandboxes with volumeMounts failed: %v", err)
+	}
+	_ = mntResp.Body.Close()
+	if mntResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from mounted sandbox, got %d", mntResp.StatusCode)
+	}
+
+	// Trigger a volume mount error (missing volume)
+	badMntReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/sandboxes", bytes.NewReader([]byte(`{"templateID":"cubeplex-ubuntu24-desktop","volumeMounts":[{"name":"missing-vol","path":"/mnt/bad"}]}`)))
+	badMntReq.Header.Set("X-API-KEY", "test-tenant-key")
+	badMntReq.Header.Set("Content-Type", "application/json")
+	badMntResp, err := ts.Client().Do(badMntReq)
+	if err != nil {
+		t.Fatalf("POST /sandboxes with bad mount failed: %v", err)
+	}
+	_ = badMntResp.Body.Close()
+	if badMntResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing volume mount, got %d", badMntResp.StatusCode)
+	}
+
+	// Record a CRD resync
+	srv.Metrics().RecordCRDResync()
+
+	// 5. Panel active sessions gauge around a live proxied request
+	inFlight := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(inFlight)
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	mintReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/sandboxes/"+rec.SandboxID+"/endpoints/8080", bytes.NewReader([]byte(`{"targetUrl":"`+upstream.URL+`"}`)))
+	mintReq.Header.Set("Content-Type", "application/json")
+	mintResp, err := ts.Client().Do(mintReq)
+	if err != nil {
+		t.Fatalf("mint endpoint failed: %v", err)
+	}
+	var minted struct {
+		URL string `json:"url"`
+	}
+	_ = json.NewDecoder(mintResp.Body).Decode(&minted)
+	_ = mintResp.Body.Close()
+
+	proxyDone := make(chan error, 1)
+	go func() {
+		resp, err := ts.Client().Get(ts.URL + minted.URL)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		proxyDone <- err
+	}()
+
+	<-inFlight
+	midBody := getMetricsText(t, ts.Client(), ts.URL)
+	if val, ok := parseMetricValue(midBody, "cubepod_panel_active_sessions"); !ok || val != "1" {
+		close(release)
+		<-proxyDone
+		t.Fatalf("expected cubepod_panel_active_sessions=1 while proxy active, got %q (ok=%v)\n%s", val, ok, midBody)
+	}
+	close(release)
+	if err := <-proxyDone; err != nil {
+		t.Fatalf("panel proxy request failed: %v", err)
+	}
+
+	body := getMetricsText(t, ts.Client(), ts.URL)
+	checks := map[string]string{
+		"cubepod_panel_active_sessions":                                                        "0",
+		"cubepod_secrets_store_count":                                                          "1",
+		"cubepod_e2b_volume_mounts_total":                                                      "1",
+		"cubepod_e2b_volume_mount_errors_total":                                                "1",
+		"cubepod_gateway_crd_resyncs_total":                                                    "1",
+		`cubepod_secrets_operations_total{op="create",status="ok"}`:                            "1",
+		`cubepod_sandbox_forks_total{mode="loopback",result="ok"}`:                             "1",
+		`cubepod_e2b_requests_total{endpoint="POST /sandboxes",status="201"}`:                  "2",
+		`cubepod_e2b_requests_total{endpoint="POST /sandboxes",status="404"}`:                  "1",
+		`cubepod_e2b_requests_total{endpoint="POST /sandboxes/{sandboxID}/fork",status="201"}`: "1",
+	}
+	for metric, want := range checks {
+		got, ok := parseMetricValue(body, metric)
+		if !ok || got != want {
+			t.Fatalf("metric %s: expected %s, got %q (ok=%v)\n%s", metric, want, got, ok, body)
+		}
+	}
+
+	requiredSubstrings := []string{
+		"cubepod_gateway_requests_total ",
+		"cubepod_gateway_auto_resumes_total ",
+		"cubepod_e2b_request_duration_seconds_bucket{le=\"+Inf\"}",
+		"cubepod_e2b_request_duration_seconds_count ",
+		"cubepod_sandbox_fork_duration_seconds_bucket{le=\"+Inf\"}",
+		"cubepod_sandbox_fork_duration_seconds_count 1",
+	}
+	for _, sub := range requiredSubstrings {
+		if !strings.Contains(body, sub) {
+			t.Fatalf("expected %q in /metrics output:\n%s", sub, body)
+		}
+	}
+}

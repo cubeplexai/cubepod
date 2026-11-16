@@ -4771,3 +4771,77 @@ fn test_connectrpc_filesystem_list_stat_and_remove() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn test_podd_metrics_json_and_prometheus_endpoints() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let config = DaemonConfig {
+        workdir: "/tmp".to_string(),
+    };
+    let registry = ProcessRegistry::new();
+
+    std::thread::spawn(move || {
+        serve(listener, config, registry);
+    });
+
+    // 1. JSON SandboxMetric on GET /metrics
+    let (status, headers, body) = get(&addr, "/metrics");
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    assert!(
+        headers
+            .get("content-type")
+            .map(|v| v.contains("application/json"))
+            .unwrap_or(false),
+        "expected application/json, got {:?}",
+        headers.get("content-type")
+    );
+    let parsed = JsonValue::parse(std::str::from_utf8(&body).unwrap()).unwrap();
+    assert!(parsed.get("timestamp").and_then(|v| v.as_str()).is_some());
+    assert!(
+        parsed
+            .get("timestampUnix")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            > 0
+    );
+    assert!(parsed.get("cpuCount").and_then(|v| v.as_u64()).unwrap_or(0) >= 1);
+    assert!(parsed.get("memTotal").and_then(|v| v.as_u64()).unwrap_or(0) > 0);
+    assert!(
+        parsed
+            .get("diskTotal")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            > 0
+    );
+    assert!(parsed.get("cpuUsedPct").is_some());
+    assert!(parsed.get("memUsed").is_some());
+    assert!(parsed.get("memCache").is_some());
+    assert!(parsed.get("diskUsed").is_some());
+
+    // 2. Prometheus format via GET /v1/prometheus
+    let (status, headers, body) = get(&addr, "/v1/prometheus");
+    assert_eq!(status, 200);
+    assert!(
+        headers
+            .get("content-type")
+            .map(|v| v.contains("text/plain"))
+            .unwrap_or(false),
+        "expected text/plain, got {:?}",
+        headers.get("content-type")
+    );
+    let prom_text = String::from_utf8_lossy(&body);
+    assert!(prom_text.contains("cubepod_podd_active_processes "));
+    assert!(prom_text.contains("cubepod_podd_init_duration_milliseconds "));
+    assert!(prom_text.contains("cubepod_podd_init_e2b_bind_duration_ms "));
+
+    // 3. Prometheus format via ?format=prometheus and Accept: text/plain
+    let (status, _, body_q) = get(&addr, "/metrics?format=prometheus");
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body_q).contains("cubepod_podd_active_processes "));
+
+    let (status, _, body_accept) =
+        http_request(&addr, "GET", "/metrics", &[("Accept", "text/plain")], &[]);
+    assert_eq!(status, 200);
+    assert!(String::from_utf8_lossy(&body_accept).contains("cubepod_podd_active_processes "));
+}

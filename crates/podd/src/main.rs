@@ -16,6 +16,7 @@ pub mod http;
 pub mod interpreter;
 pub mod json;
 pub mod lifecycle;
+pub mod metrics;
 pub mod startcmd;
 pub mod watch;
 
@@ -45,6 +46,7 @@ pub use interpreter::{
 };
 pub use json::{escape_json, parse_target, url_decode, JsonParser, JsonValue};
 pub use lifecycle::{handle_quiesce, handle_thaw, QuiesceOutcome, QuiesceState};
+pub use metrics::{handle_metrics, handle_prometheus, SandboxMetric};
 pub use startcmd::{
     clamp_nofile_rlimit, compute_clamped_nofile, configure_command_credentials,
     ensure_sigchld_handler, ensure_subreaper, exit_code_from_status, install_zombie_reaper,
@@ -114,6 +116,12 @@ pub fn route_request_with_quiesce(
     match (req.method.as_str(), path) {
         ("GET", "/health") => {
             handle_health(&mut stream, config, registry);
+        }
+        ("GET", "/metrics") => {
+            handle_metrics(&mut stream, &req, &query_params, config, registry);
+        }
+        ("GET", "/v1/prometheus") => {
+            handle_prometheus(&mut stream, config, registry);
         }
         ("POST", "/v1/lifecycle/prepare-stop") => {
             handle_prepare_stop(&mut stream, registry);

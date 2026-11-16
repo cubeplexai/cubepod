@@ -309,5 +309,9 @@ func (s *Server) handlePanelProxy(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 
+	m := s.Metrics()
+	m.PanelActiveSessions.Add(1)
+	defer m.PanelActiveSessions.Add(-1)
+
 	proxy.ServeHTTP(w, r)
 }

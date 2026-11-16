@@ -5,16 +5,128 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
 )
 
-// Metrics encapsulates Prometheus counters for CubePod Gateway observability.
+var defaultDurationBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
+
+type labelPair struct {
+	first  string
+	second string
+}
+
+type labeledCounterMap struct {
+	mu     sync.RWMutex
+	counts map[labelPair]uint64
+}
+
+func (c *labeledCounterMap) Inc(first, second string) {
+	c.Add(first, second, 1)
+}
+
+func (c *labeledCounterMap) Add(first, second string, delta uint64) {
+	c.mu.Lock()
+	if c.counts == nil {
+		c.counts = make(map[labelPair]uint64)
+	}
+	c.counts[labelPair{first: first, second: second}] += delta
+	c.mu.Unlock()
+}
+
+func (c *labeledCounterMap) Snapshot() []struct {
+	key labelPair
+	val uint64
+} {
+	c.mu.RLock()
+	out := make([]struct {
+		key labelPair
+		val uint64
+	}, 0, len(c.counts))
+	for k, v := range c.counts {
+		out = append(out, struct {
+			key labelPair
+			val uint64
+		}{key: k, val: v})
+	}
+	c.mu.RUnlock()
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].key.first != out[j].key.first {
+			return out[i].key.first < out[j].key.first
+		}
+		return out[i].key.second < out[j].key.second
+	})
+	return out
+}
+
+type promHistogram struct {
+	mu      sync.Mutex
+	buckets []float64
+	counts  []uint64
+	sum     float64
+	total   uint64
+}
+
+func (h *promHistogram) Observe(seconds float64) {
+	if seconds < 0 {
+		seconds = 0
+	}
+	h.mu.Lock()
+	if h.buckets == nil {
+		h.buckets = defaultDurationBuckets
+		h.counts = make([]uint64, len(h.buckets))
+	}
+	for i, upper := range h.buckets {
+		if seconds <= upper {
+			h.counts[i]++
+		}
+	}
+	h.sum += seconds
+	h.total++
+	h.mu.Unlock()
+}
+
+func (h *promHistogram) WritePrometheus(buf *bytes.Buffer, name, help string) {
+	h.mu.Lock()
+	buckets := h.buckets
+	if buckets == nil {
+		buckets = defaultDurationBuckets
+	}
+	counts := make([]uint64, len(buckets))
+	if len(h.counts) == len(buckets) {
+		copy(counts, h.counts)
+	}
+	sum := h.sum
+	total := h.total
+	h.mu.Unlock()
+
+	fmt.Fprintf(buf, "# HELP %s %s\n", name, help)
+	fmt.Fprintf(buf, "# TYPE %s histogram\n", name)
+	for i, upper := range buckets {
+		fmt.Fprintf(buf, "%s_bucket{le=\"%g\"} %d\n", name, upper, counts[i])
+	}
+	fmt.Fprintf(buf, "%s_bucket{le=\"+Inf\"} %d\n", name, total)
+	fmt.Fprintf(buf, "%s_sum %g\n", name, sum)
+	fmt.Fprintf(buf, "%s_count %d\n", name, total)
+}
+
+func (h *promHistogram) Snapshot() (uint64, float64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.total, h.sum
+}
+
+// Metrics encapsulates Prometheus counters, gauges, and histograms for CubePod Gateway observability.
 type Metrics struct {
 	HTTPRequestsTotal             atomic.Uint64
 	SandboxesCreatedTotal         atomic.Uint64
@@ -23,6 +135,58 @@ type Metrics struct {
 	DesktopActivationsOK          atomic.Uint64
 	DesktopActivationsUnsupported atomic.Uint64
 	DesktopActivationsError       atomic.Uint64
+	PanelActiveSessions           atomic.Int64
+	E2BVolumeMountsTotal          atomic.Uint64
+	E2BVolumeMountErrorsTotal     atomic.Uint64
+	CRDResyncsTotal               atomic.Uint64
+
+	e2bRequests        labeledCounterMap
+	e2bRequestDuration promHistogram
+	secretOperations   labeledCounterMap
+	sandboxForks       labeledCounterMap
+	sandboxForkDur     promHistogram
+
+	sandboxMetricsOnce sync.Once
+	sandboxMetrics     *sandboxMetricsStore
+}
+
+func (m *Metrics) sandboxMetricsStore() *sandboxMetricsStore {
+	m.sandboxMetricsOnce.Do(func() {
+		m.sandboxMetrics = newSandboxMetricsStore(defaultSandboxMetricHistoryCap)
+	})
+	return m.sandboxMetrics
+}
+
+// RecordE2BRequest records an E2B API request count and latency observation.
+func (m *Metrics) RecordE2BRequest(endpoint, status string, dur time.Duration) {
+	m.e2bRequests.Inc(endpoint, status)
+	m.e2bRequestDuration.Observe(dur.Seconds())
+}
+
+// RecordSecretOperation records a secret management API operation count.
+func (m *Metrics) RecordSecretOperation(op, status string) {
+	m.secretOperations.Inc(op, status)
+}
+
+// RecordE2BVolumeMount increments the E2B volume mount counter.
+func (m *Metrics) RecordE2BVolumeMount(n uint64) {
+	m.E2BVolumeMountsTotal.Add(n)
+}
+
+// RecordE2BVolumeMountError increments the E2B volume mount error counter.
+func (m *Metrics) RecordE2BVolumeMountError() {
+	m.E2BVolumeMountErrorsTotal.Add(1)
+}
+
+// RecordSandboxFork records a sandbox fork operation count and duration observation.
+func (m *Metrics) RecordSandboxFork(mode, result string, dur time.Duration) {
+	m.sandboxForks.Inc(mode, result)
+	m.sandboxForkDur.Observe(dur.Seconds())
+}
+
+// RecordCRDResync increments the CRD resync counter.
+func (m *Metrics) RecordCRDResync() {
+	m.CRDResyncsTotal.Add(1)
 }
 
 // Metrics returns the server's metrics counters.
@@ -72,19 +236,174 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
+func classifyE2BEndpoint(method, cleanPath string) (string, bool) {
+	if cleanPath == "" {
+		return "", false
+	}
+	parts := strings.Split(cleanPath, "/")
+	switch parts[0] {
+	case "sandboxes":
+		if len(parts) == 1 {
+			return method + " /sandboxes", true
+		}
+		if len(parts) == 2 {
+			if parts[1] == "metrics" {
+				return method + " /sandboxes/metrics", true
+			}
+			return method + " /sandboxes/{sandboxID}", true
+		}
+		switch parts[2] {
+		case "metrics", "pause", "connect", "timeout", "refreshes", "lease", "fork", "reset-rootfs", "events":
+			return method + " /sandboxes/{sandboxID}/" + parts[2], true
+		case "commands":
+			return method + " /sandboxes/{sandboxID}/commands", true
+		case "code", "execute":
+			return method + " /sandboxes/{sandboxID}/code/execute", true
+		case "files":
+			return method + " /sandboxes/{sandboxID}/files", true
+		case "endpoints":
+			return method + " /sandboxes/{sandboxID}/endpoints/{port}", true
+		case "desktop":
+			return method + " /sandboxes/{sandboxID}/desktop", true
+		case "process.Process":
+			if len(parts) >= 4 {
+				return method + " /process.Process/" + parts[3], true
+			}
+			return method + " /process.Process", true
+		case "filesystem.Filesystem":
+			if len(parts) >= 4 {
+				return method + " /filesystem.Filesystem/" + parts[3], true
+			}
+			return method + " /filesystem.Filesystem", true
+		default:
+			return method + " /sandboxes/{sandboxID}", true
+		}
+	case "v2":
+		if len(parts) >= 2 && parts[1] == "sandboxes" {
+			if len(parts) >= 4 && parts[3] == "connect" {
+				return method + " /sandboxes/{sandboxID}/connect", true
+			}
+			return method + " /sandboxes", true
+		}
+		if len(parts) >= 2 && parts[1] == "templates" {
+			return method + " /templates", true
+		}
+	case "v1":
+		if len(parts) >= 4 && parts[1] == "sandboxes" && parts[3] == "desktop" {
+			return method + " /sandboxes/{sandboxID}/desktop", true
+		}
+	case "v3":
+		if len(parts) >= 2 && parts[1] == "templates" {
+			return method + " /templates", true
+		}
+	case "templates":
+		return method + " /templates", true
+	case "volumes":
+		if len(parts) == 1 {
+			return method + " /volumes", true
+		}
+		return method + " /volumes/{volumeID}", true
+	case "volumecontent":
+		if len(parts) >= 3 {
+			return method + " /volumecontent/{volumeID}/" + parts[2], true
+		}
+		return method + " /volumecontent", true
+	case "secrets":
+		if len(parts) == 1 {
+			return method + " /secrets", true
+		}
+		return method + " /secrets/{secretID}", true
+	case "webhooks":
+		if len(parts) == 1 {
+			return method + " /webhooks", true
+		}
+		return method + " /webhooks/{webhookID}", true
+	case "events":
+		return method + " /events", true
+	case "files":
+		return method + " /files", true
+	case "execute":
+		return method + " /execute", true
+	case "process.Process":
+		if len(parts) >= 2 {
+			return method + " /process.Process/" + parts[1], true
+		}
+		return method + " /process.Process", true
+	case "filesystem.Filesystem":
+		if len(parts) >= 2 {
+			return method + " /filesystem.Filesystem/" + parts[1], true
+		}
+		return method + " /filesystem.Filesystem", true
+	}
+	return "", false
+}
+
+func classifySecretOp(method string, parts []string) (string, bool) {
+	if len(parts) == 0 || parts[0] != "secrets" {
+		return "", false
+	}
+	if len(parts) == 1 {
+		switch method {
+		case http.MethodPost:
+			return "create", true
+		case http.MethodGet:
+			return "list", true
+		}
+		return "", false
+	}
+	if len(parts) == 2 {
+		switch method {
+		case http.MethodGet:
+			return "get", true
+		case http.MethodPost:
+			return "update", true
+		case http.MethodDelete:
+			return "delete", true
+		}
+	}
+	return "", false
+}
+
+func peekRequestedVolumeMounts(r *http.Request) int {
+	if r.Body == nil || r.Body == http.NoBody {
+		return 0
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		return 0
+	}
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	if len(raw) == 0 {
+		return 0
+	}
+	var payload struct {
+		VolumeMounts []json.RawMessage `json:"volumeMounts"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return 0
+	}
+	return len(payload.VolumeMounts)
+}
+
 // withMetrics wraps an http.Handler to record metrics on incoming requests,
-// sandbox creations, command executions, and auto-resume transitions.
+// sandbox creations, command executions, E2B endpoints, forks, secrets, and auto-resume transitions.
 func (s *Server) withMetrics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		m := s.Metrics()
 		m.HTTPRequestsTotal.Add(1)
 
 		cleanPath := strings.Trim(r.URL.Path, "/")
 		parts := strings.Split(cleanPath, "/")
 
+		var requestedMounts int
+		if r.Method == http.MethodPost && ((len(parts) == 1 && parts[0] == "sandboxes") || (len(parts) == 2 && parts[0] == "v2" && parts[1] == "sandboxes")) {
+			requestedMounts = peekRequestedVolumeMounts(r)
+		}
+
 		var beforeResumes int
 		var trackedSandboxID string
-		if len(parts) >= 2 && parts[0] == "sandboxes" {
+		if len(parts) >= 2 && parts[0] == "sandboxes" && parts[1] != "metrics" {
 			trackedSandboxID = parts[1]
 			s.mu.RLock()
 			if sb, ok := s.sandboxes[trackedSandboxID]; ok {
@@ -95,11 +414,48 @@ func (s *Server) withMetrics(next http.Handler) http.Handler {
 
 		rec := &statusRecorder{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rec, r)
+		dur := time.Since(start)
+
+		if endpoint, isE2B := classifyE2BEndpoint(r.Method, cleanPath); isE2B {
+			m.RecordE2BRequest(endpoint, strconv.Itoa(rec.statusCode), dur)
+		}
 
 		// Check if a sandbox was created (POST /sandboxes or POST /v2/sandboxes with 201 Created)
 		if r.Method == http.MethodPost && rec.statusCode == http.StatusCreated &&
 			((len(parts) == 1 && parts[0] == "sandboxes") || (len(parts) == 2 && parts[0] == "v2" && parts[1] == "sandboxes")) {
 			m.SandboxesCreatedTotal.Add(1)
+			if requestedMounts > 0 {
+				m.RecordE2BVolumeMount(uint64(requestedMounts))
+			}
+		} else if requestedMounts > 0 && rec.statusCode >= 400 {
+			m.RecordE2BVolumeMountError()
+		}
+
+		// Check if a secret management operation occurred
+		if op, ok := classifySecretOp(r.Method, parts); ok {
+			status := "ok"
+			if rec.statusCode >= 400 {
+				status = "error"
+			}
+			m.RecordSecretOperation(op, status)
+		}
+
+		// Check if a sandbox fork occurred (POST /sandboxes/{id}/fork)
+		if r.Method == http.MethodPost && len(parts) == 3 && parts[0] == "sandboxes" && parts[2] == "fork" {
+			mode := "loopback"
+			if s.LivePodRouting() {
+				mode = "pvc_clone"
+			}
+			result := "ok"
+			if rec.statusCode >= 400 {
+				result = "error"
+			}
+			m.RecordSandboxFork(mode, result, dur)
+		}
+
+		// Track warmpool creation CRD sync when backed by a KubeClient
+		if r.Method == http.MethodPost && cleanPath == "warmpools" && s.reconciler != nil && s.reconciler.KubeClient() != nil {
+			m.RecordCRDResync()
 		}
 
 		// Check if a command was executed (POST /sandboxes/{id}/commands/run with 200 OK)
@@ -150,6 +506,11 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		warmpoolsTotal = len(s.reconciler.GetWarmPoolSpecs())
 	}
 
+	secretsStoreCount := 0
+	if secStore := s.secrets.Load(); secStore != nil {
+		secretsStoreCount = secStore.Count()
+	}
+
 	e2bEnabled := s.E2BTemplateAPIEnabled()
 	var templateStatusCounts map[string]int
 	if e2bEnabled {
@@ -181,14 +542,31 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	if strings.Contains(r.Header.Get("Accept"), "application/json") {
 		w.Header().Set("Content-Type", "application/json")
+		e2bCount, e2bSum := m.e2bRequestDuration.Snapshot()
+		forkCount, forkSum := m.sandboxForkDur.Snapshot()
 		payload := map[string]interface{}{
 			"cubepod_gateway_http_requests_total":      m.HTTPRequestsTotal.Load(),
+			"cubepod_gateway_requests_total":           m.HTTPRequestsTotal.Load(),
 			"cubepod_gateway_sandboxes_created_total":  m.SandboxesCreatedTotal.Load(),
 			"cubepod_gateway_autoresume_total":         m.AutoresumeTotal.Load(),
+			"cubepod_gateway_auto_resumes_total":       m.AutoresumeTotal.Load(),
 			"cubepod_gateway_commands_executed_total":  m.CommandsExecutedTotal.Load(),
 			"cubepod_gateway_sandboxes_active_running": runningCount,
 			"cubepod_gateway_sandboxes_active_paused":  pausedCount,
 			"cubepod_gateway_warmpools_total":          warmpoolsTotal,
+			"cubepod_panel_active_sessions":            m.PanelActiveSessions.Load(),
+			"cubepod_secrets_store_count":              secretsStoreCount,
+			"cubepod_e2b_volume_mounts_total":          m.E2BVolumeMountsTotal.Load(),
+			"cubepod_e2b_volume_mount_errors_total":    m.E2BVolumeMountErrorsTotal.Load(),
+			"cubepod_gateway_crd_resyncs_total":        m.CRDResyncsTotal.Load(),
+			"cubepod_e2b_request_duration_seconds": map[string]interface{}{
+				"count": e2bCount,
+				"sum":   e2bSum,
+			},
+			"cubepod_sandbox_fork_duration_seconds": map[string]interface{}{
+				"count": forkCount,
+				"sum":   forkSum,
+			},
 			"cubepod_desktop_activations_total": map[string]uint64{
 				"ok":          m.DesktopActivationsOK.Load(),
 				"unsupported": m.DesktopActivationsUnsupported.Load(),
@@ -212,6 +590,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_http_requests_total counter\n")
 	fmt.Fprintf(&buf, "cubepod_gateway_http_requests_total %d\n", m.HTTPRequestsTotal.Load())
 
+	fmt.Fprintf(&buf, "# HELP cubepod_gateway_requests_total Total HTTP requests handled by the gateway (CEP-0004)\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_requests_total counter\n")
+	fmt.Fprintf(&buf, "cubepod_gateway_requests_total %d\n", m.HTTPRequestsTotal.Load())
+
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_sandboxes_created_total Total sandboxes created\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_sandboxes_created_total counter\n")
 	fmt.Fprintf(&buf, "cubepod_gateway_sandboxes_created_total %d\n", m.SandboxesCreatedTotal.Load())
@@ -220,14 +602,53 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_autoresume_total counter\n")
 	fmt.Fprintf(&buf, "cubepod_gateway_autoresume_total %d\n", m.AutoresumeTotal.Load())
 
+	fmt.Fprintf(&buf, "# HELP cubepod_gateway_auto_resumes_total Total sandbox auto-resume events (CEP-0004)\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_auto_resumes_total counter\n")
+	fmt.Fprintf(&buf, "cubepod_gateway_auto_resumes_total %d\n", m.AutoresumeTotal.Load())
+
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_commands_executed_total Total commands executed in sandboxes\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_commands_executed_total counter\n")
 	fmt.Fprintf(&buf, "cubepod_gateway_commands_executed_total %d\n", m.CommandsExecutedTotal.Load())
+
+	fmt.Fprintf(&buf, "# HELP cubepod_e2b_requests_total Total E2B-compatible API requests by endpoint and status\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_e2b_requests_total counter\n")
+	for _, entry := range m.e2bRequests.Snapshot() {
+		fmt.Fprintf(&buf, "cubepod_e2b_requests_total{endpoint=%q,status=%q} %d\n", entry.key.first, entry.key.second, entry.val)
+	}
+
+	m.e2bRequestDuration.WritePrometheus(&buf, "cubepod_e2b_request_duration_seconds", "Latency histogram of E2B-compatible API requests in seconds")
+
+	fmt.Fprintf(&buf, "# HELP cubepod_secrets_operations_total Total E2B secret store operations by operation and status\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_secrets_operations_total counter\n")
+	for _, entry := range m.secretOperations.Snapshot() {
+		fmt.Fprintf(&buf, "cubepod_secrets_operations_total{op=%q,status=%q} %d\n", entry.key.first, entry.key.second, entry.val)
+	}
+
+	fmt.Fprintf(&buf, "# HELP cubepod_e2b_volume_mounts_total Total E2B volume mounts attached to sandboxes\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_e2b_volume_mounts_total counter\n")
+	fmt.Fprintf(&buf, "cubepod_e2b_volume_mounts_total %d\n", m.E2BVolumeMountsTotal.Load())
+
+	fmt.Fprintf(&buf, "# HELP cubepod_e2b_volume_mount_errors_total Total E2B volume mount planning or attachment errors\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_e2b_volume_mount_errors_total counter\n")
+	fmt.Fprintf(&buf, "cubepod_e2b_volume_mount_errors_total %d\n", m.E2BVolumeMountErrorsTotal.Load())
+
+	fmt.Fprintf(&buf, "# HELP cubepod_sandbox_forks_total Total sandbox CoW fork operations by mode and result\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_sandbox_forks_total counter\n")
+	for _, entry := range m.sandboxForks.Snapshot() {
+		fmt.Fprintf(&buf, "cubepod_sandbox_forks_total{mode=%q,result=%q} %d\n", entry.key.first, entry.key.second, entry.val)
+	}
+
+	m.sandboxForkDur.WritePrometheus(&buf, "cubepod_sandbox_fork_duration_seconds", "Latency histogram of sandbox CoW fork operations in seconds")
+
+	fmt.Fprintf(&buf, "# HELP cubepod_gateway_crd_resyncs_total Total PodBox/PodWarmPool CRD resyncs executed by the gateway\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_crd_resyncs_total counter\n")
+	fmt.Fprintf(&buf, "cubepod_gateway_crd_resyncs_total %d\n", m.CRDResyncsTotal.Load())
 
 	fmt.Fprintf(&buf, "# HELP cubepod_desktop_activations_total Total desktop stack activations by result\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_desktop_activations_total counter\n")
 	fmt.Fprintf(&buf, "cubepod_desktop_activations_total{result=\"ok\"} %d\n", m.DesktopActivationsOK.Load())
 	fmt.Fprintf(&buf, "cubepod_desktop_activations_total{result=\"unsupported\"} %d\n", m.DesktopActivationsUnsupported.Load())
+	fmt.Fprintf(&buf, "cubepod_desktop_activations_total{result=\"error\"} %d\n", m.DesktopActivationsError.Load())
 
 	if evMgr := s.events.Load(); evMgr != nil {
 		fmt.Fprintf(&buf, "# HELP cubepod_events_recorded_total Total sandbox lifecycle events recorded\n")
@@ -244,13 +665,20 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&buf, "# TYPE cubepod_webhook_queue_depth gauge\n")
 		fmt.Fprintf(&buf, "cubepod_webhook_queue_depth %d\n", evMgr.QueueDepth())
 	}
-	fmt.Fprintf(&buf, "cubepod_desktop_activations_total{result=\"error\"} %d\n", m.DesktopActivationsError.Load())
 
 	// Gauges
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_sandboxes_active Current number of active sandboxes by state\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_sandboxes_active gauge\n")
 	fmt.Fprintf(&buf, "cubepod_gateway_sandboxes_active{state=\"Running\"} %d\n", runningCount)
 	fmt.Fprintf(&buf, "cubepod_gateway_sandboxes_active{state=\"Paused\"} %d\n", pausedCount)
+
+	fmt.Fprintf(&buf, "# HELP cubepod_panel_active_sessions Current number of active panel proxy HTTP/WebSocket sessions\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_panel_active_sessions gauge\n")
+	fmt.Fprintf(&buf, "cubepod_panel_active_sessions %d\n", m.PanelActiveSessions.Load())
+
+	fmt.Fprintf(&buf, "# HELP cubepod_secrets_store_count Current number of stored E2B secrets across tenants\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_secrets_store_count gauge\n")
+	fmt.Fprintf(&buf, "cubepod_secrets_store_count %d\n", secretsStoreCount)
 
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_warmpools_total Total configured warm pools\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_warmpools_total gauge\n")
