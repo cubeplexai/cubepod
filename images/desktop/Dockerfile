@@ -11,6 +11,8 @@
 #
 # Nothing GUI-related starts on boot; the container remains idle (~0 MiB GUI overhead)
 # until `/opt/cubepod/desktop/cubepod-desktop-ctl start` is invoked.
+# Optional WebRTC: if `/usr/local/bin/neko` (or `CUBEPOD_NEKO_BIN`) is installed,
+# `--transport webrtc` launches Neko alongside noVNC; otherwise it falls back to noVNC.
 
 FROM ubuntu:24.04
 

@@ -21,10 +21,12 @@ docker build -f images/desktop/Dockerfile -t cubepod-desktop:latest .
 ## Supervisor CLI (`/opt/cubepod/desktop/cubepod-desktop-ctl`)
 
 ```bash
-/opt/cubepod/desktop/cubepod-desktop-ctl start [--resolution 1280x800x24] [--url about:blank]
+/opt/cubepod/desktop/cubepod-desktop-ctl start [--resolution 1280x800x24] [--url about:blank] [--transport novnc|webrtc]
 /opt/cubepod/desktop/cubepod-desktop-ctl status
 /opt/cubepod/desktop/cubepod-desktop-ctl stop
 ```
+
+When `--transport webrtc` is requested, `cubepod-desktop-ctl` checks `CUBEPOD_NEKO_BIN` (default `/usr/local/bin/neko`). If present, Neko WebRTC is launched on `CUBEPOD_WEBRTC_PORT` (default `8081`) alongside `noVNC` (`transportUsed: "webrtc"`). If Neko is absent in the base image, it gracefully falls back to `noVNC` WebSocket (`transportUsed: "novnc"`, `fallbackReason: "neko_not_installed"`).
 
 All subcommands emit single-line JSON on `stdout`:
 

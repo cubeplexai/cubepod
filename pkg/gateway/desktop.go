@@ -19,6 +19,7 @@ const (
 	defaultDesktopPort    = 8080
 	defaultTerminalPort   = 7681
 	defaultCDPPort        = 9222
+	defaultWebRTCPort     = 8081
 )
 
 var desktopResolutionRegex = regexp.MustCompile(`^[0-9]{3,5}x[0-9]{3,5}x(16|24|32)$`)
@@ -27,28 +28,35 @@ type desktopStartReq struct {
 	Resolution       string `json:"resolution,omitempty"`
 	InitialURL       string `json:"initialUrl,omitempty"`
 	ExpiresInSeconds int    `json:"expiresInSeconds,omitempty"`
+	Transport        string `json:"transport,omitempty"`
 }
 
 type desktopCtlPorts struct {
 	Desktop  int `json:"desktop"`
 	Terminal int `json:"terminal"`
 	CDP      int `json:"cdp"`
+	WebRTC   int `json:"webrtc,omitempty"`
 }
 
 type desktopCtlStatus struct {
-	Status     string          `json:"status"`
-	Display    string          `json:"display,omitempty"`
-	Resolution string          `json:"resolution,omitempty"`
-	Ports      desktopCtlPorts `json:"ports"`
-	PIDs       map[string]int  `json:"pids,omitempty"`
+	Status         string          `json:"status"`
+	Display        string          `json:"display,omitempty"`
+	Resolution     string          `json:"resolution,omitempty"`
+	TransportUsed  string          `json:"transportUsed,omitempty"`
+	FallbackReason string          `json:"fallbackReason,omitempty"`
+	Ports          desktopCtlPorts `json:"ports"`
+	PIDs           map[string]int  `json:"pids,omitempty"`
 }
 
 type desktopStartResp struct {
-	Status      string `json:"status"`
-	DesktopURL  string `json:"desktopUrl"`
-	TerminalURL string `json:"terminalUrl"`
-	CDPURL      string `json:"cdpUrl"`
-	ExpiresAt   string `json:"expiresAt"`
+	Status         string `json:"status"`
+	DesktopURL     string `json:"desktopUrl"`
+	TerminalURL    string `json:"terminalUrl"`
+	CDPURL         string `json:"cdpUrl"`
+	WebRTCURL      string `json:"webrtcUrl,omitempty"`
+	TransportUsed  string `json:"transportUsed"`
+	FallbackReason string `json:"fallbackReason,omitempty"`
+	ExpiresAt      string `json:"expiresAt"`
 }
 
 type desktopCmdResult struct {
@@ -233,6 +241,11 @@ func (s *Server) handleDesktopStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid resolution format (expected WxHxD where D is 16, 24, or 32)", http.StatusBadRequest)
 		return
 	}
+	requestedTransport := strings.ToLower(strings.TrimSpace(req.Transport))
+	if requestedTransport != "" && requestedTransport != "novnc" && requestedTransport != "webrtc" {
+		http.Error(w, "invalid transport (expected novnc or webrtc)", http.StatusBadRequest)
+		return
+	}
 
 	if err := s.ensureRunning(r.Context(), rec); err != nil {
 		s.Metrics().DesktopActivationsError.Add(1)
@@ -246,6 +259,9 @@ func (s *Server) handleDesktopStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.InitialURL != "" {
 		args = append(args, "--url", shellQuote(req.InitialURL))
+	}
+	if requestedTransport != "" {
+		args = append(args, "--transport", shellQuote(requestedTransport))
 	}
 	cmdStr := strings.Join(args, " ")
 
@@ -273,10 +289,30 @@ func (s *Server) handleDesktopStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	transportUsed := strings.ToLower(strings.TrimSpace(ctlStatus.TransportUsed))
+	fallbackReason := strings.TrimSpace(ctlStatus.FallbackReason)
+	if transportUsed == "" {
+		if requestedTransport == "webrtc" && ctlStatus.Ports.WebRTC > 0 {
+			transportUsed = "webrtc"
+		} else {
+			transportUsed = "novnc"
+			if requestedTransport == "webrtc" && fallbackReason == "" {
+				fallbackReason = "neko_not_installed"
+			}
+		}
+	}
+	webrtcPort := ctlStatus.Ports.WebRTC
+	if transportUsed == "webrtc" && webrtcPort <= 0 {
+		webrtcPort = defaultWebRTCPort
+	}
+
 	if host := s.resolveSandboxHost(rec); host != "" {
 		s.RegisterPort(sandboxID, ctlStatus.Ports.Desktop, fmt.Sprintf("http://%s:%d", host, ctlStatus.Ports.Desktop))
 		s.RegisterPort(sandboxID, ctlStatus.Ports.Terminal, fmt.Sprintf("http://%s:%d", host, ctlStatus.Ports.Terminal))
 		s.RegisterPort(sandboxID, ctlStatus.Ports.CDP, fmt.Sprintf("http://%s:%d", host, ctlStatus.Ports.CDP))
+		if transportUsed == "webrtc" && webrtcPort > 0 {
+			s.RegisterPort(sandboxID, webrtcPort, fmt.Sprintf("http://%s:%d", host, webrtcPort))
+		}
 	}
 
 	expiresIn := req.ExpiresInSeconds
@@ -286,6 +322,11 @@ func (s *Server) handleDesktopStart(w http.ResponseWriter, r *http.Request) {
 	tokDesktop, expTime := s.mintPanelToken(sandboxID, ctlStatus.Ports.Desktop, expiresIn)
 	tokTerminal, _ := s.mintPanelToken(sandboxID, ctlStatus.Ports.Terminal, expiresIn)
 	tokCDP, _ := s.mintPanelToken(sandboxID, ctlStatus.Ports.CDP, expiresIn)
+	var webrtcURL string
+	if transportUsed == "webrtc" && webrtcPort > 0 {
+		tokWebRTC, _ := s.mintPanelToken(sandboxID, webrtcPort, expiresIn)
+		webrtcURL = fmt.Sprintf("/panel/%s/", tokWebRTC)
+	}
 
 	statusVal := ctlStatus.Status
 	if statusVal == "" {
@@ -296,11 +337,14 @@ func (s *Server) handleDesktopStart(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(desktopStartResp{
-		Status:      statusVal,
-		DesktopURL:  fmt.Sprintf("/panel/%s/vnc.html?autoconnect=true&resize=scale", tokDesktop),
-		TerminalURL: fmt.Sprintf("/panel/%s/", tokTerminal),
-		CDPURL:      fmt.Sprintf("/panel/%s/", tokCDP),
-		ExpiresAt:   expTime.Format(time.RFC3339),
+		Status:         statusVal,
+		DesktopURL:     fmt.Sprintf("/panel/%s/vnc.html?autoconnect=true&resize=scale", tokDesktop),
+		TerminalURL:    fmt.Sprintf("/panel/%s/", tokTerminal),
+		CDPURL:         fmt.Sprintf("/panel/%s/", tokCDP),
+		WebRTCURL:      webrtcURL,
+		TransportUsed:  transportUsed,
+		FallbackReason: fallbackReason,
+		ExpiresAt:      expTime.Format(time.RFC3339),
 	})
 }
 
