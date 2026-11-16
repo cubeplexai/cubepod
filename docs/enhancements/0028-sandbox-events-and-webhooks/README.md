@@ -77,8 +77,8 @@ Currently, clients that need to track sandbox lifecycle transitions (for billing
 
 - **Idle Reaper Visibility**: In Kubernetes mode, `cubepod-controller` may transition `PodBox.Status.Phase` to `Paused` or delete expired sandboxes asynchronously. Gateway's `resolveSandbox` / `sync` loop should emit corresponding `paused` / `killed` events when observing a state transition not already recorded.
 - **Dual-Runtime Behavior**:
-  - **Production Kubernetes (`Kata + CSI Block`)**: Webhook registrations and event logs are persisted in `<state-dir>/events/` (Alpha) or shared cluster storage (Beta); SSRF dialer blocks RFC1918, loopback, and cloud metadata IPs (`169.254.169.254`).
-  - **Local Development (`Docker + Loopback ext4`)**: Identical `/events` and `/webhooks` APIs; operators may set `CUBEPOD_WEBHOOK_ALLOW_PRIVATE=1` in local test harnesses to deliver to `127.0.0.1` mock receivers.
+  - **Production Kubernetes (`Kata + CSI Block`)**: Webhook subscriptions are persisted as `SandboxWebhook` CRDs (`cubepod.io/v1alpha1`) with a companion Kubernetes `Secret` (`secretRef`) holding only the HMAC `signatureKey`, and lifecycle events are emitted as labeled Kubernetes `Event`s on `PodBox` (zero external database dependency, consistent with CEP-0022). SSRF dialer blocks RFC1918, loopback, and cloud metadata IPs (`169.254.169.254`).
+  - **Local Development (`Docker + Loopback ext4`)**: Identical `/events` and `/webhooks` APIs backed by `<state-dir>/events/` (AES-256-GCM encrypted webhook store + bounded event ring); operators may set `CUBEPOD_WEBHOOK_ALLOW_PRIVATE=1` in local test harnesses to deliver to `127.0.0.1` mock receivers.
 
 ### Risks and Mitigations
 
@@ -94,6 +94,28 @@ Currently, clients that need to track sandbox lifecycle transitions (for billing
 ## Design Details
 
 ### API / CRD / Wire Changes
+
+#### 0. `SandboxWebhook` CRD (`api/v1alpha1/types.go` & `deploy/helm/cubepod/crds/cubepod.io_sandboxwebhooks.yaml`)
+
+In Kubernetes mode, each registered webhook is stored as a `SandboxWebhook` custom resource (`cubepod.io/v1alpha1`, `sandboxwebhooks.cubepod.io`) labeled with `cubepod.io/tenant=<tenantPrefix>`, keeping configuration & delivery status in CRD `etcd` and isolating only the HMAC `signatureKey` in a referenced Kubernetes `Secret` (`secretRef`):
+
+```go
+type SandboxWebhookSpec struct {
+	TenantHash string   `json:"tenantHash"`
+	Name       string   `json:"name"`
+	URL        string   `json:"url"`
+	Events     []string `json:"events"`
+	Enabled    bool     `json:"enabled"`
+	SecretName string   `json:"secretName"` // K8s Secret holding key "signatureKey"
+}
+
+type SandboxWebhookStatus struct {
+	LastDeliveryTime    *metav1.Time `json:"lastDeliveryTime,omitempty"`
+	ConsecutiveFailures int          `json:"consecutiveFailures,omitempty"`
+}
+```
+
+In Kubernetes mode, `cubepod-controller` / `cubepod-gateway` also emits labeled Kubernetes `Event`s (`core/v1`) attached to `PodBox` (`involvedObject.name = <sandboxID>`, label `cubepod.io/tenant=<tenantPrefix>`), allowing `GET /events` and `GET /sandboxes/{id}/events` to query recent lifecycle events directly from Kubernetes without an external database.
 
 #### 1. Webhooks Endpoints (`pkg/gateway/webhooks.go` & `api/openapi/cubepod-v1.yaml`)
 
@@ -176,8 +198,8 @@ flowchart LR
 
 ### Graduation Criteria
 
-- **Alpha (`v0.6`)**: `pkg/events` + `/webhooks` + `/events` routes + SSRF-safe HMAC dispatcher passing `make test`.
-- **Beta (`v0.7`)**: Shared Kubernetes `ConfigMap`/`Secret` or PostgreSQL-backed event/webhook store for multi-replica HA gateways.
+- **Alpha (`v0.6`)**: `pkg/events` + `/webhooks` + `/events` routes + SSRF-safe HMAC dispatcher passing `make test` (local file store).
+- **Beta (`v0.7`)**: `SandboxWebhook` CRD + `secretRef` K8s `Secret` backend and labeled Kubernetes `Event`s on `PodBox` for multi-replica HA gateways (zero external DB).
 - **Stable (`v1.0`)**: Production soak in CubePlex with dead-letter inspection and alerting.
 
 ### Upgrade / Downgrade Strategy
@@ -213,4 +235,5 @@ flowchart LR
 ## Alternatives
 
 1. **Synchronous webhook calls inside `POST /sandboxes` / `DELETE /sandboxes/{id}`**: Rejected; slow receivers would stall sandbox lifecycle APIs.
-2. **Kubernetes Events (`corev1.Event`) only**: Rejected; K8s Events have short TTLs (`1h`), lack tenant isolation, and do not provide signed HTTP webhook delivery.
+2. **External PostgreSQL / Redis database**: Rejected per CEP-0022; CubePod avoids extra stateful database dependencies by using `SandboxWebhook` CRDs (`secretRef` for HMAC keys) and Kubernetes `Event`s on `PodBox`.
+3. **Storing entire webhook configs inside Kubernetes `Secret`s**: Rejected; `Secret`s are meant for credentials (`signatureKey`), whereas a `SandboxWebhook` CRD gives clean schema validation, `kubectl` visibility, and `Status` tracking.
