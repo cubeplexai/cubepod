@@ -295,7 +295,7 @@ func BuildBlockPVCsWithOptions(boxName string, tpl v1alpha1.PodTemplateSpec, spe
 		},
 	}
 
-	if opts.RootfsSnapshotName != "" || opts.WorkspaceSnapshotName != "" {
+	if !strings.EqualFold(vm, "Filesystem") && (opts.RootfsSnapshotName != "" || opts.WorkspaceSnapshotName != "") {
 		if opts.RootfsSnapshotName != "" {
 			rootfsPVC.DataSourceSnapshot = opts.RootfsSnapshotName
 			rootfsPVC.DataSourceKind = "VolumeSnapshot"

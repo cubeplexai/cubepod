@@ -1419,8 +1419,11 @@ func (r *Reconciler) executeBuild(ctx context.Context, plan *preparedBuildPlan) 
 	}
 	startTime := time.Now()
 	result := v1alpha1.BuildStatusError
+	metricsObserved := false
 	defer func() {
-		r.buildMetrics.observe(result, time.Since(startTime))
+		if !metricsObserved {
+			r.buildMetrics.observe(result, time.Since(startTime))
+		}
 		slog.Info("template build finished",
 			"templateID", plan.templateID,
 			"buildID", plan.buildID,
@@ -1438,12 +1441,18 @@ func (r *Reconciler) executeBuild(ctx context.Context, plan *preparedBuildPlan) 
 		r.markBuildError(ctx, plan, ScrubString(secErr.Error(), passwords))
 		return secErr
 	}
+	secretCleaned := false
+	cleanupSrcSecret := func() {
+		if srcSecretName == "" || secretCleaned {
+			return
+		}
+		secretCleaned = true
+		delCtx, delCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer delCancel()
+		_ = r.kubeClient.DeleteSecret(delCtx, r.namespace, srcSecretName)
+	}
 	if srcSecretName != "" {
-		defer func() {
-			delCtx, delCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer delCancel()
-			_ = r.kubeClient.DeleteSecret(delCtx, r.namespace, srcSecretName)
-		}()
+		defer cleanupSrcSecret()
 	}
 
 	workDir := filepath.Join(r.contextDir, "work", plan.buildID)
@@ -1528,6 +1537,10 @@ func (r *Reconciler) executeBuild(ctx context.Context, plan *preparedBuildPlan) 
 		}
 	}
 
+	// Clean up ephemeral source credentials and record build metrics BEFORE
+	// exposing Ready status so polling callers never observe stale secrets/zero metrics.
+	cleanupSrcSecret()
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	tpl, ok := r.templateObjects[plan.slug]
@@ -1561,6 +1574,8 @@ func (r *Reconciler) executeBuild(ctx context.Context, plan *preparedBuildPlan) 
 	r.persistLocalTemplateLocked(tpl)
 	r.retireUnclaimedWarmEntriesForTemplateLocked(tpl.Metadata.Name, plan.targetTag)
 	result = v1alpha1.BuildStatusReady
+	r.buildMetrics.observe(result, time.Since(startTime))
+	metricsObserved = true
 	return nil
 }
 

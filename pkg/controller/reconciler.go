@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"maps"
 	"math/big"
@@ -917,6 +918,17 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				WorkspacePVCName: wsPVC.Name,
 				Phase:            v1alpha1.PodBoxPhaseRunning,
 			}
+			if tpl.Egress.Enabled {
+				if secErr := r.ensureEgressSecretsLocked(ctx, entryID, warmBoxSpec); secErr != nil {
+					slog.Warn("failed to ensure egress secrets for warm pod", "pod", dummyStatus.PodName, "err", secErr)
+					cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+					_ = r.kubeClient.DeletePVC(cleanupCtx, r.namespace, rootfsPVC.Name)
+					_ = r.kubeClient.DeletePVC(cleanupCtx, r.namespace, wsPVC.Name)
+					r.deleteEgressSecretsLocked(cleanupCtx, entryID)
+					cancel()
+					break
+				}
+			}
 			pullSecrets := append([]string{r.templatePullSecret}, r.defaultImagePullSecrets...)
 			podManifest := BuildPodManifest(entryID, tpl, warmBoxSpec, dummyStatus, PodBuildOptions{
 				VolumeMode:        r.volumeMode,
@@ -948,6 +960,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 					if delErr := r.kubeClient.DeletePVC(cleanupCtx, r.namespace, wsPVC.Name); delErr != nil {
 						slog.Warn("failed to clean up warm workspace PVC after EnsurePod error", "pvc", wsPVC.Name, "err", delErr)
 					}
+					r.deleteEgressSecretsLocked(cleanupCtx, entryID)
 					stopPoolRetry := ctx.Err() != nil
 					if !stopPoolRetry && pool.persisted {
 						if _, getErr := r.kubeClient.GetPodWarmPool(cleanupCtx, r.namespace, poolName); getErr != nil && !errors.Is(getErr, ErrCRDNotInstalled) {
@@ -1031,6 +1044,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				_ = r.kubeClient.DeletePod(ctx, r.namespace, entry.PodName)
 				_ = r.kubeClient.DeletePVC(ctx, r.namespace, entry.RootfsPVCName)
 				_ = r.kubeClient.DeletePVC(ctx, r.namespace, entry.WorkspacePVCName)
+				r.deleteEgressSecretsLocked(ctx, entry.ID)
 				continue
 			}
 			filtered = append(filtered, entry)
@@ -1252,9 +1266,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	var createdForkSnapshots []string
 	if !exists {
 		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set, no ForkFrom,
-		// no deterministic VolumeKey, and no official E2B volume mounts).
-		// Standby pods do not have those mounts, so a claim would drop them.
-		if spec.WarmPoolRef != "" && spec.ForkFrom == nil && spec.VolumeKey == "" && len(spec.E2BVolumeMounts) == 0 {
+		// no deterministic VolumeKey, no custom NetworkPolicy, and no official E2B volume mounts).
+		// Standby pods have no per-sandbox NetworkPolicy or E2B volume mounts.
+		if spec.WarmPoolRef != "" && spec.ForkFrom == nil && spec.VolumeKey == "" && len(spec.E2BVolumeMounts) == 0 && spec.NetworkPolicy == nil {
 			entry, err := r.claimWarmPodLocked(ctx, spec.WarmPoolRef, name)
 			if err != nil {
 				return nil, fmt.Errorf("failed to claim from warm pool %q for box %q: %w", spec.WarmPoolRef, name, err)
@@ -1297,6 +1311,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			}
 			var rootfsPVC, wsPVC BlockPVCManifest
 			if r.forkMode == "snapshot" {
+				if strings.EqualFold(r.volumeMode, "Filesystem") {
+					delete(r.resolvedImages, name)
+					return nil, fmt.Errorf("volumeSnapshot fork mode requires volumeMode=Block, not %q", r.volumeMode)
+				}
 				rootfsSnapName := forkSnapshotName(name, "-rootfs-snap")
 				wsSnapName := forkSnapshotName(name, "-workspace-snap")
 				var snapClassPtr *string
@@ -1306,7 +1324,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				}
 				snapLabels := map[string]string{
 					"app.kubernetes.io/name": "cubepod",
-					"pod.cubeplex.ai/box":    name,
+					"pod.cubeplex.ai/box":    SanitizeLabelValue(name),
 					"cubepod.io/forked-from": SanitizeLabelValue(spec.ForkFrom.PodBoxName),
 				}
 				rootfsSnap := VolumeSnapshot{
@@ -1341,21 +1359,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				}
 
 				if err := r.kubeClient.EnsureVolumeSnapshot(ctx, rootfsSnap); err != nil {
+					r.cleanupForkSnapshotsLocked(ctx, rootfsSnapName)
+					delete(r.resolvedImages, name)
 					return nil, fmt.Errorf("failed to create rootfs VolumeSnapshot %s: %w", rootfsSnapName, err)
 				}
 				createdForkSnapshots = append(createdForkSnapshots, rootfsSnapName)
 				if err := r.kubeClient.EnsureVolumeSnapshot(ctx, wsSnap); err != nil {
-					r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
+					r.cleanupForkSnapshotsLocked(ctx, append(createdForkSnapshots, wsSnapName)...)
+					delete(r.resolvedImages, name)
 					return nil, fmt.Errorf("failed to create workspace VolumeSnapshot %s: %w", wsSnapName, err)
 				}
 				createdForkSnapshots = append(createdForkSnapshots, wsSnapName)
 
 				if err := r.kubeClient.WaitVolumeSnapshotReady(ctx, r.namespace, rootfsSnapName); err != nil {
 					r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
+					delete(r.resolvedImages, name)
 					return nil, fmt.Errorf("rootfs VolumeSnapshot %s not ready: %w", rootfsSnapName, err)
 				}
 				if err := r.kubeClient.WaitVolumeSnapshotReady(ctx, r.namespace, wsSnapName); err != nil {
 					r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
+					delete(r.resolvedImages, name)
 					return nil, fmt.Errorf("workspace VolumeSnapshot %s not ready: %w", wsSnapName, err)
 				}
 
@@ -1368,11 +1391,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				wsPVC.Namespace = r.namespace
 				if err := r.kubeClient.EnsurePVC(ctx, rootfsPVC); err != nil {
 					r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
+					delete(r.resolvedImages, name)
 					return nil, fmt.Errorf("failed to ensure forked rootfs PVC %s: %w", rootfsPVC.Name, err)
 				}
 				if err := r.kubeClient.EnsurePVC(ctx, wsPVC); err != nil {
 					_ = r.kubeClient.DeletePVC(ctx, r.namespace, rootfsPVC.Name)
 					r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
+					delete(r.resolvedImages, name)
 					return nil, fmt.Errorf("failed to ensure forked workspace PVC %s: %w", wsPVC.Name, err)
 				}
 			} else {
@@ -1443,6 +1468,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	case v1alpha1.DesiredStatePaused:
 		if status.PodName != "" {
 			_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
+			if status.PodName != name {
+				r.deleteEgressSecretsLocked(ctx, status.PodName)
+			}
 		}
 		r.deleteEgressSecretsLocked(ctx, name)
 		status.Phase = v1alpha1.PodBoxPhasePaused
@@ -1486,10 +1514,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		})
 		podManifest.Namespace = r.namespace
 		podIP, err := r.kubeClient.EnsurePod(ctx, podManifest)
+		podConflictUnconfirmed := false
 		if err != nil {
 			errStr := strings.ToLower(err.Error())
 			if strings.Contains(errStr, "409") || strings.Contains(errStr, "already exists") || strings.Contains(errStr, "conflict") {
 				err = nil
+				podConflictUnconfirmed = podIP == ""
 			} else {
 				if createdCold {
 					r.rollbackColdCreateLocked(ctx, name, spec, status, podManifest.Name)
@@ -1505,7 +1535,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		status.PodName = podManifest.Name
 		status.LastActivityAt = &now
 		status.PausedAt = nil
-		if len(createdForkSnapshots) > 0 {
+		if len(createdForkSnapshots) > 0 && !podConflictUnconfirmed {
 			r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
 		}
 	}
@@ -1905,15 +1935,22 @@ func forkSnapshotName(boxName, suffix string) string {
 	if len(name) <= 63 {
 		return name
 	}
-	maxPrefix := 63 - len(suffix)
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(boxName))
+	hashTag := fmt.Sprintf("-%08x", h.Sum32())
+	maxPrefix := 63 - len(suffix) - len(hashTag)
 	if maxPrefix <= 0 {
-		return name[:63]
+		trimmed := "s" + hashTag + suffix
+		if len(trimmed) > 63 {
+			return trimmed[:63]
+		}
+		return trimmed
 	}
 	prefix := strings.TrimRight(boxName[:maxPrefix], "-")
 	if prefix == "" {
 		prefix = "snap"
 	}
-	return prefix + suffix
+	return prefix + hashTag + suffix
 }
 
 func (r *Reconciler) cleanupForkSnapshotsLocked(ctx context.Context, snapNames ...string) {
@@ -2019,6 +2056,9 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 
 	if status.PodName != "" {
 		_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
+		if status.PodName != name {
+			r.deleteEgressSecretsLocked(ctx, status.PodName)
+		}
 	}
 	spec, hasSpec := r.specs[name]
 	if deleteVolumes || !hasSpec || spec.VolumeKey == "" {
