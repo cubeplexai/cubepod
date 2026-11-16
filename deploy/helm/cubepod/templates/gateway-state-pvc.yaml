@@ -1,0 +1,21 @@
+{{- if and .Values.gateway.persistence.enabled (not .Values.gateway.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ printf "%s-gateway-state" (include "cubepod.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/resource-policy": keep
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway-state
+spec:
+  accessModes:
+    - {{ .Values.gateway.persistence.accessMode | quote }}
+  {{- if .Values.gateway.persistence.storageClassName }}
+  storageClassName: {{ .Values.gateway.persistence.storageClassName | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.gateway.persistence.size | quote }}
+{{- end }}

@@ -23,6 +23,9 @@ spec:
         app.kubernetes.io/component: controller
     spec:
       serviceAccountName: {{ include "cubepod.serviceAccountName" . }}
+      {{- include "cubepod.podImagePullSecrets" . | nindent 6 }}
+      {{- $pullSecretsCSV := include "cubepod.imagePullSecretsCSV" . }}
+      {{- $tplPullSecret := include "cubepod.effectiveTemplatePullSecret" . }}
       containers:
         - name: controller
           image: "{{ .Values.controller.image.registry }}/{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
@@ -31,6 +34,18 @@ spec:
             - "--addr=:{{ .Values.controller.healthzPort }}"
             - "--namespace={{ .Values.controller.workloadNamespace }}"
             - "--sync-interval={{ .Values.controller.syncInterval }}"
+            - "--storage-class={{ .Values.storage.storageClassName }}"
+            - "--volume-mode={{ .Values.storage.volumeMode }}"
+            - "--runtime-class={{ .Values.runtime.runtimeClassName }}"
+            - "--podd-image={{ .Values.runtime.poddInjectorImage }}"
+            - "--sandbox-image={{ .Values.runtime.defaultSandboxImage }}"
+            - "--egress-image={{ include "cubepod.egressImage" . }}"
+            {{- if $pullSecretsCSV }}
+            - "--image-pull-secrets={{ $pullSecretsCSV }}"
+            {{- end }}
+            {{- if $tplPullSecret }}
+            - "--template-pull-secret={{ $tplPullSecret }}"
+            {{- end }}
             {{- if .Values.controller.kubeApi }}
             - "--kube-api={{ .Values.controller.kubeApi }}"
             {{- end }}
@@ -53,13 +68,14 @@ spec:
             {{- if .Values.templateBuild.registry.pushSecret }}
             - "--template-push-secret={{ .Values.templateBuild.registry.pushSecret }}"
             {{- end }}
-            {{- if .Values.templateBuild.registry.pullSecret }}
-            - "--template-pull-secret={{ .Values.templateBuild.registry.pullSecret }}"
-            {{- end }}
             {{- if .Values.templateBuild.probeTimeout }}
             - "--template-probe-timeout={{ .Values.templateBuild.probeTimeout }}"
             {{- end }}
             {{- end }}
+          {{- if .Values.egress.caSecretName }}
+          env:
+            {{- include "cubepod.egressCAEnv" . | nindent 12 }}
+          {{- end }}
           ports:
             - name: healthz
               containerPort: {{ .Values.controller.healthzPort }}
@@ -78,14 +94,20 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
-          {{- if .Values.templateBuild.enabled }}
+          {{- if or .Values.templateBuild.enabled .Values.egress.caSecretName }}
           volumeMounts:
+            {{- if .Values.templateBuild.enabled }}
             - name: context-storage
               mountPath: /var/lib/cubepod/context
+            {{- end }}
+            {{- include "cubepod.egressCAVolumeMount" . | nindent 12 }}
           {{- end }}
-      {{- if .Values.templateBuild.enabled }}
+      {{- if or .Values.templateBuild.enabled .Values.egress.caSecretName }}
       volumes:
+        {{- if .Values.templateBuild.enabled }}
         - name: context-storage
           persistentVolumeClaim:
             claimName: cubepod-template-context
+        {{- end }}
+        {{- include "cubepod.egressCAVolume" . | nindent 8 }}
       {{- end }}

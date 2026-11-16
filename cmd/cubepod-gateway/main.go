@@ -43,6 +43,13 @@ func parseFeatureGates(raw string) map[string]bool {
 	return gates
 }
 
+func defaultEgressImage() string {
+	if env := strings.TrimSpace(os.Getenv("CUBEPOD_EGRESS_IMAGE")); env != "" {
+		return env
+	}
+	return "ghcr.io/cubeplexai/cubepod-egress:v0.5.1"
+}
+
 func main() {
 	var (
 		addr                 = flag.String("addr", ":8080", "HTTP listen address for CubePod Gateway")
@@ -54,6 +61,7 @@ func main() {
 		runtimeClass         = flag.String("runtime-class", "", "Container runtime class name (empty for standard runc/containerd)")
 		poddImage            = flag.String("podd-image", "ghcr.io/cubeplexai/cubepod-podd:v0.5.1", "Image for podd-installer initContainer")
 		sandboxImage         = flag.String("sandbox-image", "ubuntu:24.04", "Default sandbox image")
+		egressImage          = flag.String("egress-image", defaultEgressImage(), "Default cubepod-egress sidecar image when template egress.image is empty")
 		livePodRouting       = flag.Bool("live-pod-routing", true, "Route commands and files to live in-cluster Pod IP")
 		e2bTemplateAPI       = flag.Bool("e2b-template-api", false, "Enable E2B template API feature gate")
 		featureGate          = flag.String("feature-gate", "", "Comma-separated feature gates (e.g. E2BTemplateAPI=true)")
@@ -64,6 +72,7 @@ func main() {
 		templateRegistry     = flag.String("template-registry", "", "Target OCI registry URL for template builds (local single-process mode)")
 		templateRepoPrefix   = flag.String("template-repo-prefix", "cubepod-templates", "Repository prefix under target template registry")
 		templatePullSecret   = flag.String("template-pull-secret", "", "Kubernetes imagePullSecret attached to sandbox pods")
+		imagePullSecrets     = flag.String("image-pull-secrets", os.Getenv("CUBEPOD_IMAGE_PULL_SECRETS"), "Comma-separated Kubernetes imagePullSecrets attached to sandbox Pods")
 		egressCACert         = flag.String("egress-ca-cert", os.Getenv("CUBEPOD_EGRESS_CA_CERT"), "Path to egress mTLS root CA certificate PEM")
 		egressCAKey          = flag.String("egress-ca-key", os.Getenv("CUBEPOD_EGRESS_CA_KEY"), "Path to egress mTLS root CA private key PEM")
 		egressUpstreamCAFile = flag.String("egress-upstream-ca-file", os.Getenv("CUBEPOD_EGRESS_UPSTREAM_CA_FILE"), "Optional path to upstream CA PEM mounted into egress sidecars")
@@ -87,6 +96,7 @@ func main() {
 		"runtimeClass", *runtimeClass,
 		"poddImage", *poddImage,
 		"sandboxImage", *sandboxImage,
+		"egressImage", *egressImage,
 		"livePodRouting", *livePodRouting,
 		"e2bTemplateAPI", e2bAPIEnabled,
 		"templateBuild", *templateBuild,
@@ -115,12 +125,14 @@ func main() {
 		controller.WithDefaultRuntimeClass(*runtimeClass),
 		controller.WithPoddInjectorImage(*poddImage),
 		controller.WithDefaultSandboxImage(*sandboxImage),
+		controller.WithDefaultEgressImage(*egressImage),
 		controller.WithE2BTemplateAPI(e2bAPIEnabled),
 		controller.WithTemplateBuildEnabled(*templateBuild),
 		controller.WithTemplateProbeTimeout(*templateProbeTimeout),
 		controller.WithTemplateRegistry(*templateRegistry),
 		controller.WithTemplateRepoPrefix(*templateRepoPrefix),
 		controller.WithTemplatePullSecret(*templatePullSecret),
+		controller.WithDefaultImagePullSecrets(*imagePullSecrets),
 	}
 
 	var contextDir string
@@ -245,8 +257,8 @@ func main() {
 	}
 
 	eventsDir := strings.TrimSpace(os.Getenv("CUBEPOD_EVENTS_DIR"))
-	if eventsDir == "" && *stateDir != "" {
-		eventsDir = filepath.Join(*stateDir, "events")
+	if eventsDir == "" && effectiveStateDir != "" {
+		eventsDir = filepath.Join(effectiveStateDir, "events")
 	} else if eventsDir == "" && volDir != "" {
 		eventsDir = filepath.Join(filepath.Dir(volDir), "events")
 	}

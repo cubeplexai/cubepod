@@ -47,8 +47,9 @@ tmp/
 logs/
 .cubepod-data/
 
-# Kubernetes / Helm secrets
+# Kubernetes / Helm secrets & local cluster profiles
 deploy/helm/cubepod/values.local.yaml
+deploy/k8s/local/
 *ca-secret.yaml
 *.pem
 *.key

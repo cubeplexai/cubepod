@@ -95,6 +95,15 @@ func WithDefaultSandboxImage(img string) ReconcilerOption {
 	}
 }
 
+// WithDefaultEgressImage configures the default cubepod-egress sidecar image when a template leaves egress.image empty.
+func WithDefaultEgressImage(img string) ReconcilerOption {
+	return func(r *Reconciler) {
+		if strings.TrimSpace(img) != "" {
+			r.defaultEgressImage = strings.TrimSpace(img)
+		}
+	}
+}
+
 // WithE2BTemplateAPI configures whether the E2B template API feature gate is enabled.
 func WithE2BTemplateAPI(enabled bool) ReconcilerOption {
 	return func(r *Reconciler) {
@@ -231,6 +240,7 @@ type Reconciler struct {
 	runtimeClassSet         bool
 	poddInjectorImage       string // default "cubepod-podd:latest"
 	defaultSandboxImage     string // default "ubuntu:24.04"
+	defaultEgressImage      string
 	FailWarmPoolClaim       bool
 	e2bTemplateAPI          bool
 	templateBuildEnabled    bool
@@ -497,6 +507,27 @@ func (r *Reconciler) GetTemplate(name string) (v1alpha1.PodTemplateSpec, bool) {
 	return tpl, ok
 }
 
+func (r *Reconciler) applyTemplateDefaults(tpl *v1alpha1.PodTemplateSpec) {
+	if tpl == nil {
+		return
+	}
+	if tpl.RuntimeClassName == "" && r.runtimeClassSet {
+		tpl.RuntimeClassName = r.defaultRuntimeClass
+	}
+	if tpl.Storage.StorageClassName == "" && r.defaultStorageClass != "" {
+		tpl.Storage.StorageClassName = r.defaultStorageClass
+	}
+	if tpl.Image == "" && r.defaultSandboxImage != "" {
+		tpl.Image = r.defaultSandboxImage
+	}
+	if tpl.PoddImage == "" && r.poddInjectorImage != "" {
+		tpl.PoddImage = r.poddInjectorImage
+	}
+	if tpl.Egress.Enabled && tpl.Egress.Image == "" && r.defaultEgressImage != "" {
+		tpl.Egress.Image = r.defaultEgressImage
+	}
+}
+
 func (r *Reconciler) defaultTemplate(templateID string) v1alpha1.PodTemplateSpec {
 	img := templateID
 	if img == "" {
@@ -591,20 +622,10 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 		if !ok {
 			tpl = r.defaultTemplate(spec.TemplateRef)
 		} else {
-			if tpl.RuntimeClassName == "" && r.runtimeClassSet {
-				tpl.RuntimeClassName = r.defaultRuntimeClass
-			}
-			if tpl.Storage.StorageClassName == "" && r.defaultStorageClass != "" {
-				tpl.Storage.StorageClassName = r.defaultStorageClass
-			}
-			if tpl.Image == "" && r.defaultSandboxImage != "" {
-				tpl.Image = r.defaultSandboxImage
-			}
-			if tpl.PoddImage == "" && r.poddInjectorImage != "" {
-				tpl.PoddImage = r.poddInjectorImage
-			}
+			r.applyTemplateDefaults(&tpl)
 		}
 	}
+	r.applyTemplateDefaults(&tpl)
 
 	// Count existing available (unclaimed) replicas.
 	var availableEntries []*WarmPodEntry
@@ -1001,6 +1022,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	if resolved.DiskSizeMB > 0 {
 		tpl.Storage.RootfsSize = fmt.Sprintf("%dMi", resolved.DiskSizeMB)
 	}
+	r.applyTemplateDefaults(&tpl)
 
 	createdCold := false
 	if !exists {

@@ -39,6 +39,13 @@ func parseFeatureGates(raw string) map[string]bool {
 	return gates
 }
 
+func defaultEgressImage() string {
+	if env := strings.TrimSpace(os.Getenv("CUBEPOD_EGRESS_IMAGE")); env != "" {
+		return env
+	}
+	return "ghcr.io/cubeplexai/cubepod-egress:v0.5.1"
+}
+
 func main() {
 	var (
 		namespace            = flag.String("namespace", "cubepod-workloads", "Kubernetes namespace for PodBox workloads")
@@ -51,6 +58,7 @@ func main() {
 		runtimeClass         = flag.String("runtime-class", "", "Container runtime class name (empty for standard runc/containerd)")
 		poddImage            = flag.String("podd-image", "ghcr.io/cubeplexai/cubepod-podd:v0.5.1", "Image for podd-installer initContainer")
 		sandboxImage         = flag.String("sandbox-image", "ubuntu:24.04", "Default sandbox image")
+		egressImage          = flag.String("egress-image", defaultEgressImage(), "Default cubepod-egress sidecar image when template egress.image is empty")
 		e2bTemplateAPI       = flag.Bool("e2b-template-api", false, "Enable E2B template API feature gate")
 		featureGate          = flag.String("feature-gate", "", "Comma-separated feature gates (e.g. E2BTemplateAPI=true)")
 		templateBuild        = flag.Bool("template-build", false, "Enable template image build Beta pipeline")
@@ -87,6 +95,7 @@ func main() {
 		"runtimeClass", *runtimeClass,
 		"poddImage", *poddImage,
 		"sandboxImage", *sandboxImage,
+		"egressImage", *egressImage,
 		"e2bTemplateAPI", e2bAPIEnabled,
 		"templateBuild", *templateBuild,
 		"buildkitAddr", *buildkitAddr,
@@ -137,6 +146,7 @@ func main() {
 		controller.WithDefaultRuntimeClass(*runtimeClass),
 		controller.WithPoddInjectorImage(*poddImage),
 		controller.WithDefaultSandboxImage(*sandboxImage),
+		controller.WithDefaultEgressImage(*egressImage),
 		controller.WithE2BTemplateAPI(e2bAPIEnabled),
 		controller.WithTemplateBuildEnabled(*templateBuild),
 		controller.WithImageBuilder(builder),

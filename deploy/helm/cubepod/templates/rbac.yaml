@@ -31,6 +31,8 @@ rules:
       - podtemplates/status
       - podwarmpools
       - podwarmpools/status
+      - sandboxwebhooks
+      - sandboxwebhooks/status
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["apps"]
     resources:

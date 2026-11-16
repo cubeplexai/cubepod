@@ -3,7 +3,7 @@ title: Kubernetes 与 Helm 部署
 description: 使用 Helm Chart 在 Kubernetes 集群中部署 CubePod Operator、Gateway、Egress 代理、CRDs 及可选的无特权 BuildKit 构建服务。
 ---
 
-在 Kubernetes 环境中，CubePod 通过位于 `deploy/helm/cubepod/` 的 Helm Chart（`cubepod`，`version: 0.5.1`，`appVersion: "0.5.1"`）进行统一打包交付，涵盖 `PodBox`、`PodTemplate`、`PodWarmPool` 三类 CRD、RBAC 权限、工作负载命名空间、Control Plane Gateway、Kubernetes Controller 以及可选的无特权 BuildKit 模板构建流水线。
+在 Kubernetes 环境中，CubePod 通过位于 `deploy/helm/cubepod/` 的 Helm Chart（`cubepod`，`version: 0.5.1`，`appVersion: "0.5.1"`）进行统一打包交付，涵盖 `PodBox`、`PodTemplate`、`PodWarmPool`、`SandboxWebhook` 四类 CRD、RBAC 权限、工作负载命名空间、Control Plane Gateway、Kubernetes Controller 以及可选的无特权 BuildKit 模板构建流水线。
 
 由 `deploy/helm/cubepod/values.yaml` 自动生成的完整字段说明，请参阅 [Helm Values 参考](/zh/reference/helm-values/)与 [Kubernetes CRD 参考](/zh/reference/crds/)。
 
@@ -31,11 +31,12 @@ helm install cubepod ./deploy/helm/cubepod \
   --create-namespace
 ```
 
-首次执行 `helm install` 时，Helm 会自动安装位于 `deploy/helm/cubepod/crds/` 下的全部 CRD：
+首次执行 `helm install` 时，Helm 会自动安装位于 `deploy/helm/cubepod/crds/` 下的全部四项 CRD：
 
 - `cubepod.io_podboxes.yaml`
 - `cubepod.io_podtemplates.yaml`
 - `cubepod.io_podwarmpools.yaml`
+- `cubepod.io_sandboxwebhooks.yaml`
 
 :::note
 Helm 在后续执行 `helm upgrade` 时不会自动更新 `crds/` 目录中的文件。升级 CubePod 版本前，请先显式应用最新 CRD 清单：
@@ -59,9 +60,10 @@ flowchart TB
 | 模板文件 | 创建的 Kubernetes 资源 | 说明 |
 | :--- | :--- | :--- |
 | `namespace.yaml` | `Namespace`（`controller.workloadNamespace`，默认 `cubepod-workloads`） | 附带标签 `cubepod.io/role: workloads` |
-| `rbac.yaml` | `ServiceAccount`、`ClusterRole`（`<fullname>-controller`）、`ClusterRoleBinding` | 授予核心资源 `pods`、`pods/exec`、`pods/log`、`persistentvolumeclaims`、`events`、`configmaps`、`secrets` 及 `cubepod.io`/`pod.cubeplex.ai` CRD 及其 `status` 子资源的增删改查权限，以及 `apps` `deployments`/`statefulsets` 只读权限 |
-| `gateway-deployment.yaml` | `Deployment`（`gateway.replicaCount`，默认 `2`） | 提供 `/health` 存活（`initialDelaySeconds: 5, periodSeconds: 10`）与就绪（`initialDelaySeconds: 2, periodSeconds: 5`）探针；配置 `gateway.panelSecret` 后自动注入 `CUBEPOD_PANEL_SECRET` |
-| `controller-deployment.yaml` | `Deployment`（`controller.replicaCount`，若 `templateBuild.enabled` 为 true 则强制锁定为 `1`） | 提供 `/livez` 与 `/healthz`；按 `--sync-interval`（默认 `5s`）执行调谐；开启 `templateBuild.enabled` 时挂载 `cubepod-template-context` PVC |
+| `rbac.yaml` | `ServiceAccount`、`ClusterRole`（`<fullname>-controller`）、`ClusterRoleBinding` | 授予核心资源 `pods`、`pods/exec`、`pods/log`、`persistentvolumeclaims`、`events`、`configmaps`、`secrets` 及 `cubepod.io`/`pod.cubeplex.ai` CRD（`podboxes`、`podtemplates`、`podwarmpools`、`sandboxwebhooks`）及其 `status` 子资源的增删改查权限，以及 `apps` `deployments`/`statefulsets` 只读权限 |
+| `gateway-deployment.yaml` | `Deployment`（`gateway.replicaCount`，默认 `2`） | 提供 `/health` 存活（`initialDelaySeconds: 5, periodSeconds: 10`）与就绪（`initialDelaySeconds: 2, periodSeconds: 5`）探针；统一注入运行时/存储/出站镜像参数、`global.imagePullSecrets`、`egress.caSecretName` 与可选的 `gateway.persistence` |
+| `controller-deployment.yaml` | `Deployment`（`controller.replicaCount`，若 `templateBuild.enabled` 为 true 则强制锁定为 `1`） | 提供 `/livez` 与 `/healthz`；按 `--sync-interval`（默认 `5s`）执行调谐；注入运行时/存储/出站镜像参数、`global.imagePullSecrets` 与 `egress.caSecretName`，开启 `templateBuild.enabled` 时挂载 `cubepod-template-context` PVC |
+| `gateway-state-pvc.yaml` | `PersistentVolumeClaim`（`<fullname>-gateway-state`，可选） | 仅当 `gateway.persistence.enabled: true` 且未指定 `existingClaim` 时渲染；用于持久化 Gateway `stateDir`（本地模板、E2B Secrets 与生命周期事件/Webhook） |
 | `service.yaml` | `<fullname>-gateway`（`:8080`）、`<fullname>-controller`（`:8081`） | 默认均为 `ClusterIP`；切换为 `NodePort` 时支持通过 `gateway.service.nodePort` 固定端口 |
 | `buildkit.yaml` | `Deployment`、`Service`（`:1234`）、2 个 `PVC`、`NetworkPolicy` | 仅当 `templateBuild.enabled: true` 时渲染 |
 
