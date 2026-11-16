@@ -23,8 +23,14 @@ spec:
       {{- $pullSecretsCSV := include "cubepod.imagePullSecretsCSV" . }}
       {{- $tplPullSecret := include "cubepod.effectiveTemplatePullSecret" . }}
       {{- $stateDir := include "cubepod.effectiveGatewayStateDir" . }}
-      {{- $hasEnv := or .Values.gateway.panelSecret .Values.e2bVolumes.enabled .Values.egress.caSecretName $stateDir .Values.gateway.webhookAllowPrivate .Values.gateway.secretsKeySecret .Values.gateway.eventsKeySecret }}
-      {{- $hasVolumes := or .Values.e2bVolumes.enabled .Values.egress.caSecretName .Values.gateway.persistence.enabled }}
+      {{- $e2bVolumesActive := eq (include "cubepod.e2bVolumesActive" .) "true" }}
+      {{- $k8sE2BMounts := eq (include "cubepod.k8sE2BVolumeMountsEnabled" .) "true" }}
+      {{- $secretsCfg := .Values.secrets | default dict }}
+      {{- $secretsEnabled := and (default true $secretsCfg.enabled) (default true .Values.featureGates.e2bSecretsAPI) }}
+      {{- $secretsBackend := default "k8s" $secretsCfg.backend }}
+      {{- $secretsKeySecret := include "cubepod.secretsKeySecretName" . }}
+      {{- $hasEnv := true }}
+      {{- $hasVolumes := or $e2bVolumesActive .Values.egress.caSecretName .Values.gateway.persistence.enabled }}
       containers:
         - name: gateway
           image: "{{ .Values.gateway.image.registry }}/{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}"
@@ -46,6 +52,7 @@ spec:
             - "--template-pull-secret={{ $tplPullSecret }}"
             {{- end }}
             - "--e2b-template-api={{ .Values.featureGates.e2bTemplateAPI }}"
+            - "--feature-gate={{ include "cubepod.featureGatesCSV" . }}"
             - "--template-build={{ .Values.templateBuild.enabled }}"
             - "--template-probe-timeout={{ .Values.templateBuild.probeTimeout }}"
             - "--controller-url=http://{{ include "cubepod.fullname" . }}-controller:{{ .Values.controller.healthzPort }}"
@@ -66,12 +73,25 @@ spec:
             - name: CUBEPOD_WEBHOOK_ALLOW_PRIVATE
               value: "1"
             {{- end }}
-            {{- if .Values.gateway.secretsKeySecret }}
+            {{- if not $secretsEnabled }}
+            - name: CUBEPOD_SECRETS_BACKEND
+              value: "disabled"
+            - name: CUBEPOD_SECRETS_DIR
+              value: "disabled"
+            {{- else }}
+            - name: CUBEPOD_SECRETS_BACKEND
+              value: {{ $secretsBackend | quote }}
+            {{- if and (eq $secretsBackend "file") $secretsCfg.dir }}
+            - name: CUBEPOD_SECRETS_DIR
+              value: {{ $secretsCfg.dir | quote }}
+            {{- end }}
+            {{- if $secretsKeySecret }}
             - name: CUBEPOD_SECRETS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.gateway.secretsKeySecret | quote }}
+                  name: {{ $secretsKeySecret | quote }}
                   key: key
+            {{- end }}
             {{- end }}
             {{- if .Values.gateway.eventsKeySecret }}
             - name: CUBEPOD_EVENTS_KEY
@@ -80,11 +100,11 @@ spec:
                   name: {{ .Values.gateway.eventsKeySecret | quote }}
                   key: key
             {{- end }}
-            {{- if .Values.e2bVolumes.enabled }}
+            {{- if $e2bVolumesActive }}
             - name: CUBEPOD_E2B_VOLUME_DIR
               value: "/var/lib/cubepod/e2b-volumes"
             - name: CUBEPOD_K8S_E2B_VOLUME_MOUNTS
-              value: "1"
+              value: {{ ternary "1" "0" $k8sE2BMounts | quote }}
             - name: CUBEPOD_E2B_SHARED_PVC
               value: {{ .Values.e2bVolumes.pvcName | quote }}
             {{- end }}
@@ -96,7 +116,7 @@ spec:
             - name: gateway-state
               mountPath: {{ $stateDir | quote }}
             {{- end }}
-            {{- if .Values.e2bVolumes.enabled }}
+            {{- if $e2bVolumesActive }}
             - name: e2b-volumes
               mountPath: /var/lib/cubepod/e2b-volumes
             {{- end }}
@@ -127,7 +147,7 @@ spec:
           persistentVolumeClaim:
             claimName: {{ default (printf "%s-gateway-state" (include "cubepod.fullname" .)) .Values.gateway.persistence.existingClaim | quote }}
         {{- end }}
-        {{- if .Values.e2bVolumes.enabled }}
+        {{- if $e2bVolumesActive }}
         - name: e2b-volumes
           persistentVolumeClaim:
             claimName: {{ .Values.e2bVolumes.pvcName }}

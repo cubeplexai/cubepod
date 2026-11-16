@@ -1,0 +1,29 @@
+{{- $pdb := .Values.gateway.podDisruptionBudget | default dict -}}
+{{- $shouldRender := false -}}
+{{- if kindIs "bool" $pdb.enabled -}}
+  {{- $shouldRender = $pdb.enabled -}}
+{{- else -}}
+  {{- $shouldRender = gt (int .Values.gateway.replicaCount) 1 -}}
+{{- end -}}
+{{- if $shouldRender }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "cubepod.fullname" . }}-gateway
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway
+spec:
+  {{- if and (hasKey $pdb "maxUnavailable") (not (kindIs "invalid" $pdb.maxUnavailable)) }}
+  maxUnavailable: {{ $pdb.maxUnavailable }}
+  {{- else if and (hasKey $pdb "minAvailable") (not (kindIs "invalid" $pdb.minAvailable)) }}
+  minAvailable: {{ $pdb.minAvailable }}
+  {{- else }}
+  minAvailable: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "cubepod.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: gateway
+{{- end }}

@@ -27,6 +27,10 @@ warmPool:
 
 gateway:
   replicaCount: 2
+  podDisruptionBudget:
+    # When null/omitted, enabled automatically when gateway.replicaCount > 1.
+    enabled: null
+    minAvailable: 1
   image:
     registry: "ghcr.io"
     repository: "cubeplexai/cubepod-gateway"
@@ -82,6 +86,7 @@ controller:
 
 egress:
   enabled: true
+  transparent: true
   image:
     registry: "ghcr.io"
     repository: "cubeplexai/cubepod-egress"
@@ -93,9 +98,27 @@ egress:
   # Mount ca.crt as CUBEPOD_EGRESS_UPSTREAM_CA_FILE into egress sidecars
   upstreamCAEnabled: false
 
+secrets:
+  enabled: true
+  # Backend for /secrets: "k8s" (multi-replica HA via Kubernetes Secrets), "file", or "disabled"
+  backend: "k8s"
+  # Directory used when secrets.backend is "file"
+  dir: "/var/lib/cubepod/secrets"
+  # Existing Kubernetes Secret containing 32-byte base64/64-hex key under data.key (overrides gateway.secretsKeySecret)
+  existingSecret: ""
+  # Optional inline 32-byte base64/64-hex key; when set without existingSecret, creates a release Secret
+  encryptionKey: ""
+
 featureGates:
   # Turning on changes GET /templates from the wrapped stub to a JSON array
   e2bTemplateAPI: false
+  transparentEgress: true
+  desktopStack: true
+  statelessGatewayHA: true
+  e2bFilesystemWatch: true
+  e2bSecretsAPI: true
+  sandboxEventsAndWebhooks: true
+  k8sE2BVolumeMounts: false
 
 templateBuild:
   enabled: false
