@@ -188,6 +188,13 @@ describe('Official E2B TypeScript SDK Compatibility Suite', () => {
       try {
         const netInfo = await netSbx.getInfo();
         assert.equal(netInfo.sandboxId, netSbx.sandboxId);
+
+        // Verify Zero-Trust Invariant 3: gateway binds opaque cpodref_ placeholder and withholds raw secrets.
+        const detailResp = await fetch(`${gw.url}/sandboxes/${netSbx.sandboxId}`);
+        assert.equal(detailResp.status, 200);
+        const detailText = await detailResp.text();
+        assert.ok(detailText.includes('cpodref_'), `expected cpodref_ placeholder in sandbox policy: ${detailText}`);
+        assert.ok(!detailText.includes('sk_ts_initial') && !detailText.includes('sk_ts_rotated'), 'raw secret must not appear in sandbox record');
       } finally {
         await netSbx.kill();
       }

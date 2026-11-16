@@ -43,7 +43,7 @@ def direct_gateway_url() -> Generator[str, None, None]:
     env["TMPDIR"] = temp_dir
     env["CUBEPOD_WORKSPACE_DIR"] = os.path.join(temp_dir, "workspaces")
     env["CUBEPOD_STATE"] = os.path.join(temp_dir, "state")
-    env["CUBEPOD_E2B_VOLUMES_DIR"] = os.path.join(temp_dir, "volumes")
+    env["CUBEPOD_E2B_VOLUME_DIR"] = os.path.join(temp_dir, "volumes")
     env["CUBEPOD_SECRETS_DIR"] = os.path.join(temp_dir, "secrets")
     env["KUBECONFIG"] = os.path.join(temp_dir, "nonexistent-kubeconfig")
     env.pop("KUBERNETES_SERVICE_HOST", None)
@@ -366,8 +366,9 @@ def test_sandbox_network_allow_deny_and_secret_fill_e2e(direct_gateway_url: str)
         except urllib.error.HTTPError as err:
             assert err.code == 403
 
+        leaked_sbx = None
         try:
-            Sandbox.create(
+            leaked_sbx = Sandbox.create(
                 "base",
                 timeout=60,
                 network={
@@ -382,6 +383,12 @@ def test_sandbox_network_allow_deny_and_secret_fill_e2e(direct_gateway_url: str)
             raise AssertionError("expected Sandbox.create to fail for destroyed secret")
         except SandboxException:
             pass
+        finally:
+            if leaked_sbx is not None:
+                try:
+                    leaked_sbx.kill()
+                except Exception:
+                    pass
     finally:
         if sbx is not None:
             try:

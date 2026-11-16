@@ -5,7 +5,7 @@
   "description": "Official E2B TypeScript SDK compatibility test suite for CubePod",
   "type": "module",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.11.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

@@ -682,7 +682,11 @@ func startSandboxConnectStream(ctx context.Context, httpClient *http.Client, gat
 		defer close(ch)
 		for {
 			f, err := readNextConnectFrame(resp.Body)
-			ch <- frameResult{frame: f, err: err}
+			select {
+			case ch <- frameResult{frame: f, err: err}:
+			case <-ctx.Done():
+				return
+			}
 			if err != nil || (f != nil && f.Flag&0x02 != 0) {
 				return
 			}
@@ -909,7 +913,7 @@ func TestK8sLiveE2EPTY(t *testing.T) {
 		}
 	}
 
-	sendPTYInput("echo PTY_READY && stty size\n")
+	sendPTYInput("printf 'PTY_%s\\n' READY && stty size\n")
 	waitPTYOutput("PTY_READY")
 	waitPTYOutput("24 80")
 
@@ -1007,6 +1011,10 @@ func TestK8sLiveE2EWatchAndMakeDir(t *testing.T) {
 				startTimer.Stop()
 				t.Fatalf("WatchDir ended before start frame: ok=%v err=%v", ok, res.err)
 			}
+			if res.frame.Flag == 2 {
+				startTimer.Stop()
+				t.Fatalf("WatchDir end frame before start: %s", res.frame.Payload)
+			}
 			if res.frame.Flag == 0 && bytes.Contains(res.frame.Payload, []byte("start")) {
 				started = true
 			}
@@ -1028,6 +1036,9 @@ func TestK8sLiveE2EWatchAndMakeDir(t *testing.T) {
 		case res, ok := <-frameCh:
 			if !ok || res.err != nil {
 				t.Fatalf("WatchDir stream closed before filesystem event: ok=%v err=%v", ok, res.err)
+			}
+			if res.frame.Flag == 2 {
+				t.Fatalf("WatchDir end frame before event: %s", res.frame.Payload)
 			}
 			if res.frame.Flag == 0 && bytes.Contains(res.frame.Payload, []byte("event.txt")) {
 				sawEvent = true
@@ -1064,9 +1075,20 @@ func TestK8sLiveE2EWatchAndMakeDir(t *testing.T) {
 		if err != nil || gwStatus != http.StatusOK {
 			t.Fatalf("GetWatcherEvents failed: status=%d err=%v body=%s", gwStatus, err, gwBody)
 		}
-		if bytes.Contains(gwBody, []byte("poll.txt")) {
-			sawPoll = true
-			break
+		var gwResp struct {
+			Events []struct {
+				Name string `json:"name"`
+				Type string `json:"type"`
+			} `json:"events"`
+		}
+		if err := json.Unmarshal(gwBody, &gwResp); err != nil {
+			t.Fatalf("invalid GetWatcherEvents payload: err=%v body=%s", err, gwBody)
+		}
+		for _, ev := range gwResp.Events {
+			if strings.Contains(ev.Name, "poll.txt") && ev.Type != "" {
+				sawPoll = true
+				break
+			}
 		}
 		time.Sleep(150 * time.Millisecond)
 	}
@@ -1105,7 +1127,8 @@ func TestK8sLiveE2EVolumeMountsAndFork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("POST /volumes: %v", err)
 	}
-	if volStatus == http.StatusNotImplemented || volStatus == http.StatusNotFound {
+	if volStatus == http.StatusNotImplemented || volStatus == http.StatusNotFound ||
+		(volStatus == http.StatusInternalServerError && strings.Contains(string(volBody), "volume store unavailable")) {
 		t.Skipf("Skipping E2B volumeMounts E2E: volume store unavailable on cluster (HTTP %d: %s)", volStatus, volBody)
 	}
 	if volStatus != http.StatusCreated && volStatus != http.StatusOK {
@@ -1253,6 +1276,8 @@ func TestK8sLiveE2EVolumeMountsAndFork(t *testing.T) {
 		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer ccancel()
 		_ = kubeClient.DeletePodBox(cctx, cfg.Namespace, rwoBoxName)
+		_ = kubeClient.DeletePVC(cctx, cfg.Namespace, rwoBoxName+"-rootfs-pvc")
+		_ = kubeClient.DeletePVC(cctx, cfg.Namespace, rwoBoxName+"-workspace-pvc")
 	}()
 
 	rwoForkStatus, rwoForkBody, err := doGatewayJSON(ctx, httpClient, http.MethodPost, strings.TrimRight(cfg.GatewayURL, "/")+"/sandboxes/"+rwoBoxName+"/fork", apiKey, nil)
@@ -1262,6 +1287,14 @@ func TestK8sLiveE2EVolumeMountsAndFork(t *testing.T) {
 	if rwoForkStatus == http.StatusNotFound {
 		t.Logf("[K8s-E2E] Skipping RWO fork 409 check (StatelessGatewayHA disabled on gateway)")
 	} else if rwoForkStatus != http.StatusConflict {
+		var unexpected struct {
+			SandboxID string `json:"sandboxID"`
+		}
+		if json.Unmarshal(rwoForkBody, &unexpected) == nil && unexpected.SandboxID != "" {
+			cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_ = c.DeleteSandboxWithOptions(cctx, unexpected.SandboxID, true)
+			ccancel()
+		}
 		t.Fatalf("expected 409 Conflict for RWO E2B PVC fork, got %d (%s)", rwoForkStatus, rwoForkBody)
 	}
 	t.Logf("[K8s-E2E] E2B volumeMounts (nosuid,nodev, RWX persistence, ForkFrom inheritance, RWO conflict) verified")
@@ -1337,10 +1370,12 @@ func TestK8sLiveE2ETemplateBuild(t *testing.T) {
 		t.Fatalf("template %s build %s did not reach ready within timeout", res.TemplateID, res.BuildID)
 	}
 
-	if podTpl, err := kubeClient.GetPodTemplate(ctx, cfg.Namespace, res.TemplateID); err == nil && podTpl != nil {
-		if podTpl.Status.BuildStatus != v1alpha1.BuildStatusReady {
-			t.Fatalf("expected PodTemplate.Status.BuildStatus=ready, got %q", podTpl.Status.BuildStatus)
-		}
+	podTpl, err := kubeClient.GetPodTemplate(ctx, cfg.Namespace, res.TemplateID)
+	if err != nil || podTpl == nil {
+		t.Fatalf("GetPodTemplate(%s): err=%v podTpl=%+v", res.TemplateID, err, podTpl)
+	}
+	if podTpl.Status.BuildStatus != v1alpha1.BuildStatusReady {
+		t.Fatalf("expected PodTemplate.Status.BuildStatus=ready, got %q", podTpl.Status.BuildStatus)
 	}
 	t.Logf("[K8s-E2E] Template.build verified (templateID=%s buildID=%s sawBuilding=%v -> ready)", res.TemplateID, res.BuildID, sawBuilding)
 }

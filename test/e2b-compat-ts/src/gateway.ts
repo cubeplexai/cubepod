@@ -82,12 +82,18 @@ export async function startDirectGateway(): Promise<GatewayHandle> {
     TMPDIR: tempDir,
     CUBEPOD_WORKSPACE_DIR: path.join(tempDir, 'workspaces'),
     CUBEPOD_STATE: path.join(tempDir, 'state'),
-    CUBEPOD_E2B_VOLUMES_DIR: path.join(tempDir, 'volumes'),
+    CUBEPOD_E2B_VOLUME_DIR: path.join(tempDir, 'volumes'),
     CUBEPOD_SECRETS_DIR: path.join(tempDir, 'secrets'),
     KUBECONFIG: path.join(tempDir, 'nonexistent-kubeconfig'),
   };
   delete env.KUBERNETES_SERVICE_HOST;
   delete env.KUBERNETES_SERVICE_PORT;
+  delete env.E2B_DOMAIN;
+  delete env.E2B_ACCESS_TOKEN;
+  delete env.CUBEPOD_RUNTIME;
+  delete env.CUBEPOD_SECRETS_BACKEND;
+  delete env.CUBEPOD_EGRESS_MTLS_ADDR;
+  delete env.CUBEPOD_API_KEYS;
 
   const proc = spawn(
     gwBin,
@@ -99,17 +105,39 @@ export async function startDirectGateway(): Promise<GatewayHandle> {
       '-template-build=false',
       `-state-dir=${tempDir}`,
     ],
-    { env, stdio: ['ignore', 'pipe', 'pipe'] },
+    { env, stdio: ['ignore', 'ignore', 'pipe'] },
   );
 
   const stderrChunks: string[] = [];
   proc.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk.toString('utf8')));
 
+  const killAndWait = async () => {
+    if (proc.exitCode === null && proc.signalCode === null) {
+      proc.kill('SIGTERM');
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(() => {
+          if (proc.exitCode === null && proc.signalCode === null) {
+            proc.kill('SIGKILL');
+          }
+          resolve();
+        }, 3_000);
+        proc.once('exit', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  };
+
   const url = `http://127.0.0.1:${port}`;
   try {
     await waitForHealth(url, proc, stderrChunks);
   } catch (err) {
-    proc.kill('SIGKILL');
+    if (proc.exitCode === null && proc.signalCode === null) {
+      proc.kill('SIGKILL');
+      await new Promise<void>((resolve) => proc.once('exit', () => resolve()));
+    }
     fs.rmSync(tempDir, { recursive: true, force: true });
     throw err;
   }
@@ -136,22 +164,7 @@ export async function startDirectGateway(): Promise<GatewayHandle> {
           process.env[k] = v;
         }
       }
-      if (proc.exitCode === null) {
-        proc.kill('SIGTERM');
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(() => {
-            if (proc.exitCode === null) {
-              proc.kill('SIGKILL');
-            }
-            resolve();
-          }, 3_000);
-          proc.once('exit', () => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
-      }
-      fs.rmSync(tempDir, { recursive: true, force: true });
+      await killAndWait();
     },
   };
 }
