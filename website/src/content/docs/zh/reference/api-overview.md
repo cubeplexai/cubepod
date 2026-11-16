@@ -64,7 +64,7 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 
 - **执行代码**：`POST /sandboxes/{id}/code/execute`（别名 `POST /sandboxes/{id}/execute` 与 `POST /execute`）。
   - 流式返回 `application/x-ndjson` 事件行，包含 `stdout`、`stderr`、`result`（支持 `text`、Base64 `png`、`html`、`json`）、`error`（`name`、`value`、`traceback`）与 `number_of_executions`。
-- **持久化上下文管理**：沙箱内 `podd` 暴露 `/contexts` 与 `/v1/code/contexts`（Gateway 对应路由为 `/sandboxes/{id}/code/contexts` 及 `/sandboxes/{id}/code/contexts/{contextId}`），支持创建、查询、重启与删除多轮有状态上下文。
+- **持久化上下文管理**：沙箱内 `podd` 在内部暴露 `/contexts` 与 `/v1/code/contexts`（可通过子域名端口路由直接访问 `:49983`），支持创建、查询、重启与删除多轮有状态上下文。通过 Gateway 路由 `POST /sandboxes/{id}/code/execute` 调用代码时，客户端可在执行载荷中通过 `context_id` 直接指定已存在的上下文。
 
 ## 交互式桌面与签名 Panel 反向代理
 
@@ -82,7 +82,7 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 
 ## E2B Connect-RPC 兼容接口
 
-为实现与 E2B 官方 SDK 的无痛对接（`pkg/gateway/connectrpc.go`），Gateway 原生解析并路由以下 Connect-RPC 服务——无论请求直接发往根路径 `/`（由 `E2b-Sandbox-Id`、`X-Sandbox-ID`、查询参数或子域名解析沙箱 ID），还是嵌套在 `/sandboxes/{id}/` 下：
+为实现与 E2B 官方 SDK 的无痛对接（`pkg/gateway/connectrpc.go`），Gateway 原生解析并路由以下 Connect-RPC 服务——无论请求直接发往根路径 `/`（由 `E2b-Sandbox-Id`、`X-Sandbox-ID`、查询参数或子域名解析沙箱 ID），还是嵌套在 `/sandboxes/{id}/` 下（详见 **[E2B 兼容性与差异参考](/zh/reference/e2b-compatibility/)** 了解完整方法矩阵）：
 
 - **Process 服务**：
   - `POST /process.Process/Start`
@@ -132,5 +132,6 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 
 ## 下一步
 
+- 参阅 **[E2B 兼容性与差异参考](/zh/reference/e2b-compatibility/)** 了解官方 SDK 方法矩阵、实测版本约束与架构差异。
 - 前往[交互式 API 参考](/zh/api/)在线调试请求。
 - 查看各语言客户端实现：[Python SDK](/zh/sdks/python/)、[TypeScript SDK](/zh/sdks/typescript/) 与 [Go SDK 与 CLI](/zh/sdks/go-and-cli/)。

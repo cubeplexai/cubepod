@@ -16,7 +16,7 @@ pip install cubepod
 ```
 
 :::tip[正在使用官方 `e2b` Python SDK？]
-如果您已有基于 `e2b` 或 `e2b-code-interpreter` 编写的 Agent 代码，CubePod 原生兼容其协议接口，无需重写现有 SDK 调用。请参阅 [E2B 无缝兼容指南](/zh/getting-started/e2b-compatibility/)。
+如果您已有基于 `e2b` 或 `e2b-code-interpreter` 编写的 Agent 代码，CubePod 实现了核心协议兼容。请参阅 [E2B 快速兼容接入](/zh/getting-started/e2b-compatibility/) 与 [E2B 兼容性与差异参考](/zh/reference/e2b-compatibility/) 了解完整方法矩阵。
 :::
 
 ## 快速开始（异步与同步）

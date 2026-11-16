@@ -1,9 +1,13 @@
 ---
-title: E2B Drop-in Compatibility
-description: Connect official E2B Python and TypeScript SDKs (e2b, e2b-code-interpreter, @e2b/code-interpreter) and AI agent frameworks to CubePod without code changes.
+title: E2B Compatibility Guide
+description: Point official E2B Python and TypeScript SDKs to CubePod using standard environment variables.
 ---
 
-CubePod provides **wire-level drop-in compatibility** with official E2B SDKs (`e2b`, `e2b-code-interpreter`, `@e2b/code-interpreter`) as specified in [CEP-0018](/ceps/0018-e2b-protocol-compatibility/) and [CEP-0019](/ceps/0019-e2b-template-api/). Existing LangChain, LlamaIndex, AutoGen, CrewAI, OpenHands, and Smolagents pipelines can switch from hosted E2B to self-hosted persistent Kata MicroVMs simply by setting environment variables.
+CubePod implements core E2B REST and Connect-RPC endpoints as designed in [CEP-0018](/ceps/0018-e2b-protocol-compatibility/) and [CEP-0019](/ceps/0019-e2b-template-api/). Official E2B Python and TypeScript SDK clients can be redirected from hosted E2B to a self-hosted CubePod instance by configuring environment variables.
+
+:::tip[Detailed Compatibility Matrix & Architectural Differences]
+This page provides a concise setup guide for environment variables and minimal code examples. For the full per-method compatibility matrix, architectural differences (such as compute scale-to-zero vs memory snapshots), tested version constraints, and untested areas, see the **[E2B Compatibility Reference](/reference/e2b-compatibility/)**.
+:::
 
 ## Pointing Official E2B SDKs at CubePod
 
@@ -28,14 +32,14 @@ export E2B_SANDBOX_URL="http://127.0.0.1:8080"
 export E2B_API_KEY="cpod_test_api_key"
 ```
 
-## Unmodified Official E2B Examples
+## Official E2B SDK Examples
 
 ### Official `e2b` Python SDK (Sync & Async)
 
 ```python
 from e2b import Sandbox
 
-# Uses E2B_API_URL / E2B_SANDBOX_URL / E2B_DOMAIN automatically
+# Automatically reads E2B_API_URL / E2B_SANDBOX_URL / E2B_DOMAIN
 with Sandbox.create("base", timeout=300) as sbx:
     sbx.files.write("/workspace/data.txt", "hello from e2b sdk")
     result = sbx.commands.run("cat /workspace/data.txt")
@@ -57,17 +61,19 @@ with Sandbox.create() as sbx:
 
 ## Protocol Surface Implemented by `cubepod-gateway`
 
-`cubepod-gateway` (`pkg/gateway/`) implements both E2B's control plane and data plane (including Connect-RPC `envd` semantics on port `49983`):
+`cubepod-gateway` (`pkg/gateway/`) implements core E2B control-plane and data-plane routes (including Connect-RPC `envd` semantics on port `49983`):
 
 | Surface | Endpoints Implemented | Behavior in CubePod |
 | :--- | :--- | :--- |
-| **Control Plane** | `POST /sandboxes`, `POST /v2/sandboxes`, `GET /sandboxes`, `GET /v2/sandboxes`, `GET /sandboxes/{id}`, `DELETE /sandboxes/{id}` | Provisions or lists `PodBox` sandboxes; always populates mandatory E2B fields (`sandboxID`, `templateID`, `clientID`, `envdVersion`, `state`, `startedAt`, `endAt`, `cpuCount`, `memoryMB`, `diskSizeMB`). |
-| **Lifecycle & Leases** | `POST /sandboxes/{id}/refreshes`, `POST /sandboxes/{id}/timeout`, `POST /sandboxes/{id}/pause`, `POST /sandboxes/{id}/connect` | Renews idle timers/leases, tears down compute on pause while retaining PVCs, and transparently auto-resumes paused sandboxes on `connect`. |
-| **Commands & Streaming** | `POST /sandboxes/{id}/commands`, `POST /sandboxes/{id}/commands/run`, `GET .../logs?cursor=N`, `POST .../kill`, Connect-RPC `/process.Process/{Start,SendSignal,Connect,List}` | Executes commands inside the guest as unprivileged UID/GID `1000:1000` (`cubeplex`) with cursor-based incremental streaming and PGID cleanup. |
-| **Filesystem & Sync** | `PUT/GET/DELETE /sandboxes/{id}/files`, `GET .../files/list`, `POST .../files/archive-sync`, Connect-RPC `/filesystem.Filesystem/{Read,Write,List,ListDir,Stat,Remove,MakeDir}` | Performs direct guest I/O and path-traversal-safe `.tar`/`.tar.gz` directory sync against persistent `/workspace` or RootFS paths. |
-| **Code Interpreter** | `POST /sandboxes/{id}/execute`, `POST /sandboxes/{id}/code/execute`, `/contexts` | Manages stateful multi-language REPL kernels inside `podd` (`python`, `bash`, `javascript`, `typescript`, `r`, `java`). |
+| **Control Plane** | `POST /sandboxes`, `POST/GET /v2/sandboxes`, `GET /sandboxes`, `GET /sandboxes/{id}`, `DELETE /sandboxes/{id}` | Provisions or lists `PodBox` sandboxes; populates mandatory E2B fields (`sandboxID`, `templateID`, `clientID`, `envdVersion`, `state`, `startedAt`, `endAt`, `cpuCount`, `memoryMB`, `diskSizeMB`). |
+| **Lifecycle & Leases** | `POST /sandboxes/{id}/refreshes`, `POST /sandboxes/{id}/timeout`, `POST /sandboxes/{id}/pause`, `POST /sandboxes/{id}/connect`, `POST /v2/sandboxes/{id}/connect` | Renews idle timers/leases, tears down compute on pause while retaining PVCs, and transparently auto-resumes paused sandboxes on `connect`. |
+| **Commands & Streaming** | `POST /sandboxes/{id}/commands`, `POST /sandboxes/{id}/commands/run`, `GET .../logs?cursor=N`, `POST .../kill`, Connect-RPC `/process.Process/{Start,SendSignal,Connect,List,SendInput,StreamInput,Update}` | Executes commands and interactive PTY sessions inside the guest as unprivileged UID/GID `1000:1000` (`cubeplex`) with cursor-based incremental streaming, 64 KiB PTY replay, resize, and PGID cleanup. |
+| **Filesystem & Sync** | `PUT/GET/DELETE /sandboxes/{id}/files`, `GET .../files/list`, `POST .../files/archive-sync`, Connect-RPC `/filesystem.Filesystem/{Read,Write,List,ListDir,Stat,Remove,MakeDir,WatchDir,CreateWatcher,GetWatcherEvents,RemoveWatcher}` | Performs direct guest I/O, recursive directory ops, `inotify` directory watching, and path-traversal-safe `.tar`/`.tar.gz` sync against persistent `/workspace` or RootFS paths. |
+| **Volumes & Content** | `POST/GET/DELETE /volumes`, `/volumecontent/{id}/{file,dir,path}`, `volumeMounts` on `POST /sandboxes` | Manages tenant-isolated persistent E2B volumes and content upload/download, attached to Docker or K8s Kata sandboxes (requires `CUBEPOD_K8S_E2B_VOLUME_MOUNTS=1` + `CUBEPOD_E2B_SHARED_PVC` on live K8s). |
+| **Secrets & Network Rules** | `POST/GET /secrets`, `GET/POST/DELETE /secrets/{id}`, `network.rules.*.transform.headers` (`${e2b.secrets.<name>}`) | Stores write-only AES-256-GCM secrets and resolves `${e2b.secrets.<name>}` into per-sandbox `cpodref_` placeholders injected over mTLS by `cubepod-egress`. |
+| **Code Interpreter** | `POST /sandboxes/{id}/execute`, `POST /sandboxes/{id}/code/execute`, `POST /execute` | Manages stateful multi-language REPL kernels inside `podd` (`python`, `bash`, `javascript`, `typescript`, `r`, `java`). Contexts are managed inside `podd`. |
 | **Subdomain Port Routing** | `Host: <port>-<sandboxID>.<domain>` and `GET/POST /sandboxes/{id}/endpoints/{port}` | Auto-resumes paused sandboxes if needed, rewrites `/envd/*` to `podd` (`:49983`), and proxies arbitrary guest app ports or mints signed `/panel/{token}/` URLs. |
-| **Template Catalog & Builds** | `/templates`, `/v2/templates`, `/v3/templates`, `/templates/{id}/builds/{buildID}/status`, `/templates/{id}/files/{hash}` | Enabled via `--e2b-template-api=true` (or `-feature-gate E2BTemplateAPI=true`) for `e2b template build` workflows. |
+| **Template Catalog & Builds** | `/templates`, `/v2/templates`, `/v3/templates`, `/templates/{id}/builds/{buildID}/status`, `/templates/{id}/files/{hash}` | Requires `--e2b-template-api=true` and `--template-build=true` (BuildKit or local Docker). |
 
 ## CubePod Superset Capabilities Beyond E2B
 
@@ -80,6 +86,7 @@ When you use CubePod's native SDKs ([Python](/sdks/python/), [TypeScript](/sdks/
 
 ## Next Steps
 
+- Consult the **[E2B Compatibility Reference](/reference/e2b-compatibility/)** for full matrix, tested constraints, and memory vs. compute differences.
 - See the **[API Reference](/api/)** for the full OpenAPI 3.1 contract (`api/openapi/cubepod-v1.yaml`).
 - Compare native clients in **[Python SDK](/sdks/python/)** and **[TypeScript SDK](/sdks/typescript/)**.
 - Inspect **[CRD Reference](/reference/crds/)** for Kubernetes `PodBox` and `PodTemplate` schemas.

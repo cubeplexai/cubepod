@@ -30,14 +30,14 @@ CubePod 彻底消除了这一取舍：直接在 **Kata Containers MicroVM** 中�
 | **算力休眠降本** | 停止即丢弃运行态 | 快照或销毁 | `desiredState: Paused` 销毁计算 Pod（`0 CPU / 0 RAM`），保留双 PVC |
 | **状态分支 (CoW Fork)** | 镜像 Commit 耗时较长 | VM 快照 | **崩溃一致性 CoW Fork**（`FIFREEZE` -> CSI 克隆 / reflink -> `FITHAW`） |
 | **密钥与出站安全** | 真实环境变量注入沙箱 | 真实环境变量注入沙箱 | **`cpodref_` 占位符** + 基于每 Pod mTLS 的选择性 HTTPS MITM |
-| **SDK 与协议生态** | 自定义 API | E2B REST / Connect-RPC | **100% E2B 无缝协议兼容** + 原生 Python、TS、Go、CLI 与 MCP |
+| **SDK 与协议生态** | 自定义 API | E2B REST / Connect-RPC | **E2B 协议兼容（核心 REST 与 Connect-RPC）** + 原生 Python、TS、Go、CLI 与 MCP |
 
 ## 核心架构支柱
 
 1. **[双卷持久化存储](/zh/concepts/dual-volume-persistence/)**：严格隔离可写操作系统 RootFS（`<box>-rootfs-pvc` 或 `<box>-rootfs-gen<N>-pvc`）与用户项目数据（挂载至 `/workspace` 的 `<box>-workspace-pvc`）。递增 `rootfsGeneration` 即可清理或升级 OS 状态，而 `/workspace` 字节不损。
 2. **[基于 `podd-init` 与 `podd` 的纯净镜像运行机制](/zh/concepts/in-guest-init-and-podd/)**：用户镜像无需内嵌任何专用 Agent。Kubernetes 中通过 `initContainer`（`podd-installer`）或本地 Docker 绑定挂载在启动期注入 `/opt/cubepod/bin/{podd-init,podd}`。单线程 Rust PID 1（`podd-init`）完成 `ext4` 自愈检查、挂载 `OverlayFS`、执行 `pivot_root` 并 `execvp` 移交至 `podd`（`:49983`）。
 3. **[WarmPool、Pause-to-Zero、CoW Fork 与无状态高可用](/zh/concepts/lifecycle-warmpool-fork/)**：`PodWarmPool` 预启动并预挂载备用 MicroVM，实现 `< 50 ms` 原子认领；`spec.forkFrom` 提供 `FIFREEZE`/`FITHAW` 崩溃一致性克隆；`cubepod-gateway` 直接基于 Kubernetes `PodBox` CRD 重建状态，实现无状态多副本高可用。
-4. **[E2B 无缝兼容](/zh/getting-started/e2b-compatibility/)**：只需将 `E2B_DOMAIN` 或 `E2B_API_URL` 指向 `cubepod-gateway`，现有 `e2b`、`e2b-code-interpreter`、`@e2b/code-interpreter` 以及 LangChain、LlamaIndex、OpenHands 工作流即可零改代码运行。
+4. **[E2B 兼容接入指南](/zh/getting-started/e2b-compatibility/)**：只需将 `E2B_DOMAIN` 或 `E2B_API_URL` 指向 `cubepod-gateway`，现有 `e2b` 与 `e2b-code-interpreter` 工作流即可接入 CubePod（详见 [E2B 兼容性与差异参考](/zh/reference/e2b-compatibility/) 了解完整方法矩阵与行为差异）。
 5. **[零信任出站代理与凭证保险库](/zh/concepts/zero-trust-egress/)**：真实 API 密钥绝不进入沙箱内存或磁盘。沙箱内仅暴露 32 位 Base32 的 `cpodref_` 占位符；`cubepod-egress` 通过 `nftables` 透明劫持、DNS 策略拦截与选择性 HTTPS MITM，在每 Pod mTLS 认证下与 `cubepod-gateway` 实时完成密钥替换。
 6. **[按需桌面与签名面板代理](/zh/concepts/desktop-and-panel-proxy/)**：桌面镜像待机内存接近 0 MiB，仅在调用时懒启动 `Xvfb`、`openbox`、Chromium CDP（`:9222`）、`x11vnc`/`noVNC`（`:8080`）与 `ttyd`（`:7681`），并通过 HMAC-SHA256 `/panel/{token}/` 代理安全暴露。
 
@@ -51,6 +51,6 @@ CubePod 的每一项核心机制均在两类运行环境中保持一致语义：
 ## 下一步
 
 - 通过 **[快速开始](/zh/getting-started/quickstart/)** 在本地启动栈并运行首个持久化沙箱。
-- 阅读 **[E2B 无缝兼容指南](/zh/getting-started/e2b-compatibility/)** 接入现有 E2B Agent 代码。
+- 阅读 **[E2B 快速兼容接入](/zh/getting-started/e2b-compatibility/)** 或参阅 **[E2B 兼容性与差异参考](/zh/reference/e2b-compatibility/)**。
 - 深入 **[平台架构](/zh/concepts/architecture/)** 了解控制面与数据面协作机制。
 - 前往 **[Kubernetes 与 Helm 部署](/zh/deployment/kubernetes-helm/)** 将 CubePod 部署到生产集群。
