@@ -1,11 +1,15 @@
 title: "Local Docker and Sparse Loopback ext4 Runtime Driver"
-cep-number: 7
+cep-number: "0007"
 authors:
   - "@cubeplex-arch"
+owning-area: "runtime"
 status: implemented
 creation-date: 2026-11-10
 last-updated: 2026-11-10
 version: v0.2.0
+target-version: v0.2.0
+stage: alpha
+latest-milestone: v0.2.0
 see-also:
   - "/docs/enhancements/0001-in-guest-overlayfs-pivot"
   - "/docs/enhancements/0003-controller-warmpool-and-fork"

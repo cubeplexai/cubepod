@@ -442,7 +442,7 @@ function syncCEPs() {
     const title = meta.title || `CEP-${num}`;
     const status = meta.status || 'implemented';
     const area = meta['owning-area'] || 'core';
-    const milestone = meta['latest-milestone'] || meta.stage || '—';
+    const milestone = meta['latest-milestone'] || meta['target-version'] || meta.version || meta.stage || '—';
 
     indexEntries.push({ dirName, num, title, status, area, milestone });
 
@@ -474,7 +474,7 @@ function syncCEPs() {
   const enIndex = [
     '---',
     'title: CubePod Enhancement Proposals (CEPs)',
-    'description: Complete index of all implemented CubePod architecture and subsystem Enhancement Proposals (CEP-0001 through CEP-0022).',
+    `description: Complete index of all CubePod architecture and subsystem Enhancement Proposals (CEP-0001 through CEP-${indexEntries[indexEntries.length - 1]?.num || '0028'}).`,
     'editUrl: false',
     'sidebar:',
     '  label: CEP Index',
@@ -497,7 +497,7 @@ function syncCEPs() {
   const zhIndex = [
     '---',
     'title: CubePod 架构演进提案 (CEPs)',
-    'description: 同步自 docs/enhancements/ 的全部 CubePod 架构与子系统设计提案索引（CEP-0001 ~ CEP-0022）。',
+    `description: 同步自 docs/enhancements/ 的全部 CubePod 架构与子系统设计提案索引（CEP-0001 ~ CEP-${indexEntries[indexEntries.length - 1]?.num || '0028'}）。`,
     'editUrl: false',
     'sidebar:',
     '  label: CEP 提案总览',
