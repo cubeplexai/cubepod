@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { GA_MEASUREMENT_ID } from '../src/config/analytics.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const websiteDir = path.resolve(__dirname, '..');
@@ -63,6 +64,9 @@ function main() {
     'vendor/scalar-api-reference.js',
     'llms.txt',
     'llms-full.txt',
+    'robots.txt',
+    'sitemap-index.xml',
+    'sitemap-0.xml',
     'pagefind/pagefind.js',
     'reference/crds/index.html',
     'zh/reference/crds/index.html',
@@ -86,7 +90,14 @@ function main() {
   for (const f of requiredFiles) {
     assertFile(f);
   }
-  console.log(`[verify] verified ${requiredFiles.length} required artifacts & ${cepDirs.length} CEP pages`);
+
+  for (const gaPage of ['index.html', 'zh/index.html', 'api/index.html', 'zh/api/index.html']) {
+    const html = fs.readFileSync(path.join(distDir, gaPage), 'utf8');
+    if (!html.includes(GA_MEASUREMENT_ID)) {
+      throw new Error(`Missing GA measurement ID ${GA_MEASUREMENT_ID} in dist/${gaPage}`);
+    }
+  }
+  console.log(`[verify] verified ${requiredFiles.length} required artifacts, GA (${GA_MEASUREMENT_ID}), & ${cepDirs.length} CEP pages`);
 
   const htmlFiles = collectHtmlFiles(distDir);
   const brokenLinks = [];

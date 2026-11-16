@@ -1,6 +1,7 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import { remarkMermaid } from './src/plugins/remark-mermaid.mjs';
+import { GA_INLINE_SCRIPT, GA_SCRIPT_SRC } from './src/config/analytics.mjs';
 
 export default defineConfig({
   site: 'https://cubepod.dev',
@@ -81,6 +82,17 @@ export default defineConfig({
             name: 'twitter:card',
             content: 'summary_large_image',
           },
+        },
+        {
+          tag: 'script',
+          attrs: {
+            async: true,
+            src: GA_SCRIPT_SRC,
+          },
+        },
+        {
+          tag: 'script',
+          content: GA_INLINE_SCRIPT,
         },
       ],
       defaultLocale: 'root',

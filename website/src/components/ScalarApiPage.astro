@@ -1,6 +1,7 @@
 ---
 import logoDark from '../assets/logo-dark.svg';
 import logoLight from '../assets/logo-light.svg';
+import { GA_INLINE_SCRIPT, GA_SCRIPT_SRC } from '../config/analytics.mjs';
 
 interface Props {
   locale: 'en' | 'zh';
@@ -32,6 +33,11 @@ const scalarConfig = {
         : 'Interactive OpenAPI 3.1 explorer for the CubePod v0.5.0 E2B-compatible superset Control and Data Plane API.'}
     />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="canonical" href={isZh ? 'https://cubepod.dev/zh/api/' : 'https://cubepod.dev/api/'} />
+    <meta property="og:image" content="https://cubepod.dev/og-banner.svg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <script is:inline async src={GA_SCRIPT_SRC}></script>
+    <script is:inline set:html={GA_INLINE_SCRIPT} />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
