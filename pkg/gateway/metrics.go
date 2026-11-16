@@ -235,104 +235,131 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
 
+func sanitizeHTTPMethodLabel(method string) (string, bool) {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead, http.MethodOptions:
+		return strings.ToUpper(strings.TrimSpace(method)), true
+	default:
+		return "", false
+	}
+}
+
+func allowlistedSegment(seg string, allowed ...string) string {
+	for _, a := range allowed {
+		if seg == a {
+			return seg
+		}
+	}
+	return "unknown"
+}
+
 func classifyE2BEndpoint(method, cleanPath string) (string, bool) {
 	if cleanPath == "" {
+		return "", false
+	}
+	m, ok := sanitizeHTTPMethodLabel(method)
+	if !ok {
 		return "", false
 	}
 	parts := strings.Split(cleanPath, "/")
 	switch parts[0] {
 	case "sandboxes":
 		if len(parts) == 1 {
-			return method + " /sandboxes", true
+			return m + " /sandboxes", true
 		}
 		if len(parts) == 2 {
 			if parts[1] == "metrics" {
-				return method + " /sandboxes/metrics", true
+				return m + " /sandboxes/metrics", true
 			}
-			return method + " /sandboxes/{sandboxID}", true
+			return m + " /sandboxes/{sandboxID}", true
 		}
 		switch parts[2] {
 		case "metrics", "pause", "connect", "timeout", "refreshes", "lease", "fork", "reset-rootfs", "events":
-			return method + " /sandboxes/{sandboxID}/" + parts[2], true
+			return m + " /sandboxes/{sandboxID}/" + parts[2], true
 		case "commands":
-			return method + " /sandboxes/{sandboxID}/commands", true
+			return m + " /sandboxes/{sandboxID}/commands", true
 		case "code", "execute":
-			return method + " /sandboxes/{sandboxID}/code/execute", true
+			return m + " /sandboxes/{sandboxID}/code/execute", true
 		case "files":
-			return method + " /sandboxes/{sandboxID}/files", true
+			return m + " /sandboxes/{sandboxID}/files", true
 		case "endpoints":
-			return method + " /sandboxes/{sandboxID}/endpoints/{port}", true
+			return m + " /sandboxes/{sandboxID}/endpoints/{port}", true
 		case "desktop":
-			return method + " /sandboxes/{sandboxID}/desktop", true
+			return m + " /sandboxes/{sandboxID}/desktop", true
 		case "process.Process":
 			if len(parts) >= 4 {
-				return method + " /process.Process/" + parts[3], true
+				rpc := allowlistedSegment(parts[3], "Start", "SendSignal", "Connect", "List", "SendInput", "Update", "StreamInput", "CloseStdin")
+				return m + " /process.Process/" + rpc, true
 			}
-			return method + " /process.Process", true
+			return m + " /process.Process", true
 		case "filesystem.Filesystem":
 			if len(parts) >= 4 {
-				return method + " /filesystem.Filesystem/" + parts[3], true
+				rpc := allowlistedSegment(parts[3], "Read", "Write", "List", "ListDir", "Stat", "Remove", "MakeDir", "CreateWatcher", "GetWatcherEvents", "RemoveWatcher", "WatchDir")
+				return m + " /filesystem.Filesystem/" + rpc, true
 			}
-			return method + " /filesystem.Filesystem", true
+			return m + " /filesystem.Filesystem", true
 		default:
-			return method + " /sandboxes/{sandboxID}", true
+			return m + " /sandboxes/{sandboxID}", true
 		}
 	case "v2":
 		if len(parts) >= 2 && parts[1] == "sandboxes" {
 			if len(parts) >= 4 && parts[3] == "connect" {
-				return method + " /sandboxes/{sandboxID}/connect", true
+				return m + " /sandboxes/{sandboxID}/connect", true
 			}
-			return method + " /sandboxes", true
+			return m + " /sandboxes", true
 		}
 		if len(parts) >= 2 && parts[1] == "templates" {
-			return method + " /templates", true
+			return m + " /templates", true
 		}
 	case "v1":
 		if len(parts) >= 4 && parts[1] == "sandboxes" && parts[3] == "desktop" {
-			return method + " /sandboxes/{sandboxID}/desktop", true
+			return m + " /sandboxes/{sandboxID}/desktop", true
 		}
 	case "v3":
 		if len(parts) >= 2 && parts[1] == "templates" {
-			return method + " /templates", true
+			return m + " /templates", true
 		}
 	case "templates":
-		return method + " /templates", true
+		return m + " /templates", true
 	case "volumes":
 		if len(parts) == 1 {
-			return method + " /volumes", true
+			return m + " /volumes", true
 		}
-		return method + " /volumes/{volumeID}", true
+		return m + " /volumes/{volumeID}", true
 	case "volumecontent":
 		if len(parts) >= 3 {
-			return method + " /volumecontent/{volumeID}/" + parts[2], true
+			op := allowlistedSegment(parts[2], "file", "dir", "path")
+			return m + " /volumecontent/{volumeID}/" + op, true
 		}
-		return method + " /volumecontent", true
+		return m + " /volumecontent", true
 	case "secrets":
 		if len(parts) == 1 {
-			return method + " /secrets", true
+			return m + " /secrets", true
 		}
-		return method + " /secrets/{secretID}", true
+		return m + " /secrets/{secretID}", true
 	case "webhooks":
 		if len(parts) == 1 {
-			return method + " /webhooks", true
+			return m + " /webhooks", true
 		}
-		return method + " /webhooks/{webhookID}", true
+		return m + " /webhooks/{webhookID}", true
 	case "events":
-		return method + " /events", true
+		return m + " /events", true
 	case "files":
-		return method + " /files", true
+		return m + " /files", true
 	case "execute":
-		return method + " /execute", true
+		return m + " /execute", true
 	case "process.Process":
 		if len(parts) >= 2 {
-			return method + " /process.Process/" + parts[1], true
+			rpc := allowlistedSegment(parts[1], "Start", "SendSignal", "Connect", "List", "SendInput", "Update", "StreamInput", "CloseStdin")
+			return m + " /process.Process/" + rpc, true
 		}
-		return method + " /process.Process", true
+		return m + " /process.Process", true
 	case "filesystem.Filesystem":
 		if len(parts) >= 2 {
-			return method + " /filesystem.Filesystem/" + parts[1], true
+			rpc := allowlistedSegment(parts[1], "Read", "Write", "List", "ListDir", "Stat", "Remove", "MakeDir", "CreateWatcher", "GetWatcherEvents", "RemoveWatcher", "WatchDir")
+			return m + " /filesystem.Filesystem/" + rpc, true
 		}
-		return method + " /filesystem.Filesystem", true
+		return m + " /filesystem.Filesystem", true
 	}
 	return "", false
 }
@@ -400,7 +427,7 @@ func (s *Server) withMetrics(next http.Handler) http.Handler {
 		}
 
 		// Record secret HTTP error when no Store processed the request (store tracks its own ops).
-		if op, ok := classifySecretOp(r.Method, parts); ok && (s.secrets.Load() == nil || rec.statusCode == http.StatusUnauthorized || rec.statusCode == http.StatusNotImplemented) {
+		if op, ok := classifySecretOp(r.Method, parts); ok && (s.secrets.Load() == nil || rec.statusCode == http.StatusUnauthorized || rec.statusCode == http.StatusNotImplemented || rec.statusCode == http.StatusBadRequest) {
 			status := "ok"
 			if rec.statusCode >= 400 {
 				status = "error"
@@ -419,11 +446,6 @@ func (s *Server) withMetrics(next http.Handler) http.Handler {
 				result = "error"
 			}
 			m.RecordSandboxFork(mode, result, dur)
-		}
-
-		// Track warmpool creation CRD sync when backed by a KubeClient
-		if r.Method == http.MethodPost && cleanPath == "warmpools" && s.reconciler != nil && s.reconciler.KubeClient() != nil {
-			m.RecordCRDResync()
 		}
 
 		// Check if a command was executed (POST /sandboxes/{id}/commands/run with 200 OK)

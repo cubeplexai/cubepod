@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -287,4 +289,101 @@ func TestSandboxMetrics_BatchQuery(t *testing.T) {
 	if _, ok := batchAll.Sandboxes[sb2.SandboxID]; !ok {
 		t.Fatalf("missing %s in batchAll", sb2.SandboxID)
 	}
+}
+
+func TestSandboxMetrics_TenantIsolationAndDeleteEviction(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	createWithKey := func(apiKey string) gateway.SandboxRecord {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/sandboxes", bytes.NewReader([]byte(`{"templateID":"cubeplex-ubuntu24-desktop"}`)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-KEY", apiKey)
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			t.Fatalf("create sandbox failed: %v", err)
+		}
+		defer resp.Body.Close()
+		var rec gateway.SandboxRecord
+		_ = json.NewDecoder(resp.Body).Decode(&rec)
+		return rec
+	}
+
+	sbA := createWithKey("tenant-a-key")
+	sbB := createWithKey("tenant-b-key")
+
+	// Pause sbA and verify Tenant B cannot read metrics OR wake sbA via autoResume.
+	pauseReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/sandboxes/"+sbA.SandboxID+"/pause", nil)
+	pauseReq.Header.Set("X-API-KEY", "tenant-a-key")
+	pauseResp, err := ts.Client().Do(pauseReq)
+	if err != nil {
+		t.Fatalf("pause failed: %v", err)
+	}
+	_ = pauseResp.Body.Close()
+
+	// Unauthenticated request to tenant-owned sandbox -> 401
+	unauthResp, err := ts.Client().Get(ts.URL + "/sandboxes/" + sbA.SandboxID + "/metrics")
+	if err != nil {
+		t.Fatalf("unauth GET metrics failed: %v", err)
+	}
+	_ = unauthResp.Body.Close()
+	if unauthResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without API key on tenant sandbox, got %d", unauthResp.StatusCode)
+	}
+
+	// Wrong tenant -> 404, and sbA must stay Paused
+	crossReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/sandboxes/"+sbA.SandboxID+"/metrics", nil)
+	crossReq.Header.Set("X-API-KEY", "tenant-b-key")
+	crossResp, err := ts.Client().Do(crossReq)
+	if err != nil {
+		t.Fatalf("cross-tenant GET metrics failed: %v", err)
+	}
+	_ = crossResp.Body.Close()
+	if crossResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for cross-tenant GET metrics, got %d", crossResp.StatusCode)
+	}
+	infoResp, _ := ts.Client().Get(ts.URL + "/sandboxes/" + sbA.SandboxID)
+	var fetchedA gateway.SandboxRecord
+	_ = json.NewDecoder(infoResp.Body).Decode(&fetchedA)
+	_ = infoResp.Body.Close()
+	if !strings.EqualFold(fetchedA.State, "Paused") {
+		t.Fatalf("expected cross-tenant metrics denial not to resume sbA, got %q", fetchedA.State)
+	}
+
+	// Batch metrics filters to only caller's sandboxes
+	batchReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/sandboxes/metrics", nil)
+	batchReq.Header.Set("X-API-KEY", "tenant-b-key")
+	batchResp, err := ts.Client().Do(batchReq)
+	if err != nil {
+		t.Fatalf("batch GET metrics failed: %v", err)
+	}
+	var batch struct {
+		Sandboxes map[string]gateway.SandboxMetric `json:"sandboxes"`
+	}
+	_ = json.NewDecoder(batchResp.Body).Decode(&batch)
+	_ = batchResp.Body.Close()
+	if _, leaked := batch.Sandboxes[sbA.SandboxID]; leaked {
+		t.Fatalf("batch metrics leaked Tenant A sandbox %s to Tenant B", sbA.SandboxID)
+	}
+	if _, ok := batch.Sandboxes[sbB.SandboxID]; !ok {
+		t.Fatalf("expected Tenant B sandbox %s in batch metrics", sbB.SandboxID)
+	}
+
+	// Unknown RPC method label cardinality is bounded
+	badRPCReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/sandboxes/"+sbB.SandboxID+"/filesystem.Filesystem/ArbitraryEvilMethod", bytes.NewReader([]byte(`{}`)))
+	badRPCResp, _ := ts.Client().Do(badRPCReq)
+	_ = badRPCResp.Body.Close()
+	promResp, _ := ts.Client().Get(ts.URL + "/metrics")
+	promRaw, _ := io.ReadAll(promResp.Body)
+	_ = promResp.Body.Close()
+	if strings.Contains(string(promRaw), "ArbitraryEvilMethod") {
+		t.Fatalf("unbounded RPC method name leaked into Prometheus label:\n%s", string(promRaw))
+	}
+
+	// Deleting sbB evicts its historical ring buffer
+	delReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+sbB.SandboxID, nil)
+	delResp, _ := ts.Client().Do(delReq)
+	_ = delResp.Body.Close()
 }

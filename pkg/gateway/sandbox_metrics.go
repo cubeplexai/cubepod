@@ -13,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/cubeplexai/cubepod/pkg/events"
 )
 
 const (
@@ -119,6 +121,15 @@ func (st *sandboxMetricsStore) latest(sandboxID string) (SandboxMetric, bool) {
 	return ring.latest()
 }
 
+func (st *sandboxMetricsStore) delete(sandboxID string) {
+	if sandboxID == "" {
+		return
+	}
+	st.mu.Lock()
+	delete(st.rings, sandboxID)
+	st.mu.Unlock()
+}
+
 func parseMetricTimestamp(raw string) (*int64, error) {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -191,6 +202,8 @@ func (s *Server) sampleLocalSandboxMetric(rec *SandboxRecord) SandboxMetric {
 	diskSizeMB := 10240
 	var workdir string
 
+	s.mu.RLock()
+	baseDir := s.workspaceBaseDir
 	if rec != nil {
 		if rec.CPUCount > 0 {
 			cpuCount = rec.CPUCount
@@ -203,10 +216,11 @@ func (s *Server) sampleLocalSandboxMetric(rec *SandboxRecord) SandboxMetric {
 		}
 		workdir = rec.WorkspaceDir
 	}
+	s.mu.RUnlock()
 
 	cpuPct := sampleHostCPUPct(cpuCount)
 	memUsed, memCache := sampleHostMemoryCapped(memLimitBytes)
-	diskUsed, diskTotal := sampleWorkspaceDisk(workdir, s.workspaceBaseDir, diskSizeMB)
+	diskUsed, diskTotal := sampleWorkspaceDisk(workdir, baseDir, diskSizeMB)
 
 	return SandboxMetric{
 		Timestamp:     now.Format(time.RFC3339),
@@ -231,7 +245,7 @@ func sampleHostCPUPct(cpuCount int) float64 {
 		return 0
 	}
 	load1, err := strconv.ParseFloat(fields[0], 64)
-	if err != nil || load1 < 0 {
+	if err != nil || math.IsNaN(load1) || math.IsInf(load1, 0) || load1 < 0 {
 		return 0
 	}
 	if cpuCount <= 0 {
@@ -340,12 +354,37 @@ func (s *Server) collectSandboxMetric(ctx context.Context, rec *SandboxRecord) S
 	return s.sampleLocalSandboxMetric(rec)
 }
 
+func (s *Server) authorizeSandboxMetricsAccess(r *http.Request, rec *SandboxRecord) (authorized bool, missingAPIKey bool) {
+	if rec == nil {
+		return false, false
+	}
+	s.mu.RLock()
+	ownerTenant := rec.OwnerTenantHash
+	s.mu.RUnlock()
+	if ownerTenant == "" {
+		return true, false
+	}
+	key := managementAPIKey(r)
+	if key == "" {
+		return false, true
+	}
+	return events.TenantHash(key) == ownerTenant, false
+}
+
 // handleGetSandboxMetrics implements E2B GET /sandboxes/{sandboxID}/metrics.
 func (s *Server) handleGetSandboxMetrics(w http.ResponseWriter, r *http.Request) {
 	sandboxID := r.PathValue("sandboxID")
 	rec, ok := s.resolveSandbox(r.Context(), sandboxID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "sandbox not found")
+		return
+	}
+	if allowed, missingKey := s.authorizeSandboxMetricsAccess(r, rec); !allowed {
+		if missingKey {
+			writeError(w, http.StatusUnauthorized, "API key is required")
+		} else {
+			writeError(w, http.StatusNotFound, "sandbox not found")
+		}
 		return
 	}
 
@@ -364,7 +403,9 @@ func (s *Server) handleGetSandboxMetrics(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	autoResume := !strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("autoResume")), "false")
+	nowUnix := time.Now().UTC().Unix()
+	historicalOnly := endUnix != nil && *endUnix < nowUnix
+	autoResume := !historicalOnly && !strings.EqualFold(strings.TrimSpace(r.URL.Query().Get("autoResume")), "false")
 	if autoResume {
 		if err := s.ensureRunning(r.Context(), rec); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to resume sandbox: "+err.Error())
@@ -378,7 +419,7 @@ func (s *Server) handleGetSandboxMetrics(w http.ResponseWriter, r *http.Request)
 	state := rec.State
 	s.mu.RUnlock()
 
-	if !strings.EqualFold(state, "Paused") && !strings.EqualFold(state, "Terminated") {
+	if !historicalOnly && !strings.EqualFold(state, "Paused") && !strings.EqualFold(state, "Terminated") {
 		sample := s.collectSandboxMetric(r.Context(), rec)
 		store.record(sandboxID, sample)
 	}
@@ -407,7 +448,7 @@ func (s *Server) handleBatchSandboxMetrics(w http.ResponseWriter, r *http.Reques
 	}
 
 	if len(requestedIDs) == 0 {
-		if s.LivePodRouting() && s.reconciler != nil && s.reconciler.KubeClient() != nil {
+		if s.LivePodRouting() && s.FeatureGateEnabled(FeatureGateStatelessGatewayHA) && s.reconciler != nil && s.reconciler.KubeClient() != nil {
 			if boxes, err := s.reconciler.KubeClient().ListPodBoxes(r.Context(), ""); err == nil {
 				for i := range boxes {
 					if boxes[i].Metadata.Name != "" {
@@ -428,6 +469,9 @@ func (s *Server) handleBatchSandboxMetrics(w http.ResponseWriter, r *http.Reques
 	for _, id := range requestedIDs {
 		rec, ok := s.resolveSandbox(r.Context(), id)
 		if !ok {
+			continue
+		}
+		if allowed, _ := s.authorizeSandboxMetricsAccess(r, rec); !allowed {
 			continue
 		}
 		s.mu.RLock()

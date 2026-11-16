@@ -111,7 +111,7 @@ pub fn parse_proc_stat_cpu(contents: &str) -> Option<(u64, u64)> {
         if nums.len() < 4 {
             return None;
         }
-        let total: u64 = nums.iter().copied().sum();
+        let total: u64 = nums.iter().copied().fold(0u64, u64::saturating_add);
         let idle = nums[3].saturating_add(nums.get(4).copied().unwrap_or(0));
         return Some((total, idle));
     }
@@ -126,6 +126,9 @@ pub fn compute_cpu_used_pct(prev: (u64, u64), curr: (u64, u64)) -> f64 {
     let idle_delta = curr.1.saturating_sub(prev.1).min(total_delta);
     let busy = total_delta - idle_delta;
     let pct = (busy as f64 / total_delta as f64) * 100.0;
+    if !pct.is_finite() {
+        return 0.0;
+    }
     ((pct * 100.0).round() / 100.0).clamp(0.0, 100.0)
 }
 
@@ -145,9 +148,33 @@ pub fn parse_cgroup_cpu_count(cpu_max: Option<&str>) -> Option<usize> {
     Some(cpus.max(1))
 }
 
+pub fn parse_cgroup_v1_cpu_count(
+    quota_raw: Option<&str>,
+    period_raw: Option<&str>,
+) -> Option<usize> {
+    let quota: i64 = quota_raw?.trim().parse().ok()?;
+    if quota <= 0 {
+        return None;
+    }
+    let period: i64 = period_raw
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(100_000);
+    if period <= 0 {
+        return None;
+    }
+    let cpus = (quota as u64).div_ceil(period as u64) as usize;
+    Some(cpus.max(1))
+}
+
 pub fn sample_cpu_count() -> usize {
     if let Ok(cpu_max) = fs::read_to_string("/sys/fs/cgroup/cpu.max") {
         if let Some(n) = parse_cgroup_cpu_count(Some(&cpu_max)) {
+            return n;
+        }
+    }
+    if let Ok(quota_v1) = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us") {
+        let period_v1 = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us").ok();
+        if let Some(n) = parse_cgroup_v1_cpu_count(Some(&quota_v1), period_v1.as_deref()) {
             return n;
         }
     }
@@ -167,6 +194,9 @@ fn sample_loadavg_pct(cpu_count: usize) -> f64 {
     let Ok(load1) = first.parse::<f64>() else {
         return 0.0;
     };
+    if !load1.is_finite() || load1 < 0.0 {
+        return 0.0;
+    }
     let cpus = cpu_count.max(1) as f64;
     let pct = (load1 / cpus) * 100.0;
     ((pct * 100.0).round() / 100.0).clamp(0.0, 100.0)
@@ -453,7 +483,10 @@ pub fn handle_metrics(
     let accept_plain = req
         .headers
         .get("accept")
-        .map(|a| a.contains("text/plain") && !a.contains("application/json"))
+        .map(|a| {
+            let lower = a.to_ascii_lowercase();
+            lower.contains("text/plain") && !lower.contains("application/json")
+        })
         .unwrap_or(false);
 
     if format_prom || accept_plain {
@@ -560,6 +593,15 @@ SReclaimable:     500000 kB
         assert_eq!(parse_cgroup_cpu_count(Some("200000 100000\n")), Some(2));
         assert_eq!(parse_cgroup_cpu_count(Some("150000 100000")), Some(2));
         assert_eq!(parse_cgroup_cpu_count(Some("max 100000")), None);
+        assert_eq!(
+            parse_cgroup_v1_cpu_count(Some("250000\n"), Some("100000\n")),
+            Some(3)
+        );
+        assert_eq!(
+            parse_cgroup_v1_cpu_count(Some("-1\n"), Some("100000")),
+            None
+        );
+        assert!(parse_proc_stat_cpu("cpu 18446744073709551610 10 10 10\n").is_some());
     }
 
     #[test]
