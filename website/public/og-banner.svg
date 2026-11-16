@@ -1,48 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630" fill="none">
+  <title>CubePod — Sandbox Built for Long-Lived Autonomous Agents</title>
+  <desc>Social share card. Right side is the live cubepod.dev bottom CTA ASCII architecture (Brain-Hands Decoupling), not Kubernetes. No version badge.</desc>
   <defs>
-    <radialGradient id="og-glow-1" cx="20%" cy="20%" r="60%">
-      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.22"/>
-      <stop offset="100%" stop-color="#070b14" stop-opacity="0"/>
-    </radialGradient>
-    <radialGradient id="og-glow-2" cx="85%" cy="80%" r="60%">
-      <stop offset="0%" stop-color="#6366f1" stop-opacity="0.24"/>
-      <stop offset="100%" stop-color="#070b14" stop-opacity="0"/>
-    </radialGradient>
-    <linearGradient id="og-cube-top" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#22d3ee"/>
-      <stop offset="100%" stop-color="#06b6d4"/>
+    <linearGradient id="cp-copper-logo" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#f97316"/>
     </linearGradient>
-    <linearGradient id="og-cube-bot" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#818cf8"/>
-      <stop offset="100%" stop-color="#4f46e5"/>
-    </linearGradient>
+    <radialGradient id="og-glow-1" cx="18%" cy="18%" r="50%">
+      <stop offset="0%" stop-color="#f97316" stop-opacity="0.12"/>
+      <stop offset="55%" stop-color="#f97316" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#0e0e0d" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="og-glow-2" cx="84%" cy="52%" r="42%">
+      <stop offset="0%" stop-color="#f97316" stop-opacity="0.11"/>
+      <stop offset="100%" stop-color="#0e0e0d" stop-opacity="0"/>
+    </radialGradient>
   </defs>
-  <rect width="1200" height="630" fill="#070b14"/>
+
+  <rect width="1200" height="630" fill="#0e0e0d"/>
   <rect width="1200" height="630" fill="url(#og-glow-1)"/>
   <rect width="1200" height="630" fill="url(#og-glow-2)"/>
-  <g stroke="#1e293b" stroke-opacity="0.45" stroke-width="1">
-    <line x1="0" y1="126" x2="1200" y2="126"/>
+  <g stroke="#44423c" stroke-opacity="0.28" stroke-width="1">
+    <line x1="0" y1="0" x2="0" y2="630"/>
+    <line x1="36" y1="0" x2="36" y2="630"/>
+    <line x1="72" y1="0" x2="72" y2="630"/>
+    <line x1="108" y1="0" x2="108" y2="630"/>
+    <line x1="144" y1="0" x2="144" y2="630"/>
+    <line x1="180" y1="0" x2="180" y2="630"/>
+    <line x1="216" y1="0" x2="216" y2="630"/>
+    <line x1="252" y1="0" x2="252" y2="630"/>
+    <line x1="288" y1="0" x2="288" y2="630"/>
+    <line x1="324" y1="0" x2="324" y2="630"/>
+    <line x1="360" y1="0" x2="360" y2="630"/>
+    <line x1="396" y1="0" x2="396" y2="630"/>
+    <line x1="432" y1="0" x2="432" y2="630"/>
+    <line x1="468" y1="0" x2="468" y2="630"/>
+    <line x1="504" y1="0" x2="504" y2="630"/>
+    <line x1="540" y1="0" x2="540" y2="630"/>
+    <line x1="576" y1="0" x2="576" y2="630"/>
+    <line x1="612" y1="0" x2="612" y2="630"/>
+    <line x1="648" y1="0" x2="648" y2="630"/>
+    <line x1="684" y1="0" x2="684" y2="630"/>
+    <line x1="720" y1="0" x2="720" y2="630"/>
+    <line x1="756" y1="0" x2="756" y2="630"/>
+    <line x1="792" y1="0" x2="792" y2="630"/>
+    <line x1="828" y1="0" x2="828" y2="630"/>
+    <line x1="864" y1="0" x2="864" y2="630"/>
+    <line x1="900" y1="0" x2="900" y2="630"/>
+    <line x1="936" y1="0" x2="936" y2="630"/>
+    <line x1="972" y1="0" x2="972" y2="630"/>
+    <line x1="1008" y1="0" x2="1008" y2="630"/>
+    <line x1="1044" y1="0" x2="1044" y2="630"/>
+    <line x1="1080" y1="0" x2="1080" y2="630"/>
+    <line x1="1116" y1="0" x2="1116" y2="630"/>
+    <line x1="1152" y1="0" x2="1152" y2="630"/>
+    <line x1="1188" y1="0" x2="1188" y2="630"/>
+    <line x1="0" y1="0" x2="1200" y2="0"/>
+    <line x1="0" y1="36" x2="1200" y2="36"/>
+    <line x1="0" y1="72" x2="1200" y2="72"/>
+    <line x1="0" y1="108" x2="1200" y2="108"/>
+    <line x1="0" y1="144" x2="1200" y2="144"/>
+    <line x1="0" y1="180" x2="1200" y2="180"/>
+    <line x1="0" y1="216" x2="1200" y2="216"/>
     <line x1="0" y1="252" x2="1200" y2="252"/>
-    <line x1="0" y1="378" x2="1200" y2="378"/>
+    <line x1="0" y1="288" x2="1200" y2="288"/>
+    <line x1="0" y1="324" x2="1200" y2="324"/>
+    <line x1="0" y1="360" x2="1200" y2="360"/>
+    <line x1="0" y1="396" x2="1200" y2="396"/>
+    <line x1="0" y1="432" x2="1200" y2="432"/>
+    <line x1="0" y1="468" x2="1200" y2="468"/>
     <line x1="0" y1="504" x2="1200" y2="504"/>
-    <line x1="200" y1="0" x2="200" y2="630"/>
-    <line x1="400" y1="0" x2="400" y2="630"/>
-    <line x1="600" y1="0" x2="600" y2="630"/>
-    <line x1="800" y1="0" x2="800" y2="630"/>
-    <line x1="1000" y1="0" x2="1000" y2="630"/>
+    <line x1="0" y1="540" x2="1200" y2="540"/>
+    <line x1="0" y1="576" x2="1200" y2="576"/>
+    <line x1="0" y1="612" x2="1200" y2="612"/>
   </g>
-  <g transform="translate(820, 145)">
-    <polygon points="160,12 292,88 292,240 160,316 28,240 28,88" stroke="#334155" stroke-width="3" fill="#0b1222"/>
-    <polygon points="160,174 264,114 264,218 160,278 56,218 56,114" fill="url(#og-cube-bot)" fill-opacity="0.32" stroke="#818cf8" stroke-width="3" stroke-linejoin="round"/>
-    <polyline points="56,166 160,226 264,166" stroke="#818cf8" stroke-width="3" stroke-linejoin="round" fill="none"/>
-    <polygon points="160,46 264,106 160,166 56,106" fill="url(#og-cube-top)" stroke="#cffafe" stroke-width="2.5" stroke-linejoin="round"/>
-    <line x1="160" y1="166" x2="160" y2="278" stroke="#22d3ee" stroke-width="3" stroke-linecap="round"/>
+
+  <g transform="translate(80,64) scale(1.684211)">
+    <polygon points="19,3.5 32.5,11.2 32.5,26.8 19,34.5 5.5,26.8 5.5,11.2" fill="#161614" stroke="#36342f" stroke-width="1.4" stroke-linejoin="round"/>
+    <polygon points="19,7.5 28.8,13.1 19,18.7 9.2,13.1" fill="url(#cp-copper-logo)"/>
+    <polygon points="9.2,15.6 17.7,20.5 17.7,29.8 9.2,24.9" fill="#d6d3cd" fill-opacity="0.22" stroke="#d6d3cd" stroke-width="1.15" stroke-linejoin="round"/>
+    <polygon points="28.8,15.6 20.3,20.5 20.3,29.8 28.8,24.9" fill="#f97316" fill-opacity="0.16" stroke="#fb923c" stroke-width="1.15" stroke-linejoin="round"/>
   </g>
-  <rect x="88" y="132" width="290" height="36" rx="18" fill="#0f172a" stroke="#22d3ee" stroke-opacity="0.5"/>
-  <text x="110" y="156" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#22d3ee">v0.4.0 · E2B Compatible Superset</text>
-  <text x="88" y="245" font-family="ui-sans-serif, system-ui, sans-serif" font-size="76" font-weight="800" letter-spacing="-0.03em" fill="#f8fafc">Cube<tspan fill="#22d3ee">Pod</tspan></text>
-  <text x="88" y="305" font-family="ui-sans-serif, system-ui, sans-serif" font-size="30" font-weight="600" fill="#cbd5e1">Persistent Writable RootFS MicroVM</text>
-  <text x="88" y="348" font-family="ui-sans-serif, system-ui, sans-serif" font-size="30" font-weight="600" fill="#cbd5e1">Execution Platform for AI Agents</text>
-  <text x="88" y="425" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="20" fill="#94a3b8">&lt;50ms WarmPool  ·  ~1s CoW Fork  ·  0 CPU Suspend  ·  Zero-Trust Egress</text>
-  <text x="88" y="510" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" fill="#22d3ee">https://cubepod.dev</text>
+  <text x="156" y="106.9" font-family="Plus Jakarta Sans, Inter, ui-sans-serif, sans-serif" font-size="34" font-weight="700" letter-spacing="-0.03em" fill="#f2f0ea">CubePod</text>
+
+  <rect x="80" y="152" width="384.8" height="31" rx="6" fill="#161614" stroke="#2a2926" stroke-width="1"/>
+  <circle cx="100" cy="167.5" r="7.2" fill="#f97316" fill-opacity="0.28"/>
+  <circle cx="100" cy="167.5" r="4" fill="#f97316"/>
+  <text x="114" y="172.0" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="600" letter-spacing="0.08em" fill="#a8a49c">APACHE 2.0  ·  E2B COMPATIBLE SUPERSET</text>
+
+  <text x="80" y="271.00" font-family="Plus Jakarta Sans, Inter, ui-sans-serif, sans-serif" font-size="54" font-weight="800" letter-spacing="-0.03em" fill="#f2f0ea">Sandbox Built for</text>
+  <text x="80" y="331.48" font-family="Plus Jakarta Sans, Inter, ui-sans-serif, sans-serif" font-size="54" font-weight="800" letter-spacing="-0.03em" fill="#f97316">Long-Lived</text>
+  <text x="80" y="391.96" font-family="Plus Jakarta Sans, Inter, ui-sans-serif, sans-serif" font-size="54" font-weight="800" letter-spacing="-0.03em" fill="#f97316">Autonomous Agents</text>
+
+  <text x="80" y="424.00" font-family="Plus Jakarta Sans, Inter, ui-sans-serif, sans-serif" font-size="22" font-weight="600" letter-spacing="-0.01em" fill="#e5e2da">Persistent Writable RootFS MicroVM Execution Platform</text>
+  <text x="80" y="486.00" font-family="JetBrains Mono, ui-monospace, monospace" font-size="20" font-weight="600" fill="#fb923c">cubepod.dev</text>
+
+  <rect x="733.34" y="107.00" width="394.66" height="415.50" rx="4" fill="#080807" stroke="#2a2926" stroke-width="1"/>
+    <text x="751.34" y="136.00" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">[ BRAIN · Planning &amp; Orchestration ]</text>
+    <text x="751.34" y="155.50" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">+--------------------------------------------+</text>
+    <text x="751.34" y="175.00" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">|  CubePlex        Team Agent Workspace      |</text>
+    <text x="751.34" y="194.50" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">|  Collaborative UI · Threads · Sessions     |</text>
+    <text x="751.34" y="214.00" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">+--------------------------------------------+</text>
+    <text x="751.34" y="233.50" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">                     |  orchestrates</text>
+    <text x="751.34" y="253.00" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">                     v</text>
+    <text x="751.34" y="272.50" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">+--------------------------------------------+</text>
+    <text x="751.34" y="292.00" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">|  CubeLoop        Async Agent Runtime       |</text>
+    <text x="751.34" y="311.50" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">|  Long-Lived Loops · Tool Calls · State     |</text>
+    <text x="751.34" y="331.00" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">+--------------------------------------------+</text>
+    <text x="751.34" y="350.50" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">                     |</text>
+    <text x="751.34" y="370.00" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">====== Brain-Hands Decoupling (REST/MCP) =====</text>
+    <text x="751.34" y="389.50" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">                     |  executes in</text>
+    <text x="751.34" y="409.00" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="400" xml:space="preserve" fill="#a8a49c">                     v</text>
+    <text x="751.34" y="428.50" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="600" xml:space="preserve" fill="#f97316">[ HANDS · Hardware-Isolated Execution ]</text>
+    <text x="751.34" y="448.00" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="600" xml:space="preserve" fill="#f97316">+--------------------------------------------+</text>
+    <text x="751.34" y="467.50" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="600" xml:space="preserve" fill="#f97316">|  CubePod         MicroVM Execution Layer   |</text>
+    <text x="751.34" y="487.00" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="600" xml:space="preserve" fill="#f97316">|  Persistent RootFS · /workspace · Zero-CPU |</text>
+    <text x="751.34" y="506.50" font-family="JetBrains Mono, ui-monospace, monospace" font-size="13" font-weight="600" xml:space="preserve" fill="#f97316">+--------------------------------------------+</text>
 </svg>
