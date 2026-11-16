@@ -102,7 +102,7 @@ export E2B_API_KEY="cpod_test_api_key"
 | `Sandbox.create(...)` [JS/TS] | `POST /sandboxes`<br/>`POST /v2/sandboxes` | **未测试** | `pkg/gateway/sandboxes.go:handleCreateSandbox` | 仓库内无用例 | 仓库内无针对官方 `@e2b/code-interpreter` 或 `e2b` npm 包的自动化测试。 |
 | `Sandbox.get(...)` / `get_sandbox` | `GET /sandboxes/{id}` | **未测试** | `pkg/gateway/sandboxes.go:handleGetSandbox` 中有处理器实现；`test/e2b-compat` 未调用官方 SDK 方法。协议级符合性在 `pkg/gateway/e2b_conformance_test.go` 中通过 HTTP GET 验证。 | 兼容测试集中未调用 | 返回当前生命周期阶段、持久存储挂载信息与租约到期时间。响应符合 `E2BSandboxDetail` 结构。 |
 | `Sandbox.list()` | `GET /sandboxes` | **部分兼容** | `pkg/gateway/sandboxes.go:handleListSandboxes` 中有处理器实现；`test/e2b-compat` 未调用官方 SDK 方法。协议级符合性在 `pkg/gateway/e2b_conformance_test.go` 中通过 HTTP GET 验证。 | 兼容测试集中未调用 | 支持 `GET /sandboxes` 列表查询并返回 `E2BListedSandbox[]`。**注意：** `pkg/gateway/server.go` 中**未注册** `GET /v2/sandboxes`。 |
-| `sandbox.kill()` / `delete` | `DELETE /sandboxes/{id}` | **兼容** | `pkg/gateway/sandboxes.go:handleDeleteSandbox`<br/>`test/e2b-compat/test_official_e2b_sync.py`<br/>`test/e2b-compat/test_official_e2b_async.py` | `e2b>=2.0.0`（依赖下限，非已测版本全集） | 释放计算 Pod。根据策略保留双 PVC（`rootfs-pvc`、`workspace-pvc`），除非显式指定删除卷。 |
+| `sandbox.kill()` / `delete` | `DELETE /sandboxes/{id}` | **兼容** | `pkg/gateway/sandboxes.go:handleDeleteSandbox`<br/>`test/e2b-compat/test_official_e2b_sync.py`<br/>`test/e2b-compat/test_official_e2b_async.py` | `e2b>=2.0.0`（依赖下限，非已测版本全集） | 释放计算 Pod。临时沙箱（`volumeKey == ""`）会回收其临时 `rootfs-pvc` 与 `workspace-pvc`；命名 `volumeKey` PVC 默认保留，除非显式指定 `deleteVolumes=true`。 |
 | `sandbox.set_timeout(...)` / 租约续期 | `POST /sandboxes/{id}/refreshes`<br/>`POST /sandboxes/{id}/timeout` | **兼容** | `pkg/gateway/sandboxes.go:handleRefreshSandbox`<br/>`test/e2b-compat/test_official_e2b_sync.py`<br/>`test/e2b-compat/test_official_e2b_async.py`<br/>`pkg/gateway/e2b_conformance_test.go`（协议验证） | `e2b>=2.0.0`（依赖下限，非已测版本全集） | 续期沙箱租约并重置后台空闲回收器（Idle Reaper）计时。 |
 | `Sandbox.connect(...)` | `POST /sandboxes/{id}/connect` | **未测试** | `pkg/gateway/sandboxes.go:handleConnectSandbox` 中有处理器实现；`test/e2b-compat` 未调用官方 SDK 方法。在 `pkg/gateway/server_test.go` 中覆盖 Go 逻辑。 | 兼容测试集中未调用 | 重新连接运行中沙箱，或透明自动唤醒处于 `Paused` 状态的沙箱计算 Pod（参见[暂停与唤醒语义](#1-暂停与唤醒-vs-内存快照)）。 |
 
@@ -116,7 +116,7 @@ export E2B_API_KEY="cpod_test_api_key"
 | `sandbox.commands.run(..., background=True)` | `POST /sandboxes/{id}/commands`（`background: true`） | **未测试** | `pkg/gateway/commands.go:handleRunCommand` 中有处理器实现；`test/e2b-compat` 未调用官方 SDK 的后台命令方法（`background=True`）。 | 兼容测试集中未调用 | 在 Guest 内部创建独立进程组并在后台运行；返回命令 ID 用于轮询状态。 |
 | 日志流式推送与回调（`on_stdout`、`on_stderr`） | `GET /sandboxes/{id}/commands/{cmdId}/logs`<br/>`GET /sandboxes/{id}/commands/{cmdId}/stream`<br/>Connect-RPC `/process.Process/Connect` | **未测试** | `pkg/gateway/commands.go` 与 `connectrpc.go` 中有处理器实现；`test/e2b-compat` 未调用官方 SDK 的 `commands.run(..., on_stdout=...)` 流式接口（`test_streaming_realtime.py` 验证的是代码解释器的 `run_code` 流式，而非 `commands`）。 | 兼容测试集中未调用 | 网关支持基于游标的增量拉取（`?cursor=N`）、Server-Sent Events（`text/event-stream`）与 Connect-RPC 分帧流。 |
 | `sandbox.commands.kill(pid)` | `POST /sandboxes/{id}/commands/{cmdId}/kill`<br/>Connect-RPC `/process.Process/SendSignal` | **未测试** | `pkg/gateway/commands.go:handleKillCommand` 与 `connectrpc.go` 中有处理器实现；`test/e2b-compat` 未调用官方 SDK 的 `commands.kill`（`test_timeout_and_zombie_kill.py` 验证的是代码解释器执行超时终止，而非 `commands.kill`）。 | 兼容测试集中未调用 | 向 Guest 内进程组（PGID）发送信号（`SIGTERM`、`SIGKILL`）。`test/e2b-compat` 中的官方 SDK 测试并未证明这能消除所有残留进程。 |
-| `sandbox.pty` / 交互式伪终端 | 无 | **未支持** | 在 `cubepod-gateway` 与 `crates/podd` 中未找到 PTY 处理器 | 无 | 未实现上游 E2B PTY 流式协议。CubePod 通过带签名的 Panel 反向代理提供 Web 终端与桌面环境（`/panel/{token}/`，运行 `ttyd` 与 `noVNC`）。 |
+| `sandbox.pty` / 交互式伪终端 | Connect-RPC `/process.Process/{Start,Connect,SendInput,StreamInput,Update,SendSignal}`（`pty: true`） | **部分兼容** | `pkg/gateway/connectrpc.go`<br/>`crates/podd/src/commands.rs`<br/>`pkg/gateway/local_watch_pty_test.go` | Go/Rust 单元与集成测试已覆盖；`test/e2b-compat` 尚未覆盖 | 已实现交互式 PTY 启动、64 KiB 重连回放、窗口 resize（`Update`）、输入流与信号发送。PTY 会话的 `CloseStdin` 返回 `501 unimplemented`。CubePod 亦通过 `/panel/{token}/` 提供 Web 终端与桌面。 |
 
 ---
 
@@ -129,7 +129,7 @@ export E2B_API_KEY="cpod_test_api_key"
 | `sandbox.files.list(path)` | `GET /sandboxes/{id}/files/list`<br/>`GET /files/list`<br/>Connect-RPC `/filesystem.Filesystem/List`<br/>Connect-RPC `/filesystem.Filesystem/ListDir` | **未测试** | `pkg/gateway/files.go` 与 `connectrpc.go` 中有处理器实现；`test/e2b-compat` 未调用官方 SDK 的 `files.list` 方法。 | 兼容测试集中未调用 | 返回目录条目列表及元数据（`name`、`size`、`isDir`、`permissions`）。 |
 | `sandbox.files.remove(path)` | `DELETE /sandboxes/{id}/files`<br/>`DELETE /files`<br/>Connect-RPC `/filesystem.Filesystem/Remove` | **未测试** | `pkg/gateway/files.go` 与 `connectrpc.go` 中有处理器实现；`test/e2b-compat` 未调用官方 SDK 的 `files.remove` 方法。 | 兼容测试集中未调用 | 递归删除沙箱内的目标文件或目录。 |
 | `sandbox.files.make_dir(path)` | Connect-RPC `/filesystem.Filesystem/MakeDir` | **未测试** | `pkg/gateway/connectrpc.go:handleConnectRPCFilesystemMakeDir` 中有处理器实现；`test/e2b-compat` 未调用官方 SDK 的 `files.make_dir` 方法（自动递归创建父目录由 `files.write` 验证）。 | 兼容测试集中未调用 | 通过 Connect-RPC 递归创建目录（权限 `0755`）。 |
-| `sandbox.files.watch_dir(path, on_event)` | 无 | **未支持** | 在 `cubepod-gateway` 与 `crates/podd` 中未找到文件监控处理器 | 无 | 未实现实时文件变更通知流。 |
+| `sandbox.files.watch_dir(path, on_event)` | Connect-RPC `/filesystem.Filesystem/{WatchDir,CreateWatcher,GetWatcherEvents,RemoveWatcher}` | **未测试** | `pkg/gateway/watch.go`<br/>`pkg/gateway/connectrpc.go`<br/>`crates/podd/src/watch.rs`<br/>`pkg/gateway/local_watch_pty_test.go` | Go/Rust 单元与集成测试已覆盖；`test/e2b-compat` 尚未覆盖 | 基于 `inotify` 实现目录变更实时流式推送（`WatchDir`）与轮询式 Watcher（`CreateWatcher`/`GetWatcherEvents`）。 |
 
 ---
 
@@ -173,8 +173,8 @@ export E2B_API_KEY="cpod_test_api_key"
 | :--- | :--- | :--- |
 | **官方 JS/TS SDK**（`@e2b/code-interpreter`、`e2b`） | **未测试** | 本仓库内未编写运行官方 `@e2b/code-interpreter` 或 `e2b` npm 客户端的自动化测试。Gateway 实现了对应的 Connect-RPC 与 REST 端点，但在 CI 中缺乏形式化测试覆盖。 |
 | **Agent 编排框架**（LangChain、LlamaIndex、AutoGen、CrewAI、OpenHands、Smolagents） | **未测试** | 尽管这些框架在文档中声明基于 E2B 客户端 SDK 构建，但本仓库并未集成针对各框架的端到端集成测试套件。 |
-| **官方 E2B Volumes API**（`POST /volumes`） | **未支持** | `cubepod-gateway` 中未提供该 REST 处理器。CubePod 通过 Kubernetes PVC（`workspace-pvc`、`rootfs-pvc`）与 `volumeKey` 扩展机制管理存储生命周期。 |
-| **官方 E2B Secrets API**（`POST /secrets`） | **未支持** | 未实现官方 E2B 密钥云端接口。CubePod 通过 `secretBindings` 与 `cpodref_` 出站代理保险库提供真正的零信任凭据隔离保护。 |
+| **官方 E2B Volumes API**（`POST /volumes`、`/volumecontent/{id}/*`、`volumeMounts`） | **部分兼容** | 已在 `pkg/volume/`、`pkg/gateway/volumes.go`、`pkg/controller/manifests.go` 与 `crates/podd-init/src/main.rs` 中实现（Go/Rust 单元测试已覆盖，`test/e2b-compat` 尚未覆盖）。支持 Docker 绑定挂载及 Kubernetes Kata RWX PVC 挂载（K8s 需配置 `CUBEPOD_K8S_E2B_VOLUME_MOUNTS=1` 与 `CUBEPOD_E2B_SHARED_PVC`，未开启时返回 `501 Not Implemented`）。 |
+| **官方 E2B Secrets API**（`POST /secrets`、`GET /secrets`、`POST /secrets/{id}`、`DELETE /secrets/{id}`、`network.rules`） | **部分兼容** | Alpha 已在 `pkg/secret/`、`pkg/gateway/secrets.go` 与 `pkg/egress/proxy.go` 中实现（Go 单元与集成测试已覆盖，`test/e2b-compat` 尚未覆盖）。提供 Write-Only AES-256-GCM 加密存储、`${e2b.secrets.<name>}` 解析为 `cpodref_` 占位符及实时轮换/吊销；Beta 多副本 K8s `Secret` 后端待后续实现。 |
 | **官方 E2B `sandbox.git` 助手** | **未测试** | 上游文档将 `sandbox.git` 说明为已弃用的 SDK 助手，它绑定在命令执行器上（`Git` 由 `Commands` 对象构造），并不是专用 HTTP Git 接口。`test/e2b-compat` 没有调用 `sandbox.git`。通过 `sandbox.commands.run()` 执行 `git` 只是普通 shell 命令路径，不能证明官方 git helper 兼容（例如 clone 选项、凭据助手、`dangerously_authenticate`、结构化 status/branch API 等）。 |
 
 ---
