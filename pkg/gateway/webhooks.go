@@ -42,6 +42,10 @@ func (s *Server) CloseEvents() {
 }
 
 func (s *Server) requireEventsManager(w http.ResponseWriter) (*events.Manager, bool) {
+	if !s.FeatureGateEnabled(FeatureGateSandboxEventsAndWebhooks) {
+		writeError(w, http.StatusNotImplemented, "sandbox events and webhooks feature gate is disabled")
+		return nil, false
+	}
 	mgr := s.events.Load()
 	if mgr == nil {
 		writeError(w, http.StatusNotImplemented, "events and webhooks are not configured")
@@ -51,6 +55,9 @@ func (s *Server) requireEventsManager(w http.ResponseWriter) (*events.Manager, b
 }
 
 func (s *Server) emitSandboxEvent(tenantHash, eventType string, rec *SandboxRecord, data *events.EventData) {
+	if !s.FeatureGateEnabled(FeatureGateSandboxEventsAndWebhooks) {
+		return
+	}
 	mgr := s.events.Load()
 	if mgr == nil || rec == nil || tenantHash == "" {
 		return

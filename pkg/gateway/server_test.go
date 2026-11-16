@@ -22,6 +22,7 @@ import (
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/gateway"
+	"github.com/cubeplexai/cubepod/pkg/runtime"
 )
 
 func TestSandboxLifecycleAndRootfsReset(t *testing.T) {
@@ -2576,5 +2577,366 @@ func TestGateway_HealthDoesNotBlockDuringSlowReconcile(t *testing.T) {
 	}
 	if !strings.EqualFold(fetched.State, "paused") {
 		t.Fatalf("expected final state Paused, got %q", fetched.State)
+	}
+}
+
+type blockingRuntimeBackend struct {
+	mu            sync.Mutex
+	inFlightByID  map[string]int
+	maxInFlightID map[string]int
+
+	slowPauseID    string
+	pauseStarted   chan struct{}
+	pauseOnce      sync.Once
+	releasePauseCh chan struct{}
+}
+
+func newBlockingRuntimeBackend(slowPauseID string) *blockingRuntimeBackend {
+	return &blockingRuntimeBackend{
+		inFlightByID:   make(map[string]int),
+		maxInFlightID:  make(map[string]int),
+		slowPauseID:    slowPauseID,
+		pauseStarted:   make(chan struct{}),
+		releasePauseCh: make(chan struct{}),
+	}
+}
+
+func (b *blockingRuntimeBackend) enter(id string) func() {
+	b.mu.Lock()
+	b.inFlightByID[id]++
+	if b.inFlightByID[id] > b.maxInFlightID[id] {
+		b.maxInFlightID[id] = b.inFlightByID[id]
+	}
+	b.mu.Unlock()
+	return func() {
+		b.mu.Lock()
+		b.inFlightByID[id]--
+		b.mu.Unlock()
+	}
+}
+
+func (b *blockingRuntimeBackend) maxConcurrent(id string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.maxInFlightID[id]
+}
+
+func (b *blockingRuntimeBackend) EnsureRunning(ctx context.Context, spec runtime.SandboxSpec) (*runtime.InstanceInfo, error) {
+	leave := b.enter(spec.SandboxID)
+	defer leave()
+	return &runtime.InstanceInfo{SandboxID: spec.SandboxID}, nil
+}
+
+func (b *blockingRuntimeBackend) Pause(ctx context.Context, sandboxID string) error {
+	leave := b.enter(sandboxID)
+	defer leave()
+	if sandboxID == b.slowPauseID {
+		b.pauseOnce.Do(func() { close(b.pauseStarted) })
+		select {
+		case <-b.releasePauseCh:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (b *blockingRuntimeBackend) ResetRootFS(ctx context.Context, sandboxID string) error {
+	return nil
+}
+
+func (b *blockingRuntimeBackend) Fork(ctx context.Context, sourceSandboxID, newSandboxID string) (*runtime.InstanceInfo, error) {
+	return &runtime.InstanceInfo{SandboxID: newSandboxID}, nil
+}
+
+func (b *blockingRuntimeBackend) Delete(ctx context.Context, sandboxID string) error {
+	leave := b.enter(sandboxID)
+	defer leave()
+	return nil
+}
+
+func (b *blockingRuntimeBackend) Inspect(ctx context.Context, sandboxID string) (*runtime.InstanceInfo, error) {
+	return &runtime.InstanceInfo{SandboxID: sandboxID}, nil
+}
+
+func (b *blockingRuntimeBackend) Close() error { return nil }
+
+func TestPerSandboxLockingDoesNotBlockOtherSandboxesHealthOrMetrics(t *testing.T) {
+	mem := controller.NewMemoryKubeClient()
+	rec := controller.NewReconciler(controller.WithKubeClient(mem))
+	srv := gateway.NewServer(rec)
+	srv.SetWorkspaceBaseDir(t.TempDir())
+	t.Cleanup(srv.Close)
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	create := func() string {
+		t.Helper()
+		resp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"base"}`))
+		if err != nil || resp.StatusCode != http.StatusCreated {
+			t.Fatalf("create failed: resp=%v err=%v", resp, err)
+		}
+		var out gateway.SandboxRecord
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		_ = resp.Body.Close()
+		return out.SandboxID
+	}
+
+	sbxA := create()
+	sbxB := create()
+
+	backend := newBlockingRuntimeBackend(sbxA)
+	srv.SetRuntime(backend)
+
+	// Start slow pause on sandbox A.
+	pauseADone := make(chan int, 1)
+	go func() {
+		resp, err := http.Post(ts.URL+"/sandboxes/"+sbxA+"/pause", "application/json", nil)
+		if err != nil {
+			pauseADone <- 0
+			return
+		}
+		_ = resp.Body.Close()
+		pauseADone <- resp.StatusCode
+	}()
+
+	select {
+	case <-backend.pauseStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for sandbox A pause to enter runtime.Pause")
+	}
+
+	// While sandbox A is blocked in Pause, sandbox B, /health, and /metrics must succeed promptly.
+	doneQuick := make(chan error, 1)
+	go func() {
+		if r, err := http.Get(ts.URL + "/health"); err != nil {
+			doneQuick <- err
+			return
+		} else {
+			_ = r.Body.Close()
+			if r.StatusCode != http.StatusOK {
+				doneQuick <- fmt.Errorf("/health status %d", r.StatusCode)
+				return
+			}
+		}
+		if r, err := http.Get(ts.URL + "/metrics"); err != nil {
+			doneQuick <- err
+			return
+		} else {
+			_ = r.Body.Close()
+			if r.StatusCode != http.StatusOK {
+				doneQuick <- fmt.Errorf("/metrics status %d", r.StatusCode)
+				return
+			}
+		}
+		if r, err := http.Post(ts.URL+"/sandboxes/"+sbxB+"/pause", "application/json", nil); err != nil {
+			doneQuick <- err
+			return
+		} else {
+			_ = r.Body.Close()
+			if r.StatusCode != http.StatusOK {
+				doneQuick <- fmt.Errorf("pause B status %d", r.StatusCode)
+				return
+			}
+		}
+		if r, err := http.Post(ts.URL+"/sandboxes/"+sbxB+"/connect", "application/json", nil); err != nil {
+			doneQuick <- err
+			return
+		} else {
+			_ = r.Body.Close()
+			if r.StatusCode != http.StatusOK {
+				doneQuick <- fmt.Errorf("connect B status %d", r.StatusCode)
+				return
+			}
+		}
+		doneQuick <- nil
+	}()
+
+	select {
+	case err := <-doneQuick:
+		if err != nil {
+			close(backend.releasePauseCh)
+			t.Fatalf("unrelated requests failed while sandbox A paused: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(backend.releasePauseCh)
+		t.Fatal("sandbox B / health / metrics blocked while sandbox A paused")
+	}
+
+	// Concurrent operation on the SAME sandbox A must serialize behind Pause.
+	connectADone := make(chan int, 1)
+	go func() {
+		resp, err := http.Post(ts.URL+"/sandboxes/"+sbxA+"/connect", "application/json", nil)
+		if err != nil {
+			connectADone <- 0
+			return
+		}
+		_ = resp.Body.Close()
+		connectADone <- resp.StatusCode
+	}()
+
+	select {
+	case code := <-connectADone:
+		close(backend.releasePauseCh)
+		t.Fatalf("expected connect on sandbox A to wait for in-flight pause, but finished early with %d", code)
+	case <-time.After(80 * time.Millisecond):
+	}
+
+	close(backend.releasePauseCh)
+
+	if code := <-pauseADone; code != http.StatusOK {
+		t.Fatalf("pause A status = %d; want 200", code)
+	}
+	if code := <-connectADone; code != http.StatusOK {
+		t.Fatalf("connect A status = %d; want 200", code)
+	}
+	if got := backend.maxConcurrent(sbxA); got != 1 {
+		t.Fatalf("expected max concurrent runtime ops on sandbox A == 1, got %d", got)
+	}
+}
+
+func TestPerSandboxLockingSerializesSameSandboxOperations(t *testing.T) {
+	mem := controller.NewMemoryKubeClient()
+	rec := controller.NewReconciler(controller.WithKubeClient(mem))
+	srv := gateway.NewServer(rec)
+	srv.SetWorkspaceBaseDir(t.TempDir())
+	t.Cleanup(srv.Close)
+
+	backend := newBlockingRuntimeBackend("")
+	srv.SetRuntime(backend)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"base"}`))
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create failed: resp=%v err=%v", resp, err)
+	}
+	var created gateway.SandboxRecord
+	_ = json.NewDecoder(resp.Body).Decode(&created)
+	_ = resp.Body.Close()
+
+	var wg sync.WaitGroup
+	var errCount atomic.Int32
+	for i := 0; i < 12; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var endpoint string
+			switch i % 3 {
+			case 0:
+				endpoint = "/pause"
+			case 1:
+				endpoint = "/connect"
+			default:
+				endpoint = "/reset-rootfs"
+			}
+			r, err := http.Post(ts.URL+"/sandboxes/"+created.SandboxID+endpoint, "application/json", nil)
+			if err != nil {
+				errCount.Add(1)
+				return
+			}
+			_ = r.Body.Close()
+			if r.StatusCode != http.StatusOK {
+				errCount.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if errCount.Load() != 0 {
+		t.Fatalf("expected 0 errors across concurrent same-sandbox lifecycle calls, got %d", errCount.Load())
+	}
+	if got := backend.maxConcurrent(created.SandboxID); got > 1 {
+		t.Fatalf("expected same-sandbox runtime ops to be serialized (maxConcurrent <= 1), got %d", got)
+	}
+}
+
+func TestUnifiedFeatureGatesAndDisabling(t *testing.T) {
+	parsed := gateway.ParseFeatureGates("E2BTemplateAPI=true,DesktopStack=false,E2BFilesystemWatch=0,StatelessGatewayHA")
+	if !parsed[gateway.FeatureGateE2BTemplateAPI] || parsed[gateway.FeatureGateDesktopStack] || parsed[gateway.FeatureGateE2BFilesystemWatch] || !parsed[gateway.FeatureGateStatelessGatewayHA] {
+		t.Fatalf("unexpected ParseFeatureGates result: %+v", parsed)
+	}
+
+	defs := gateway.DefaultFeatureGates()
+	if defs[gateway.FeatureGateE2BTemplateAPI] || defs[gateway.FeatureGateK8sE2BVolumeMounts] {
+		t.Fatalf("expected E2BTemplateAPI and K8sE2BVolumeMounts to default false: %+v", defs)
+	}
+	for _, g := range []string{
+		gateway.FeatureGateTransparentEgress,
+		gateway.FeatureGateDesktopStack,
+		gateway.FeatureGateStatelessGatewayHA,
+		gateway.FeatureGateE2BFilesystemWatch,
+		gateway.FeatureGateE2BSecretsAPI,
+		gateway.FeatureGateSandboxEventsAndWebhooks,
+	} {
+		if !defs[g] {
+			t.Fatalf("expected feature gate %s to default true", g)
+		}
+	}
+
+	sharedKube := controller.NewMemoryKubeClient()
+	r1 := controller.NewReconciler(controller.WithKubeClient(sharedKube))
+	srv1 := gateway.NewServer(r1)
+	srv1.SetWorkspaceBaseDir(t.TempDir())
+	srv1.SetLivePodRouting(true)
+	t.Cleanup(srv1.Close)
+	ts1 := httptest.NewServer(srv1.Handler())
+	defer ts1.Close()
+
+	// Create sandbox on srv1 for HA and endpoint tests.
+	cResp, err := http.Post(ts1.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"base"}`))
+	if err != nil || cResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create sandbox failed: resp=%v err=%v", cResp, err)
+	}
+	var sbx gateway.SandboxRecord
+	_ = json.NewDecoder(cResp.Body).Decode(&sbx)
+	_ = cResp.Body.Close()
+
+	// Disable E2BFilesystemWatch, E2BSecretsAPI, DesktopStack, TransparentEgress on srv1.
+	srv1.SetFeatureGate(gateway.FeatureGateE2BFilesystemWatch, false)
+	srv1.SetFeatureGate(gateway.FeatureGateE2BSecretsAPI, false)
+	srv1.SetFeatureGate(gateway.FeatureGateDesktopStack, false)
+	srv1.SetFeatureGate(gateway.FeatureGateTransparentEgress, false)
+
+	assert501 := func(method, url, body string) {
+		t.Helper()
+		req, _ := http.NewRequest(method, url, strings.NewReader(body))
+		req.Header.Set("X-API-KEY", "test-key")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s failed: %v", method, url, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusNotImplemented {
+			t.Fatalf("%s %s = %d; want 501 Not Implemented", method, url, resp.StatusCode)
+		}
+	}
+
+	assert501(http.MethodPost, ts1.URL+"/sandboxes/"+sbx.SandboxID+"/filesystem.Filesystem/CreateWatcher", `{"path":"/workspace"}`)
+	assert501(http.MethodPost, ts1.URL+"/filesystem.Filesystem/WatchDir", `{"path":"/workspace"}`)
+	assert501(http.MethodGet, ts1.URL+"/secrets", "")
+	assert501(http.MethodPost, ts1.URL+"/secrets", `{"name":"OPENAI_API_KEY","value":"sk-123"}`)
+	assert501(http.MethodPost, ts1.URL+"/sandboxes/"+sbx.SandboxID+"/desktop/start", `{}`)
+	assert501(http.MethodGet, ts1.URL+"/v1/sandboxes/"+sbx.SandboxID+"/desktop/status", "")
+	assert501(http.MethodPost, ts1.URL+"/internal/v1/egress/exchange", `{}`)
+	assert501(http.MethodPost, ts1.URL+"/sandboxes", `{"templateID":"base","network":{"denyOut":["*"]}}`)
+
+	// Disable StatelessGatewayHA on a second replica sharing sharedKube -> cache miss returns 404.
+	r2 := controller.NewReconciler(controller.WithKubeClient(sharedKube))
+	srv2 := gateway.NewServer(r2)
+	srv2.SetLivePodRouting(true)
+	srv2.SetFeatureGate(gateway.FeatureGateStatelessGatewayHA, false)
+	t.Cleanup(srv2.Close)
+	ts2 := httptest.NewServer(srv2.Handler())
+	defer ts2.Close()
+
+	missResp, err := http.Get(ts2.URL + "/sandboxes/" + sbx.SandboxID)
+	if err != nil {
+		t.Fatalf("GET on disabled-HA replica failed: %v", err)
+	}
+	_ = missResp.Body.Close()
+	if missResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 when StatelessGatewayHA=false on cache miss, got %d", missResp.StatusCode)
 	}
 }

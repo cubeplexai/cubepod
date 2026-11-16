@@ -62,6 +62,68 @@ type SandboxRecord struct {
 	Reason           string                      `json:"reason,omitempty"`
 	WorkspaceDir     string                      `json:"-"`
 	OwnerTenantHash  string                      `json:"-"`
+
+	lastEmittedLifecycleState string
+	explicitlyPaused          bool
+	explicitlyDeleted         bool
+}
+
+// Canonical gateway feature gate names.
+const (
+	FeatureGateE2BTemplateAPI           = "E2BTemplateAPI"
+	FeatureGateK8sE2BVolumeMounts       = "K8sE2BVolumeMounts"
+	FeatureGateTransparentEgress        = "TransparentEgress"
+	FeatureGateDesktopStack             = "DesktopStack"
+	FeatureGateStatelessGatewayHA       = "StatelessGatewayHA"
+	FeatureGateE2BFilesystemWatch       = "E2BFilesystemWatch"
+	FeatureGateE2BSecretsAPI            = "E2BSecretsAPI"
+	FeatureGateSandboxEventsAndWebhooks = "SandboxEventsAndWebhooks"
+)
+
+// FeatureGates holds gateway feature gate enablement flags.
+type FeatureGates map[string]bool
+
+// DefaultFeatureGates returns a fresh copy of the default gateway feature gates.
+func DefaultFeatureGates() FeatureGates {
+	return FeatureGates{
+		FeatureGateE2BTemplateAPI:           false,
+		FeatureGateK8sE2BVolumeMounts:       false,
+		FeatureGateTransparentEgress:        true,
+		FeatureGateDesktopStack:             true,
+		FeatureGateStatelessGatewayHA:       true,
+		FeatureGateE2BFilesystemWatch:       true,
+		FeatureGateE2BSecretsAPI:            true,
+		FeatureGateSandboxEventsAndWebhooks: true,
+	}
+}
+
+// ParseFeatureGates parses comma-separated feature gate overrides (e.g. "E2BTemplateAPI=true,DesktopStack=false").
+func ParseFeatureGates(raw string) map[string]bool {
+	gates := make(map[string]bool)
+	for _, item := range strings.Split(raw, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		parts := strings.SplitN(item, "=", 2)
+		key := strings.TrimSpace(parts[0])
+		if key == "" {
+			continue
+		}
+		if len(parts) == 1 {
+			gates[key] = true
+			continue
+		}
+		if val, err := strconv.ParseBool(strings.TrimSpace(parts[1])); err == nil {
+			gates[key] = val
+		}
+	}
+	return gates
+}
+
+type sandboxOpLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 // ptyReplayCap is the Connect replay tail for a live PTY. Older bytes are dropped.
@@ -246,35 +308,43 @@ func (w *lockedWriter) Write(p []byte) (n int, err error) {
 
 // Server serves the CubePod Control Plane and Panel Proxy routes.
 type Server struct {
-	reconciler       *controller.Reconciler
-	mu               sync.RWMutex
-	opLocksMu        sync.Mutex
-	opLocks          map[string]*sync.Mutex
-	sandboxes        map[string]*SandboxRecord
-	commands         map[string]*commandEntry
-	watchers         map[string]*dirWatcher
-	endpoints        map[string]map[int]string
-	workspaceBaseDir string
-	panelSecret      []byte
-	vault            *egress.Vault
-	ca               *egress.CA
-	strictEgressMTLS bool
-	livePodRouting   bool
-	metrics          *Metrics
-	e2bTemplateAPI   bool
-	templateBuild    bool
-	controllerURL    string
-	probeTimeout     time.Duration
-	httpClient       *http.Client
-	e2b              atomic.Pointer[volume.Store]
-	secrets          atomic.Pointer[secret.Store]
-	events           atomic.Pointer[events.Manager]
-	e2bDir           string
-	e2bCfg           volume.Config
-	e2bMaxFileBytes  int64
-	e2bK8sMounts     bool
-	e2bSharedPVC     string
-	runtime          runtime.Backend
+	reconciler                *controller.Reconciler
+	mu                        sync.RWMutex
+	sandboxMu                 sync.Mutex
+	sandboxLocks              map[string]*sandboxOpLock
+	sandboxes                 map[string]*SandboxRecord
+	commands                  map[string]*commandEntry
+	watchers                  map[string]*dirWatcher
+	endpoints                 map[string]map[int]string
+	workspaceBaseDir          string
+	panelSecret               []byte
+	vault                     *egress.Vault
+	ca                        *egress.CA
+	strictEgressMTLS          bool
+	livePodRouting            bool
+	metrics                   *Metrics
+	e2bTemplateAPI            bool
+	templateBuild             bool
+	controllerURL             string
+	probeTimeout              time.Duration
+	httpClient                *http.Client
+	e2b                       atomic.Pointer[volume.Store]
+	secrets                   atomic.Pointer[secret.Store]
+	events                    atomic.Pointer[events.Manager]
+	e2bDir                    string
+	e2bCfg                    volume.Config
+	e2bMaxFileBytes           int64
+	e2bK8sMounts              bool
+	e2bSharedPVC              string
+	runtime                   runtime.Backend
+	featureGates              FeatureGates
+	syncMu                    sync.Mutex
+	syncInterval              time.Duration
+	syncCancel                context.CancelFunc
+	syncWG                    sync.WaitGroup
+	crdResyncsTotal           atomic.Uint64
+	E2BVolumeMountsTotal      atomic.Uint64
+	E2BVolumeMountErrorsTotal atomic.Uint64
 }
 
 // SetRuntime installs a product execution backend used during sandbox create,
@@ -306,9 +376,11 @@ func NewServer(reconciler *controller.Reconciler) *Server {
 		e2bAPI = reconciler.E2BTemplateAPIEnabled()
 		tplBuild = reconciler.TemplateBuildEnabled()
 	}
+	gates := DefaultFeatureGates()
+	gates[FeatureGateE2BTemplateAPI] = e2bAPI
 	return &Server{
 		reconciler:       reconciler,
-		opLocks:          make(map[string]*sync.Mutex),
+		sandboxLocks:     make(map[string]*sandboxOpLock),
 		sandboxes:        make(map[string]*SandboxRecord),
 		commands:         make(map[string]*commandEntry),
 		watchers:         make(map[string]*dirWatcher),
@@ -321,14 +393,76 @@ func NewServer(reconciler *controller.Reconciler) *Server {
 		templateBuild:    tplBuild,
 		probeTimeout:     120 * time.Second,
 		httpClient:       &http.Client{Timeout: 60 * time.Second},
+		featureGates:     gates,
 	}
+}
+
+// SetFeatureGate sets a named gateway feature gate and synchronizes dependent state.
+func (s *Server) SetFeatureGate(name string, enabled bool) {
+	s.mu.Lock()
+	if s.featureGates == nil {
+		s.featureGates = DefaultFeatureGates()
+	}
+	s.featureGates[name] = enabled
+	switch name {
+	case FeatureGateE2BTemplateAPI:
+		s.e2bTemplateAPI = enabled
+	case FeatureGateK8sE2BVolumeMounts:
+		s.e2bK8sMounts = enabled
+	}
+	r := s.reconciler
+	s.mu.Unlock()
+
+	if name == FeatureGateE2BTemplateAPI && r != nil {
+		r.SetE2BTemplateAPI(enabled)
+	}
+}
+
+// ApplyFeatureGates applies parsed feature gate overrides onto the server.
+func (s *Server) ApplyFeatureGates(gates map[string]bool) {
+	for k, v := range gates {
+		s.SetFeatureGate(k, v)
+	}
+}
+
+// FeatureGateEnabled returns whether the named feature gate is enabled.
+func (s *Server) FeatureGateEnabled(name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.featureGates == nil {
+		return DefaultFeatureGates()[name]
+	}
+	return s.featureGates[name]
+}
+
+// DesktopStackEnabled reports whether the DesktopStack feature gate is enabled.
+func (s *Server) DesktopStackEnabled() bool {
+	return s.FeatureGateEnabled(FeatureGateDesktopStack)
+}
+
+func (s *Server) requireGate(gate, disabledMsg string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.FeatureGateEnabled(gate) {
+			writeError(w, http.StatusNotImplemented, disabledMsg)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func isFilesystemWatchPath(p string) bool {
+	return strings.HasSuffix(p, "/CreateWatcher") ||
+		strings.HasSuffix(p, "/GetWatcherEvents") ||
+		strings.HasSuffix(p, "/RemoveWatcher") ||
+		strings.HasSuffix(p, "/WatchDir")
 }
 
 // SetLivePodRouting enables or disables automatic routing to the live Kubernetes PodIP.
 func (s *Server) SetLivePodRouting(enabled bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.livePodRouting = enabled
+	s.mu.Unlock()
+	s.reconcileSyncWorker()
 }
 
 // LivePodRouting returns whether live pod routing is enabled.
@@ -340,12 +474,7 @@ func (s *Server) LivePodRouting() bool {
 
 // SetE2BTemplateAPI enables or disables the E2B-compatible template API feature gate.
 func (s *Server) SetE2BTemplateAPI(enabled bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.e2bTemplateAPI = enabled
-	if s.reconciler != nil {
-		s.reconciler.SetE2BTemplateAPI(enabled)
-	}
+	s.SetFeatureGate(FeatureGateE2BTemplateAPI, enabled)
 }
 
 // E2BTemplateAPIEnabled returns whether the E2B-compatible template API is enabled.
@@ -481,20 +610,20 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /volumes/{volumeID}", s.handleDeleteVolume)
 
 	// Official E2B Secrets management (write-only, tenant-isolated).
-	mux.HandleFunc("POST /secrets", s.handleCreateSecret)
-	mux.HandleFunc("GET /secrets", s.handleListSecrets)
-	mux.HandleFunc("GET /secrets/{secretID}", s.handleGetSecret)
-	mux.HandleFunc("POST /secrets/{secretID}", s.handleUpdateSecret)
-	mux.HandleFunc("DELETE /secrets/{secretID}", s.handleDeleteSecret)
+	mux.HandleFunc("POST /secrets", s.requireGate(FeatureGateE2BSecretsAPI, "E2B secrets API feature gate is disabled", s.handleCreateSecret))
+	mux.HandleFunc("GET /secrets", s.requireGate(FeatureGateE2BSecretsAPI, "E2B secrets API feature gate is disabled", s.handleListSecrets))
+	mux.HandleFunc("GET /secrets/{secretID}", s.requireGate(FeatureGateE2BSecretsAPI, "E2B secrets API feature gate is disabled", s.handleGetSecret))
+	mux.HandleFunc("POST /secrets/{secretID}", s.requireGate(FeatureGateE2BSecretsAPI, "E2B secrets API feature gate is disabled", s.handleUpdateSecret))
+	mux.HandleFunc("DELETE /secrets/{secretID}", s.requireGate(FeatureGateE2BSecretsAPI, "E2B secrets API feature gate is disabled", s.handleDeleteSecret))
 
 	// Sandbox Lifecycle Events and Signed Webhooks (CEP-0028).
-	mux.HandleFunc("POST /webhooks", s.handleCreateWebhook)
-	mux.HandleFunc("GET /webhooks", s.handleListWebhooks)
-	mux.HandleFunc("GET /webhooks/{webhookID}", s.handleGetWebhook)
-	mux.HandleFunc("PATCH /webhooks/{webhookID}", s.handleUpdateWebhook)
-	mux.HandleFunc("DELETE /webhooks/{webhookID}", s.handleDeleteWebhook)
-	mux.HandleFunc("GET /events", s.handleListEvents)
-	mux.HandleFunc("GET /sandboxes/{sandboxID}/events", s.handleListSandboxEvents)
+	mux.HandleFunc("POST /webhooks", s.requireGate(FeatureGateSandboxEventsAndWebhooks, "sandbox events and webhooks feature gate is disabled", s.handleCreateWebhook))
+	mux.HandleFunc("GET /webhooks", s.requireGate(FeatureGateSandboxEventsAndWebhooks, "sandbox events and webhooks feature gate is disabled", s.handleListWebhooks))
+	mux.HandleFunc("GET /webhooks/{webhookID}", s.requireGate(FeatureGateSandboxEventsAndWebhooks, "sandbox events and webhooks feature gate is disabled", s.handleGetWebhook))
+	mux.HandleFunc("PATCH /webhooks/{webhookID}", s.requireGate(FeatureGateSandboxEventsAndWebhooks, "sandbox events and webhooks feature gate is disabled", s.handleUpdateWebhook))
+	mux.HandleFunc("DELETE /webhooks/{webhookID}", s.requireGate(FeatureGateSandboxEventsAndWebhooks, "sandbox events and webhooks feature gate is disabled", s.handleDeleteWebhook))
+	mux.HandleFunc("GET /events", s.requireGate(FeatureGateSandboxEventsAndWebhooks, "sandbox events and webhooks feature gate is disabled", s.handleListEvents))
+	mux.HandleFunc("GET /sandboxes/{sandboxID}/events", s.requireGate(FeatureGateSandboxEventsAndWebhooks, "sandbox events and webhooks feature gate is disabled", s.handleListSandboxEvents))
 	mux.HandleFunc("GET /volumecontent/{volumeID}/file", s.handleGetVolumeFile)
 	mux.HandleFunc("PUT /volumecontent/{volumeID}/file", s.handlePutVolumeFile)
 	mux.HandleFunc("GET /volumecontent/{volumeID}/dir", s.handleGetVolumeDir)
@@ -551,10 +680,10 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /filesystem.Filesystem/Stat", s.handleConnectRPCFilesystemStat)
 	mux.HandleFunc("POST /filesystem.Filesystem/Remove", s.handleConnectRPCFilesystemRemove)
 	mux.HandleFunc("POST /filesystem.Filesystem/MakeDir", s.handleConnectRPCFilesystemMakeDir)
-	mux.HandleFunc("POST /filesystem.Filesystem/CreateWatcher", s.handleConnectRPCCreateWatcher)
-	mux.HandleFunc("POST /filesystem.Filesystem/GetWatcherEvents", s.handleConnectRPCGetWatcherEvents)
-	mux.HandleFunc("POST /filesystem.Filesystem/RemoveWatcher", s.handleConnectRPCRemoveWatcher)
-	mux.HandleFunc("POST /filesystem.Filesystem/WatchDir", s.handleConnectRPCWatchDir)
+	mux.HandleFunc("POST /filesystem.Filesystem/CreateWatcher", s.requireGate(FeatureGateE2BFilesystemWatch, "filesystem watch feature gate is disabled", s.handleConnectRPCCreateWatcher))
+	mux.HandleFunc("POST /filesystem.Filesystem/GetWatcherEvents", s.requireGate(FeatureGateE2BFilesystemWatch, "filesystem watch feature gate is disabled", s.handleConnectRPCGetWatcherEvents))
+	mux.HandleFunc("POST /filesystem.Filesystem/RemoveWatcher", s.requireGate(FeatureGateE2BFilesystemWatch, "filesystem watch feature gate is disabled", s.handleConnectRPCRemoveWatcher))
+	mux.HandleFunc("POST /filesystem.Filesystem/WatchDir", s.requireGate(FeatureGateE2BFilesystemWatch, "filesystem watch feature gate is disabled", s.handleConnectRPCWatchDir))
 
 	// Path-prefixed Connect-RPC routes for sandboxes
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/process.Process/Start", s.handleConnectRPCProcessStart)
@@ -572,10 +701,10 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/Stat", s.handleConnectRPCFilesystemStat)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/Remove", s.handleConnectRPCFilesystemRemove)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/MakeDir", s.handleConnectRPCFilesystemMakeDir)
-	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/CreateWatcher", s.handleConnectRPCCreateWatcher)
-	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/GetWatcherEvents", s.handleConnectRPCGetWatcherEvents)
-	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/RemoveWatcher", s.handleConnectRPCRemoveWatcher)
-	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/WatchDir", s.handleConnectRPCWatchDir)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/CreateWatcher", s.requireGate(FeatureGateE2BFilesystemWatch, "filesystem watch feature gate is disabled", s.handleConnectRPCCreateWatcher))
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/GetWatcherEvents", s.requireGate(FeatureGateE2BFilesystemWatch, "filesystem watch feature gate is disabled", s.handleConnectRPCGetWatcherEvents))
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/RemoveWatcher", s.requireGate(FeatureGateE2BFilesystemWatch, "filesystem watch feature gate is disabled", s.handleConnectRPCRemoveWatcher))
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/filesystem.Filesystem/WatchDir", s.requireGate(FeatureGateE2BFilesystemWatch, "filesystem watch feature gate is disabled", s.handleConnectRPCWatchDir))
 
 	// WarmPool & OpenAPI routes
 	mux.HandleFunc("POST /warmpools", s.handleCreateWarmPool)
@@ -589,15 +718,15 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/panel/{token}", s.handlePanelProxy)
 
 	// Interactive Desktop Lifecycle routes (CEP-0021)
-	mux.HandleFunc("POST /sandboxes/{sandboxID}/desktop/start", s.handleDesktopStart)
-	mux.HandleFunc("GET /sandboxes/{sandboxID}/desktop/status", s.handleDesktopStatus)
-	mux.HandleFunc("POST /sandboxes/{sandboxID}/desktop/stop", s.handleDesktopStop)
-	mux.HandleFunc("POST /v1/sandboxes/{sandboxID}/desktop/start", s.handleDesktopStart)
-	mux.HandleFunc("GET /v1/sandboxes/{sandboxID}/desktop/status", s.handleDesktopStatus)
-	mux.HandleFunc("POST /v1/sandboxes/{sandboxID}/desktop/stop", s.handleDesktopStop)
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/desktop/start", s.requireGate(FeatureGateDesktopStack, "desktop stack feature gate is disabled", s.handleDesktopStart))
+	mux.HandleFunc("GET /sandboxes/{sandboxID}/desktop/status", s.requireGate(FeatureGateDesktopStack, "desktop stack feature gate is disabled", s.handleDesktopStatus))
+	mux.HandleFunc("POST /sandboxes/{sandboxID}/desktop/stop", s.requireGate(FeatureGateDesktopStack, "desktop stack feature gate is disabled", s.handleDesktopStop))
+	mux.HandleFunc("POST /v1/sandboxes/{sandboxID}/desktop/start", s.requireGate(FeatureGateDesktopStack, "desktop stack feature gate is disabled", s.handleDesktopStart))
+	mux.HandleFunc("GET /v1/sandboxes/{sandboxID}/desktop/status", s.requireGate(FeatureGateDesktopStack, "desktop stack feature gate is disabled", s.handleDesktopStatus))
+	mux.HandleFunc("POST /v1/sandboxes/{sandboxID}/desktop/stop", s.requireGate(FeatureGateDesktopStack, "desktop stack feature gate is disabled", s.handleDesktopStop))
 
 	// Zero-Trust Egress Exchange route
-	mux.HandleFunc("POST /internal/v1/egress/exchange", s.handleEgressExchange)
+	mux.HandleFunc("POST /internal/v1/egress/exchange", s.requireGate(FeatureGateTransparentEgress, "transparent egress feature gate is disabled", s.handleEgressExchange))
 }
 
 // Handler returns the HTTP router for the CubePod Gateway.
@@ -660,21 +789,6 @@ func (s *Server) Handler() http.Handler {
 	})
 
 	return s.withMetrics(hostRouter)
-}
-
-func (s *Server) lockSandboxOp(id string) func() {
-	s.opLocksMu.Lock()
-	if s.opLocks == nil {
-		s.opLocks = make(map[string]*sync.Mutex)
-	}
-	mu := s.opLocks[id]
-	if mu == nil {
-		mu = &sync.Mutex{}
-		s.opLocks[id] = mu
-	}
-	s.opLocksMu.Unlock()
-	mu.Lock()
-	return mu.Unlock
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
@@ -801,7 +915,7 @@ func (s *Server) handleCreateWarmPool(w http.ResponseWriter, r *http.Request) {
 		Replicas:    replicas,
 	}
 
-	if _, syncErr := s.reconciler.SyncFromKube(r.Context()); syncErr != nil && !errors.Is(syncErr, controller.ErrCRDNotInstalled) {
+	if _, syncErr := s.syncFromKube(r.Context()); syncErr != nil && !errors.Is(syncErr, controller.ErrCRDNotInstalled) {
 		slog.Error("SyncFromKube failed before ReconcileWarmPool", "pool", name, "err", syncErr)
 		http.Error(w, "failed to sync cluster state before creating warm pool: "+syncErr.Error(), http.StatusInternalServerError)
 		return
@@ -951,12 +1065,16 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sa
 
 	targetURLStr := s.GetRegisteredPort(sandboxID, port)
 	if targetURLStr == "" && rec != nil {
-		if s.livePodRouting {
+		s.mu.RLock()
+		liveRouting := s.livePodRouting
+		poddURL := rec.PoddURL
+		s.mu.RUnlock()
+		if liveRouting {
 			if boxStatus, ok := s.reconciler.GetBox(sandboxID); ok && boxStatus.PodIP != "" && boxStatus.PodIP != "10.244.0.42" {
 				targetURLStr = fmt.Sprintf("http://%s:%d", boxStatus.PodIP, port)
 			}
-		} else if rec.PoddURL != "" {
-			if u, err := url.Parse(rec.PoddURL); err == nil && u.Hostname() != "" && u.Hostname() != "10.244.0.42" {
+		} else if poddURL != "" {
+			if u, err := url.Parse(poddURL); err == nil && u.Hostname() != "" && u.Hostname() != "10.244.0.42" {
 				targetURLStr = fmt.Sprintf("http://%s:%d", u.Hostname(), port)
 			}
 		}
@@ -970,6 +1088,10 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sa
 
 	// Fallback to local Connect-RPC handlers if port 49983 or Connect-RPC path is targeted without a live upstream daemon
 	if targetURLStr == "" && (port == 49983 || strings.HasPrefix(r.URL.Path, "/process.Process/") || strings.HasPrefix(r.URL.Path, "/filesystem.Filesystem/")) {
+		if !s.FeatureGateEnabled(FeatureGateE2BFilesystemWatch) && isFilesystemWatchPath(r.URL.Path) {
+			writeError(w, http.StatusNotImplemented, "filesystem watch feature gate is disabled")
+			return
+		}
 		s.handleConnectRPCDispatch(w, r, rec)
 		return
 	}
@@ -1103,12 +1225,16 @@ func (s *Server) executeCodeForSandbox(w http.ResponseWriter, r *http.Request, s
 	// Check if in-guest port 49999 has a target upstream registered
 	targetURLStr := s.GetRegisteredPort(sandboxID, 49999)
 	if targetURLStr == "" && rec != nil {
-		if s.livePodRouting {
+		s.mu.RLock()
+		liveRouting := s.livePodRouting
+		poddURL := rec.PoddURL
+		s.mu.RUnlock()
+		if liveRouting {
 			if boxStatus, ok := s.reconciler.GetBox(sandboxID); ok && boxStatus.PodIP != "" && boxStatus.PodIP != "10.244.0.42" {
 				targetURLStr = fmt.Sprintf("http://%s:49999", boxStatus.PodIP)
 			}
-		} else if rec.PoddURL != "" {
-			if u, err := url.Parse(rec.PoddURL); err == nil && u.Hostname() != "" && u.Hostname() != "10.244.0.42" {
+		} else if poddURL != "" {
+			if u, err := url.Parse(poddURL); err == nil && u.Hostname() != "" && u.Hostname() != "10.244.0.42" {
 				targetURLStr = fmt.Sprintf("http://%s:49999", u.Hostname())
 			}
 		}
