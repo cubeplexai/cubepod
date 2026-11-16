@@ -332,6 +332,13 @@ func (s *Server) SyncPodBoxesOnce(ctx context.Context) {
 		return
 	}
 
+	s.mu.RLock()
+	ids := make([]string, 0, len(s.sandboxes))
+	for id := range s.sandboxes {
+		ids = append(ids, id)
+	}
+	s.mu.RUnlock()
+
 	boxes, err := r.KubeClient().ListPodBoxes(ctx, "")
 	if err != nil {
 		return
@@ -345,22 +352,34 @@ func (s *Server) SyncPodBoxesOnce(ctx context.Context) {
 		}
 	}
 
-	s.mu.RLock()
-	ids := make([]string, 0, len(s.sandboxes))
-	for id := range s.sandboxes {
-		ids = append(ids, id)
-	}
-	s.mu.RUnlock()
-
 	for _, id := range ids {
 		unlock, ok := s.tryAcquireSandboxLock(id)
 		if !ok {
 			continue
 		}
 		box, found := byName[id]
+		if !found {
+			// Re-verify under the per-sandbox lock so a concurrent create/fork is never
+			// evicted due to an older ListPodBoxes snapshot.
+			if liveBox, getErr := r.KubeClient().GetPodBox(ctx, r.Namespace(), id); getErr == nil && liveBox != nil {
+				box = *liveBox
+				found = true
+			} else if getErr != nil && !isBoxNotFoundErr(getErr) {
+				unlock()
+				continue
+			}
+		}
 		s.reconcileCachedSandboxWithPodBox(id, box, found)
 		unlock()
 	}
+}
+
+func isBoxNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") || strings.Contains(msg, "404")
 }
 
 func (s *Server) reconcileCachedSandboxWithPodBox(sandboxID string, box v1alpha1.PodBox, found bool) (*SandboxRecord, bool) {
@@ -372,10 +391,10 @@ func (s *Server) reconcileCachedSandboxWithPodBox(sandboxID string, box v1alpha1
 		s.mu.Lock()
 		rec, ok := s.sandboxes[sandboxID]
 		if ok && rec != nil {
+			wireRec = cloneSandboxRecord(rec)
 			if !rec.explicitlyDeleted && rec.lastEmittedLifecycleState != events.EventKilled {
 				rec.lastEmittedLifecycleState = events.EventKilled
 				emitKilled = true
-				wireRec = cloneSandboxRecord(rec)
 				tenantHash = rec.OwnerTenantHash
 			}
 			delete(s.sandboxes, sandboxID)
@@ -388,6 +407,9 @@ func (s *Server) reconcileCachedSandboxWithPodBox(sandboxID string, box v1alpha1
 			s.releaseLocalSandbox(sandboxID)
 			if s.vault != nil {
 				s.vault.RevokeSandbox(sandboxID)
+			}
+			if wireRec != nil && wireRec.WorkspaceDir != "" && wireRec.VolumeKey == "" {
+				_ = os.RemoveAll(filepath.Dir(wireRec.WorkspaceDir))
 			}
 		}
 		if emitKilled && wireRec != nil {
@@ -1076,6 +1098,10 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 	if err := s.startRuntimeSandbox(r.Context(), recCopy, "", nil); err != nil {
 		s.mu.Lock()
 		rec.State = string(status.Phase)
+		rec.Reason = status.Reason
+		if wasPaused && (status.Phase == v1alpha1.PodBoxPhaseRunning || strings.EqualFold(string(status.Phase), "running")) {
+			rec.lastEmittedLifecycleState = events.EventResumed
+		}
 		s.mu.Unlock()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1237,6 +1263,7 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.RLock()
+	wasPaused := rec.State == "Paused" || rec.State == string(v1alpha1.PodBoxPhasePaused)
 	recCopy := cloneSandboxRecord(rec)
 	recCopy.RootfsGeneration++
 	liveRouting := s.livePodRouting
@@ -1262,6 +1289,10 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		rec.RootfsGeneration = recCopy.RootfsGeneration
 		rec.State = string(status.Phase)
+		rec.Reason = status.Reason
+		if wasPaused && (status.Phase == v1alpha1.PodBoxPhaseRunning || strings.EqualFold(string(status.Phase), "running")) {
+			rec.lastEmittedLifecycleState = events.EventResumed
+		}
 		s.mu.Unlock()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1271,6 +1302,9 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 	rec.RootfsGeneration = recCopy.RootfsGeneration
 	rec.State = string(status.Phase)
 	rec.Reason = status.Reason
+	if wasPaused {
+		rec.lastEmittedLifecycleState = events.EventResumed
+	}
 	if recCopy.PoddURL != "" {
 		rec.PoddURL = recCopy.PoddURL
 	}
@@ -1406,6 +1440,10 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	unlock := s.acquireSandboxLock(id)
 	defer unlock()
 
+	s.mu.RLock()
+	prevRec := cloneSandboxRecord(s.sandboxes[id])
+	s.mu.RUnlock()
+
 	rec, ok := s.resolveSandbox(r.Context(), id)
 	var alreadyEmittedKilled bool
 	s.mu.Lock()
@@ -1441,8 +1479,12 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	if ok && wireRec != nil && wireRec.WorkspaceDir != "" && (wireRec.VolumeKey == "" || deleteVolumes) {
-		_ = os.RemoveAll(filepath.Dir(wireRec.WorkspaceDir))
+	cleanupRec := wireRec
+	if cleanupRec == nil {
+		cleanupRec = prevRec
+	}
+	if cleanupRec != nil && cleanupRec.WorkspaceDir != "" && (cleanupRec.VolumeKey == "" || deleteVolumes) {
+		_ = os.RemoveAll(filepath.Dir(cleanupRec.WorkspaceDir))
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1527,6 +1569,10 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 		if err := s.startRuntimeSandbox(ctx, recCopy, "", nil); err != nil {
 			s.mu.Lock()
 			rec.State = string(status.Phase)
+			rec.Reason = status.Reason
+			if status.Phase == v1alpha1.PodBoxPhaseRunning || strings.EqualFold(string(status.Phase), "running") {
+				rec.lastEmittedLifecycleState = events.EventResumed
+			}
 			s.mu.Unlock()
 			return err
 		}

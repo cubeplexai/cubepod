@@ -2939,4 +2939,24 @@ func TestUnifiedFeatureGatesAndDisabling(t *testing.T) {
 	if missResp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404 when StatelessGatewayHA=false on cache miss, got %d", missResp.StatusCode)
 	}
+
+	// Subdomain proxy must enforce FeatureGateE2BFilesystemWatch even when live PodBox/PoddURL is present.
+	watchSbx := sbx.SandboxID
+	_ = sharedKube.UpsertPodBox(context.Background(), v1alpha1.PodBox{
+		Metadata: v1alpha1.ObjectMeta{Name: watchSbx, Namespace: "cubepod-workloads"},
+		Spec:     v1alpha1.PodBoxSpec{TemplateRef: "base", DesiredState: v1alpha1.DesiredStateRunning},
+		Status:   v1alpha1.PodBoxStatus{Phase: v1alpha1.PodBoxPhaseRunning, PodIP: "10.244.0.99"},
+	})
+	srv2.SetFeatureGate(gateway.FeatureGateStatelessGatewayHA, true)
+	srv2.SetFeatureGate(gateway.FeatureGateE2BFilesystemWatch, false)
+	subReq, _ := http.NewRequest(http.MethodPost, ts2.URL+"/filesystem.Filesystem/CreateWatcher", strings.NewReader(`{"path":"/workspace"}`))
+	subReq.Host = "49983-" + watchSbx + ".sandbox.local"
+	subResp, err := http.DefaultClient.Do(subReq)
+	if err != nil {
+		t.Fatalf("subdomain CreateWatcher failed: %v", err)
+	}
+	_ = subResp.Body.Close()
+	if subResp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("expected 501 for subdomain CreateWatcher when E2BFilesystemWatch=false with live poddURL, got %d", subResp.StatusCode)
+	}
 }

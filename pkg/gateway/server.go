@@ -1080,6 +1080,11 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sa
 		}
 	}
 
+	if !s.FeatureGateEnabled(FeatureGateE2BFilesystemWatch) && isFilesystemWatchPath(r.URL.Path) {
+		writeError(w, http.StatusNotImplemented, "filesystem watch feature gate is disabled")
+		return
+	}
+
 	// Fallback to local code runner if port 49999 is targeted without a live upstream daemon
 	if targetURLStr == "" && port == 49999 && (r.URL.Path == "/execute" || r.URL.Path == "/sandboxes/"+sandboxID+"/code/execute") {
 		s.executeCodeLocally(w, r, rec)
@@ -1088,10 +1093,6 @@ func (s *Server) handleSubdomainProxy(w http.ResponseWriter, r *http.Request, sa
 
 	// Fallback to local Connect-RPC handlers if port 49983 or Connect-RPC path is targeted without a live upstream daemon
 	if targetURLStr == "" && (port == 49983 || strings.HasPrefix(r.URL.Path, "/process.Process/") || strings.HasPrefix(r.URL.Path, "/filesystem.Filesystem/")) {
-		if !s.FeatureGateEnabled(FeatureGateE2BFilesystemWatch) && isFilesystemWatchPath(r.URL.Path) {
-			writeError(w, http.StatusNotImplemented, "filesystem watch feature gate is disabled")
-			return
-		}
 		s.handleConnectRPCDispatch(w, r, rec)
 		return
 	}
