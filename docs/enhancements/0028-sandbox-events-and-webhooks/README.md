@@ -107,31 +107,47 @@ All routes require `X-API-Key` (`requireManagementKey`).
 - **`PATCH /webhooks/{webhookID}`**: Update `url`, `events`, `enabled`, or `"rotateSecret": true`.
 - **`DELETE /webhooks/{webhookID}`**: Remove webhook (`204 No Content`).
 
-#### 2. Events Endpoints
+#### 2. Events Endpoints & E2B-Compatible Event Payload Schema
 
 - **`GET /events?sandboxID=...&eventType=...&limit=50&nextToken=...`**: Paginated tenant lifecycle events (`X-Next-Token` header).
 - **`GET /sandboxes/{sandboxID}/events`**: Convenience route scoped to one sandbox.
 
-Event payload schema:
+Event payload schema (compatible with E2B `v1` Sandbox Lifecycle Webhooks):
 
 ```json
 {
-  "id": "evt_01j9x...",
-  "type": "sandbox.lifecycle.created",
-  "sandboxID": "cpod-123",
-  "templateID": "base",
+  "version": "v1",
+  "id": "f5911677-cb60-498f-afed-f68143b3cc59",
+  "type": "sandbox.lifecycle.paused",
   "timestamp": "2026-11-16T01:15:00Z",
-  "data": {
-    "state": "running",
-    "reason": "Created"
+  "eventCategory": "lifecycle",
+  "eventLabel": "pause",
+  "sandboxId": "cpod-123",
+  "sandboxTeamId": "team_abc...",
+  "sandboxTemplateId": "base",
+  "sandboxBuildId": "a979a14b-bdcc-49e6-bc04-1189fc9fe7c2",
+  "sandboxExecutionId": "1dae9e1c-9957-4ce7-a236-a99d5779aadf",
+  "eventData": {
+    "pause_mode": "filesystem",
+    "execution": {
+      "started_at": "2026-11-16T01:10:00Z",
+      "vcpu_count": 2,
+      "memory_mb": 512,
+      "execution_time": 300000
+    }
   }
 }
 ```
 
+Notes on E2B compatibility:
+- CubePod emits `pause_mode: "filesystem"` on `paused` and `resume_mode: "reboot"` on `resumed` (reflecting CubePod's scale-to-zero PVC retention rather than RAM snapshot restore).
+- `eventData` may be `null` on `created` / `updated` / `forked`, or carry `execution` usage metadata on `paused` / `killed`.
+
 #### 3. Signature Verification Header
 
 Every delivery sends:
-- `X-CubePod-Event-ID: evt_...`
+- `e2b-signature: <hmac-sha256-hex-or-v1>` (official E2B webhook signature header)
+- `X-CubePod-Event-ID: <event-uuid>`
 - `X-CubePod-Signature: t=1794816900,v1=<hmac-sha256-hex(signatureKey, "1794816900." + rawBody)>`
 
 ### State Machine & Data Flow
