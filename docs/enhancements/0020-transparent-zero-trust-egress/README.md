@@ -3,7 +3,7 @@
 | Field | Value |
 | :--- | :--- |
 | **CEP Number** | `0020` |
-| **Status** | `implementable` (`alpha`) |
+| **Status** | `implemented` (`beta`) |
 | **Owning Area** | `egress` |
 | **Participating Areas** | `controller`, `gateway` |
 | **Authors** | @cubepod-maintainers |

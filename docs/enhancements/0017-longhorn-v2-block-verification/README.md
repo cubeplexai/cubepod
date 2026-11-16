@@ -3,9 +3,9 @@
 | Field | Value |
 | :--- | :--- |
 | Stage | alpha |
-| Status | implementable |
+| Status | implemented (opt-in) |
 | Created | 2026-11-11 |
-| Updated | 2026-11-11 |
+| Updated | 2026-11-16 |
 | Owning Area | storage |
 
 ## Release Signoff Checklist
@@ -14,7 +14,14 @@
 - [x] Design covers Production Kubernetes (`Kata + CSI Block`) and Local Development (`Docker + Loopback ext4`).
 - [x] Test plan names the live invariant: a `volumeMode: Block` PVC on `longhorn-v2-block-thin` binds and the consumer sees an NVMe block device.
 - [x] Graduation: `make test-k8s-longhorn-v2` passed on the live cluster on 2026-11-11. Kubelet on `gpu-214` advertised `hugepages-2Mi: 2Gi` after the pages were allocated, before the restart Pod ran, so kubelet was not restarted.
-- [ ] Security review of the privileged Longhorn DaemonSet is recorded before this StorageClass becomes the default for CubePod sandboxes.
+- [ ] Security review of the privileged Longhorn DaemonSet is recorded before this StorageClass becomes the default for CubePod sandboxes *(Longhorn V2 remains optional/opt-in in `deploy/k8s/longhorn-v2/` and is NOT the cluster-wide default `StorageClass`; `cubepod-controller` and `cubepod-gateway` CLI flags default to `nfs-storage`)*.
+
+> [!NOTE]
+> **Opt-In Status & Pre-Default Security/Operational Review Notes (Updated 2026-11-16):**
+> Although `deploy/helm/cubepod/values.yaml` lists `storage.storageClassName: "longhorn-v2-block-thin"` for SPDK raw block templates, Longhorn V2 remains **optional/opt-in** in cluster operations (`persistence.defaultClass: false`, node-pinned via `cubepod.io/longhorn-v2=true`, and binary `--storage-class` flags defaulting to `nfs-storage`). Before promoting Longhorn V2 as a general cluster default, operators must complete and record a security and operational review covering:
+> 1. **Privileged DaemonSet surface**: `longhorn-manager`, CSI node plugins, and `instance-manager` run with privileged host access, host PID/network/IPC or device access, and `nvme-tcp` kernel module loading.
+> 2. **Dedicated SPDK resource pinning**: `spdk_tgt` polls continuously (`v2DataEngineGuaranteedInstanceManagerCPU: 1000m`, `v2DataEngineCPUMask: "0x2"`) and requires `2Gi` of `2Mi` hugepages per storage node.
+> 3. **Verification backing & version lifecycle**: Current verification (`deploy/k8s/longhorn-v2/`) uses a single-replica sparse loop AIO disk on Longhorn `v1.8.2` (pinned for K8s `1.27` compatibility, outside upstream maintenance) rather than multi-replica physical NVMe storage.
 
 ## Summary
 

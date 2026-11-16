@@ -34,7 +34,7 @@ CubePod 通过两大协同设计解决了这一问题（参见 **[CEP 提案总�
 
 `cubepod-gateway` 对外暴露以下桌面控制接口（同步支持 `/v1/sandboxes/{id}/desktop/...` 路径）：
 
-- `POST /sandboxes/{id}/desktop/start` — 校验分辨率格式（`WxHx{16|24|32}`），若沙箱处于 `Paused` 则自动唤醒，检查 `/opt/cubepod/desktop/cubepod-desktop-ctl` 是否存在（非桌面镜像直接返回 **`HTTP 422 desktop_not_installed`**），随后通过 `podd` 启动桌面栈并返回访问端点（`desktopUrl`、`terminalUrl`、`cdpUrl`）。
+- `POST /sandboxes/{id}/desktop/start` — 校验分辨率格式（`WxHx{16|24|32}`）与可选 `transport` 参数（`"webrtc" | "novnc"`，*v0.6.0 新增*），若沙箱处于 `Paused` 则自动唤醒，检查 `/opt/cubepod/desktop/cubepod-desktop-ctl` 是否存在（非桌面镜像直接返回 **`HTTP 422 desktop_not_installed`**），随后通过 `podd` 启动桌面栈并返回访问端点（`desktopUrl`、`terminalUrl`、`cdpUrl`，以及 `transportUsed`、可选端口 `8081` 的 `webrtcUrl` 与 `fallbackReason`）。若在未安装 Neko/WebRTC 二进制的镜像上请求 `transport: "webrtc"`，`cubepod-desktop-ctl` 与网关会优雅降级回退至 `noVNC`（`transportUsed: "novnc"`、`fallbackReason: "neko_not_installed"`）。
 - `GET /sandboxes/{id}/desktop/status` — 实时查询 `Xvfb`、`openbox`、`chromium`、`x11vnc`/`noVNC` 与 `ttyd` 的运行状态。
 - `POST /sandboxes/{id}/desktop/stop` — 优雅停止图形守护进程以释放内存，同时不影响沙箱计算或 `/workspace` 数据。
 

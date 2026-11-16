@@ -13,12 +13,12 @@ reviewers:
   - "@cubepod-maintainers"
 approvers:
   - "@cubepod-maintainers"
-stage: "alpha"
-latest-milestone: "v0.5"
+stage: "beta"
+latest-milestone: "v0.6.0"
 milestone:
-  alpha: "v0.5"
-  beta: "v0.6"
-  stable: "v1.0"
+  alpha: "v0.5.0"
+  beta: "v0.6.0"
+  stable: "v1.0.0"
 feature-gates:
   - name: "E2BSecretsAPI"
     components:

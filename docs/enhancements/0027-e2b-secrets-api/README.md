@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `alpha` | `implemented` | `2026-11-15` | `2026-11-15` | `gateway` |
+| `beta` | `implemented` | `2026-11-15` | `2026-11-16` | `gateway` |
 
 ## Table of Contents
 

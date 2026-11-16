@@ -14,11 +14,11 @@ reviewers:
 approvers:
   - "@xfgong"
 stage: "alpha"
-latest-milestone: "v0.4"
+latest-milestone: "v0.4.0"
 milestone:
-  alpha: "v0.4"
-  beta: "v0.5"
-  stable: "v1.0"
+  alpha: "v0.4.0"
+  beta: "v0.6.0"
+  stable: "v1.0.0"
 feature-gates:
   - name: "E2BVolumes"
     components:

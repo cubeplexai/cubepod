@@ -9,7 +9,7 @@ CubePod 实现了核心 E2B REST 与 Connect-RPC 端点，允许使用官方 E2B
 
 :::note[兼容性测试覆盖一览]
 - **官方 Python SDK（CI 持续验证）**：每次提交与 PR 都会自动运行 `make test-e2b-compat`（共 34 个自动化用例，使用官方 `e2b` 同步/异步与 `e2b-code-interpreter` SDK 对接真实的 `cubepod-gateway` 与进程内数据面桩），并与完整 Rust + Go 运行时端到端测试（`make test-e2e`）一并通过。如需针对自建网关验证，可通过 `CUBEPOD_GATEWAY_URL` 运行 [`test/e2b-compat/`](https://github.com/cubeplexai/cubepod/tree/main/test/e2b-compat)。
-- **官方 JS / TypeScript SDK（暂未测试）**：上游 `@e2b/code-interpreter` 与 `e2b` npm 包暂未纳入自动化兼容测试。如需在 TypeScript 项目中直接接入，推荐使用经过完整单元测试的 CubePod 原生 **[TypeScript SDK](/zh/sdks/typescript/)**。
+- **官方 JS / TypeScript SDK（暂未测试）与原生 SDK 功能对齐（`v0.6.0`）**：上游 `@e2b/code-interpreter` 与 `e2b` npm 包暂未纳入 CI 自动化兼容测试。在 `v0.6.0` 中，CubePod 原生 **[Python SDK](/zh/sdks/python/)** 与 **[TypeScript SDK](/zh/sdks/typescript/)** 已实现完整功能对齐（含 `get_metrics`/`getMetrics`、`Secret.fill`/`fillSecret`、Secrets、Volumes、Events 与 Webhooks）。
 - **上层 Agent 框架（暂未测试）**：LangChain、LlamaIndex、AutoGen、CrewAI、OpenHands、Smolagents 等编排框架可通过兼容端点接入，但仓库内暂未包含对应的专项集成测试套件。
 :::
 
@@ -103,6 +103,7 @@ export E2B_API_KEY="cpod_test_api_key"
 | `sandbox.kill()` / `delete` | `DELETE /sandboxes/{id}` | **兼容** | `pkg/gateway/sandboxes.go:handleDeleteSandbox`<br/>`test/e2b-compat/test_official_e2b_sync.py`<br/>`test/e2b-compat/test_official_e2b_async.py` | `e2b>=2.0.0`（依赖下限，非已测版本全集） | 释放计算 Pod。临时沙箱在销毁时自动回收临时存储；命名持久化工作区默认保留，除非显式指定删除。 |
 | `sandbox.set_timeout(...)` / 租约续期 | `POST /sandboxes/{id}/refreshes`<br/>`POST /sandboxes/{id}/timeout` | **兼容** | `pkg/gateway/sandboxes.go:handleRefreshSandbox`<br/>`test/e2b-compat/test_official_e2b_sync.py`<br/>`test/e2b-compat/test_official_e2b_async.py`<br/>`pkg/gateway/e2b_conformance_test.go` | `e2b>=2.0.0`（依赖下限，非已测版本全集） | 续期沙箱租约并重置后台空闲回收计时。 |
 | `Sandbox.connect(...)` | `POST /v2/sandboxes/{id}/connect`<br/>`POST /sandboxes/{id}/connect` | **兼容** | `pkg/gateway/sandboxes.go:handleConnectSandbox`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | 重新连接运行中沙箱，或自动唤醒已暂停沙箱（但不保留暂停前的内存进程状态）。 |
+| `sbx.get_metrics(...)` / `Sandbox.get_metrics(...)` *(v0.6.0 新增)* | `GET /sandboxes/{sandboxID}/metrics`<br/>`GET /sandboxes/metrics` | **部分兼容** | `pkg/gateway/sandbox_metrics.go`<br/>`crates/podd/src/metrics.rs`<br/>`pkg/gateway/sandbox_metrics_test.go` | Go `-race` 与 Rust 单测 | 返回 `SandboxMetric` 快照（`timestamp`、`timestampUnix`、`cpuCount`、`cpuUsedPct`、`memUsed`、`memTotal`、`memCache`、`diskUsed`、`diskTotal`），支持 `start`/`end` 过滤（`autoResume=false` 时直接读取缓存而不唤醒暂停沙箱）。原生 Python/TS SDK 提供 `get_metrics` / `getMetrics`，`test/e2b-compat/` 暂未纳入对应官方用例。 |
 
 ---
 
@@ -171,9 +172,9 @@ export E2B_API_KEY="cpod_test_api_key"
 | :--- | :--- | :--- |
 | **官方 JS/TS SDK**（`@e2b/code-interpreter`、`e2b`） | **未测试** | 仓库内尚未运行官方 JS/TS npm 客户端的自动化兼容测试。 |
 | **Agent 编排框架**（LangChain、LlamaIndex、AutoGen、CrewAI、OpenHands、Smolagents） | **未测试** | 仓库内尚未集成针对各第三方框架的端到端测试套件。 |
-| **官方 E2B Volumes API**（`POST /volumes`、`/volumecontent/{id}/*`、`volumeMounts`） | **部分兼容** | **对用户的影响：** 卷管理与文件读写在 `e2b>=2.0.0` 下可用，但调用 `vol.write_file()` / `vol.read_file()` 连接自建网关时必须显式传入 `api_url`（否则官方 SDK 默认请求 `e2b.app`）。在 Kubernetes 集群上挂载卷到沙箱需要配置集群级 RWX 共享存储，否则创建带 `volumeMounts` 的沙箱会返回 `501 Not Implemented`。 |
-| **官方 E2B Secrets API**（`POST /secrets`、`GET /secrets`、`POST /secrets/{id}`、`DELETE /secrets/{id}`、`network.rules`） | **部分兼容** | **对用户的影响：** 单实例网关支持 Write-Only 密钥增删改查（`Secret.create`/`list`/`get_info`/`update`/`destroy`/`fill`）与 `network.rules` 请求头注入；暂不支持多副本 Kubernetes Gateway 之间的密钥状态同步，且本地 Docker 模式下不运行出站代理，无法对容器出站流量执行密钥头注入。 |
-| **沙箱生命周期事件与 Webhook**（`POST/GET /webhooks`、`PATCH/DELETE /webhooks/{id}`、`GET /events`、`GET /sandboxes/{id}/events`） | **部分兼容** | **对用户的影响：** 支持发送带 `e2b-signature` 签名的 E2B `v1` 生命周期事件（`created`、`paused`、`resumed`、`updated`、`forked`、`killed`），其中暂停与恢复模式固定为 `pause_mode: "filesystem"` 与 `resume_mode: "reboot"`。目前事件历史与 Webhook 配置仅支持单实例网关本地持久化（多副本 Kubernetes HA 共享将在 Beta 支持）。 |
+| **官方 E2B Volumes API**（`POST /volumes`、`/volumecontent/{id}/*`、`volumeMounts`） | **部分兼容** | **对用户的影响：** 卷管理与文件读写在 `e2b>=2.0.0` 下可用，但调用 `vol.write_file()` / `vol.read_file()` 连接自建网关时必须显式传入 `api_url`（否则上游 SDK 默认请求 `e2b.app`）。*v0.6.0 变更：* 在 Helm 中配置 `e2bVolumes.rwxStorageClassName` 后会自动激活共享 RWX PVC 并启用 Kubernetes 下的 `K8sE2BVolumeMounts`（未配置时返回 `501 Not Implemented`）。 |
+| **官方 E2B Secrets API**（`POST /secrets`、`GET /secrets`、`POST /secrets/{id}`、`DELETE /secrets/{id}`、`Secret.fill()`、`network.rules`） | **部分兼容** | **对用户的影响：** Write-Only 密钥增删改查与 `Secret.fill(name)`（`${e2b.secrets.<name>}`）已通过 `test/e2b-compat/test_official_e2b_extended.py` 中的 `test_official_secret_crud_and_fill` 验证，原生 Python/TS SDK 亦实现 `Secret.fill` / `fillSecret` 对齐。*v0.6.0 变更：* 新增 `KubeSecretBackend`（`secrets.backend: "k8s"`）、后台同步及按需 Vault 重水合，支持多副本 Kubernetes 网关 HA 与严格 mTLS 交换。本地 Docker 模式仍不运行出站代理，因此出站头注入仅适用于 Kubernetes 模式。 |
+| **沙箱生命周期事件与 Webhook**（`POST/GET /webhooks`、`PATCH/DELETE /webhooks/{id}`、`GET /events`、`GET /sandboxes/{id}/events`） | **部分兼容** | **对用户的影响：** *v0.6.0 新增。* 支持发送带 `e2b-signature` 签名的 E2B `v1` 生命周期事件（`created`、`paused`、`resumed`、`updated`、`forked`、`killed`），暂停/恢复模式为 `pause_mode: "filesystem"` 与 `resume_mode: "reboot"`，并由 `SyncPodBoxesOnce` 异步捕获 K8s 空闲回收状态转换。Kubernetes 模式下 Webhook 配置持久化为 `SandboxWebhook` CRD（HMAC 密钥保存在 `secretRef`），事件历史仍按有界本地保留与 K8s 事件提供。 |
 | **官方 E2B `sandbox.git` 助手** | **未测试** | 上游文档将 `sandbox.git` 说明为已弃用的 SDK 助手，它绑定在命令执行器上（`Git` 由 `Commands` 对象构造），并不是专用 HTTP Git 接口。`test/e2b-compat` 没有调用 `sandbox.git`。通过 `sandbox.commands.run()` 执行 `git` 只是普通 shell 命令路径，不能证明官方 git helper 兼容（例如 clone 选项、凭据助手、`dangerously_authenticate`、结构化 status/branch API 等）。 |
 
 ---

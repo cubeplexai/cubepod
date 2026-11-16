@@ -45,7 +45,7 @@ In `pkg/controller/reconciler.go` (`ensureEgressSecretsLocked`), `cubepod-contro
 `cubepod-egress` (`cmd/cubepod-egress/`, `pkg/egress/`) supports both explicit HTTP proxy clients and proxy-unaware binaries (such as static Go/Rust tools, `curl --noproxy`, or raw sockets):
 
 - **Explicit Proxy Listener (`:18080`)**: Serves HTTP proxy and `HTTPS CONNECT` tunnels via `HTTP_PROXY` / `HTTPS_PROXY`.
-- **Transparent Interception (`CUBEPOD_TRANSPARENT=1`)**: An init hook (`images/egress/egress-init.sh`) installs the `nftables` table `cubepod_egress` in the Pod network namespace before guest workload start:
+- **Transparent Interception (`CUBEPOD_TRANSPARENT=1`, *Changed in v0.6.0*)**: When `TransparentEgress` is enabled (`cubepod-controller` `--transparent-egress=true` / `--feature-gate=TransparentEgress=true`, Helm `egress.transparent: true` and `featureGates.transparentEgress: true`), `cubepod-controller` injects `CUBEPOD_TRANSPARENT=1` and `securityContext.capabilities.add: ["NET_ADMIN"]` on the `egress` sidecar container (`pkg/controller/manifests.go`), while an init hook (`images/egress/egress-init.sh`) installs the `nftables` table `cubepod_egress` in the Pod network namespace before guest workload start:
   - Redirects outbound **TCP port `80`** -> **`:18081`** (`cubepod-egress` transparent HTTP)
   - Redirects outbound **TCP port `443`** -> **`:18443`** (`cubepod-egress` transparent TLS SNI router)
   - Redirects outbound **UDP/TCP port `53`** -> **`:18053`** (`cubepod-egress` policy-enforcing DNS proxy)
@@ -74,6 +74,14 @@ For allowed TLS connections (`CONNECT :18080` or transparent `:18443`), `pkg/egr
   2. Scans headers (respecting `AllowedHeaders` restrictions when set) for `cpodref_` tokens.
   3. Calls `cubepod-gateway` (`POST /internal/v1/egress/exchange`) over **per-sandbox mTLS**, where the gateway verifies that the sidecar's client certificate **`CN` matches `sandboxID`**, along with `sniHost` and `headerName`.
   4. Replaces `cpodref_...` with the real secret solely in transit buffers and forwards upstream; real credentials are never logged or sent back to the guest.
+
+## 6. Multi-Replica Gateway HA Secrets & Strict mTLS Exchange *(Added / Changed in v0.6.0)*
+
+To support horizontally scaled `cubepod-gateway` deployments (`gateway.replicaCount > 1`) without local state drift:
+
+- **`KubeSecretBackend` Cross-Replica HA Sync (`pkg/secret/kube_backend.go`)**: When `CUBEPOD_SECRETS_BACKEND=k8s` (the Kubernetes default when `CUBEPOD_SECRETS_DIR` is unset), `/secrets` entries are persisted as `core/v1` `Secret` objects named `cubepod-e2b-sec-<id>` (labeled `cubepod.io/resource=e2b-secret` and `cubepod.io/tenant=<prefix>`). Every gateway replica runs `StartSecretsSync` (every `5s`) to keep its in-memory store synchronized and propagate secret rotations/revocations (`OnUpdate` / `OnRevoke`) into its local `Vault`.
+- **On-Demand Vault Re-Hydration (`rehydrateVaultBinding`)**: If a `cubepod-egress` sidecar hits a gateway replica whose in-memory `Vault` does not yet hold the `cpodref_` binding (for example after a Pod rollout or round-robin routing), the gateway fetches the `PodBox` CR from Kubernetes, inspects `spec.networkPolicy.secretRefBindings`, syncs the secret store, restores the managed binding into `Vault`, and completes the exchange without failing the outbound request.
+- **Strict mTLS Exchange Listener (`--egress-mtls-addr`)**: When running with Kubernetes or `--egress-ca-cert` / `--egress-mtls-addr`, `cubepod-gateway` enforces `SetStrictEgressMTLS(true)`, rejecting any non-mTLS header/body sandbox identity fallbacks. Passing `--egress-mtls-addr` (optionally with `--egress-tls-cert` / `--egress-tls-key`, otherwise auto-minted from `EgressCA`) starts a dedicated `POST /internal/v1/egress/exchange` HTTPS server configured with `tls.RequireAndVerifyClientCert`.
 
 Prometheus metrics and liveness probes are exposed by `cubepod-egress` on **`:19090`** (`/metrics` and `/healthz`).
 

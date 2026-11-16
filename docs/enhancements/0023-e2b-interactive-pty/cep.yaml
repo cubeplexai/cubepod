@@ -12,11 +12,11 @@ reviewers:
 approvers:
   - "@cubepod-maintainers"
 stage: "alpha"
-latest-milestone: "v0.5"
+latest-milestone: "v0.5.0"
 milestone:
-  alpha: "v0.5"
-  beta: "v0.6"
-  stable: "v1.0"
+  alpha: "v0.5.0"
+  beta: "v0.7.0"
+  stable: "v1.0.0"
 feature-gates: []
 disable-supported: false
 metrics: []

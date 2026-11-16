@@ -33,10 +33,10 @@ stateDiagram-v2
 
 ### 空闲自动暂停、租约保护与透明唤醒
 
-- **空闲回收 (`ReapIdle`)**：`cubepod-controller` 持续对照 `status.lastActivityAt` 与 `spec.lifecycle.idleTimeoutSeconds`。若 Agent 持有尚未过期的租约（`spec.lifecycle.leaseExpiresAt` 在未来），控制器会延后自动暂停，防止长任务中途休眠。
+- **空闲回收 (`ReapIdle`) 与 K8s 异步回收事件推送** *(v0.6.0 新增)*：`cubepod-controller` 持续对照 `status.lastActivityAt` 与 `spec.lifecycle.idleTimeoutSeconds`。若 Agent 持有尚未过期的租约（`spec.lifecycle.leaseExpiresAt` 在未来），控制器会延后自动暂停。当控制器异步将 `PodBox` 转为 `Paused`、`Terminated` 或清理过期对象时，`cubepod-gateway` 的 `SyncPodBoxesOnce` 同步循环会捕获状态变化并去重发出 `sandbox.lifecycle.paused`（`pause_mode: "filesystem"`）与 `sandbox.lifecycle.killed` 事件到 `/events` 及已订阅 Webhook。
 - **算力暂停归零**：将 `desiredState` 设为 `Paused` 会销毁计算 Pod（清空 `status.podName` 与 `status.podIP`），而 `<box>-rootfs-pvc` 与 `<box>-workspace-pvc` 保持完整保留。
 - **暂停 TTL 清理**：当 `status.pausedAt` 超过 `spec.lifecycle.pausedTTLSeconds` 后，控制器自动清理过期持久卷。
-- **透明自动唤醒**：向处于 `Paused` 状态的沙箱发起任意请求——无论是显式 `POST /sandboxes/{id}/connect`、数据面 `/commands` 或 `/files`、通配符子域名访问、桌面启动还是 `/panel/{token}/` 代理——`cubepod-gateway` 都会自动将 `desiredState` 切回 `Running`，并通过 `waitForPoddReady` 等待 `podd` `/health` 就绪后无缝完成转发。
+- **透明自动唤醒与沙箱粒度锁** *(v0.6.0 变更)*：向处于 `Paused` 状态的沙箱发起任意请求——无论是显式 `POST /sandboxes/{id}/connect`、数据面 `/commands` 或 `/files`、通配符子域名访问、桌面启动还是 `/panel/{token}/` 代理——`cubepod-gateway` 都会自动将 `desiredState` 切回 `Running`，并通过 `waitForPoddReady` 等待 `podd` `/health` 就绪后无缝完成转发。生命周期操作通过引用计数的单沙箱操作锁（`acquireSandboxLock` / `tryAcquireSandboxLock`）串行化，并在耗时的 Kubernetes `Reconcile` 与 `waitForPoddReady` 期间释放全局锁 `Server.mu`，确保 `/health` 探针与其它沙箱互不阻塞。
 
 ## 基于 `PodWarmPool` 的 `< 50 ms` 极速创建
 
@@ -76,7 +76,7 @@ sequenceDiagram
 
 - **有界冻结防死锁**：父沙箱 `podd` 在刷新脏页（`sync` + `syncfs`）后调用 `FIFREEZE`（`0xC0045877`），由单调时钟看门狗约束最长冻结窗口（`maxFreezeMs` 限制在 `[100, 5000]` ms，默认 `1500` ms）。即使 `cubepod-controller` 在克隆中途崩溃重启，父 MicroVM 也会按时自动解冻。
 - **双后端无缝实现**：
-  - **Kubernetes CSI 模式**：`cubepod-controller` 通过 `dataSource`（`DataSourcePVC` / 快照克隆）创建指向父沙箱 RootFS 与 Workspace 卷的子 PVC。
+  - **Kubernetes CSI 模式（`pvc-clone` 与 `snapshot`，*v0.6.0 新增*）**：默认模式下（`--fork-mode=pvc-clone`），`cubepod-controller` 通过 `dataSource`（`DataSourcePVC`）创建指向父沙箱 RootFS 与 Workspace 卷的子 PVC；当配置 `--fork-mode=snapshot`（可配 `--volume-snapshot-class=<VolumeSnapshotClassName>`）时，控制器会先为父卷创建临时 `snapshot.storage.k8s.io/v1` `VolumeSnapshot`，等待 `ReadyToUse`（`WaitVolumeSnapshotReady`）后再以 `dataSource.kind: VolumeSnapshot` 创建子 PVC，并在完成后（或失败回滚时）清理临时快照。
   - **本地 Docker Loopback 模式**：`pkg/runtime/docker.go` 调用 `quiesceSandbox`，利用 `cp --reflink=auto --sparse=always -a` 克隆两个稀疏 `.ext4` 文件，随后触发 `thaw` 并以 `CUBEPOD_FORKED=1` 启动子容器。
 - **跨代 PVC 解析 (`resolveParentPVCNames`)**：若父沙箱此前执行过 `reset-rootfs`（`rootfsGeneration > 1`），其实际在用的 RootFS PVC 名为 `<parent>-rootfs-gen<N>-pvc`。`resolveParentPVCNames` 会直接读取父沙箱的 `status.RootfsPVCName` 与 `status.WorkspacePVCName`，避免错克隆第 1 代旧卷。
 
