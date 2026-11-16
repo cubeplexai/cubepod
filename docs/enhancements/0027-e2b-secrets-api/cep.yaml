@@ -30,4 +30,3 @@ metrics:
   - "cubepod_secrets_operations_total"
   - "cubepod_secrets_store_count"
   - "cubepod_egress_secret_exchanges_total"
-  - "cubepod_egress_secret_denied_total"
