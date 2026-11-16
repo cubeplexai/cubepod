@@ -419,8 +419,8 @@ func TestE2E_GatewayFullStackLifecycle(t *testing.T) {
 	chkResp, _ := http.Get(ts.URL + "/sandboxes/" + sbID)
 	_ = json.NewDecoder(chkResp.Body).Decode(&rec)
 	chkResp.Body.Close()
-	if rec.State != "Running" || rec.AutoResumeCount < 1 {
-		t.Fatalf("expected Running state and AutoResumeCount >= 1, got state=%s count=%d", rec.State, rec.AutoResumeCount)
+	if rec.State != "running" || rec.AutoResumeCount < 1 {
+		t.Fatalf("expected running state and AutoResumeCount >= 1, got state=%s count=%d", rec.State, rec.AutoResumeCount)
 	}
 
 	// 7. Reset RootFS preserving /workspace
