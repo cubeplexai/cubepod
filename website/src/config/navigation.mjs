@@ -21,6 +21,7 @@ export function getHeaderNav(locale, pathname = '/') {
       active:
         stripped !== '/' &&
         !stripped.startsWith('/getting-started/quickstart') &&
+        !stripped.includes('e2b-compatibility') &&
         !stripped.startsWith('/sdks') &&
         !stripped.startsWith('/deployment') &&
         !stripped.startsWith('/api'),
@@ -30,6 +31,12 @@ export function getHeaderNav(locale, pathname = '/') {
       label: isZh ? '快速上手' : 'Quickstart',
       href: `${prefix}/getting-started/quickstart/`,
       active: stripped.startsWith('/getting-started/quickstart'),
+    },
+    {
+      id: 'e2b',
+      label: isZh ? 'E2B 兼容' : 'E2B Compat',
+      href: `${prefix}/reference/e2b-compatibility/`,
+      active: stripped.includes('e2b-compatibility'),
     },
     {
       id: 'sdks',
