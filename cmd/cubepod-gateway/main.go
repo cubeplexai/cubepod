@@ -244,6 +244,36 @@ func main() {
 		slog.Info("E2B secret store enabled", "dir", secretsDir)
 	}
 
+	eventsDir := strings.TrimSpace(os.Getenv("CUBEPOD_EVENTS_DIR"))
+	if eventsDir == "" && *stateDir != "" {
+		eventsDir = filepath.Join(*stateDir, "events")
+	} else if eventsDir == "" && volDir != "" {
+		eventsDir = filepath.Join(filepath.Dir(volDir), "events")
+	}
+	if eventsDir != "" && !strings.EqualFold(eventsDir, "disabled") {
+		ecfg := gateway.E2BEventsConfig{Dir: eventsDir}
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_WEBHOOK_ALLOW_PRIVATE"))) {
+		case "1", "true", "yes":
+			ecfg.AllowPrivateIPs = true
+		}
+		if rawKey := strings.TrimSpace(os.Getenv("CUBEPOD_EVENTS_KEY")); rawKey != "" {
+			if decoded, err := base64.StdEncoding.DecodeString(rawKey); err == nil && len(decoded) == 32 {
+				ecfg.EncryptionKey = decoded
+			} else if decoded, err := hex.DecodeString(rawKey); err == nil && len(decoded) == 32 {
+				ecfg.EncryptionKey = decoded
+			} else {
+				slog.Error("CUBEPOD_EVENTS_KEY must be a 32-byte base64 or 64-char hex key")
+				os.Exit(1)
+			}
+		}
+		if err := gw.ConfigureEvents(ecfg); err != nil {
+			slog.Error("failed to configure E2B events and webhooks", "dir", eventsDir, "err", err)
+			os.Exit(1)
+		}
+		defer gw.CloseEvents()
+		slog.Info("E2B events and webhooks enabled", "dir", eventsDir, "allowPrivateIPs", ecfg.AllowPrivateIPs)
+	}
+
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("CUBEPOD_RUNTIME")), "docker") {
 		cfg := runtime.DockerConfig{
 			DockerHost:          os.Getenv("DOCKER_HOST"),
