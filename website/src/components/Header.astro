@@ -1,0 +1,309 @@
+---
+import config from 'virtual:starlight/user-config';
+
+import LanguageSelect from 'virtual:starlight/components/LanguageSelect';
+import Search from 'virtual:starlight/components/Search';
+import SiteTitle from 'virtual:starlight/components/SiteTitle';
+import SocialIcons from 'virtual:starlight/components/SocialIcons';
+import ThemeSelect from 'virtual:starlight/components/ThemeSelect';
+import { getHeaderNav } from '../config/navigation.mjs';
+
+const shouldRenderSearch =
+  config.pagefind || config.components.Search !== '@astrojs/starlight/components/Search.astro';
+
+const pathname = Astro.url.pathname;
+const locale = pathname === '/zh' || pathname.startsWith('/zh/') ? 'zh' : 'en';
+const { isZh, docsLinks, ecosystemLinks } = getHeaderNav(locale, pathname);
+---
+
+<div class="header">
+  <div class="cp-header-left sl-flex">
+    <div class="title-wrapper sl-flex">
+      <SiteTitle />
+    </div>
+
+    <nav class="cp-header-nav sl-hidden md:sl-flex" aria-label={isZh ? '主导航' : 'Primary'}>
+      {docsLinks.map((item) => (
+        <a
+          href={item.href}
+          class:list={['cp-nav-link', { 'is-active': item.active }]}
+          aria-current={item.active ? 'page' : undefined}
+        >
+          {item.label}
+        </a>
+      ))}
+      <span class="cp-nav-sep" aria-hidden="true"></span>
+      {ecosystemLinks.map((eco) => (
+        <a
+          href={eco.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={eco.title}
+          class="cp-nav-link cp-nav-eco"
+        >
+          <span>{eco.label}</span>
+          <span class="cp-nav-ext" aria-hidden="true">↗</span>
+        </a>
+      ))}
+    </nav>
+  </div>
+
+  <div class="cp-header-actions sl-flex print:hidden">
+    <div class="cp-header-search sl-flex">
+      {shouldRenderSearch && <Search />}
+    </div>
+
+    <details class="cp-mobile-nav md:sl-hidden">
+      <summary class="cp-mobile-nav-btn">
+        <span>{isZh ? '导航' : 'Nav'}</span>
+        <span aria-hidden="true">▾</span>
+      </summary>
+      <div class="cp-mobile-nav-panel">
+        <div class="cp-mobile-nav-group">
+          <div class="cp-mobile-nav-heading">{isZh ? '文档导航' : 'Documentation'}</div>
+          {docsLinks.map((item) => (
+            <a
+              href={item.href}
+              class:list={['cp-mobile-nav-link', { 'is-active': item.active }]}
+              aria-current={item.active ? 'page' : undefined}
+            >
+              {item.label}
+            </a>
+          ))}
+        </div>
+        <div class="cp-mobile-nav-group">
+          <div class="cp-mobile-nav-heading">{isZh ? 'CubePlex 生态' : 'Ecosystem'}</div>
+          {ecosystemLinks.map((eco) => (
+            <a
+              href={eco.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              class="cp-mobile-nav-link"
+            >
+              <span>{eco.label}</span>
+              <span class="cp-nav-ext" aria-hidden="true">↗</span>
+            </a>
+          ))}
+        </div>
+      </div>
+    </details>
+  </div>
+
+  <div class="sl-hidden md:sl-flex print:hidden right-group">
+    <div class="sl-flex social-icons">
+      <SocialIcons />
+    </div>
+    <ThemeSelect />
+    <LanguageSelect />
+  </div>
+</div>
+
+<script is:inline>
+  document.addEventListener('click', (e) => {
+    document.querySelectorAll('details.cp-mobile-nav[open]').forEach((el) => {
+      if (!el.contains(e.target)) el.removeAttribute('open');
+    });
+  });
+</script>
+
+<style>
+  @layer starlight.core {
+    .header {
+      display: flex;
+      gap: 0.75rem;
+      justify-content: space-between;
+      align-items: center;
+      height: 100%;
+    }
+
+    .cp-header-left {
+      align-items: center;
+      gap: 1.1rem;
+      min-width: 0;
+    }
+
+    .title-wrapper {
+      overflow: clip;
+      padding: 0.25rem;
+      margin: -0.25rem;
+      min-width: 0;
+      flex-shrink: 0;
+    }
+
+    .cp-header-nav {
+      align-items: center;
+      gap: 0.2rem;
+      flex-wrap: nowrap;
+      white-space: nowrap;
+    }
+
+    .cp-nav-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.22rem;
+      padding: 0.32rem 0.56rem;
+      border-radius: 0.25rem;
+      border: 1px solid transparent;
+      font-family: var(--sl-font);
+      font-size: 0.84rem;
+      font-weight: 500;
+      line-height: 1.2;
+      color: var(--cp-muted, var(--sl-color-gray-2));
+      text-decoration: none;
+      transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+    }
+
+    .cp-nav-link:hover {
+      color: var(--cp-heading, var(--sl-color-white));
+      background-color: var(--cp-surface, var(--sl-color-gray-6));
+      border-color: var(--cp-border, var(--sl-color-gray-5));
+    }
+
+    .cp-nav-link.is-active {
+      color: var(--cp-primary, var(--sl-color-text-accent));
+      background-color: var(--cp-primary-soft, transparent);
+      border-color: var(--cp-primary-border, transparent);
+      font-weight: 600;
+    }
+
+    .cp-nav-sep {
+      width: 1px;
+      height: 1.05rem;
+      margin-inline: 0.35rem;
+      background-color: var(--cp-border, var(--sl-color-gray-5));
+      flex-shrink: 0;
+    }
+
+    .cp-nav-eco {
+      font-family: var(--sl-font-mono);
+      font-size: 0.78rem;
+    }
+
+    .cp-nav-ext {
+      font-size: 0.72em;
+      opacity: 0.75;
+    }
+
+    .cp-header-actions {
+      align-items: center;
+      gap: 0.5rem;
+      margin-inline-start: auto;
+    }
+
+    .cp-header-search {
+      align-items: center;
+    }
+
+    .cp-header-search :global(button[data-open-modal]) {
+      max-width: 13rem;
+    }
+
+    @media (min-width: 50rem) and (max-width: 72rem) {
+      .cp-header-left {
+        gap: 0.65rem;
+      }
+      .cp-nav-link {
+        padding: 0.28rem 0.42rem;
+        font-size: 0.78rem;
+      }
+      .cp-nav-eco {
+        font-size: 0.74rem;
+      }
+      .cp-header-search :global(button[data-open-modal]) {
+        width: auto;
+        min-width: 2.25rem;
+        padding-inline: 0.5rem;
+      }
+      .cp-header-search :global(button[data-open-modal] > span),
+      .cp-header-search :global(button[data-open-modal] > kbd) {
+        display: none !important;
+      }
+    }
+
+    /* Mobile compact dropdown menu (works on splash homepage too) */
+    .cp-mobile-nav {
+      position: relative;
+    }
+
+    .cp-mobile-nav-btn {
+      list-style: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      padding: 0.32rem 0.6rem;
+      border-radius: 0.25rem;
+      border: 1px solid var(--cp-border, var(--sl-color-gray-5));
+      background: var(--cp-surface, var(--sl-color-gray-6));
+      color: var(--cp-heading, var(--sl-color-white));
+      font-family: var(--sl-font-mono);
+      font-size: 0.78rem;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .cp-mobile-nav-btn::-webkit-details-marker {
+      display: none;
+    }
+
+    .cp-mobile-nav-panel {
+      position: fixed;
+      top: calc(var(--sl-nav-height) + 0.35rem);
+      left: 0.75rem;
+      right: 0.75rem;
+      z-index: 1000;
+      padding: 0.85rem 1rem;
+      border-radius: 0.35rem;
+      border: 1px solid var(--cp-border, var(--sl-color-gray-5));
+      background: var(--cp-surface-solid, var(--sl-color-bg-nav));
+      box-shadow: var(--sl-shadow-lg);
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 0.85rem;
+    }
+
+    .cp-mobile-nav-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+    }
+
+    .cp-mobile-nav-heading {
+      font-family: var(--sl-font-mono);
+      font-size: 0.68rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--cp-subtle, var(--sl-color-gray-3));
+      margin-bottom: 0.15rem;
+    }
+
+    .cp-mobile-nav-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      padding: 0.32rem 0.45rem;
+      border-radius: 0.25rem;
+      font-size: 0.85rem;
+      color: var(--cp-body, var(--sl-color-gray-1));
+      text-decoration: none;
+    }
+
+    .cp-mobile-nav-link.is-active {
+      color: var(--cp-primary, var(--sl-color-text-accent));
+      background: var(--cp-primary-soft, transparent);
+      font-weight: 600;
+    }
+
+    .right-group,
+    .social-icons {
+      gap: 0.85rem;
+      align-items: center;
+      flex-shrink: 0;
+    }
+
+    .social-icons::after {
+      content: '';
+      height: 1.6rem;
+      border-inline-end: 1px solid var(--sl-color-gray-5);
+    }
+  }
+</style>

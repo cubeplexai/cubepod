@@ -34,6 +34,7 @@ export default defineConfig({
       customCss: ['./src/styles/custom.css'],
       components: {
         Head: './src/components/HeadWithMermaid.astro',
+        Header: './src/components/Header.astro',
       },
       head: [
         {
