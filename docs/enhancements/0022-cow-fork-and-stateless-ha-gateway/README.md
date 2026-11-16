@@ -8,7 +8,7 @@
 | **Participating Areas** | `gateway`, `storage`, `runtime` |
 | **Authors** | @cubepod-maintainers |
 | **Created** | 2026-11-13 |
-| **Last Updated** | 2026-11-13 |
+| **Last Updated** | 2026-11-16 |
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
@@ -144,7 +144,7 @@ flowchart TD
 ### Graduation Criteria
 
 - **Alpha (`v0.5.0`)**: Multi-gen `ForkFrom`, Docker sparse reflink fork, bounded `quiesce`/`thaw`, and stateless `gw1`->`gw2` failover merged and tested.
-- **Beta (`v0.6.0`)**: Helm chart defaults `gateway.replicas: 2` with PodDisruptionBudget; CSI `VolumeSnapshot` mode verified on Longhorn V2 SPDK.
+- **Beta (`v0.6.0`)**: Helm chart defaults `gateway.replicas: 2` with PodDisruptionBudget; CSI `VolumeSnapshot` mode implemented with unit tests and K8s E2E test harness (`live Longhorn V2 SPDK CSI snapshot verification ongoing`).
 - **Stable (`v1.0.0`)**: Zero-downtime Gateway rolling updates verified under continuous load in CubePlex.
 
 ### Upgrade / Downgrade Strategy

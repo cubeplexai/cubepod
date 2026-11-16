@@ -8,7 +8,7 @@
 | **Participating Areas** | `gateway`, `controller` |
 | **Authors** | @cubepod-maintainers |
 | **Created** | 2026-11-13 |
-| **Last Updated** | 2026-11-13 |
+| **Last Updated** | 2026-11-16 |
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)

@@ -30,7 +30,7 @@ CubePod Gateway（`cmd/cubepod-gateway`）对外提供一套**兼容 E2B 的超�
 | `POST /sandboxes/{id}/refreshes` | 刷新租约与延长 TTL（E2B 兼容别名） | 请求体：`{ "duration": <int> }` |
 | `POST /sandboxes/{id}/lease` | 续期沙箱独占租约 | 请求体：租约时长 / TTL |
 | `POST /sandboxes/{id}/reset-rootfs` | 递增 `rootfsGeneration` 清空 OS RootFS 层，同时完好保留 `/workspace` | 可选重置/模板参数 |
-| `POST /sandboxes/{id}/fork` | 通过 CSI（`pvc-clone` 或 `snapshot` 模式）/ reflink 克隆出独立的子沙箱 | 可选分支参数 |
+| `POST /sandboxes/{id}/fork` *(v0.6.0 变更)* | 通过 CSI（`pvc-clone` 或 `snapshot` 模式）/ reflink 克隆出独立的子沙箱 | 可选分支参数 |
 | `GET /sandboxes/{sandboxID}/metrics` *(v0.6.0 新增)* | 查询单个沙箱的时间序列 `SandboxMetric` 快照 | 查询参数：`start`、`end`（Unix 秒或 RFC3339）、`autoResume`（默认 `true`；`false` 仅读取缓存环形缓冲） |
 | `GET /sandboxes/metrics` *(v0.6.0 新增)* | 批量查询多个沙箱的最新 `SandboxMetric` 快照 | 查询参数：`sandboxIds`（逗号分隔或重复参数）；返回 `{"sandboxes": {...}}`，不会唤醒暂停沙箱 |
 
@@ -128,7 +128,7 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 
 ## 密钥、持久化卷、事件与 Webhook
 
-- **E2B 密钥（`E2BSecretsAPI`）**：`POST /secrets`、`GET /secrets`、`GET /secrets/{secretID}`、`POST /secrets/{secretID}`、`DELETE /secrets/{secretID}` — 租户隔离的 Write-Only 密钥存储（`KubeSecretBackend` 多副本 HA 或 AES-256-GCM 文件存储），配合 `${e2b.secrets.<name>}`（`Secret.fill()`）解析。
+- **E2B 密钥（`E2BSecretsAPI`，*v0.6.0 变更*）**：`POST /secrets`、`GET /secrets`、`GET /secrets/{secretID}`、`POST /secrets/{secretID}`、`DELETE /secrets/{secretID}` — 租户隔离的 Write-Only 密钥存储（`KubeSecretBackend` 多副本 HA 或 AES-256-GCM 文件存储），配合 `${e2b.secrets.<name>}`（`Secret.fill()`）解析。
 - **E2B 卷（Volumes）**：`POST /volumes`、`GET /volumes`、`GET /volumes/{volumeID}`、`DELETE /volumes/{volumeID}`，内容传输 `/volumecontent/{volumeID}/{file,dir,path}`，以及 `POST /sandboxes` 的 `volumeMounts`（K8s Kata RWX 挂载由 `K8sE2BVolumeMounts` / Helm `e2bVolumes.rwxStorageClassName` 控制）。
 - **生命周期事件与 Webhook（`SandboxEventsAndWebhooks`，*v0.6.0 新增*）**：`GET /events`、`GET /sandboxes/{sandboxID}/events`、`POST /webhooks`、`GET /webhooks`、`GET /webhooks/{webhookID}`、`PATCH /webhooks/{webhookID}`、`DELETE /webhooks/{webhookID}`。
 
@@ -139,7 +139,7 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 | 特性开关名称 | 默认值 | 生效组件 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `E2BTemplateAPI` | `false` | `gateway`、`controller` | 启用 E2B JSON 数组格式 `GET /templates` 与 `/v2`–`/v3` 模板接口（也可通过 `--e2b-template-api` 开启）。 |
-| `K8sE2BVolumeMounts` | `false` | `gateway`、`controller` | 启用 Kubernetes RWX E2B `volumeMounts`（在 Helm 中设置 `e2bVolumes.rwxStorageClassName` 时会自动开启）。 |
+| `K8sE2BVolumeMounts` | `false` | `gateway` | 启用 Kubernetes RWX E2B `volumeMounts`（在 Helm 中设置 `e2bVolumes.rwxStorageClassName` 时会自动开启）。 |
 | `TransparentEgress` | `true` | `gateway`、`controller` | 控制 `CUBEPOD_TRANSPARENT=1` + `NET_ADMIN` `nftables` 透明劫持及 `/internal/v1/egress/exchange`。 |
 | `DesktopStack` | `true` | `gateway` | 控制 `/sandboxes/{id}/desktop/{start,status,stop}` 接口。 |
 | `StatelessGatewayHA` | `true` | `gateway` | 控制多副本网关跨副本基于 `PodBox` CRD 的缓存未命中重建。 |

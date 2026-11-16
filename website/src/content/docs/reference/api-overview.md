@@ -30,7 +30,7 @@ For interactive schema exploration and copy-paste request testing, open the [Int
 | `POST /sandboxes/{id}/refreshes` | Refresh lease / extend TTL (E2B alias) | Body: `{ "duration": <int> }` |
 | `POST /sandboxes/{id}/lease` | Renew sandbox TTL lease | Body: lease duration / TTL |
 | `POST /sandboxes/{id}/reset-rootfs` | Increment `rootfsGeneration` to clear OS rootfs while keeping `/workspace` intact | Body: optional `template` / reset options |
-| `POST /sandboxes/{id}/fork` | Clone sandbox via CSI (`pvc-clone` or `snapshot` mode) / reflink into an independent child sandbox | Optional fork parameters |
+| `POST /sandboxes/{id}/fork` *(Changed in v0.6.0)* | Clone sandbox via CSI (`pvc-clone` or `snapshot` mode) / reflink into an independent child sandbox | Optional fork parameters |
 | `GET /sandboxes/{sandboxID}/metrics` *(Added in v0.6.0)* | Fetch time-series `SandboxMetric` snapshots for one sandbox | Query: `start`, `end` (Unix seconds or RFC3339), `autoResume` (`true` default; `false` reads cached ring buffer) |
 | `GET /sandboxes/metrics` *(Added in v0.6.0)* | Fetch latest `SandboxMetric` snapshot per sandbox | Query: `sandboxIds` (comma-separated or repeated); returns `{"sandboxes": {...}}` without waking paused sandboxes |
 
@@ -128,7 +128,7 @@ When `--e2b-template-api=true` is enabled on the Gateway and Controller, the ful
 
 ## Secrets, Volumes, Events & Webhooks
 
-- **E2B Secrets (`E2BSecretsAPI`)**: `POST /secrets`, `GET /secrets`, `GET /secrets/{secretID}`, `POST /secrets/{secretID}`, `DELETE /secrets/{secretID}` — tenant-isolated write-only secret store (`KubeSecretBackend` HA or AES-256-GCM file store) resolved via `${e2b.secrets.<name>}` (`Secret.fill()`).
+- **E2B Secrets (`E2BSecretsAPI`, *Changed in v0.6.0*)**: `POST /secrets`, `GET /secrets`, `GET /secrets/{secretID}`, `POST /secrets/{secretID}`, `DELETE /secrets/{secretID}` — tenant-isolated write-only secret store (`KubeSecretBackend` HA or AES-256-GCM file store) resolved via `${e2b.secrets.<name>}` (`Secret.fill()`).
 - **E2B Volumes**: `POST /volumes`, `GET /volumes`, `GET /volumes/{volumeID}`, `DELETE /volumes/{volumeID}`, plus content endpoints `/volumecontent/{volumeID}/{file,dir,path}` and `volumeMounts` on `POST /sandboxes` (K8s Kata RWX mounts gated by `K8sE2BVolumeMounts` / Helm `e2bVolumes.rwxStorageClassName`).
 - **Lifecycle Events & Webhooks (`SandboxEventsAndWebhooks`, *Added in v0.6.0*)**: `GET /events`, `GET /sandboxes/{sandboxID}/events`, `POST /webhooks`, `GET /webhooks`, `GET /webhooks/{webhookID}`, `PATCH /webhooks/{webhookID}`, `DELETE /webhooks/{webhookID}`.
 
@@ -139,7 +139,7 @@ Both `cubepod-gateway` and `cubepod-controller` accept `--feature-gate=GateA=tru
 | Feature Gate | Default | Components | Purpose |
 | :--- | :--- | :--- | :--- |
 | `E2BTemplateAPI` | `false` | `gateway`, `controller` | Enables E2B JSON-array `GET /templates` and `/v2`–`/v3` template APIs (`--e2b-template-api` also toggles it). |
-| `K8sE2BVolumeMounts` | `false` | `gateway`, `controller` | Enables Kubernetes RWX E2B `volumeMounts` (auto-enabled in Helm when `e2bVolumes.rwxStorageClassName` is set). |
+| `K8sE2BVolumeMounts` | `false` | `gateway` | Enables Kubernetes RWX E2B `volumeMounts` (auto-enabled in Helm when `e2bVolumes.rwxStorageClassName` is set). |
 | `TransparentEgress` | `true` | `gateway`, `controller` | Controls `CUBEPOD_TRANSPARENT=1` + `NET_ADMIN` `nftables` interception and `/internal/v1/egress/exchange`. |
 | `DesktopStack` | `true` | `gateway` | Enables `/sandboxes/{id}/desktop/{start,status,stop}` routes. |
 | `StatelessGatewayHA` | `true` | `gateway` | Enables Kubernetes `PodBox` cache-miss reconstruction across gateway replicas. |

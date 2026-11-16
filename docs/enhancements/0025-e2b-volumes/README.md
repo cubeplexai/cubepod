@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `alpha` | `implemented` | `2026-11-15` | `2026-11-15` | `storage` (`gateway`, `runtime`, `controller`) |
+| `alpha` | `implemented` | `2026-11-15` | `2026-11-16` | `storage` (`gateway`, `runtime`, `controller`) |
 
 ## Table of Contents
 

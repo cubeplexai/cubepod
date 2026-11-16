@@ -3,7 +3,7 @@
 | Field | Value |
 | :--- | :--- |
 | Stage | alpha |
-| Status | implemented (opt-in) |
+| Status | implemented |
 | Created | 2026-11-11 |
 | Updated | 2026-11-16 |
 | Owning Area | storage |

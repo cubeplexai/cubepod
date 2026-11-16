@@ -358,6 +358,10 @@ const HELM_VALUE_DESCRIPTIONS = {
     en: 'Legacy fallback Kubernetes Secret name (key `key`) for `CUBEPOD_SECRETS_KEY` when `secrets.existingSecret` is unset.',
     zh: '当未配置 `secrets.existingSecret` 时，作为 `CUBEPOD_SECRETS_KEY` 的旧版回退 Secret 名称（键名 `key`）。',
   },
+  'gateway.eventsKeySecret': {
+    en: 'Optional Kubernetes Secret name (key `key`) holding the 32-byte encryption key (`CUBEPOD_EVENTS_KEY`) for local persisted event/webhook state.',
+    zh: '可选 Kubernetes Secret 名称（键名 `key`），用于注入本地事件与 Webhook 持久化所需的 32 字节加密密钥（`CUBEPOD_EVENTS_KEY`）。',
+  },
   'egress.enabled': {
     en: 'Inject the `cubepod-egress` sidecar container by default on seeded and fallback templates.',
     zh: '是否在默认与兜底模板中默认注入 `cubepod-egress` 出站边车容器。',
