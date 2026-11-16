@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"sort"
@@ -364,27 +363,6 @@ func classifySecretOp(method string, parts []string) (string, bool) {
 	return "", false
 }
 
-func peekRequestedVolumeMounts(r *http.Request) int {
-	if r.Body == nil || r.Body == http.NoBody {
-		return 0
-	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		return 0
-	}
-	r.Body = io.NopCloser(bytes.NewReader(raw))
-	if len(raw) == 0 {
-		return 0
-	}
-	var payload struct {
-		VolumeMounts []json.RawMessage `json:"volumeMounts"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return 0
-	}
-	return len(payload.VolumeMounts)
-}
-
 // withMetrics wraps an http.Handler to record metrics on incoming requests,
 // sandbox creations, command executions, E2B endpoints, forks, secrets, and auto-resume transitions.
 func (s *Server) withMetrics(next http.Handler) http.Handler {
@@ -395,11 +373,6 @@ func (s *Server) withMetrics(next http.Handler) http.Handler {
 
 		cleanPath := strings.Trim(r.URL.Path, "/")
 		parts := strings.Split(cleanPath, "/")
-
-		var requestedMounts int
-		if r.Method == http.MethodPost && ((len(parts) == 1 && parts[0] == "sandboxes") || (len(parts) == 2 && parts[0] == "v2" && parts[1] == "sandboxes")) {
-			requestedMounts = peekRequestedVolumeMounts(r)
-		}
 
 		var beforeResumes int
 		var trackedSandboxID string
@@ -424,15 +397,10 @@ func (s *Server) withMetrics(next http.Handler) http.Handler {
 		if r.Method == http.MethodPost && rec.statusCode == http.StatusCreated &&
 			((len(parts) == 1 && parts[0] == "sandboxes") || (len(parts) == 2 && parts[0] == "v2" && parts[1] == "sandboxes")) {
 			m.SandboxesCreatedTotal.Add(1)
-			if requestedMounts > 0 {
-				m.RecordE2BVolumeMount(uint64(requestedMounts))
-			}
-		} else if requestedMounts > 0 && rec.statusCode >= 400 {
-			m.RecordE2BVolumeMountError()
 		}
 
-		// Check if a secret management operation occurred
-		if op, ok := classifySecretOp(r.Method, parts); ok {
+		// Record secret HTTP error when no Store processed the request (store tracks its own ops).
+		if op, ok := classifySecretOp(r.Method, parts); ok && (s.secrets.Load() == nil || rec.statusCode == http.StatusUnauthorized || rec.statusCode == http.StatusNotImplemented) {
 			status := "ok"
 			if rec.statusCode >= 400 {
 				status = "error"
@@ -507,9 +475,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	secretsStoreCount := 0
+	var secretOpsSnapshot map[string]map[string]uint64
 	if secStore := s.secrets.Load(); secStore != nil {
 		secretsStoreCount = secStore.Count()
+		secretOpsSnapshot = secStore.OperationsSnapshot()
 	}
+	volumeMountsTotal := s.E2BVolumeMountsTotal.Load() + m.E2BVolumeMountsTotal.Load()
+	volumeMountErrorsTotal := s.E2BVolumeMountErrorsTotal.Load() + m.E2BVolumeMountErrorsTotal.Load()
+	crdResyncsTotal := s.crdResyncsTotal.Load() + m.CRDResyncsTotal.Load()
 
 	e2bEnabled := s.E2BTemplateAPIEnabled()
 	var templateStatusCounts map[string]int
@@ -556,9 +529,9 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			"cubepod_gateway_warmpools_total":          warmpoolsTotal,
 			"cubepod_panel_active_sessions":            m.PanelActiveSessions.Load(),
 			"cubepod_secrets_store_count":              secretsStoreCount,
-			"cubepod_e2b_volume_mounts_total":          m.E2BVolumeMountsTotal.Load(),
-			"cubepod_e2b_volume_mount_errors_total":    m.E2BVolumeMountErrorsTotal.Load(),
-			"cubepod_gateway_crd_resyncs_total":        m.CRDResyncsTotal.Load(),
+			"cubepod_e2b_volume_mounts_total":          volumeMountsTotal,
+			"cubepod_e2b_volume_mount_errors_total":    volumeMountErrorsTotal,
+			"cubepod_gateway_crd_resyncs_total":        crdResyncsTotal,
 			"cubepod_e2b_request_duration_seconds": map[string]interface{}{
 				"count": e2bCount,
 				"sum":   e2bSum,
@@ -620,17 +593,42 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintf(&buf, "# HELP cubepod_secrets_operations_total Total E2B secret store operations by operation and status\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_secrets_operations_total counter\n")
+	mergedSecretOps := make(map[labelPair]uint64)
+	for op, statuses := range secretOpsSnapshot {
+		for st, cnt := range statuses {
+			mergedSecretOps[labelPair{first: op, second: st}] += cnt
+		}
+	}
 	for _, entry := range m.secretOperations.Snapshot() {
+		mergedSecretOps[entry.key] += entry.val
+	}
+	secretOpsList := make([]struct {
+		key labelPair
+		val uint64
+	}, 0, len(mergedSecretOps))
+	for k, v := range mergedSecretOps {
+		secretOpsList = append(secretOpsList, struct {
+			key labelPair
+			val uint64
+		}{key: k, val: v})
+	}
+	sort.Slice(secretOpsList, func(i, j int) bool {
+		if secretOpsList[i].key.first != secretOpsList[j].key.first {
+			return secretOpsList[i].key.first < secretOpsList[j].key.first
+		}
+		return secretOpsList[i].key.second < secretOpsList[j].key.second
+	})
+	for _, entry := range secretOpsList {
 		fmt.Fprintf(&buf, "cubepod_secrets_operations_total{op=%q,status=%q} %d\n", entry.key.first, entry.key.second, entry.val)
 	}
 
 	fmt.Fprintf(&buf, "# HELP cubepod_e2b_volume_mounts_total Total E2B volume mounts attached to sandboxes\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_e2b_volume_mounts_total counter\n")
-	fmt.Fprintf(&buf, "cubepod_e2b_volume_mounts_total %d\n", m.E2BVolumeMountsTotal.Load())
+	fmt.Fprintf(&buf, "cubepod_e2b_volume_mounts_total %d\n", volumeMountsTotal)
 
 	fmt.Fprintf(&buf, "# HELP cubepod_e2b_volume_mount_errors_total Total E2B volume mount planning or attachment errors\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_e2b_volume_mount_errors_total counter\n")
-	fmt.Fprintf(&buf, "cubepod_e2b_volume_mount_errors_total %d\n", m.E2BVolumeMountErrorsTotal.Load())
+	fmt.Fprintf(&buf, "cubepod_e2b_volume_mount_errors_total %d\n", volumeMountErrorsTotal)
 
 	fmt.Fprintf(&buf, "# HELP cubepod_sandbox_forks_total Total sandbox CoW fork operations by mode and result\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_sandbox_forks_total counter\n")
@@ -642,7 +640,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_crd_resyncs_total Total PodBox/PodWarmPool CRD resyncs executed by the gateway\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_crd_resyncs_total counter\n")
-	fmt.Fprintf(&buf, "cubepod_gateway_crd_resyncs_total %d\n", m.CRDResyncsTotal.Load())
+	fmt.Fprintf(&buf, "cubepod_gateway_crd_resyncs_total %d\n", crdResyncsTotal)
 
 	fmt.Fprintf(&buf, "# HELP cubepod_desktop_activations_total Total desktop stack activations by result\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_desktop_activations_total counter\n")

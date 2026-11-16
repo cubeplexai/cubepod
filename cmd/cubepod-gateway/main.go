@@ -24,27 +24,6 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/version"
 )
 
-func parseFeatureGates(raw string) map[string]bool {
-	gates := make(map[string]bool)
-	for _, item := range strings.Split(raw, ",") {
-		item = strings.TrimSpace(item)
-		if item == "" {
-			continue
-		}
-		parts := strings.SplitN(item, "=", 2)
-		key := strings.TrimSpace(parts[0])
-		if len(parts) == 1 {
-			gates[key] = true
-			continue
-		}
-		val, err := strconv.ParseBool(strings.TrimSpace(parts[1]))
-		if err == nil {
-			gates[key] = val
-		}
-	}
-	return gates
-}
-
 func defaultEgressImage() string {
 	if env := strings.TrimSpace(os.Getenv("CUBEPOD_EGRESS_IMAGE")); env != "" {
 		return env
@@ -84,8 +63,8 @@ func main() {
 	)
 	flag.Parse()
 
-	gates := parseFeatureGates(*featureGate)
-	e2bAPIEnabled := *e2bTemplateAPI || gates["E2BTemplateAPI"]
+	gates := gateway.ParseFeatureGates(*featureGate)
+	e2bAPIEnabled := *e2bTemplateAPI || gates[gateway.FeatureGateE2BTemplateAPI]
 
 	effectiveStateDir := *stateDir
 	if effectiveStateDir == "" {
@@ -234,6 +213,10 @@ func main() {
 			os.Exit(1)
 		}
 		slog.Info("E2B volume store enabled", "dir", volDir, "dockerVolumes", vcfg.DockerVolumes)
+	}
+	gw.ApplyFeatureGates(gates)
+	if *e2bTemplateAPI {
+		gw.SetFeatureGate(gateway.FeatureGateE2BTemplateAPI, true)
 	}
 
 	secretsEnabled, secretsK8s, scfg, err := resolveSecretsConfig(

@@ -401,7 +401,7 @@ func TestMetricsCEPAlignmentAndPanelGauge(t *testing.T) {
 		t.Fatalf("expected 404 for missing volume mount, got %d", badMntResp.StatusCode)
 	}
 
-	// Record a CRD resync
+	// Record a CRD resync (creating a sandbox with no warmpool also triggers 1 SyncFromKube)
 	srv.Metrics().RecordCRDResync()
 
 	// 5. Panel active sessions gauge around a live proxied request
@@ -453,7 +453,7 @@ func TestMetricsCEPAlignmentAndPanelGauge(t *testing.T) {
 		"cubepod_secrets_store_count":                                                          "1",
 		"cubepod_e2b_volume_mounts_total":                                                      "1",
 		"cubepod_e2b_volume_mount_errors_total":                                                "1",
-		"cubepod_gateway_crd_resyncs_total":                                                    "1",
+		"cubepod_gateway_crd_resyncs_total":                                                    "2",
 		`cubepod_secrets_operations_total{op="create",status="ok"}`:                            "1",
 		`cubepod_sandbox_forks_total{mode="loopback",result="ok"}`:                             "1",
 		`cubepod_e2b_requests_total{endpoint="POST /sandboxes",status="201"}`:                  "2",
