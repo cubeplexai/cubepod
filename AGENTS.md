@@ -37,3 +37,4 @@ Live cluster E2E tests (requires cluster/kubeconfig): `make test-k8s-e2e` and `m
 
 - **Commits**: Conventional Commits (`type(scope): imperative summary`, e.g., `feat(podd-init): ...`, `docs(cep): ...`).
 - **File Naming**: Name source and test files strictly after their module or domain capability (e.g., `manifests_test.go`, `reconciler_test.go`). Never name files after CEP, PR, or issue numbers (e.g., never `cep0020_test.go`).
+- **Documentation**: Update user-facing documentation (under `website/`) alongside feature development, API/CRD changes, or behavioral changes, and run `make docs-build` to verify. Because the documentation site does not maintain multi-version snapshots, explicitly note the introduced or affected version (e.g., `Added in vX.Y.Z`, `Changed in vX.Y.Z`, `Deprecated in vX.Y.Z`) for all new features, breaking/incompatible changes, and deprecations.
