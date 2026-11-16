@@ -293,6 +293,11 @@ main:has(.cp-otel) .sl-container,
   vertical-align: top;
 }
 
-.sl-markdown-content td :where(code):not(:where(.not-content *)) {
-  overflow-wrap: anywhere;
+.sl-markdown-content .cp-nowrap-col2 td:nth-child(1),
+.sl-markdown-content .cp-nowrap-col2 td:nth-child(2) {
+  white-space: nowrap;
+}
+
+.sl-markdown-content .cp-nowrap-col2 td:nth-child(3) {
+  min-width: 16rem;
 }
