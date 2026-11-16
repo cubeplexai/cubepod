@@ -6,7 +6,7 @@ global:
 
 runtime:
   runtimeClassName: "kata-clh"
-  poddInjectorImage: "registry.example.com/cubepod/cubepod-podd:v0.5.1"
+  poddInjectorImage: "registry.example.com/cubepod/cubepod-podd:v0.5.2"
   defaultSandboxImage: "registry.example.com/cubepod/sandbox:latest"
   templatePullSecret: "regcred"
 
@@ -19,7 +19,7 @@ gateway:
   image:
     registry: "registry.example.com"
     repository: "cubepod/cubepod-gateway"
-    tag: "v0.5.1"
+    tag: "v0.5.2"
     pullPolicy: "IfNotPresent"
   service:
     type: "NodePort"
@@ -32,7 +32,7 @@ controller:
   image:
     registry: "registry.example.com"
     repository: "cubepod/cubepod-controller"
-    tag: "v0.5.1"
+    tag: "v0.5.2"
     pullPolicy: "IfNotPresent"
   workloadNamespace: "cubepod-workloads"
 
@@ -41,6 +41,6 @@ egress:
   image:
     registry: "registry.example.com"
     repository: "cubepod/cubepod-egress"
-    tag: "v0.5.1"
+    tag: "v0.5.2"
   caSecretName: "cubepod-egress-ca"
   upstreamCAEnabled: true
