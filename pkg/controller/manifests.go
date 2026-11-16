@@ -106,14 +106,26 @@ func WorkspacePVCName(podBoxName string, spec v1alpha1.PodBoxSpec) string {
 // BlockPVCManifest represents the Kubernetes PersistentVolumeClaim specification
 // for a raw block volume (volumeMode: Block).
 type BlockPVCManifest struct {
-	Name             string            `json:"name"`
-	Namespace        string            `json:"namespace,omitempty"`
-	StorageClassName string            `json:"storageClassName"`
-	VolumeMode       string            `json:"volumeMode"`
-	Size             string            `json:"size"`
-	AccessModes      []string          `json:"accessModes"`
-	DataSourcePVC    string            `json:"dataSourcePVC,omitempty"`
-	Labels           map[string]string `json:"labels,omitempty"`
+	Name               string            `json:"name"`
+	Namespace          string            `json:"namespace,omitempty"`
+	StorageClassName   string            `json:"storageClassName"`
+	VolumeMode         string            `json:"volumeMode"`
+	Size               string            `json:"size"`
+	AccessModes        []string          `json:"accessModes"`
+	DataSourcePVC      string            `json:"dataSourcePVC,omitempty"`
+	DataSourceSnapshot string            `json:"dataSourceSnapshot,omitempty"`
+	DataSourceKind     string            `json:"dataSourceKind,omitempty"`
+	DataSourceAPIGroup string            `json:"dataSourceAPIGroup,omitempty"`
+	Labels             map[string]string `json:"labels,omitempty"`
+}
+
+// BlockPVCOptions configures PVC synthesis for BuildBlockPVCsWithOptions.
+type BlockPVCOptions struct {
+	VolumeMode            string
+	ParentRootfsPVC       string
+	ParentWorkspacePVC    string
+	RootfsSnapshotName    string
+	WorkspaceSnapshotName string
 }
 
 // VolumeMount represents a file system volume mount inside a container.
@@ -152,6 +164,20 @@ type ProbeSpec struct {
 	FailureThreshold    int32          `json:"failureThreshold,omitempty"`
 }
 
+// CapabilitiesSpec specifies POSIX capabilities to add or drop for a container.
+type CapabilitiesSpec struct {
+	Add  []string `json:"add,omitempty"`
+	Drop []string `json:"drop,omitempty"`
+}
+
+// SecurityContextSpec holds container-level security attributes.
+type SecurityContextSpec struct {
+	Privileged   *bool             `json:"privileged,omitempty"`
+	RunAsUser    *int64            `json:"runAsUser,omitempty"`
+	RunAsGroup   *int64            `json:"runAsGroup,omitempty"`
+	Capabilities *CapabilitiesSpec `json:"capabilities,omitempty"`
+}
+
 // ContainerManifest represents a container specification within a Pod.
 type ContainerManifest struct {
 	Name            string                        `json:"name"`
@@ -166,6 +192,7 @@ type ContainerManifest struct {
 	Privileged      bool                          `json:"privileged,omitempty"`
 	RunAsUser       *int64                        `json:"runAsUser,omitempty"`
 	RunAsGroup      *int64                        `json:"runAsGroup,omitempty"`
+	SecurityContext *SecurityContextSpec          `json:"securityContext,omitempty"`
 	ReadinessProbe  *ProbeSpec                    `json:"readinessProbe,omitempty"`
 }
 
@@ -196,9 +223,24 @@ type PodManifest struct {
 // When ForkFrom is specified in spec, DataSourcePVC is populated pointing to the parent sandbox's PVCs (in Block mode).
 // When volumeMode is "Filesystem", DataSourcePVC cloning is skipped so NFS provisioners do not reject the PVC.
 func BuildBlockPVCs(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.PodBoxSpec, volumeMode ...string) (rootfsPVC, workspacePVC BlockPVCManifest) {
-	vm := "Block"
-	if len(volumeMode) > 0 && volumeMode[0] != "" {
-		vm = volumeMode[0]
+	opts := BlockPVCOptions{}
+	if len(volumeMode) > 0 {
+		opts.VolumeMode = volumeMode[0]
+	}
+	if len(volumeMode) > 1 {
+		opts.ParentRootfsPVC = volumeMode[1]
+	}
+	if len(volumeMode) > 2 {
+		opts.ParentWorkspacePVC = volumeMode[2]
+	}
+	return BuildBlockPVCsWithOptions(boxName, tpl, spec, opts)
+}
+
+// BuildBlockPVCsWithOptions generates RootFS Upper and Workspace PVC manifests with explicit clone or snapshot options.
+func BuildBlockPVCsWithOptions(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.PodBoxSpec, opts BlockPVCOptions) (rootfsPVC, workspacePVC BlockPVCManifest) {
+	vm := opts.VolumeMode
+	if vm == "" {
+		vm = "Block"
 	}
 
 	storageClass := tpl.Storage.StorageClassName
@@ -253,15 +295,26 @@ func BuildBlockPVCs(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.
 		},
 	}
 
-	if spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != "" {
+	if opts.RootfsSnapshotName != "" || opts.WorkspaceSnapshotName != "" {
+		if opts.RootfsSnapshotName != "" {
+			rootfsPVC.DataSourceSnapshot = opts.RootfsSnapshotName
+			rootfsPVC.DataSourceKind = "VolumeSnapshot"
+			rootfsPVC.DataSourceAPIGroup = "snapshot.storage.k8s.io"
+		}
+		if opts.WorkspaceSnapshotName != "" {
+			workspacePVC.DataSourceSnapshot = opts.WorkspaceSnapshotName
+			workspacePVC.DataSourceKind = "VolumeSnapshot"
+			workspacePVC.DataSourceAPIGroup = "snapshot.storage.k8s.io"
+		}
+	} else if spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != "" {
 		if !strings.EqualFold(vm, "Filesystem") {
 			rootfsSource := fmt.Sprintf("%s-rootfs-pvc", spec.ForkFrom.PodBoxName)
-			if len(volumeMode) > 1 && volumeMode[1] != "" {
-				rootfsSource = volumeMode[1]
+			if opts.ParentRootfsPVC != "" {
+				rootfsSource = opts.ParentRootfsPVC
 			}
 			wsSource := fmt.Sprintf("%s-workspace-pvc", spec.ForkFrom.PodBoxName)
-			if len(volumeMode) > 2 && volumeMode[2] != "" {
-				wsSource = volumeMode[2]
+			if opts.ParentWorkspacePVC != "" {
+				wsSource = opts.ParentWorkspacePVC
 			}
 			rootfsPVC.DataSourcePVC = rootfsSource
 			workspacePVC.DataSourcePVC = wsSource
@@ -380,14 +433,36 @@ func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest,
 	return volumes, main
 }
 
+// PodBuildOptions configures optional pod synthesis settings for BuildPodManifest.
+type PodBuildOptions struct {
+	VolumeMode        string
+	ImagePullSecrets  []string
+	TransparentEgress bool
+}
+
 // BuildKataPod synthesizes the complete Kubernetes Pod manifest for running a Kata or container sandbox.
 // In volumeMode: Block, it maps raw block devices /dev/cubepod-rootfs and /dev/cubepod-workspace.
 // In volumeMode: Filesystem, it mounts rootfs-pvc at /mnt/cubepod/rootfs and workspace-pvc at /workspace
 // via ContainerManifest.VolumeMounts instead of VolumeDevices, and adds CUBEPOD_SKIP_PIVOT=1 when RuntimeClassName == "".
 func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.PodBoxSpec, status v1alpha1.PodBoxStatus, volumeMode ...string) PodManifest {
-	vm := "Block"
-	if len(volumeMode) > 0 && volumeMode[0] != "" {
-		vm = volumeMode[0]
+	opts := PodBuildOptions{
+		TransparentEgress: true,
+	}
+	if len(volumeMode) > 0 {
+		opts.VolumeMode = volumeMode[0]
+	}
+	if len(volumeMode) > 1 {
+		opts.ImagePullSecrets = volumeMode[1:]
+	}
+	return BuildPodManifest(boxName, tpl, spec, status, opts)
+}
+
+// BuildPodManifest synthesizes the complete Kubernetes Pod manifest for running a Kata or container sandbox
+// with explicit PodBuildOptions (such as TransparentEgress interception).
+func BuildPodManifest(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.PodBoxSpec, status v1alpha1.PodBoxStatus, opts PodBuildOptions) PodManifest {
+	vm := opts.VolumeMode
+	if vm == "" {
+		vm = "Block"
 	}
 
 	podName := status.PodName
@@ -616,6 +691,12 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 				Value: spec.NetworkPolicy.UpstreamProxy,
 			})
 		}
+		if opts.TransparentEgress {
+			egressEnv = append(egressEnv, EnvVar{
+				Name:  "CUBEPOD_TRANSPARENT",
+				Value: "1",
+			})
+		}
 
 		egressContainer := ContainerManifest{
 			Name:  "egress",
@@ -628,6 +709,13 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 				},
 			},
 			Env: egressEnv,
+		}
+		if opts.TransparentEgress {
+			egressContainer.SecurityContext = &SecurityContextSpec{
+				Capabilities: &CapabilitiesSpec{
+					Add: []string{"NET_ADMIN"},
+				},
+			}
 		}
 		containers = append(containers, mainContainer, egressContainer)
 	} else {
@@ -650,16 +738,14 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 	}
 
 	var pullSecrets []string
-	if len(volumeMode) > 1 {
-		for _, raw := range volumeMode[1:] {
-			for _, s := range strings.Split(raw, ",") {
-				s = strings.TrimSpace(s)
-				if s == "" || strings.HasPrefix(s, "cubepod-template-src-") {
-					continue
-				}
-				if !slices.Contains(pullSecrets, s) {
-					pullSecrets = append(pullSecrets, s)
-				}
+	for _, raw := range opts.ImagePullSecrets {
+		for _, s := range strings.Split(raw, ",") {
+			s = strings.TrimSpace(s)
+			if s == "" || strings.HasPrefix(s, "cubepod-template-src-") {
+				continue
+			}
+			if !slices.Contains(pullSecrets, s) {
+				pullSecrets = append(pullSecrets, s)
 			}
 		}
 	}

@@ -144,6 +144,7 @@ func (m *ControllerManager) handleMetrics(w http.ResponseWriter, r *http.Request
 	warmReady := m.reconciler.WarmPoolReadyCount()
 	tplCounts, showTemplates := m.templateStatusCounts()
 	buildMetrics := m.reconciler.TemplateBuildMetrics()
+	forkMetrics := m.reconciler.ForkMetrics()
 
 	if strings.Contains(r.Header.Get("Accept"), "application/json") {
 		w.Header().Set("Content-Type", "application/json")
@@ -151,9 +152,13 @@ func (m *ControllerManager) handleMetrics(w http.ResponseWriter, r *http.Request
 			"cubepod_active_sandboxes":                      active,
 			"cubepod_paused_sandboxes":                      paused,
 			"cubepod_warmpool_ready":                        warmReady,
+			"cubepod_warmpool_available_replicas":           warmReady,
 			"cubepod_template_builds_total":                 buildMetrics.TemplateBuildsTotal,
 			"cubepod_template_build_duration_seconds_sum":   buildMetrics.TemplateBuildDurationSum,
 			"cubepod_template_build_duration_seconds_count": buildMetrics.TemplateBuildDurationCount,
+			"cubepod_sandbox_forks_total":                   forkMetrics.ForksTotal,
+			"cubepod_sandbox_fork_duration_seconds_sum":     forkMetrics.ForkDurationSum,
+			"cubepod_sandbox_fork_duration_seconds_count":   forkMetrics.ForkDurationCount,
 		}
 		if showTemplates {
 			payload["cubepod_templates"] = tplCounts
@@ -172,6 +177,9 @@ func (m *ControllerManager) handleMetrics(w http.ResponseWriter, r *http.Request
 	fmt.Fprintf(w, "# HELP cubepod_warmpool_ready Ready warm standby sandboxes in warmpools\n")
 	fmt.Fprintf(w, "# TYPE cubepod_warmpool_ready gauge\n")
 	fmt.Fprintf(w, "cubepod_warmpool_ready %d\n", warmReady)
+	fmt.Fprintf(w, "# HELP cubepod_warmpool_available_replicas Available unclaimed standby replicas across warmpools\n")
+	fmt.Fprintf(w, "# TYPE cubepod_warmpool_available_replicas gauge\n")
+	fmt.Fprintf(w, "cubepod_warmpool_available_replicas %d\n", warmReady)
 
 	if showTemplates {
 		fmt.Fprintf(w, "# HELP cubepod_templates Current number of templates by build status\n")
@@ -208,6 +216,37 @@ func (m *ControllerManager) handleMetrics(w http.ResponseWriter, r *http.Request
 	}
 	fmt.Fprintf(w, "cubepod_template_build_duration_seconds_sum %g\n", buildMetrics.TemplateBuildDurationSum)
 	fmt.Fprintf(w, "cubepod_template_build_duration_seconds_count %d\n", buildMetrics.TemplateBuildDurationCount)
+
+	fmt.Fprintf(w, "# HELP cubepod_sandbox_forks_total Total sandbox CoW forks attempted by mode and result\n")
+	fmt.Fprintf(w, "# TYPE cubepod_sandbox_forks_total counter\n")
+	for _, mode := range []string{"pvc_clone", "snapshot"} {
+		for _, res := range []string{"ok", "error"} {
+			var val int64
+			if forkMetrics.ForksTotal != nil && forkMetrics.ForksTotal[mode] != nil {
+				val = forkMetrics.ForksTotal[mode][res]
+			}
+			fmt.Fprintf(w, "cubepod_sandbox_forks_total{mode=%q,result=%q} %d\n", mode, res, val)
+		}
+	}
+
+	fmt.Fprintf(w, "# HELP cubepod_sandbox_fork_duration_seconds Duration of sandbox CoW fork provisioning in seconds\n")
+	fmt.Fprintf(w, "# TYPE cubepod_sandbox_fork_duration_seconds histogram\n")
+	for _, b := range []struct {
+		key string
+		le  string
+	}{
+		{"le_0_1", "0.1"},
+		{"le_0_5", "0.5"},
+		{"le_1", "1"},
+		{"le_5", "5"},
+		{"le_15", "15"},
+		{"le_60", "60"},
+		{"le_inf", "+Inf"},
+	} {
+		fmt.Fprintf(w, "cubepod_sandbox_fork_duration_seconds_bucket{le=%q} %d\n", b.le, forkMetrics.ForkDurationBuckets[b.key])
+	}
+	fmt.Fprintf(w, "cubepod_sandbox_fork_duration_seconds_sum %g\n", forkMetrics.ForkDurationSum)
+	fmt.Fprintf(w, "cubepod_sandbox_fork_duration_seconds_count %d\n", forkMetrics.ForkDurationCount)
 }
 
 func (m *ControllerManager) handleInternalHeadContext(w http.ResponseWriter, r *http.Request) {

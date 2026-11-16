@@ -1,6 +1,10 @@
 package controller
 
-import "github.com/cubeplexai/cubepod/api/v1alpha1"
+import (
+	"slices"
+
+	"github.com/cubeplexai/cubepod/api/v1alpha1"
+)
 
 // KubeSecret represents a Kubernetes core/v1 Secret payload.
 type KubeSecret struct {
@@ -10,6 +14,41 @@ type KubeSecret struct {
 	Type       string              `json:"type,omitempty"`
 	Data       map[string][]byte   `json:"data,omitempty"`
 	StringData map[string]string   `json:"stringData,omitempty"`
+}
+
+// VolumeSnapshotSource identifies the PersistentVolumeClaim used as the snapshot source.
+type VolumeSnapshotSource struct {
+	PersistentVolumeClaimName string `json:"persistentVolumeClaimName,omitempty"`
+}
+
+// VolumeSnapshotSpec defines the desired state of a snapshot.storage.k8s.io/v1 VolumeSnapshot.
+type VolumeSnapshotSpec struct {
+	VolumeSnapshotClassName *string              `json:"volumeSnapshotClassName,omitempty"`
+	Source                  VolumeSnapshotSource `json:"source"`
+}
+
+// VolumeSnapshotError describes an error encountered during snapshot creation.
+type VolumeSnapshotError struct {
+	Time    string `json:"time,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// VolumeSnapshotStatus reports the observed state of a VolumeSnapshot.
+type VolumeSnapshotStatus struct {
+	BoundVolumeSnapshotContentName string               `json:"boundVolumeSnapshotContentName,omitempty"`
+	CreationTime                   string               `json:"creationTime,omitempty"`
+	ReadyToUse                     *bool                `json:"readyToUse,omitempty"`
+	RestoreSize                    string               `json:"restoreSize,omitempty"`
+	Error                          *VolumeSnapshotError `json:"error,omitempty"`
+}
+
+// VolumeSnapshot represents a Kubernetes snapshot.storage.k8s.io/v1 VolumeSnapshot object.
+type VolumeSnapshot struct {
+	APIVersion string               `json:"apiVersion,omitempty"`
+	Kind       string               `json:"kind,omitempty"`
+	Metadata   v1alpha1.ObjectMeta  `json:"metadata"`
+	Spec       VolumeSnapshotSpec   `json:"spec"`
+	Status     VolumeSnapshotStatus `json:"status,omitempty"`
 }
 
 // coreV1Metadata represents common object metadata in the Kubernetes v1 API.
@@ -27,8 +66,9 @@ type coreV1ResourceRequirements struct {
 
 // coreV1DataSource identifies the API object that was used to populate a PVC volume.
 type coreV1DataSource struct {
-	Kind string `json:"kind"`
-	Name string `json:"name"`
+	APIGroup *string `json:"apiGroup,omitempty"`
+	Kind     string  `json:"kind"`
+	Name     string  `json:"name"`
 }
 
 // coreV1PVCSpec represents the specification of a PersistentVolumeClaim.
@@ -94,11 +134,18 @@ type coreV1LocalObjectReference struct {
 	Name string `json:"name"`
 }
 
+// coreV1Capabilities holds POSIX capabilities to add or drop in a container securityContext.
+type coreV1Capabilities struct {
+	Add  []string `json:"add,omitempty"`
+	Drop []string `json:"drop,omitempty"`
+}
+
 // coreV1SecurityContext holds container-level security attributes.
 type coreV1SecurityContext struct {
-	Privileged *bool  `json:"privileged,omitempty"`
-	RunAsUser  *int64 `json:"runAsUser,omitempty"`
-	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
+	Privileged   *bool               `json:"privileged,omitempty"`
+	RunAsUser    *int64              `json:"runAsUser,omitempty"`
+	RunAsGroup   *int64              `json:"runAsGroup,omitempty"`
+	Capabilities *coreV1Capabilities `json:"capabilities,omitempty"`
 }
 
 // coreV1HTTPGetAction represents an HTTPGet probe action.
@@ -185,11 +232,34 @@ func toCoreV1PVC(pvc BlockPVCManifest, namespace string) coreV1PVC {
 	if pvc.StorageClassName != "" {
 		res.Spec.StorageClassName = &pvc.StorageClassName
 	}
-	if pvc.DataSourcePVC != "" {
+	if pvc.DataSourceSnapshot != "" {
+		apiGroup := pvc.DataSourceAPIGroup
+		if apiGroup == "" {
+			apiGroup = "snapshot.storage.k8s.io"
+		}
+		kind := pvc.DataSourceKind
+		if kind == "" {
+			kind = "VolumeSnapshot"
+		}
 		res.Spec.DataSource = &coreV1DataSource{
-			Kind: "PersistentVolumeClaim",
+			APIGroup: &apiGroup,
+			Kind:     kind,
+			Name:     pvc.DataSourceSnapshot,
+		}
+	} else if pvc.DataSourcePVC != "" {
+		kind := pvc.DataSourceKind
+		if kind == "" {
+			kind = "PersistentVolumeClaim"
+		}
+		ds := &coreV1DataSource{
+			Kind: kind,
 			Name: pvc.DataSourcePVC,
 		}
+		if pvc.DataSourceAPIGroup != "" {
+			ag := pvc.DataSourceAPIGroup
+			ds.APIGroup = &ag
+		}
+		res.Spec.DataSource = ds
 	}
 	return res
 }
@@ -246,7 +316,12 @@ func toCoreV1Container(c ContainerManifest) coreV1Container {
 			Value: ev.Value,
 		})
 	}
-	if c.Privileged || c.RunAsUser != nil || c.RunAsGroup != nil {
+	hasTopLevelSC := c.Privileged || c.RunAsUser != nil || c.RunAsGroup != nil
+	hasCaps := c.SecurityContext != nil && c.SecurityContext.Capabilities != nil &&
+		(len(c.SecurityContext.Capabilities.Add) > 0 || len(c.SecurityContext.Capabilities.Drop) > 0)
+	hasNestedSC := c.SecurityContext != nil &&
+		(c.SecurityContext.Privileged != nil || c.SecurityContext.RunAsUser != nil || c.SecurityContext.RunAsGroup != nil || hasCaps)
+	if hasTopLevelSC || hasNestedSC {
 		sc := &coreV1SecurityContext{
 			RunAsUser:  c.RunAsUser,
 			RunAsGroup: c.RunAsGroup,
@@ -254,6 +329,26 @@ func toCoreV1Container(c ContainerManifest) coreV1Container {
 		if c.Privileged {
 			priv := true
 			sc.Privileged = &priv
+		}
+		if c.SecurityContext != nil {
+			if c.SecurityContext.Privileged != nil {
+				priv := *c.SecurityContext.Privileged
+				sc.Privileged = &priv
+			}
+			if c.SecurityContext.RunAsUser != nil {
+				u := *c.SecurityContext.RunAsUser
+				sc.RunAsUser = &u
+			}
+			if c.SecurityContext.RunAsGroup != nil {
+				g := *c.SecurityContext.RunAsGroup
+				sc.RunAsGroup = &g
+			}
+			if hasCaps {
+				sc.Capabilities = &coreV1Capabilities{
+					Add:  slices.Clone(c.SecurityContext.Capabilities.Add),
+					Drop: slices.Clone(c.SecurityContext.Capabilities.Drop),
+				}
+			}
 		}
 		res.SecurityContext = sc
 	}

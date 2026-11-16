@@ -104,6 +104,54 @@ func WithDefaultEgressImage(img string) ReconcilerOption {
 	}
 }
 
+// WithTransparentEgress configures whether transparent nftables/DNS egress interception is enabled on egress sidecars (default true).
+func WithTransparentEgress(enabled bool) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.transparentEgress = enabled
+	}
+}
+
+// WithDefaultEgressEnabled configures whether seeded and fallback templates enable the egress sidecar by default.
+func WithDefaultEgressEnabled(enabled bool) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.defaultEgressEnabled = enabled
+	}
+}
+
+// WithDefaultEgressExchangeURL configures the default secret exchange URL when a template leaves egress.exchangeUrl empty.
+func WithDefaultEgressExchangeURL(exchangeURL string) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.defaultEgressExchangeURL = strings.TrimSpace(exchangeURL)
+	}
+}
+
+// WithEgressDefaults configures default egress sidecar enablement, image, and exchange URL in one option.
+func WithEgressDefaults(enabled bool, image, exchangeURL string) ReconcilerOption {
+	return func(r *Reconciler) {
+		r.defaultEgressEnabled = enabled
+		if strings.TrimSpace(image) != "" {
+			r.defaultEgressImage = strings.TrimSpace(image)
+		}
+		if strings.TrimSpace(exchangeURL) != "" {
+			r.defaultEgressExchangeURL = strings.TrimSpace(exchangeURL)
+		}
+	}
+}
+
+// WithForkMode configures the volume cloning strategy used for ForkFrom sandboxes ("pvc-clone" or "snapshot").
+func WithForkMode(mode, snapshotClass string) ReconcilerOption {
+	return func(r *Reconciler) {
+		normalized := strings.ToLower(strings.TrimSpace(mode))
+		switch normalized {
+		case "snapshot":
+			r.forkMode = "snapshot"
+		case "pvc-clone", "pvc_clone", "":
+			r.forkMode = "pvc-clone"
+		}
+		r.volumeSnapshotClass = strings.TrimSpace(snapshotClass)
+	}
+}
+
 // WithE2BTemplateAPI configures whether the E2B template API feature gate is enabled.
 func WithE2BTemplateAPI(enabled bool) ReconcilerOption {
 	return func(r *Reconciler) {
@@ -224,44 +272,181 @@ func WithDefaultImagePullSecrets(secrets ...string) ReconcilerOption {
 // Reconciler manages the lifecycle of PodBox instances, pre-attached PodWarmPools,
 // and dual Raw Block PVCs.
 type Reconciler struct {
-	mu                      sync.RWMutex
-	boxes                   map[string]*v1alpha1.PodBoxStatus
-	specs                   map[string]v1alpha1.PodBoxSpec
-	resolvedImages          map[string]string
-	boxAnnotations          map[string]map[string]string
-	templates               map[string]v1alpha1.PodTemplateSpec
-	warmPools               map[string]*warmPoolState
-	warmCounter             int64
-	kubeClient              KubeClient
-	namespace               string
-	volumeMode              string // "Block" or "Filesystem", default "Block"
-	defaultStorageClass     string // default "standard"
-	defaultRuntimeClass     string // default "kata-qemu"
-	runtimeClassSet         bool
-	poddInjectorImage       string // default "cubepod-podd:latest"
-	defaultSandboxImage     string // default "ubuntu:24.04"
-	defaultEgressImage      string
-	FailWarmPoolClaim       bool
-	e2bTemplateAPI          bool
-	templateBuildEnabled    bool
-	imageBuilder            ImageBuilder
-	contextStore            ContextStore
-	contextDir              string
-	contextDirSet           bool
-	stateDir                string
-	templatePullSecret      string
-	defaultImagePullSecrets []string
-	templatePushSecret      string
-	templateRegistry        string
-	templateRepoPrefix      string
-	templateProbeTimeout    time.Duration
-	templateObjects         map[string]*v1alpha1.PodTemplate
-	templateIndex           map[string]string
-	idempotency             map[string]idempotencyRecord
-	buildingPids            map[string]int
-	buildMetrics            templateBuildMetricsCollector
-	egressCA                *egress.CA
-	egressUpstreamCAPEM     []byte
+	mu                       sync.RWMutex
+	boxes                    map[string]*v1alpha1.PodBoxStatus
+	specs                    map[string]v1alpha1.PodBoxSpec
+	resolvedImages           map[string]string
+	boxAnnotations           map[string]map[string]string
+	templates                map[string]v1alpha1.PodTemplateSpec
+	warmPools                map[string]*warmPoolState
+	warmCounter              int64
+	kubeClient               KubeClient
+	namespace                string
+	volumeMode               string // "Block" or "Filesystem", default "Block"
+	defaultStorageClass      string // default "standard"
+	defaultRuntimeClass      string // default "kata-qemu"
+	runtimeClassSet          bool
+	poddInjectorImage        string // default "cubepod-podd:latest"
+	defaultSandboxImage      string // default "ubuntu:24.04"
+	defaultEgressImage       string
+	defaultEgressExchangeURL string
+	defaultEgressEnabled     bool
+	transparentEgress        bool
+	forkMode                 string // "pvc-clone" or "snapshot", default "pvc-clone"
+	volumeSnapshotClass      string
+	FailWarmPoolClaim        bool
+	e2bTemplateAPI           bool
+	templateBuildEnabled     bool
+	imageBuilder             ImageBuilder
+	contextStore             ContextStore
+	contextDir               string
+	contextDirSet            bool
+	stateDir                 string
+	templatePullSecret       string
+	defaultImagePullSecrets  []string
+	templatePushSecret       string
+	templateRegistry         string
+	templateRepoPrefix       string
+	templateProbeTimeout     time.Duration
+	templateObjects          map[string]*v1alpha1.PodTemplate
+	templateIndex            map[string]string
+	idempotency              map[string]idempotencyRecord
+	buildingPids             map[string]int
+	buildMetrics             templateBuildMetricsCollector
+	forkMetrics              forkMetricsCollector
+	egressCA                 *egress.CA
+	egressUpstreamCAPEM      []byte
+}
+
+// ForkMetricsSnapshot holds Prometheus-ready sandbox fork counters and duration histogram buckets.
+type ForkMetricsSnapshot struct {
+	ForksTotal          map[string]map[string]int64
+	ForkDurationBuckets map[string]int64
+	ForkDurationSum     float64
+	ForkDurationCount   int64
+}
+
+type forkMetricsCollector struct {
+	mu       sync.Mutex
+	total    map[string]map[string]int64
+	buckets  map[string]int64
+	sumSecs  float64
+	countObs int64
+}
+
+func (m *forkMetricsCollector) observe(mode, result string, dur time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.total == nil {
+		m.total = make(map[string]map[string]int64)
+	}
+	if m.total[mode] == nil {
+		m.total[mode] = make(map[string]int64)
+	}
+	if m.buckets == nil {
+		m.buckets = map[string]int64{
+			"le_0_1": 0,
+			"le_0_5": 0,
+			"le_1":   0,
+			"le_5":   0,
+			"le_15":  0,
+			"le_60":  0,
+			"le_inf": 0,
+		}
+	}
+	m.total[mode][result]++
+	secs := dur.Seconds()
+	if secs < 0 {
+		secs = 0
+	}
+	m.sumSecs += secs
+	m.countObs++
+	if secs <= 0.1 {
+		m.buckets["le_0_1"]++
+	}
+	if secs <= 0.5 {
+		m.buckets["le_0_5"]++
+	}
+	if secs <= 1 {
+		m.buckets["le_1"]++
+	}
+	if secs <= 5 {
+		m.buckets["le_5"]++
+	}
+	if secs <= 15 {
+		m.buckets["le_15"]++
+	}
+	if secs <= 60 {
+		m.buckets["le_60"]++
+	}
+	m.buckets["le_inf"]++
+}
+
+func (m *forkMetricsCollector) snapshot() ForkMetricsSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tot := make(map[string]map[string]int64, len(m.total))
+	for mode, results := range m.total {
+		cp := make(map[string]int64, len(results))
+		for res, v := range results {
+			cp[res] = v
+		}
+		tot[mode] = cp
+	}
+	bkt := map[string]int64{
+		"le_0_1": m.buckets["le_0_1"],
+		"le_0_5": m.buckets["le_0_5"],
+		"le_1":   m.buckets["le_1"],
+		"le_5":   m.buckets["le_5"],
+		"le_15":  m.buckets["le_15"],
+		"le_60":  m.buckets["le_60"],
+		"le_inf": m.buckets["le_inf"],
+	}
+	return ForkMetricsSnapshot{
+		ForksTotal:          tot,
+		ForkDurationBuckets: bkt,
+		ForkDurationSum:     m.sumSecs,
+		ForkDurationCount:   m.countObs,
+	}
+}
+
+// ForkMetrics returns a snapshot of sandbox CoW fork counters and duration histogram buckets.
+func (r *Reconciler) ForkMetrics() ForkMetricsSnapshot {
+	if r == nil {
+		return ForkMetricsSnapshot{}
+	}
+	return r.forkMetrics.snapshot()
+}
+
+// TransparentEgressEnabled reports whether transparent egress interception is enabled.
+func (r *Reconciler) TransparentEgressEnabled() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.transparentEgress
+}
+
+// DefaultEgressEnabled reports whether default egress sidecar injection is enabled.
+func (r *Reconciler) DefaultEgressEnabled() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.defaultEgressEnabled
+}
+
+// ForkMode returns the configured CoW fork strategy ("pvc-clone" or "snapshot").
+func (r *Reconciler) ForkMode() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.forkMode == "" {
+		return "pvc-clone"
+	}
+	return r.forkMode
+}
+
+// VolumeSnapshotClass returns the configured VolumeSnapshotClassName for snapshot fork mode.
+func (r *Reconciler) VolumeSnapshotClass() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.volumeSnapshotClass
 }
 
 // WithEgressUpstreamCA configures an optional upstream root CA PEM bundle distributed
@@ -297,6 +482,8 @@ func NewReconciler(opts ...ReconcilerOption) *Reconciler {
 		defaultRuntimeClass:  "kata-qemu",
 		poddInjectorImage:    "cubepod-podd:latest",
 		defaultSandboxImage:  "ubuntu:24.04",
+		transparentEgress:    true,
+		forkMode:             "pvc-clone",
 		e2bTemplateAPI:       false,
 		templateBuildEnabled: false,
 		imageBuilder:         NewFakeImageBuilder(),
@@ -523,8 +710,13 @@ func (r *Reconciler) applyTemplateDefaults(tpl *v1alpha1.PodTemplateSpec) {
 	if tpl.PoddImage == "" && r.poddInjectorImage != "" {
 		tpl.PoddImage = r.poddInjectorImage
 	}
-	if tpl.Egress.Enabled && tpl.Egress.Image == "" && r.defaultEgressImage != "" {
-		tpl.Egress.Image = r.defaultEgressImage
+	if tpl.Egress.Enabled {
+		if tpl.Egress.Image == "" && r.defaultEgressImage != "" {
+			tpl.Egress.Image = r.defaultEgressImage
+		}
+		if tpl.Egress.ExchangeURL == "" && r.defaultEgressExchangeURL != "" {
+			tpl.Egress.ExchangeURL = r.defaultEgressExchangeURL
+		}
 	}
 }
 
@@ -554,10 +746,20 @@ func (r *Reconciler) defaultTemplate(templateID string) v1alpha1.PodTemplateSpec
 		sc = "standard"
 	}
 
+	var egressCfg v1alpha1.EgressConfig
+	if r.defaultEgressEnabled {
+		egressCfg = v1alpha1.EgressConfig{
+			Enabled:     true,
+			Image:       r.defaultEgressImage,
+			ExchangeURL: r.defaultEgressExchangeURL,
+		}
+	}
+
 	return v1alpha1.PodTemplateSpec{
 		RuntimeClassName: rtClass,
 		Image:            img,
 		PoddImage:        poddImg,
+		Egress:           egressCfg,
 		Resources: v1alpha1.ResourceRequirements{
 			CPURequest:    "1",
 			CPULimit:      "2",
@@ -715,8 +917,12 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				WorkspacePVCName: wsPVC.Name,
 				Phase:            v1alpha1.PodBoxPhaseRunning,
 			}
-			podArgs := append([]string{r.volumeMode, r.templatePullSecret}, r.defaultImagePullSecrets...)
-			podManifest := BuildKataPod(entryID, tpl, warmBoxSpec, dummyStatus, podArgs...)
+			pullSecrets := append([]string{r.templatePullSecret}, r.defaultImagePullSecrets...)
+			podManifest := BuildPodManifest(entryID, tpl, warmBoxSpec, dummyStatus, PodBuildOptions{
+				VolumeMode:        r.volumeMode,
+				ImagePullSecrets:  pullSecrets,
+				TransparentEgress: r.transparentEgress,
+			})
 			podManifest.Namespace = r.namespace
 			if podManifest.Labels == nil {
 				podManifest.Labels = make(map[string]string)
@@ -988,6 +1194,22 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	now := time.Now().UTC()
 	status, exists := r.boxes[name]
 
+	isFork := !exists && spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != ""
+	var forkStart time.Time
+	var forkMetricMode string
+	forkResult := "error"
+	if isFork {
+		forkStart = time.Now()
+		if r.forkMode == "snapshot" {
+			forkMetricMode = "snapshot"
+		} else {
+			forkMetricMode = "pvc_clone"
+		}
+		defer func() {
+			r.forkMetrics.observe(forkMetricMode, forkResult, time.Since(forkStart))
+		}()
+	}
+
 	resolved, err := r.resolveTemplateLocked(spec.TemplateRef)
 	if err != nil {
 		return nil, err
@@ -1027,6 +1249,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 
 	createdCold := false
 	claimedFromWarmPool := false
+	var createdForkSnapshots []string
 	if !exists {
 		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set, no ForkFrom,
 		// no deterministic VolumeKey, and no official E2B volume mounts).
@@ -1052,6 +1275,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			// 2. CoW Fork provisioning from parent sandbox
 			createdCold = true
 			parentRootfsPVC, parentWorkspacePVC := r.resolveForkParentPVCsLocked(ctx, spec.ForkFrom.PodBoxName)
+			if parentRootfsPVC == "" {
+				parentRootfsPVC = fmt.Sprintf("%s-rootfs-pvc", spec.ForkFrom.PodBoxName)
+			}
+			if parentWorkspacePVC == "" {
+				parentWorkspacePVC = fmt.Sprintf("%s-workspace-pvc", spec.ForkFrom.PodBoxName)
+			}
 			rootfsName := fmt.Sprintf("%s-rootfs-pvc", name)
 			if spec.RootfsGeneration > 1 {
 				rootfsName = fmt.Sprintf("%s-rootfs-gen%d-pvc", name, spec.RootfsGeneration)
@@ -1066,11 +1295,93 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				Reason:            "ForkCloned",
 				Message:           fmt.Sprintf("Forked from parent sandbox %s", spec.ForkFrom.PodBoxName),
 			}
-			rootfsPVC, wsPVC := BuildBlockPVCs(name, tpl, spec, r.volumeMode, parentRootfsPVC, parentWorkspacePVC)
-			rootfsPVC.Namespace = r.namespace
-			wsPVC.Namespace = r.namespace
-			_ = r.kubeClient.EnsurePVC(ctx, rootfsPVC)
-			_ = r.kubeClient.EnsurePVC(ctx, wsPVC)
+			var rootfsPVC, wsPVC BlockPVCManifest
+			if r.forkMode == "snapshot" {
+				rootfsSnapName := forkSnapshotName(name, "-rootfs-snap")
+				wsSnapName := forkSnapshotName(name, "-workspace-snap")
+				var snapClassPtr *string
+				if r.volumeSnapshotClass != "" {
+					sc := r.volumeSnapshotClass
+					snapClassPtr = &sc
+				}
+				snapLabels := map[string]string{
+					"app.kubernetes.io/name": "cubepod",
+					"pod.cubeplex.ai/box":    name,
+					"cubepod.io/forked-from": SanitizeLabelValue(spec.ForkFrom.PodBoxName),
+				}
+				rootfsSnap := VolumeSnapshot{
+					APIVersion: "snapshot.storage.k8s.io/v1",
+					Kind:       "VolumeSnapshot",
+					Metadata: v1alpha1.ObjectMeta{
+						Name:      rootfsSnapName,
+						Namespace: r.namespace,
+						Labels:    snapLabels,
+					},
+					Spec: VolumeSnapshotSpec{
+						VolumeSnapshotClassName: snapClassPtr,
+						Source: VolumeSnapshotSource{
+							PersistentVolumeClaimName: parentRootfsPVC,
+						},
+					},
+				}
+				wsSnap := VolumeSnapshot{
+					APIVersion: "snapshot.storage.k8s.io/v1",
+					Kind:       "VolumeSnapshot",
+					Metadata: v1alpha1.ObjectMeta{
+						Name:      wsSnapName,
+						Namespace: r.namespace,
+						Labels:    snapLabels,
+					},
+					Spec: VolumeSnapshotSpec{
+						VolumeSnapshotClassName: snapClassPtr,
+						Source: VolumeSnapshotSource{
+							PersistentVolumeClaimName: parentWorkspacePVC,
+						},
+					},
+				}
+
+				if err := r.kubeClient.EnsureVolumeSnapshot(ctx, rootfsSnap); err != nil {
+					return nil, fmt.Errorf("failed to create rootfs VolumeSnapshot %s: %w", rootfsSnapName, err)
+				}
+				createdForkSnapshots = append(createdForkSnapshots, rootfsSnapName)
+				if err := r.kubeClient.EnsureVolumeSnapshot(ctx, wsSnap); err != nil {
+					r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
+					return nil, fmt.Errorf("failed to create workspace VolumeSnapshot %s: %w", wsSnapName, err)
+				}
+				createdForkSnapshots = append(createdForkSnapshots, wsSnapName)
+
+				if err := r.kubeClient.WaitVolumeSnapshotReady(ctx, r.namespace, rootfsSnapName); err != nil {
+					r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
+					return nil, fmt.Errorf("rootfs VolumeSnapshot %s not ready: %w", rootfsSnapName, err)
+				}
+				if err := r.kubeClient.WaitVolumeSnapshotReady(ctx, r.namespace, wsSnapName); err != nil {
+					r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
+					return nil, fmt.Errorf("workspace VolumeSnapshot %s not ready: %w", wsSnapName, err)
+				}
+
+				rootfsPVC, wsPVC = BuildBlockPVCsWithOptions(name, tpl, spec, BlockPVCOptions{
+					VolumeMode:            r.volumeMode,
+					RootfsSnapshotName:    rootfsSnapName,
+					WorkspaceSnapshotName: wsSnapName,
+				})
+				rootfsPVC.Namespace = r.namespace
+				wsPVC.Namespace = r.namespace
+				if err := r.kubeClient.EnsurePVC(ctx, rootfsPVC); err != nil {
+					r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
+					return nil, fmt.Errorf("failed to ensure forked rootfs PVC %s: %w", rootfsPVC.Name, err)
+				}
+				if err := r.kubeClient.EnsurePVC(ctx, wsPVC); err != nil {
+					_ = r.kubeClient.DeletePVC(ctx, r.namespace, rootfsPVC.Name)
+					r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
+					return nil, fmt.Errorf("failed to ensure forked workspace PVC %s: %w", wsPVC.Name, err)
+				}
+			} else {
+				rootfsPVC, wsPVC = BuildBlockPVCs(name, tpl, spec, r.volumeMode, parentRootfsPVC, parentWorkspacePVC)
+				rootfsPVC.Namespace = r.namespace
+				wsPVC.Namespace = r.namespace
+				_ = r.kubeClient.EnsurePVC(ctx, rootfsPVC)
+				_ = r.kubeClient.EnsurePVC(ctx, wsPVC)
+			}
 		} else {
 			// 3. Standard fresh sandbox provisioning
 			createdCold = true
@@ -1167,8 +1478,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		if status.PodName == "" {
 			status.PodName = name
 		}
-		podArgs := append([]string{r.volumeMode, r.templatePullSecret}, r.defaultImagePullSecrets...)
-		podManifest := BuildKataPod(name, tpl, spec, *status, podArgs...)
+		pullSecrets := append([]string{r.templatePullSecret}, r.defaultImagePullSecrets...)
+		podManifest := BuildPodManifest(name, tpl, spec, *status, PodBuildOptions{
+			VolumeMode:        r.volumeMode,
+			ImagePullSecrets:  pullSecrets,
+			TransparentEgress: r.transparentEgress,
+		})
 		podManifest.Namespace = r.namespace
 		podIP, err := r.kubeClient.EnsurePod(ctx, podManifest)
 		if err != nil {
@@ -1190,6 +1505,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		status.PodName = podManifest.Name
 		status.LastActivityAt = &now
 		status.PausedAt = nil
+		if len(createdForkSnapshots) > 0 {
+			r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
+		}
 	}
 
 	r.specs[name] = spec
@@ -1212,6 +1530,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		Status: cp,
 	}
 	_ = r.kubeClient.UpsertPodBox(ctx, box)
+	forkResult = "ok"
 
 	return &cp, nil
 }
@@ -1568,11 +1887,49 @@ func (r *Reconciler) rollbackColdCreateLocked(ctx context.Context, name string, 
 			}
 		}
 		r.deleteEgressSecretsLocked(cleanupCtx, name)
+		if spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != "" {
+			r.cleanupForkSnapshotsLocked(cleanupCtx,
+				forkSnapshotName(name, "-rootfs-snap"),
+				forkSnapshotName(name, "-workspace-snap"),
+			)
+		}
 		_ = r.kubeClient.DeletePodBox(cleanupCtx, r.namespace, name)
 	}
 	delete(r.boxes, name)
 	delete(r.specs, name)
 	delete(r.resolvedImages, name)
+}
+
+func forkSnapshotName(boxName, suffix string) string {
+	name := boxName + suffix
+	if len(name) <= 63 {
+		return name
+	}
+	maxPrefix := 63 - len(suffix)
+	if maxPrefix <= 0 {
+		return name[:63]
+	}
+	prefix := strings.TrimRight(boxName[:maxPrefix], "-")
+	if prefix == "" {
+		prefix = "snap"
+	}
+	return prefix + suffix
+}
+
+func (r *Reconciler) cleanupForkSnapshotsLocked(ctx context.Context, snapNames ...string) {
+	if r.kubeClient == nil || len(snapNames) == 0 {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+	defer cancel()
+	for _, snapName := range snapNames {
+		if snapName == "" {
+			continue
+		}
+		if err := r.kubeClient.DeleteVolumeSnapshot(cleanupCtx, r.namespace, snapName); err != nil && !isSecretNotFoundError(err) {
+			slog.Warn("failed to clean up temporary fork VolumeSnapshot", "snapshot", snapName, "err", err)
+		}
+	}
 }
 
 func (r *Reconciler) deleteEgressSecretsLocked(ctx context.Context, boxName string) {
@@ -1647,6 +2004,12 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 
 	_ = r.kubeClient.DeletePodBox(ctx, r.namespace, name)
 	r.deleteEgressSecretsLocked(ctx, name)
+	if spec, hasSpec := r.specs[name]; hasSpec && spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != "" {
+		r.cleanupForkSnapshotsLocked(ctx,
+			forkSnapshotName(name, "-rootfs-snap"),
+			forkSnapshotName(name, "-workspace-snap"),
+		)
+	}
 
 	status, ok := r.boxes[name]
 	if !ok {

@@ -424,6 +424,14 @@ func (r *Reconciler) EnsureSeededTemplates(ctx context.Context) error {
 
 	for _, s := range seededTemplates {
 		if _, exists := r.templateObjects[s.name]; !exists {
+			var egressCfg v1alpha1.EgressConfig
+			if r.defaultEgressEnabled {
+				egressCfg = v1alpha1.EgressConfig{
+					Enabled:     true,
+					Image:       r.defaultEgressImage,
+					ExchangeURL: r.defaultEgressExchangeURL,
+				}
+			}
 			tpl := v1alpha1.PodTemplate{
 				APIVersion: "cubepod.io/v1alpha1",
 				Kind:       "PodTemplate",
@@ -432,6 +440,7 @@ func (r *Reconciler) EnsureSeededTemplates(ctx context.Context) error {
 					Namespace: r.namespace,
 				},
 				Spec: v1alpha1.PodTemplateSpec{
+					Egress:           egressCfg,
 					RuntimeClassName: r.defaultRuntimeClass,
 					Image:            s.image,
 					PoddImage:        r.poddInjectorImage,

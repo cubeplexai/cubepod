@@ -59,8 +59,13 @@ func main() {
 		poddImage            = flag.String("podd-image", "ghcr.io/cubeplexai/cubepod-podd:v0.5.4", "Image for podd-installer initContainer")
 		sandboxImage         = flag.String("sandbox-image", "ubuntu:24.04", "Default sandbox image")
 		egressImage          = flag.String("egress-image", defaultEgressImage(), "Default cubepod-egress sidecar image when template egress.image is empty")
+		egressExchangeURL    = flag.String("egress-exchange-url", os.Getenv("CUBEPOD_EGRESS_EXCHANGE_URL"), "Default egress secret exchange URL when template egress.exchangeUrl is empty")
+		defaultEgressEnabled = flag.Bool("default-egress-enabled", true, "Enable zero-trust egress sidecar by default on seeded and fallback templates")
+		transparentEgress    = flag.Bool("transparent-egress", true, "Enable transparent nftables/DNS egress interception in sidecars")
+		forkMode             = flag.String("fork-mode", "pvc-clone", "Sandbox fork volume cloning mode (pvc-clone or snapshot)")
+		volumeSnapshotClass  = flag.String("volume-snapshot-class", "", "VolumeSnapshotClassName used when --fork-mode=snapshot")
 		e2bTemplateAPI       = flag.Bool("e2b-template-api", false, "Enable E2B template API feature gate")
-		featureGate          = flag.String("feature-gate", "", "Comma-separated feature gates (e.g. E2BTemplateAPI=true)")
+		featureGate          = flag.String("feature-gate", "", "Comma-separated feature gates (e.g. E2BTemplateAPI=true,TransparentEgress=true)")
 		templateBuild        = flag.Bool("template-build", false, "Enable template image build Beta pipeline")
 		buildkitAddr         = flag.String("buildkit-addr", "", "BuildKit daemon gRPC address (e.g. tcp://cubepod-buildkit:1234)")
 		stateDir             = flag.String("state-dir", "", "State directory for template contexts and logs")
@@ -78,6 +83,20 @@ func main() {
 
 	gates := parseFeatureGates(*featureGate)
 	e2bAPIEnabled := *e2bTemplateAPI || gates["E2BTemplateAPI"]
+	transparentEgressEnabled := *transparentEgress
+	if v, ok := gates["TransparentEgress"]; ok {
+		transparentEgressEnabled = v
+	}
+	normalizedForkMode := strings.ToLower(strings.TrimSpace(*forkMode))
+	switch normalizedForkMode {
+	case "pvc-clone", "pvc_clone", "":
+		normalizedForkMode = "pvc-clone"
+	case "snapshot":
+		normalizedForkMode = "snapshot"
+	default:
+		slog.Error("invalid --fork-mode (expected pvc-clone or snapshot)", "forkMode", *forkMode)
+		os.Exit(1)
+	}
 
 	effectiveStateDir := *stateDir
 	if effectiveStateDir == "" {
@@ -96,6 +115,11 @@ func main() {
 		"poddImage", *poddImage,
 		"sandboxImage", *sandboxImage,
 		"egressImage", *egressImage,
+		"egressExchangeURL", *egressExchangeURL,
+		"defaultEgressEnabled", *defaultEgressEnabled,
+		"transparentEgress", transparentEgressEnabled,
+		"forkMode", normalizedForkMode,
+		"volumeSnapshotClass", *volumeSnapshotClass,
 		"e2bTemplateAPI", e2bAPIEnabled,
 		"templateBuild", *templateBuild,
 		"buildkitAddr", *buildkitAddr,
@@ -147,6 +171,10 @@ func main() {
 		controller.WithPoddInjectorImage(*poddImage),
 		controller.WithDefaultSandboxImage(*sandboxImage),
 		controller.WithDefaultEgressImage(*egressImage),
+		controller.WithDefaultEgressExchangeURL(*egressExchangeURL),
+		controller.WithDefaultEgressEnabled(*defaultEgressEnabled),
+		controller.WithTransparentEgress(transparentEgressEnabled),
+		controller.WithForkMode(normalizedForkMode, *volumeSnapshotClass),
 		controller.WithE2BTemplateAPI(e2bAPIEnabled),
 		controller.WithTemplateBuildEnabled(*templateBuild),
 		controller.WithImageBuilder(builder),

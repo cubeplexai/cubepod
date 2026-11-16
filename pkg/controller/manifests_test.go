@@ -403,3 +403,85 @@ func TestValidateOfficialVolumeMounts_RejectsInvalid(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildPodManifest_TransparentEgress(t *testing.T) {
+	tpl := sampleTemplate()
+	tpl.Egress = v1alpha1.EgressConfig{
+		Enabled:     true,
+		Image:       "cubepod-egress:v0.6.0",
+		ExchangeURL: "https://exchange.internal:8443",
+	}
+	spec := v1alpha1.PodBoxSpec{RootfsGeneration: 1}
+	status := v1alpha1.PodBoxStatus{PodName: "trans-box"}
+
+	findEgress := func(pod controller.PodManifest) controller.ContainerManifest {
+		for _, c := range pod.Containers {
+			if c.Name == "egress" {
+				return c
+			}
+		}
+		t.Fatal("egress container not found")
+		return controller.ContainerManifest{}
+	}
+
+	// 1. TransparentEgress = true -> CUBEPOD_TRANSPARENT=1 and NET_ADMIN capability
+	podOn := controller.BuildPodManifest("trans-box", tpl, spec, status, controller.PodBuildOptions{
+		VolumeMode:        "Block",
+		TransparentEgress: true,
+	})
+	egressOn := findEgress(podOn)
+	var hasTransparentEnv bool
+	for _, ev := range egressOn.Env {
+		if ev.Name == "CUBEPOD_TRANSPARENT" && ev.Value == "1" {
+			hasTransparentEnv = true
+		}
+	}
+	if !hasTransparentEnv {
+		t.Fatalf("expected CUBEPOD_TRANSPARENT=1 in egress env, got %+v", egressOn.Env)
+	}
+	if egressOn.SecurityContext == nil || egressOn.SecurityContext.Capabilities == nil ||
+		!slices.Contains(egressOn.SecurityContext.Capabilities.Add, "NET_ADMIN") {
+		t.Fatalf("expected NET_ADMIN capability on egress container, got %+v", egressOn.SecurityContext)
+	}
+
+	// 2. TransparentEgress = false -> neither CUBEPOD_TRANSPARENT nor NET_ADMIN
+	podOff := controller.BuildPodManifest("trans-box", tpl, spec, status, controller.PodBuildOptions{
+		VolumeMode:        "Block",
+		TransparentEgress: false,
+	})
+	egressOff := findEgress(podOff)
+	for _, ev := range egressOff.Env {
+		if ev.Name == "CUBEPOD_TRANSPARENT" {
+			t.Fatalf("did not expect CUBEPOD_TRANSPARENT when TransparentEgress=false, got %+v", ev)
+		}
+	}
+	if egressOff.SecurityContext != nil {
+		t.Fatalf("expected nil SecurityContext when TransparentEgress=false, got %+v", egressOff.SecurityContext)
+	}
+}
+
+func TestBuildBlockPVCsWithOptions_VolumeSnapshotDataSource(t *testing.T) {
+	tpl := sampleTemplate()
+	spec := v1alpha1.PodBoxSpec{
+		RootfsGeneration: 1,
+		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: "parent-box"},
+	}
+
+	rootfsPVC, wsPVC := controller.BuildBlockPVCsWithOptions("child-box", tpl, spec, controller.BlockPVCOptions{
+		VolumeMode:            "Block",
+		RootfsSnapshotName:    "child-box-rootfs-snap",
+		WorkspaceSnapshotName: "child-box-workspace-snap",
+	})
+	if rootfsPVC.DataSourceSnapshot != "child-box-rootfs-snap" ||
+		rootfsPVC.DataSourceKind != "VolumeSnapshot" ||
+		rootfsPVC.DataSourceAPIGroup != "snapshot.storage.k8s.io" ||
+		rootfsPVC.DataSourcePVC != "" {
+		t.Fatalf("unexpected rootfsPVC snapshot dataSource: %+v", rootfsPVC)
+	}
+	if wsPVC.DataSourceSnapshot != "child-box-workspace-snap" ||
+		wsPVC.DataSourceKind != "VolumeSnapshot" ||
+		wsPVC.DataSourceAPIGroup != "snapshot.storage.k8s.io" ||
+		wsPVC.DataSourcePVC != "" {
+		t.Fatalf("unexpected wsPVC snapshot dataSource: %+v", wsPVC)
+	}
+}

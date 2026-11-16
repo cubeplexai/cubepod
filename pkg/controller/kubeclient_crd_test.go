@@ -21,6 +21,7 @@ type mockCRDServer struct {
 	mu                 sync.RWMutex
 	podBoxes           map[string]v1alpha1.PodBox
 	podWarmPools       map[string]v1alpha1.PodWarmPool
+	volumeSnapshots    map[string]controller.VolumeSnapshot
 	getCalls           int
 	postCalls          int
 	putCalls           int
@@ -37,8 +38,9 @@ type mockCRDServer struct {
 
 func newMockCRDServer() (*mockCRDServer, *httptest.Server) {
 	m := &mockCRDServer{
-		podBoxes:     make(map[string]v1alpha1.PodBox),
-		podWarmPools: make(map[string]v1alpha1.PodWarmPool),
+		podBoxes:        make(map[string]v1alpha1.PodBox),
+		podWarmPools:    make(map[string]v1alpha1.PodWarmPool),
+		volumeSnapshots: make(map[string]controller.VolumeSnapshot),
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -56,6 +58,65 @@ func newMockCRDServer() (*mockCRDServer, *httptest.Server) {
 
 		if m.return404CRD {
 			http.Error(w, `{"kind":"Status","status":"Failure","message":"the server could not find the requested resource","reason":"NotFound","code":404}`, http.StatusNotFound)
+			return
+		}
+
+		// Prefix: /apis/snapshot.storage.k8s.io/v1/namespaces/{ns}/volumesnapshots
+		const snapPrefix = "/apis/snapshot.storage.k8s.io/v1/namespaces/"
+		if strings.HasPrefix(path, snapPrefix) {
+			trimmed := strings.TrimPrefix(path, snapPrefix)
+			parts := strings.Split(trimmed, "/")
+			if len(parts) < 2 || parts[1] != "volumesnapshots" {
+				http.NotFound(w, r)
+				return
+			}
+			ns := parts[0]
+			if len(parts) == 2 && r.Method == http.MethodPost {
+				m.postCalls++
+				var snap controller.VolumeSnapshot
+				if err := json.NewDecoder(r.Body).Decode(&snap); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				key := fmt.Sprintf("%s/%s", ns, snap.Metadata.Name)
+				if _, exists := m.volumeSnapshots[key]; exists {
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+				snap.Metadata.Namespace = ns
+				m.volumeSnapshots[key] = snap
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(snap)
+				return
+			}
+			if len(parts) == 3 {
+				name := parts[2]
+				key := fmt.Sprintf("%s/%s", ns, name)
+				switch r.Method {
+				case http.MethodGet:
+					m.getCalls++
+					snap, ok := m.volumeSnapshots[key]
+					if !ok {
+						http.NotFound(w, r)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(snap)
+					return
+				case http.MethodDelete:
+					m.deleteCalls++
+					if _, ok := m.volumeSnapshots[key]; !ok {
+						http.NotFound(w, r)
+						return
+					}
+					delete(m.volumeSnapshots, key)
+					w.WriteHeader(http.StatusOK)
+					_ = json.NewEncoder(w).Encode(map[string]string{"status": "Success"})
+					return
+				}
+			}
+			http.NotFound(w, r)
 			return
 		}
 
@@ -1027,5 +1088,123 @@ func TestRESTKubeClient_PodWarmPool_MissingCRD(t *testing.T) {
 	specs := r.GetWarmPoolSpecs()
 	if _, exists := specs["missing-crd-pool"]; !exists {
 		t.Fatal("expected missing-crd-pool to NOT be deleted when CRD is not installed")
+	}
+}
+
+func TestRESTKubeClient_VolumeSnapshot_CRUDAndWaitReady(t *testing.T) {
+	mock, ts := newMockCRDServer()
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(
+		ts.URL,
+		"cubepod-workloads",
+		"test-token",
+		ts.Client(),
+		controller.WithPollInterval(10*time.Millisecond),
+		controller.WithPollTimeout(2*time.Second),
+	)
+	ctx := context.Background()
+
+	snapClass := "longhorn-snapclass"
+	notReady := false
+	snap := controller.VolumeSnapshot{
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "snap-1",
+			Namespace: "cubepod-workloads",
+		},
+		Spec: controller.VolumeSnapshotSpec{
+			VolumeSnapshotClassName: &snapClass,
+			Source: controller.VolumeSnapshotSource{
+				PersistentVolumeClaimName: "parent-rootfs-pvc",
+			},
+		},
+		Status: controller.VolumeSnapshotStatus{
+			ReadyToUse: &notReady,
+		},
+	}
+
+	if err := client.EnsureVolumeSnapshot(ctx, snap); err != nil {
+		t.Fatalf("EnsureVolumeSnapshot failed: %v", err)
+	}
+	// Idempotent on 409 Conflict
+	if err := client.EnsureVolumeSnapshot(ctx, snap); err != nil {
+		t.Fatalf("EnsureVolumeSnapshot idempotent 409 failed: %v", err)
+	}
+
+	got, err := client.GetVolumeSnapshot(ctx, "cubepod-workloads", "snap-1")
+	if err != nil {
+		t.Fatalf("GetVolumeSnapshot failed: %v", err)
+	}
+	if got.Spec.Source.PersistentVolumeClaimName != "parent-rootfs-pvc" {
+		t.Fatalf("unexpected snapshot source: %+v", got.Spec.Source)
+	}
+	if got.Spec.VolumeSnapshotClassName == nil || *got.Spec.VolumeSnapshotClassName != snapClass {
+		t.Fatalf("unexpected volumeSnapshotClassName: %v", got.Spec.VolumeSnapshotClassName)
+	}
+
+	// Transition readyToUse -> true asynchronously and verify WaitVolumeSnapshotReady succeeds
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		mock.mu.Lock()
+		defer mock.mu.Unlock()
+		s := mock.volumeSnapshots["cubepod-workloads/snap-1"]
+		ready := true
+		s.Status.ReadyToUse = &ready
+		mock.volumeSnapshots["cubepod-workloads/snap-1"] = s
+	}()
+	if err := client.WaitVolumeSnapshotReady(ctx, "cubepod-workloads", "snap-1"); err != nil {
+		t.Fatalf("WaitVolumeSnapshotReady failed: %v", err)
+	}
+
+	// Error status causes WaitVolumeSnapshotReady to fail immediately
+	mock.mu.Lock()
+	errSnap := mock.volumeSnapshots["cubepod-workloads/snap-1"]
+	errSnap.Status.ReadyToUse = &notReady
+	errSnap.Status.Error = &controller.VolumeSnapshotError{Message: "csi snapshot failed"}
+	mock.volumeSnapshots["cubepod-workloads/snap-1"] = errSnap
+	mock.mu.Unlock()
+	if err := client.WaitVolumeSnapshotReady(ctx, "cubepod-workloads", "snap-1"); err == nil || !strings.Contains(err.Error(), "csi snapshot failed") {
+		t.Fatalf("expected WaitVolumeSnapshotReady error containing 'csi snapshot failed', got %v", err)
+	}
+
+	// DeleteVolumeSnapshot + idempotent 404
+	if err := client.DeleteVolumeSnapshot(ctx, "cubepod-workloads", "snap-1"); err != nil {
+		t.Fatalf("DeleteVolumeSnapshot failed: %v", err)
+	}
+	if err := client.DeleteVolumeSnapshot(ctx, "cubepod-workloads", "snap-1"); err != nil {
+		t.Fatalf("DeleteVolumeSnapshot idempotent 404 failed: %v", err)
+	}
+	if _, err := client.GetVolumeSnapshot(ctx, "cubepod-workloads", "snap-1"); err == nil {
+		t.Fatal("expected GetVolumeSnapshot after delete to fail")
+	}
+}
+
+func TestMemoryKubeClient_VolumeSnapshot_CRUDAndWaitReady(t *testing.T) {
+	mk := controller.NewMemoryKubeClient()
+	ctx := context.Background()
+
+	if err := mk.EnsureVolumeSnapshot(ctx, controller.VolumeSnapshot{
+		Metadata: v1alpha1.ObjectMeta{Name: "mem-snap", Namespace: "ns1"},
+		Spec: controller.VolumeSnapshotSpec{
+			Source: controller.VolumeSnapshotSource{PersistentVolumeClaimName: "pvc-1"},
+		},
+	}); err != nil {
+		t.Fatalf("EnsureVolumeSnapshot failed: %v", err)
+	}
+	if err := mk.WaitVolumeSnapshotReady(ctx, "ns1", "mem-snap"); err != nil {
+		t.Fatalf("WaitVolumeSnapshotReady failed: %v", err)
+	}
+	got, err := mk.GetVolumeSnapshot(ctx, "ns1", "mem-snap")
+	if err != nil {
+		t.Fatalf("GetVolumeSnapshot failed: %v", err)
+	}
+	if got.APIVersion != "snapshot.storage.k8s.io/v1" || got.Kind != "VolumeSnapshot" {
+		t.Fatalf("unexpected apiVersion/kind: %s/%s", got.APIVersion, got.Kind)
+	}
+	if err := mk.DeleteVolumeSnapshot(ctx, "ns1", "mem-snap"); err != nil {
+		t.Fatalf("DeleteVolumeSnapshot failed: %v", err)
+	}
+	if _, err := mk.GetVolumeSnapshot(ctx, "ns1", "mem-snap"); err == nil {
+		t.Fatal("expected error getting deleted snapshot")
 	}
 }

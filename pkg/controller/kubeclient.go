@@ -58,33 +58,40 @@ type KubeClient interface {
 	CreateSecret(ctx context.Context, secret KubeSecret) error
 	GetSecret(ctx context.Context, namespace, name string) (*KubeSecret, error)
 	DeleteSecret(ctx context.Context, namespace, name string) error
+
+	EnsureVolumeSnapshot(ctx context.Context, snap VolumeSnapshot) error
+	GetVolumeSnapshot(ctx context.Context, namespace, name string) (*VolumeSnapshot, error)
+	WaitVolumeSnapshotReady(ctx context.Context, namespace, name string) error
+	DeleteVolumeSnapshot(ctx context.Context, namespace, name string) error
 }
 
 // MemoryKubeClient is an in-memory, thread-safe implementation of KubeClient
 // for unit testing and offline development.
 type MemoryKubeClient struct {
-	mu        sync.RWMutex
-	PVCs      map[string]BlockPVCManifest
-	Pods      map[string]PodManifest
-	PodPhases map[string]string
-	IPs       map[string]string
-	Boxes     map[string]v1alpha1.PodBox
-	WarmPools map[string]v1alpha1.PodWarmPool
-	Templates map[string]v1alpha1.PodTemplate
-	Secrets   map[string]KubeSecret
+	mu              sync.RWMutex
+	PVCs            map[string]BlockPVCManifest
+	Pods            map[string]PodManifest
+	PodPhases       map[string]string
+	IPs             map[string]string
+	Boxes           map[string]v1alpha1.PodBox
+	WarmPools       map[string]v1alpha1.PodWarmPool
+	Templates       map[string]v1alpha1.PodTemplate
+	Secrets         map[string]KubeSecret
+	VolumeSnapshots map[string]VolumeSnapshot
 }
 
 // NewMemoryKubeClient creates a new in-memory KubeClient.
 func NewMemoryKubeClient() *MemoryKubeClient {
 	m := &MemoryKubeClient{
-		PVCs:      make(map[string]BlockPVCManifest),
-		Pods:      make(map[string]PodManifest),
-		PodPhases: make(map[string]string),
-		IPs:       make(map[string]string),
-		Boxes:     make(map[string]v1alpha1.PodBox),
-		WarmPools: make(map[string]v1alpha1.PodWarmPool),
-		Templates: make(map[string]v1alpha1.PodTemplate),
-		Secrets:   make(map[string]KubeSecret),
+		PVCs:            make(map[string]BlockPVCManifest),
+		Pods:            make(map[string]PodManifest),
+		PodPhases:       make(map[string]string),
+		IPs:             make(map[string]string),
+		Boxes:           make(map[string]v1alpha1.PodBox),
+		WarmPools:       make(map[string]v1alpha1.PodWarmPool),
+		Templates:       make(map[string]v1alpha1.PodTemplate),
+		Secrets:         make(map[string]KubeSecret),
+		VolumeSnapshots: make(map[string]VolumeSnapshot),
 	}
 	if stateDir := os.Getenv("CUBEPOD_STATE"); stateDir != "" {
 		m.LoadLocalTemplates(stateDir)
@@ -549,6 +556,95 @@ func (m *MemoryKubeClient) DeleteSecret(_ context.Context, namespace, name strin
 		namespace = "default"
 	}
 	delete(m.Secrets, podKey(namespace, name))
+	return nil
+}
+
+// EnsureVolumeSnapshot records a VolumeSnapshot in memory (idempotent on existing name).
+// If Status.ReadyToUse is nil, it defaults to true so in-memory tests proceed immediately.
+func (m *MemoryKubeClient) EnsureVolumeSnapshot(_ context.Context, snap VolumeSnapshot) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if snap.Metadata.Name == "" {
+		return fmt.Errorf("VolumeSnapshot metadata.name is required")
+	}
+	if m.VolumeSnapshots == nil {
+		m.VolumeSnapshots = make(map[string]VolumeSnapshot)
+	}
+	ns := snap.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	snap.Metadata.Namespace = ns
+	if snap.APIVersion == "" {
+		snap.APIVersion = "snapshot.storage.k8s.io/v1"
+	}
+	if snap.Kind == "" {
+		snap.Kind = "VolumeSnapshot"
+	}
+	key := podKey(ns, snap.Metadata.Name)
+	if _, exists := m.VolumeSnapshots[key]; exists {
+		return nil
+	}
+	if snap.Status.ReadyToUse == nil {
+		ready := true
+		snap.Status.ReadyToUse = &ready
+	}
+	m.VolumeSnapshots[key] = snap
+	return nil
+}
+
+// GetVolumeSnapshot retrieves a VolumeSnapshot from memory by namespace and name.
+func (m *MemoryKubeClient) GetVolumeSnapshot(_ context.Context, namespace, name string) (*VolumeSnapshot, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	snap, ok := m.VolumeSnapshots[podKey(namespace, name)]
+	if !ok {
+		return nil, fmt.Errorf("volumesnapshot %s/%s not found", namespace, name)
+	}
+	cp := snap
+	return &cp, nil
+}
+
+// WaitVolumeSnapshotReady blocks until the in-memory VolumeSnapshot has ReadyToUse=true or fails.
+func (m *MemoryKubeClient) WaitVolumeSnapshotReady(ctx context.Context, namespace, name string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if namespace == "" {
+		namespace = "default"
+	}
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		snap, err := m.GetVolumeSnapshot(ctx, namespace, name)
+		if err != nil {
+			return err
+		}
+		if snap.Status.Error != nil && snap.Status.Error.Message != "" {
+			return fmt.Errorf("volumesnapshot %s/%s failed: %s", namespace, name, snap.Status.Error.Message)
+		}
+		if snap.Status.ReadyToUse != nil && *snap.Status.ReadyToUse {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for volumesnapshot %s/%s: %w", namespace, name, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+// DeleteVolumeSnapshot removes a VolumeSnapshot from memory.
+func (m *MemoryKubeClient) DeleteVolumeSnapshot(_ context.Context, namespace, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	delete(m.VolumeSnapshots, podKey(namespace, name))
 	return nil
 }
 
