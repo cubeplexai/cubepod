@@ -35,7 +35,7 @@ export function getHeaderNav(locale, pathname = '/') {
     {
       id: 'e2b',
       label: isZh ? 'E2B 兼容' : 'E2B Compat',
-      href: `${prefix}/reference/e2b-compatibility/`,
+      href: `${prefix}/getting-started/e2b-compatibility/`,
       active: stripped.includes('e2b-compatibility'),
     },
     {
