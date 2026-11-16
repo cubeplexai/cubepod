@@ -2796,3 +2796,64 @@ func TestWithDefaultEgressImage(t *testing.T) {
 		t.Fatalf("explicit egress container image = %q; want custom/egress:v9", gotImg)
 	}
 }
+
+type ensureCountingKubeClient struct {
+	*controller.MemoryKubeClient
+	ensurePodCalls int
+}
+
+func (c *ensureCountingKubeClient) EnsurePod(ctx context.Context, pod controller.PodManifest) (string, error) {
+	c.ensurePodCalls++
+	return c.MemoryKubeClient.EnsurePod(ctx, pod)
+}
+
+func TestWarmPoolClaim_SkipsRedundantEnsurePodAndSetsReadinessProbe(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	ck := &ensureCountingKubeClient{MemoryKubeClient: memKube}
+	r := controller.NewReconciler(
+		controller.WithKubeClient(ck),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	tpl := sampleTemplate()
+	r.RegisterTemplate("fast-claim-tpl", tpl)
+
+	// BuildKataPod must attach a podd /health:49983 readinessProbe.
+	pod := controller.BuildKataPod("probe-check", tpl, v1alpha1.PodBoxSpec{RootfsGeneration: 1}, v1alpha1.PodBoxStatus{PodName: "probe-check"})
+	if len(pod.Containers) == 0 || pod.Containers[0].ReadinessProbe == nil || pod.Containers[0].ReadinessProbe.HTTPGet == nil {
+		t.Fatalf("expected ReadinessProbe on main container, got %+v", pod.Containers)
+	}
+	if pod.Containers[0].ReadinessProbe.HTTPGet.Path != "/health" || pod.Containers[0].ReadinessProbe.HTTPGet.Port != 49983 {
+		t.Fatalf("unexpected readinessProbe target: %+v", pod.Containers[0].ReadinessProbe.HTTPGet)
+	}
+
+	if _, err := r.ReconcileWarmPool(ctx, "fast-claim-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "fast-claim-tpl",
+		Replicas:    1,
+	}); err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+	if ck.ensurePodCalls != 1 {
+		t.Fatalf("expected 1 EnsurePod call during warmup, got %d", ck.ensurePodCalls)
+	}
+
+	st, err := r.Reconcile(ctx, "fast-claim-box", v1alpha1.PodBoxSpec{
+		TemplateRef:      "fast-claim-tpl",
+		WarmPoolRef:      "fast-claim-pool",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	})
+	if err != nil {
+		t.Fatalf("Reconcile claim failed: %v", err)
+	}
+	if st.Reason != "WarmPoolClaimed" {
+		t.Fatalf("Reason = %q; want WarmPoolClaimed", st.Reason)
+	}
+	if st.PodIP == "" {
+		t.Fatal("expected PodIP preserved on claimed box status")
+	}
+	if ck.ensurePodCalls != 1 {
+		t.Fatalf("expected WarmPool claim to skip redundant EnsurePod (calls=%d; want 1)", ck.ensurePodCalls)
+	}
+}

@@ -13,6 +13,8 @@ type WarmPodEntry struct {
 	PoolName         string           `json:"poolName"`
 	TemplateRef      string           `json:"templateRef"`
 	PodName          string           `json:"podName"`
+	PodIP            string           `json:"podIP,omitempty"`
+	NotReady         bool             `json:"notReady,omitempty"`
 	RootfsPVCName    string           `json:"rootfsPVCName"`
 	WorkspacePVCName string           `json:"workspacePVCName"`
 	Image            string           `json:"image"`

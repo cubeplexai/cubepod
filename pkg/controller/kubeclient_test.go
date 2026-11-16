@@ -1148,3 +1148,90 @@ func TestRESTKubeClient_ListPods(t *testing.T) {
 		t.Fatalf("expected 3 pods total, got %d", len(all))
 	}
 }
+
+func TestRESTKubeClient_WaitForPodRunning_WaitsForReadyCondition(t *testing.T) {
+	var getCalls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": map[string]any{"phase": "Pending"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods/ready-check-pod":
+			getCalls++
+			readyStatus := "False"
+			if getCalls >= 3 {
+				readyStatus = "True"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": map[string]any{
+					"phase": "Running",
+					"podIP": "10.1.2.3",
+					"conditions": []map[string]any{
+						{"type": "Ready", "status": readyStatus},
+					},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"items": []map[string]any{
+					{
+						"metadata": map[string]any{"name": "warm-ready"},
+						"status": map[string]any{
+							"phase":      "Running",
+							"podIP":      "10.1.2.10",
+							"conditions": []map[string]any{{"type": "Ready", "status": "True"}},
+						},
+					},
+					{
+						"metadata": map[string]any{"name": "warm-not-ready"},
+						"status": map[string]any{
+							"phase":      "Running",
+							"podIP":      "10.1.2.11",
+							"conditions": []map[string]any{{"type": "Ready", "status": "False"}},
+						},
+					},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(
+		ts.URL,
+		"cubepod-workloads",
+		"test-token",
+		ts.Client(),
+		controller.WithWaitForRunning(true),
+		controller.WithPollInterval(5*time.Millisecond),
+		controller.WithPollTimeout(2*time.Second),
+	)
+	ip, err := client.EnsurePod(context.Background(), controller.PodManifest{
+		Name:      "ready-check-pod",
+		Namespace: "cubepod-workloads",
+	})
+	if err != nil {
+		t.Fatalf("EnsurePod failed: %v", err)
+	}
+	if ip != "10.1.2.3" {
+		t.Fatalf("ip = %q; want 10.1.2.3", ip)
+	}
+	if getCalls < 3 {
+		t.Fatalf("expected waitForPodRunning to poll until Ready=True (>=3 calls), got %d", getCalls)
+	}
+
+	pods, err := client.ListPods(context.Background(), "cubepod-workloads", "")
+	if err != nil {
+		t.Fatalf("ListPods failed: %v", err)
+	}
+	if len(pods) != 2 {
+		t.Fatalf("expected 2 pods, got %d", len(pods))
+	}
+	if pods[0].PodIP != "10.1.2.10" || pods[0].NotReady {
+		t.Fatalf("expected warm-ready to have PodIP=10.1.2.10 and NotReady=false, got %+v", pods[0])
+	}
+	if pods[1].PodIP != "10.1.2.11" || !pods[1].NotReady {
+		t.Fatalf("expected warm-not-ready to have PodIP=10.1.2.11 and NotReady=true, got %+v", pods[1])
+	}
+}

@@ -673,6 +673,9 @@ func (m *MemoryKubeClient) ListPods(_ context.Context, namespace string, labelSe
 			}
 		}
 
+		if pod.PodIP == "" {
+			pod.PodIP = m.IPs[podKey(podNs, pod.Name)]
+		}
 		res = append(res, pod)
 	}
 	return res, nil
@@ -996,8 +999,8 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 	defer ticker.Stop()
 
 	for {
-		ip, phase, err := c.getPodStatus(pollCtx, namespace, name)
-		if err == nil && ((phase == "Running" && ip != "") || phase == "Succeeded") {
+		ip, phase, ready, err := c.getPodStatus(pollCtx, namespace, name)
+		if err == nil && ((phase == "Running" && ip != "" && ready) || phase == "Succeeded") {
 			return ip, nil
 		}
 		if phase == "Failed" {
@@ -1018,37 +1021,49 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 // GetPodPhase returns the current status.phase of a Pod.
 func (c *RESTKubeClient) GetPodPhase(ctx context.Context, namespace, name string) (string, error) {
 	ns := c.resolveNamespace(namespace)
-	_, phase, err := c.getPodStatus(ctx, ns, name)
+	_, phase, _, err := c.getPodStatus(ctx, ns, name)
 	return phase, err
 }
 
-func (c *RESTKubeClient) getPodStatus(ctx context.Context, namespace, name string) (string, string, error) {
+func isPodStatusReady(status *coreV1PodStatus) bool {
+	if status == nil {
+		return true
+	}
+	if status.Phase != "" && status.Phase != "Running" {
+		return false
+	}
+	for _, cond := range status.Conditions {
+		if cond.Type == "Ready" {
+			return strings.EqualFold(cond.Status, "True")
+		}
+	}
+	return true
+}
+
+func (c *RESTKubeClient) getPodStatus(ctx context.Context, namespace, name string) (string, string, bool, error) {
 	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s", c.baseURL, namespace, name)
 	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", "", fmt.Errorf("getPodStatus request failed: %w", err)
+		return "", "", false, fmt.Errorf("getPodStatus request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", "", fmt.Errorf("getPodStatus failed: status %d (%s)", resp.StatusCode, string(respBody))
+		return "", "", false, fmt.Errorf("getPodStatus failed: status %d (%s)", resp.StatusCode, string(respBody))
 	}
 
 	var podResp struct {
-		Status struct {
-			Phase string `json:"phase"`
-			PodIP string `json:"podIP"`
-		} `json:"status"`
+		Status coreV1PodStatus `json:"status"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&podResp); err != nil {
-		return "", "", fmt.Errorf("failed to decode pod status: %w", err)
+		return "", "", false, fmt.Errorf("failed to decode pod status: %w", err)
 	}
-	return podResp.Status.PodIP, podResp.Status.Phase, nil
+	return podResp.Status.PodIP, podResp.Status.Phase, isPodStatusReady(&podResp.Status), nil
 }
 
 func (c *RESTKubeClient) getPodIP(ctx context.Context, namespace, name string) (string, error) {
-	ip, _, err := c.getPodStatus(ctx, namespace, name)
+	ip, _, _, err := c.getPodStatus(ctx, namespace, name)
 	if err != nil {
 		return "", nil
 	}
@@ -1145,7 +1160,7 @@ func (c *RESTKubeClient) DeletePod(ctx context.Context, namespace, name string) 
 		ticker := time.NewTicker(c.pollInterval)
 		defer ticker.Stop()
 		for {
-			_, _, err := c.getPodStatus(pollCtx, ns, name)
+			_, _, _, err := c.getPodStatus(pollCtx, ns, name)
 			if err != nil {
 				// Pod is gone
 				break
@@ -1304,12 +1319,17 @@ func (c *RESTKubeClient) ListPods(ctx context.Context, namespace string, labelSe
 		if itemNs == "" {
 			itemNs = ns
 		}
-		res = append(res, PodManifest{
+		pm := PodManifest{
 			Name:             p.Metadata.Name,
 			Namespace:        itemNs,
 			Labels:           p.Metadata.Labels,
 			RuntimeClassName: p.Spec.RuntimeClassName,
-		})
+		}
+		if p.Status != nil {
+			pm.PodIP = p.Status.PodIP
+			pm.NotReady = !isPodStatusReady(p.Status)
+		}
+		res = append(res, pm)
 	}
 	return res, nil
 }

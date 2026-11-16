@@ -800,6 +800,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				PoolName:         poolName,
 				TemplateRef:      spec.TemplateRef,
 				PodName:          dummyStatus.PodName,
+				PodIP:            podIP,
 				RootfsPVCName:    rootfsPVC.Name,
 				WorkspacePVCName: wsPVC.Name,
 				Image:            tpl.Image,
@@ -833,7 +834,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 
 	var finalAvail int32
 	for _, entry := range pool.entries {
-		if !entry.Claimed {
+		if !entry.Claimed && !entry.NotReady {
 			finalAvail++
 		}
 	}
@@ -913,7 +914,7 @@ func (r *Reconciler) claimWarmPodLocked(ctx context.Context, poolName string, bo
 	}
 
 	for _, entry := range pool.entries {
-		if !entry.Claimed {
+		if !entry.Claimed && !entry.NotReady {
 			if entry.Image != "" && expectedImage != "" && entry.Image != expectedImage {
 				continue
 			}
@@ -962,7 +963,7 @@ func (r *Reconciler) GetWarmPoolStatus(poolName string) (*v1alpha1.PodWarmPoolSt
 
 	var avail int32
 	for _, entry := range pool.entries {
-		if !entry.Claimed {
+		if !entry.Claimed && !entry.NotReady {
 			avail++
 		}
 	}
@@ -1025,6 +1026,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	r.applyTemplateDefaults(&tpl)
 
 	createdCold := false
+	claimedFromWarmPool := false
 	if !exists {
 		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set, no ForkFrom,
 		// no deterministic VolumeKey, and no official E2B volume mounts).
@@ -1034,9 +1036,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			if err != nil {
 				return nil, fmt.Errorf("failed to claim from warm pool %q for box %q: %w", spec.WarmPoolRef, name, err)
 			}
+			claimedFromWarmPool = true
 			status = &v1alpha1.PodBoxStatus{
 				Phase:             v1alpha1.PodBoxPhaseRunning,
 				PodName:           entry.PodName,
+				PodIP:             entry.PodIP,
 				RootfsPVCName:     entry.RootfsPVCName,
 				WorkspacePVCName:  entry.WorkspacePVCName,
 				ObservedRootfsGen: spec.RootfsGeneration,
@@ -1135,6 +1139,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		status.PodIP = ""
 		status.PausedAt = &now
 	default:
+		if err := ValidateOfficialVolumeMounts(spec.E2BVolumeMounts); err != nil {
+			if createdCold {
+				r.rollbackColdCreateLocked(ctx, name, spec, status, "")
+			} else if didResetRootFS {
+				r.persistFailedTransitionLocked(ctx, name, spec, status, status.PodName, effectiveImage, now)
+			}
+			return nil, fmt.Errorf("invalid official E2B volume mounts: %w", err)
+		}
+		if claimedFromWarmPool && status.PodName != "" && status.PodIP != "" {
+			status.Phase = v1alpha1.PodBoxPhaseRunning
+			status.LastActivityAt = &now
+			status.PausedAt = nil
+			break
+		}
 		if tpl.Egress.Enabled {
 			if err := r.ensureEgressSecretsLocked(ctx, name, spec); err != nil {
 				if createdCold {
@@ -1144,14 +1162,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				}
 				return nil, fmt.Errorf("failed to ensure egress secrets: %w", err)
 			}
-		}
-		if err := ValidateOfficialVolumeMounts(spec.E2BVolumeMounts); err != nil {
-			if createdCold {
-				r.rollbackColdCreateLocked(ctx, name, spec, status, "")
-			} else if didResetRootFS {
-				r.persistFailedTransitionLocked(ctx, name, spec, status, status.PodName, effectiveImage, now)
-			}
-			return nil, fmt.Errorf("invalid official E2B volume mounts: %w", err)
 		}
 		status.Phase = v1alpha1.PodBoxPhaseRunning
 		if status.PodName == "" {
@@ -1805,6 +1815,10 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 				if entry, ok := existingEntries[pod.Name]; ok {
 					entry.Claimed = claimed
 					entry.ClaimedBy = claimedBy
+					entry.NotReady = pod.NotReady
+					if pod.PodIP != "" {
+						entry.PodIP = pod.PodIP
+					}
 					if entry.PodManifest.Labels == nil {
 						entry.PodManifest.Labels = make(map[string]string)
 					}
@@ -1832,6 +1846,8 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 						PoolName:         pName,
 						TemplateRef:      tplRef,
 						PodName:          pod.Name,
+						PodIP:            pod.PodIP,
+						NotReady:         pod.NotReady,
 						RootfsPVCName:    entryID + "-rootfs-pvc",
 						WorkspacePVCName: entryID + "-workspace-pvc",
 						Claimed:          claimed,
@@ -1908,7 +1924,7 @@ func (r *Reconciler) FindAvailableWarmPool(templateRef string) string {
 	for name, pool := range r.warmPools {
 		if pool.spec.TemplateRef == templateRef {
 			for _, entry := range pool.entries {
-				if !entry.Claimed {
+				if !entry.Claimed && !entry.NotReady {
 					return name
 				}
 			}
@@ -2048,7 +2064,7 @@ func (r *Reconciler) WarmPoolReadyCount() int {
 	total := 0
 	for _, pool := range r.warmPools {
 		for _, entry := range pool.entries {
-			if !entry.Claimed {
+			if !entry.Claimed && !entry.NotReady {
 				total++
 			}
 		}
