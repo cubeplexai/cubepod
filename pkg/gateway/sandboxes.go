@@ -604,15 +604,12 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(rec)
 }
 
-func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
-	stateFilter := r.URL.Query().Get("state")
-	templateFilter := r.URL.Query().Get("templateID")
-
+func (s *Server) listSandboxesFiltered(ctx context.Context, stateFilter, templateFilter string, lowercaseState bool) []*SandboxRecord {
 	if s.LivePodRouting() && s.reconciler != nil && s.reconciler.KubeClient() != nil {
-		if boxes, err := s.reconciler.KubeClient().ListPodBoxes(r.Context(), ""); err == nil {
+		if boxes, err := s.reconciler.KubeClient().ListPodBoxes(ctx, ""); err == nil {
 			for i := range boxes {
 				if boxes[i].Metadata.Name != "" {
-					_, _ = s.resolveSandbox(r.Context(), boxes[i].Metadata.Name)
+					_, _ = s.resolveSandbox(ctx, boxes[i].Metadata.Name)
 				}
 			}
 		}
@@ -621,16 +618,32 @@ func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	list := make([]*SandboxRecord, 0, len(s.sandboxes))
 	for _, rec := range s.sandboxes {
-		if stateFilter != "" && rec.State != stateFilter {
+		if stateFilter != "" && !strings.EqualFold(rec.State, stateFilter) {
 			continue
 		}
 		if templateFilter != "" && rec.TemplateID != templateFilter {
 			continue
 		}
-		list = append(list, rec)
+		if lowercaseState {
+			wireRec := *rec
+			wireRec.State = strings.ToLower(wireRec.State)
+			list = append(list, &wireRec)
+		} else {
+			list = append(list, rec)
+		}
 	}
 	s.mu.RUnlock()
+	return list
+}
 
+func (s *Server) handleListSandboxes(w http.ResponseWriter, r *http.Request) {
+	list := s.listSandboxesFiltered(r.Context(), r.URL.Query().Get("state"), r.URL.Query().Get("templateID"), false)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(list)
+}
+
+func (s *Server) handleListSandboxesV2(w http.ResponseWriter, r *http.Request) {
+	list := s.listSandboxesFiltered(r.Context(), r.URL.Query().Get("state"), r.URL.Query().Get("templateID"), true)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(list)
 }
@@ -642,8 +655,10 @@ func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
+	wireRec := *rec
+	wireRec.State = strings.ToLower(wireRec.State)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(rec)
+	_ = json.NewEncoder(w).Encode(&wireRec)
 }
 
 func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {

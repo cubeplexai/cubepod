@@ -80,7 +80,7 @@ func TestE2BSecretsCRUDAndPagination(t *testing.T) {
 			t.Fatalf("unmarshal create: %v", err)
 		}
 		if i == 0 {
-			createdID, _ = info["id"].(string)
+			createdID, _ = info["secretID"].(string)
 		}
 	}
 
@@ -134,8 +134,8 @@ func TestE2BSecretsCRUDAndPagination(t *testing.T) {
 	}
 	var updInfo map[string]any
 	_ = json.Unmarshal(rrUpd.Body.Bytes(), &updInfo)
-	if updInfo["version"] != float64(2) {
-		t.Fatalf("expected version=2, got %v", updInfo["version"])
+	if updInfo["currentVersion"] != float64(2) {
+		t.Fatalf("expected currentVersion=2, got %v", updInfo["currentVersion"])
 	}
 
 	// Delete secret
@@ -160,7 +160,7 @@ func TestSandboxCreateWithE2BNetworkSecretsAndRotation(t *testing.T) {
 		t.Fatalf("create secret = %d", rrSec.Code)
 	}
 	var secInfo struct {
-		ID string `json:"id"`
+		ID string `json:"secretID"`
 	}
 	_ = json.Unmarshal(rrSec.Body.Bytes(), &secInfo)
 

@@ -459,6 +459,7 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /sandboxes", s.handleCreateSandbox)
 	mux.HandleFunc("POST /v2/sandboxes", s.handleCreateSandbox)
 	mux.HandleFunc("GET /sandboxes", s.handleListSandboxes)
+	mux.HandleFunc("GET /v2/sandboxes", s.handleListSandboxesV2)
 	mux.HandleFunc("GET /sandboxes/{sandboxID}", s.handleGetSandbox)
 
 	// Official E2B 2.64.0 Volume management (API key) and content (volume token).
@@ -482,6 +483,7 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /volumecontent/{volumeID}/path", s.handleDeleteVolumePath)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/pause", s.handlePauseSandbox)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/connect", s.handleConnectSandbox)
+	mux.HandleFunc("POST /v2/sandboxes/{sandboxID}/connect", s.handleConnectSandbox)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/timeout", s.handleTimeoutSandbox)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/refreshes", s.handleRefreshSandbox)
 	mux.HandleFunc("POST /sandboxes/{sandboxID}/lease", s.handleLeaseSandbox)

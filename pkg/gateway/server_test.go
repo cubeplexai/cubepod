@@ -283,8 +283,8 @@ func TestCommandExecutionAndAutoResume(t *testing.T) {
 	getResp, _ := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID)
 	_ = json.NewDecoder(getResp.Body).Decode(&rec)
 	getResp.Body.Close()
-	if rec.State != "Paused" {
-		t.Fatalf("expected state Paused before auto-resume test, got %s", rec.State)
+	if rec.State != "paused" {
+		t.Fatalf("expected state paused before auto-resume test, got %s", rec.State)
 	}
 
 	// Trigger command on paused sandbox
@@ -304,8 +304,8 @@ func TestCommandExecutionAndAutoResume(t *testing.T) {
 	getResp2, _ := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID)
 	_ = json.NewDecoder(getResp2.Body).Decode(&rec)
 	getResp2.Body.Close()
-	if rec.State != "Running" || rec.AutoResumeCount < 1 {
-		t.Fatalf("expected state Running and AutoResumeCount >= 1, got state=%s count=%d", rec.State, rec.AutoResumeCount)
+	if rec.State != "running" || rec.AutoResumeCount < 1 {
+		t.Fatalf("expected state running and AutoResumeCount >= 1, got state=%s count=%d", rec.State, rec.AutoResumeCount)
 	}
 }
 
@@ -400,8 +400,8 @@ func TestFileOperationsAndArchiveSyncWithAutoResume(t *testing.T) {
 	chkResp, _ := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID)
 	_ = json.NewDecoder(chkResp.Body).Decode(&rec)
 	chkResp.Body.Close()
-	if rec.State != "Running" || rec.AutoResumeCount < 1 {
-		t.Fatalf("expected auto-resumed state Running, got %s (count=%d)", rec.State, rec.AutoResumeCount)
+	if rec.State != "running" || rec.AutoResumeCount < 1 {
+		t.Fatalf("expected auto-resumed state running, got %s (count=%d)", rec.State, rec.AutoResumeCount)
 	}
 
 	// 7. Verify extracted files can be retrieved via GET /files
@@ -524,8 +524,8 @@ func TestSignedPanelTokenAndReverseProxy(t *testing.T) {
 	getResp, _ := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID)
 	_ = json.NewDecoder(getResp.Body).Decode(&rec)
 	getResp.Body.Close()
-	if rec.State != "Paused" {
-		t.Fatalf("expected sandbox to be Paused, got %s", rec.State)
+	if rec.State != "paused" {
+		t.Fatalf("expected sandbox to be paused, got %s", rec.State)
 	}
 
 	// Request /panel/{token}/hello on the paused sandbox
@@ -543,8 +543,8 @@ func TestSignedPanelTokenAndReverseProxy(t *testing.T) {
 	getResp2, _ := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID)
 	_ = json.NewDecoder(getResp2.Body).Decode(&rec)
 	getResp2.Body.Close()
-	if rec.State != "Running" || rec.AutoResumeCount < 1 {
-		t.Fatalf("expected sandbox state Running and AutoResumeCount >= 1, got state=%s count=%d", rec.State, rec.AutoResumeCount)
+	if rec.State != "running" || rec.AutoResumeCount < 1 {
+		t.Fatalf("expected sandbox state running and AutoResumeCount >= 1, got state=%s count=%d", rec.State, rec.AutoResumeCount)
 	}
 }
 
@@ -1352,8 +1352,8 @@ func TestSubdomainHostRouting(t *testing.T) {
 	var chkRec gateway.SandboxRecord
 	_ = json.NewDecoder(getResp.Body).Decode(&chkRec)
 	getResp.Body.Close()
-	if chkRec.State != "Running" || chkRec.AutoResumeCount < 1 {
-		t.Fatalf("expected sandbox to be auto-resumed to Running, got %s (resumes=%d)", chkRec.State, chkRec.AutoResumeCount)
+	if chkRec.State != "running" || chkRec.AutoResumeCount < 1 {
+		t.Fatalf("expected sandbox to be auto-resumed to running, got %s (resumes=%d)", chkRec.State, chkRec.AutoResumeCount)
 	}
 
 	// 8. Test 404 for unknown sandbox on subdomain
@@ -2429,7 +2429,7 @@ func TestGateway_ResolveSandbox_PreservesStateWhenPodBoxPhaseEmpty(t *testing.T)
 	if err := json.NewDecoder(getResp.Body).Decode(&fetched); err != nil {
 		t.Fatalf("decode get response: %v", err)
 	}
-	if fetched.State != string(v1alpha1.PodBoxPhaseRunning) {
-		t.Fatalf("expected state %q when PodBox.Status.Phase is empty, got %q", v1alpha1.PodBoxPhaseRunning, fetched.State)
+	if fetched.State != "running" {
+		t.Fatalf("expected state %q when PodBox.Status.Phase is empty, got %q", "running", fetched.State)
 	}
 }
