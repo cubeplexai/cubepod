@@ -669,6 +669,52 @@ func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(&wireRec)
 }
 
+func (s *Server) snapshotReconcileSpec(rec *SandboxRecord, desiredState v1alpha1.DesiredState, rootfsGen int64) (v1alpha1.PodBoxSpec, string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	wasPaused := rec.State == "Paused" || rec.State == string(v1alpha1.PodBoxPhasePaused)
+	spec := s.withOfficialMounts(v1alpha1.PodBoxSpec{
+		TemplateRef:      rec.TemplateID,
+		DesiredState:     desiredState,
+		RootfsGeneration: rootfsGen,
+		VolumeKey:        rec.VolumeKey,
+		NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
+	}, rec.SandboxID)
+	return spec, rec.PoddURL, wasPaused
+}
+
+func (s *Server) reconcileRunningSandbox(ctx context.Context, rec *SandboxRecord, rootfsGen int64, readyTimeout time.Duration, incrementResume bool) (SandboxRecord, error) {
+	spec, _, wasPaused := s.snapshotReconcileSpec(rec, v1alpha1.DesiredStateRunning, rootfsGen)
+	status, err := s.reconciler.Reconcile(ctx, rec.SandboxID, spec)
+	if err != nil {
+		return SandboxRecord{}, err
+	}
+
+	poddURL := ""
+	if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
+		poddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
+		_ = waitForPoddReady(ctx, poddURL, readyTimeout)
+	}
+
+	s.mu.Lock()
+	rec.State = string(status.Phase)
+	rec.RootfsGeneration = rootfsGen
+	if incrementResume && wasPaused {
+		rec.AutoResumeCount++
+	}
+	if poddURL != "" {
+		rec.PoddURL = poddURL
+	}
+	s.recordActivity(rec)
+	recSnapshot := *rec
+	s.mu.Unlock()
+
+	if err := s.startRuntimeSandbox(ctx, &recSnapshot, "", nil); err != nil {
+		return SandboxRecord{}, err
+	}
+	return recSnapshot, nil
+}
+
 func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sandboxID")
 	rec, ok := s.resolveSandbox(r.Context(), id)
@@ -676,9 +722,10 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
-	s.mu.Lock()
-	poddURL := rec.PoddURL
-	s.mu.Unlock()
+	unlock := s.lockSandboxOp(id)
+	defer unlock()
+
+	spec, poddURL, _ := s.snapshotReconcileSpec(rec, v1alpha1.DesiredStatePaused, rec.RootfsGeneration)
 
 	// Call POST <PoddURL>/v1/lifecycle/prepare-stop before pausing if podd is running
 	if poddURL != "" {
@@ -693,30 +740,25 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.mu.Lock()
-	status, err := s.reconciler.Reconcile(r.Context(), id, s.withOfficialMounts(v1alpha1.PodBoxSpec{
-		TemplateRef:      rec.TemplateID,
-		DesiredState:     v1alpha1.DesiredStatePaused,
-		RootfsGeneration: rec.RootfsGeneration,
-		VolumeKey:        rec.VolumeKey,
-		NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
-	}, id))
-	if err == nil {
-		rec.State = string(status.Phase)
-		rec.PoddURL = ""
-		s.pauseRuntimeSandbox(r.Context(), id)
-	}
-	s.mu.Unlock()
+	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.emitSandboxEvent(rec.OwnerTenantHash, events.EventPaused, rec, &events.EventData{
+	s.pauseRuntimeSandbox(r.Context(), id)
+
+	s.mu.Lock()
+	rec.State = string(status.Phase)
+	rec.PoddURL = ""
+	recSnapshot := *rec
+	s.mu.Unlock()
+
+	s.emitSandboxEvent(recSnapshot.OwnerTenantHash, events.EventPaused, &recSnapshot, &events.EventData{
 		PauseMode: "filesystem",
-		Execution: executionDataForRecord(rec),
+		Execution: executionDataForRecord(&recSnapshot),
 	})
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(rec)
+	_ = json.NewEncoder(w).Encode(&recSnapshot)
 }
 
 func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
@@ -726,44 +768,26 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
-	s.mu.Lock()
+	unlock := s.lockSandboxOp(id)
+	defer unlock()
+
+	s.mu.RLock()
 	wasPaused := rec.State == "Paused" || rec.State == string(v1alpha1.PodBoxPhasePaused)
-	// Auto-resume from Paused if needed (E2B connect semantics).
-	status, err := s.reconciler.Reconcile(r.Context(), id, s.withOfficialMounts(v1alpha1.PodBoxSpec{
-		TemplateRef:      rec.TemplateID,
-		DesiredState:     v1alpha1.DesiredStateRunning,
-		RootfsGeneration: rec.RootfsGeneration,
-		VolumeKey:        rec.VolumeKey,
-		NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
-	}, id))
-	if err == nil {
-		rec.State = string(status.Phase)
-		if wasPaused {
-			rec.AutoResumeCount++
-		}
-		if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
-			rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
-			_ = waitForPoddReady(r.Context(), rec.PoddURL, 30*time.Second)
-		}
-		if err := s.startRuntimeSandbox(r.Context(), rec, "", nil); err != nil {
-			s.mu.Unlock()
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		s.recordActivity(rec)
-	}
-	s.mu.Unlock()
+	rootfsGen := rec.RootfsGeneration
+	s.mu.RUnlock()
+
+	recSnapshot, err := s.reconcileRunningSandbox(r.Context(), rec, rootfsGen, 30*time.Second, true)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if wasPaused {
-		s.emitSandboxEvent(rec.OwnerTenantHash, events.EventResumed, rec, &events.EventData{
+		s.emitSandboxEvent(recSnapshot.OwnerTenantHash, events.EventResumed, &recSnapshot, &events.EventData{
 			ResumeMode: "reboot",
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(rec)
+	_ = json.NewEncoder(w).Encode(&recSnapshot)
 }
 
 type timeoutReq struct {
@@ -884,37 +908,23 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
-	s.mu.Lock()
-	rec.RootfsGeneration++
-	status, err := s.reconciler.Reconcile(r.Context(), id, s.withOfficialMounts(v1alpha1.PodBoxSpec{
-		TemplateRef:      rec.TemplateID,
-		DesiredState:     v1alpha1.DesiredStateRunning,
-		RootfsGeneration: rec.RootfsGeneration,
-		VolumeKey:        rec.VolumeKey,
-		NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
-	}, id))
-	if err == nil {
-		rec.State = string(status.Phase)
-		if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
-			rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
-			_ = waitForPoddReady(r.Context(), rec.PoddURL, 30*time.Second)
-		}
-		if err := s.startRuntimeSandbox(r.Context(), rec, "", nil); err != nil {
-			s.mu.Unlock()
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-	s.mu.Unlock()
+	unlock := s.lockSandboxOp(id)
+	defer unlock()
+
+	s.mu.RLock()
+	nextGen := rec.RootfsGeneration + 1
+	s.mu.RUnlock()
+
+	recSnapshot, err := s.reconcileRunningSandbox(r.Context(), rec, nextGen, 30*time.Second, false)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	s.emitSandboxEvent(rec.OwnerTenantHash, events.EventUpdated, rec, &events.EventData{
+	s.emitSandboxEvent(recSnapshot.OwnerTenantHash, events.EventUpdated, &recSnapshot, &events.EventData{
 		Reason: "RootfsReset",
 	})
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(rec)
+	_ = json.NewEncoder(w).Encode(&recSnapshot)
 }
 
 func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
@@ -1037,6 +1047,9 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	delete(s.sandboxes, id)
 	delete(s.endpoints, id)
 	s.mu.Unlock()
+	s.opLocksMu.Lock()
+	delete(s.opLocks, id)
+	s.opLocksMu.Unlock()
 	s.releaseSandboxVolumeMounts(id)
 	s.releaseLocalSandbox(id)
 
@@ -1102,46 +1115,37 @@ func (s *Server) releaseLocalSandbox(sandboxID string) {
 
 // ensureRunning resumes a Paused sandbox to Running, incrementing AutoResumeCount.
 func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
+	unlock := s.lockSandboxOp(rec.SandboxID)
+	defer unlock()
+
 	s.mu.Lock()
 	s.recordActivity(rec)
-
-	resumed := false
-	if rec.State == string(v1alpha1.PodBoxPhasePaused) || rec.State == "Paused" {
-		status, err := s.reconciler.Reconcile(ctx, rec.SandboxID, s.withOfficialMounts(v1alpha1.PodBoxSpec{
-			TemplateRef:      rec.TemplateID,
-			DesiredState:     v1alpha1.DesiredStateRunning,
-			RootfsGeneration: rec.RootfsGeneration,
-			VolumeKey:        rec.VolumeKey,
-			NetworkPolicy:    cloneNetworkPolicy(rec.NetworkPolicy),
-		}, rec.SandboxID))
-		if err != nil {
-			s.mu.Unlock()
-			return err
-		}
-		rec.State = string(status.Phase)
-		rec.AutoResumeCount++
-		if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
-			rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)
-			_ = waitForPoddReady(ctx, rec.PoddURL, 45*time.Second)
-		}
-		if err := s.startRuntimeSandbox(ctx, rec, "", nil); err != nil {
-			s.mu.Unlock()
-			return err
-		}
-		resumed = true
-	} else if s.livePodRouting && rec.PoddURL == "" {
-		if boxStatus, ok := s.reconciler.GetBox(rec.SandboxID); ok && boxStatus.PodIP != "" && boxStatus.PodIP != "10.244.0.42" {
-			rec.PoddURL = fmt.Sprintf("http://%s:%d", boxStatus.PodIP, rec.EnvdPort)
-			_ = waitForPoddReady(ctx, rec.PoddURL, 45*time.Second)
-		}
-	}
-	tenantHash := rec.OwnerTenantHash
+	isPaused := rec.State == string(v1alpha1.PodBoxPhasePaused) || rec.State == "Paused"
+	rootfsGen := rec.RootfsGeneration
+	needPoddURL := s.livePodRouting && rec.PoddURL == ""
 	s.mu.Unlock()
 
-	if resumed {
-		s.emitSandboxEvent(tenantHash, events.EventResumed, rec, &events.EventData{
+	if isPaused {
+		recSnapshot, err := s.reconcileRunningSandbox(ctx, rec, rootfsGen, 45*time.Second, true)
+		if err != nil {
+			return err
+		}
+		s.emitSandboxEvent(recSnapshot.OwnerTenantHash, events.EventResumed, &recSnapshot, &events.EventData{
 			ResumeMode: "reboot",
 		})
+		return nil
+	}
+
+	if needPoddURL {
+		if boxStatus, ok := s.reconciler.GetBox(rec.SandboxID); ok && boxStatus.PodIP != "" && boxStatus.PodIP != "10.244.0.42" {
+			poddURL := fmt.Sprintf("http://%s:%d", boxStatus.PodIP, rec.EnvdPort)
+			_ = waitForPoddReady(ctx, poddURL, 45*time.Second)
+			s.mu.Lock()
+			if rec.PoddURL == "" {
+				rec.PoddURL = poddURL
+			}
+			s.mu.Unlock()
+		}
 	}
 	return nil
 }

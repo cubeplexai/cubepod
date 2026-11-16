@@ -248,6 +248,8 @@ func (w *lockedWriter) Write(p []byte) (n int, err error) {
 type Server struct {
 	reconciler       *controller.Reconciler
 	mu               sync.RWMutex
+	opLocksMu        sync.Mutex
+	opLocks          map[string]*sync.Mutex
 	sandboxes        map[string]*SandboxRecord
 	commands         map[string]*commandEntry
 	watchers         map[string]*dirWatcher
@@ -300,6 +302,7 @@ func NewServer(reconciler *controller.Reconciler) *Server {
 	}
 	return &Server{
 		reconciler:       reconciler,
+		opLocks:          make(map[string]*sync.Mutex),
 		sandboxes:        make(map[string]*SandboxRecord),
 		commands:         make(map[string]*commandEntry),
 		watchers:         make(map[string]*dirWatcher),
@@ -651,6 +654,21 @@ func (s *Server) Handler() http.Handler {
 	})
 
 	return s.withMetrics(hostRouter)
+}
+
+func (s *Server) lockSandboxOp(id string) func() {
+	s.opLocksMu.Lock()
+	if s.opLocks == nil {
+		s.opLocks = make(map[string]*sync.Mutex)
+	}
+	mu := s.opLocks[id]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		s.opLocks[id] = mu
+	}
+	s.opLocksMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
