@@ -276,3 +276,65 @@ func TestSandboxCreateWithE2BNetworkSecretsAndRotation(t *testing.T) {
 		t.Fatalf("exchange after delete = %d; want 403", rrEx3.Code)
 	}
 }
+
+func TestE2BSecretsQuotaControlCharsAndVolumeFailureRollback(t *testing.T) {
+	srv, _ := newSecretsTestServer(t)
+	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{Dir: t.TempDir()}); err != nil {
+		t.Fatalf("ConfigureE2BVolumes: %v", err)
+	}
+	h := srv.Handler()
+
+	// 1. Create 10 secrets (MaxSecretsPerTenant=10) -> 11th returns 429
+	for i := 0; i < 10; i++ {
+		rr := doJSONReq(t, h, http.MethodPost, "/secrets", "tenant-quota", map[string]string{
+			"name":  "k_" + string(rune('a'+i)),
+			"value": "val",
+		})
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("create %d = %d", i, rr.Code)
+		}
+	}
+	rrOver := doJSONReq(t, h, http.MethodPost, "/secrets", "tenant-quota", map[string]string{
+		"name":  "k_overflow",
+		"value": "val",
+	})
+	if rrOver.Code != http.StatusTooManyRequests {
+		t.Fatalf("11th secret status = %d; want 429", rrOver.Code)
+	}
+
+	// 2. Control characters in header template rejected with 400
+	rrCtl := doJSONReq(t, h, http.MethodPost, "/sandboxes", "tenant-quota", map[string]any{
+		"templateID": "base",
+		"network": map[string]any{
+			"rules": map[string]any{
+				"api.example.com": []map[string]any{
+					{"transform": map[string]any{"headers": map[string]string{"X-Test": "bad\x07val"}}},
+				},
+			},
+		},
+	})
+	if rrCtl.Code != http.StatusBadRequest {
+		t.Fatalf("CTL header template status = %d; want 400", rrCtl.Code)
+	}
+
+	// 3. Volume mount failure must revoke vault bindings bound in resolveSandboxSecretsAndNetwork
+	rrVolFail := doJSONReq(t, h, http.MethodPost, "/sandboxes", "tenant-quota", map[string]any{
+		"templateID": "base",
+		"volumeMounts": []map[string]string{
+			{"name": "missing-vol", "path": "/data"},
+		},
+		"network": map[string]any{
+			"rules": map[string]any{
+				"api.example.com": []map[string]any{
+					{"transform": map[string]any{"headers": map[string]string{"Authorization": "Bearer ${e2b.secrets.k_a}"}}},
+				},
+			},
+		},
+	})
+	if rrVolFail.Code != http.StatusNotFound {
+		t.Fatalf("missing volume status = %d; want 404 (%s)", rrVolFail.Code, rrVolFail.Body.String())
+	}
+	if got := srv.Vault().Count(); got != 0 {
+		t.Fatalf("expected 0 vault bindings after rollback, got %d", got)
+	}
+}

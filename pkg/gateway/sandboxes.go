@@ -414,7 +414,9 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	id := fmt.Sprintf("cpod-%d", time.Now().UnixNano())
 	resolvedNetPolicy, secretEnvVars, secErr := s.resolveSandboxSecretsAndNetwork(managementAPIKey(r), id, &req, netPolicy)
 	if secErr != nil {
-		s.vault.RevokeSandbox(id)
+		if s.vault != nil {
+			s.vault.RevokeSandbox(id)
+		}
 		switch {
 		case errors.Is(secErr, secret.ErrUnauthorized):
 			writeError(w, http.StatusUnauthorized, "API key is required")
@@ -458,6 +460,9 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.commitSandboxVolumeMounts(id, managementAPIKey(r), plannedMounts); err != nil {
+		if s.vault != nil {
+			s.vault.RevokeSandbox(id)
+		}
 		if errors.Is(err, volume.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "volume not found")
 			return

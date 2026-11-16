@@ -231,6 +231,19 @@ func isForbiddenTransformHeader(name string) bool {
 	return forbiddenTransformHeaders[strings.ToLower(strings.TrimSpace(name))]
 }
 
+func isValidHeaderValue(v string) bool {
+	for i := 0; i < len(v); i++ {
+		b := v[i]
+		if b == '\t' {
+			continue
+		}
+		if b < 0x20 || b == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 type e2bNetworkSpec struct {
 	AllowOut []string                        `json:"allowOut,omitempty"`
 	DenyOut  []string                        `json:"denyOut,omitempty"`
@@ -291,14 +304,15 @@ func (s *Server) resolveSandboxSecretsAndNetwork(apiKey, sandboxID string, req *
 					if !isValidHeaderName(hdrName) || isForbiddenTransformHeader(hdrName) {
 						return nil, nil, errors.New("invalid or forbidden transform header: " + hdrName)
 					}
-					if strings.ContainsAny(hdrTemplate, "\r\n\x00") {
+					canonHdr := http.CanonicalHeaderKey(hdrName)
+					if !isValidHeaderValue(hdrTemplate) {
 						return nil, nil, errors.New("transform header template contains control characters")
 					}
-					resolvedTemplate, refBindings, err := s.bindSecretTokens(apiKey, sandboxID, host, hdrName, hdrTemplate)
+					resolvedTemplate, refBindings, err := s.bindSecretTokens(apiKey, sandboxID, host, canonHdr, hdrTemplate)
 					if err != nil {
 						return nil, nil, err
 					}
-					mergedHeaders[hdrName] = resolvedTemplate
+					mergedHeaders[canonHdr] = resolvedTemplate
 					policy.SecretRefBindings = append(policy.SecretRefBindings, refBindings...)
 				}
 			}
@@ -342,8 +356,11 @@ func (s *Server) resolveSandboxSecretsAndNetwork(apiKey, sandboxID string, req *
 		if rawSecret == "" {
 			continue
 		}
-		if strings.ContainsAny(rawSecret, "\r\n\x00") {
+		if !isValidHeaderValue(rawSecret) {
 			return nil, nil, errors.New("secret value contains invalid control characters")
+		}
+		if s.vault == nil {
+			return nil, nil, errors.New("egress vault is not initialized")
 		}
 		ph, err := s.vault.BindManagedSecret(sandboxID, tenantHash, secretID, sb.EnvName, rawSecret, sb.AllowedHosts, sb.AllowedHeaders)
 		if err != nil {
@@ -403,8 +420,11 @@ func (s *Server) bindSecretTokens(apiKey, sandboxID, host, hdrName, tmpl string)
 			return "", nil, err
 		}
 		rawVal := val.Raw()
-		if strings.ContainsAny(rawVal, "\r\n\x00") {
+		if !isValidHeaderValue(rawVal) {
 			return "", nil, errors.New("secret value contains invalid control characters")
+		}
+		if s.vault == nil {
+			return "", nil, errors.New("egress vault is not initialized")
 		}
 		ph, err := s.vault.BindManagedSecret(sandboxID, tenantHash, info.ID, "", rawVal, []string{host}, []string{hdrName})
 		if err != nil {

@@ -367,7 +367,7 @@ func (p *EgressProxy) replaceHeaderPlaceholders(ctx context.Context, src http.He
 					return nil, fmt.Errorf("header %q: %w", key, err)
 				}
 				p.metrics.IncSecretExchange("ok")
-				if strings.ContainsAny(realSecret, "\r\n\x00") {
+				if !isValidHeaderValue(realSecret) {
 					return nil, fmt.Errorf("header %q: exchanged secret contains invalid control characters", key)
 				}
 				replacedVal = replacedVal[:idx] + realSecret + replacedVal[end:]
@@ -925,6 +925,19 @@ func applyHeaderTransforms(headers http.Header, policy v1alpha1.NetworkPolicySpe
 			headers.Set(k, v)
 		}
 	}
+}
+
+func isValidHeaderValue(v string) bool {
+	for i := 0; i < len(v); i++ {
+		b := v[i]
+		if b == '\t' {
+			continue
+		}
+		if b < 0x20 || b == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func splitHostPortDefault(raw, defaultPort string) (string, string) {
