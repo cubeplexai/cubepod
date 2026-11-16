@@ -78,7 +78,7 @@ func TestStoreCRUDPaginationAndEncryption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}
-	if upd.Version != 2 || upd.UpdatedAt == nil {
+	if upd.Version != 2 || upd.UpdatedAt.IsZero() {
 		t.Fatalf("expected version 2 and updatedAt, got %+v", upd)
 	}
 

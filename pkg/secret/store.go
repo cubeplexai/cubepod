@@ -71,11 +71,12 @@ func (v SecretValue) Raw() string { return string(v) }
 
 // SecretInfo is the write-only metadata returned by all /secrets endpoints.
 type SecretInfo struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	Version   int        `json:"version"`
-	CreatedAt time.Time  `json:"createdAt"`
-	UpdatedAt *time.Time `json:"updatedAt,omitempty"`
+	ID        string            `json:"secretID"`
+	Name      string            `json:"name"`
+	Version   int               `json:"currentVersion"`
+	Metadata  map[string]string `json:"metadata"`
+	CreatedAt time.Time         `json:"createdAt"`
+	UpdatedAt time.Time         `json:"updatedAt"`
 }
 
 // Config configures the encrypted durable secret store.
@@ -339,17 +340,17 @@ func newSecretID() (string, error) {
 }
 
 func toInfo(rec *storedSecret) SecretInfo {
-	var updatedCopy *time.Time
+	updated := rec.CreatedAt
 	if rec.UpdatedAt != nil {
-		t := *rec.UpdatedAt
-		updatedCopy = &t
+		updated = *rec.UpdatedAt
 	}
 	return SecretInfo{
 		ID:        rec.ID,
 		Name:      rec.Name,
 		Version:   rec.Version,
+		Metadata:  map[string]string{},
 		CreatedAt: rec.CreatedAt,
-		UpdatedAt: updatedCopy,
+		UpdatedAt: updated,
 	}
 }
 
@@ -456,7 +457,19 @@ func (s *Store) List(apiKey string, limit int, nextToken string) ([]SecretInfo, 
 	return items[offset:end], outNext, nil
 }
 
-// Get returns secret metadata (never value) for secretID owned by the tenant.
+func (s *Store) findLocked(tenant, idOrName string) (*storedSecret, bool) {
+	if rec, ok := s.byID[idOrName]; ok && rec.TenantHash == tenant {
+		return rec, true
+	}
+	if id, ok := s.byTenName[tenNameKey(tenant, idOrName)]; ok {
+		if rec, ok := s.byID[id]; ok && rec.TenantHash == tenant {
+			return rec, true
+		}
+	}
+	return nil, false
+}
+
+// Get returns secret metadata (never value) for secretID or name owned by the tenant.
 func (s *Store) Get(apiKey, secretID string) (SecretInfo, error) {
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
@@ -465,8 +478,8 @@ func (s *Store) Get(apiKey, secretID string) (SecretInfo, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rec, ok := s.byID[secretID]
-	if !ok || rec.TenantHash != tenant {
+	rec, ok := s.findLocked(tenant, secretID)
+	if !ok {
 		return SecretInfo{}, ErrNotFound
 	}
 	return toInfo(rec), nil
@@ -485,8 +498,8 @@ func (s *Store) Update(apiKey, secretID, value string) (SecretInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, ok := s.byID[secretID]
-	if !ok || rec.TenantHash != tenant {
+	rec, ok := s.findLocked(tenant, secretID)
+	if !ok {
 		return SecretInfo{}, ErrNotFound
 	}
 
@@ -518,17 +531,17 @@ func (s *Store) Delete(apiKey, secretID string) (SecretInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, ok := s.byID[secretID]
-	if !ok || rec.TenantHash != tenant {
+	rec, ok := s.findLocked(tenant, secretID)
+	if !ok {
 		return SecretInfo{}, ErrNotFound
 	}
 	info := toInfo(rec)
-	delete(s.byID, secretID)
+	delete(s.byID, rec.ID)
 	delete(s.byTenName, tenNameKey(tenant, rec.Name))
 
 	if err := s.saveLocked(); err != nil {
-		s.byID[secretID] = rec
-		s.byTenName[tenNameKey(tenant, rec.Name)] = secretID
+		s.byID[rec.ID] = rec
+		s.byTenName[tenNameKey(tenant, rec.Name)] = rec.ID
 		return SecretInfo{}, err
 	}
 	return info, nil
