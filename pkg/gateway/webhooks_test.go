@@ -138,7 +138,11 @@ func TestWebhooksCRUDAndEventsEndToEnd(t *testing.T) {
 		t.Fatalf("unexpected e2b-signature header: %q", sigHeaders[0])
 	}
 
-	// 6. PATCH rotateSecret & DELETE
+	// 6. PATCH rotateSecret & DELETE + verify Prometheus metrics
+	rrMetrics := doJSONReq(t, h, http.MethodGet, "/metrics", "", nil)
+	if rrMetrics.Code != http.StatusOK || !bytesContains(rrMetrics.Body.Bytes(), "cubepod_events_recorded_total 5") || !bytesContains(rrMetrics.Body.Bytes(), "cubepod_webhook_deliveries_total{result=\"ok\"} 5") {
+		t.Fatalf("unexpected /metrics output:\n%s", rrMetrics.Body.String())
+	}
 	rrPatch := doJSONReq(t, h, http.MethodPatch, "/webhooks/"+whCreated.ID, "tenant-a", map[string]any{"rotateSecret": true})
 	if rrPatch.Code != http.StatusOK {
 		t.Fatalf("PATCH /webhooks/{id} = %d", rrPatch.Code)

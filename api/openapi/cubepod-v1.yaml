@@ -1677,6 +1677,131 @@ paths:
         "204":
           description: Secret deleted
 
+  /webhooks:
+    post:
+      summary: Register a tenant-scoped webhook subscription
+      operationId: createWebhook
+      responses:
+        "201":
+          description: Webhook created (returns signatureKey once)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookWithSecret"
+    get:
+      summary: List tenant webhooks (omits signatureKey)
+      operationId: listWebhooks
+      responses:
+        "200":
+          description: Webhook list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WebhookInfo"
+
+  /webhooks/{webhookID}:
+    get:
+      summary: Get webhook metadata (omits signatureKey)
+      operationId: getWebhook
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Webhook metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookInfo"
+    patch:
+      summary: Update webhook URL, events, enabled flag, or rotate signatureKey
+      operationId: updateWebhook
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Updated webhook
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookWithSecret"
+    delete:
+      summary: Delete webhook subscription
+      operationId: deleteWebhook
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Webhook deleted
+
+  /events:
+    get:
+      summary: List tenant sandbox lifecycle events (E2B v1 schema)
+      operationId: listEvents
+      parameters:
+        - name: sandboxID
+          in: query
+          schema:
+            type: string
+        - name: eventType
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: nextToken
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Event page
+          headers:
+            X-Next-Token:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LifecycleEvent"
+
+  /sandboxes/{sandboxID}/events:
+    get:
+      summary: List lifecycle events for a single sandbox
+      operationId: listSandboxEvents
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Event page
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LifecycleEvent"
+
 components:
   schemas:
     SecretInfo:
@@ -1718,6 +1843,62 @@ components:
         value:
           type: string
           writeOnly: true
+    WebhookInfo:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        url:
+          type: string
+        events:
+          type: array
+          items:
+            type: string
+        enabled:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    WebhookWithSecret:
+      allOf:
+        - $ref: "#/components/schemas/WebhookInfo"
+        - type: object
+          properties:
+            signatureKey:
+              type: string
+    LifecycleEvent:
+      type: object
+      properties:
+        version:
+          type: string
+        id:
+          type: string
+        type:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        eventCategory:
+          type: string
+        eventLabel:
+          type: string
+        sandboxId:
+          type: string
+        sandboxTeamId:
+          type: string
+        sandboxTemplateId:
+          type: string
+        sandboxBuildId:
+          type: string
+        sandboxExecutionId:
+          type: string
+        eventData:
+          type: object
     CreateSandboxRequest:
       type: object
       properties:

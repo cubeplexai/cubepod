@@ -127,7 +127,7 @@ type WebhookInfo struct {
 // WebhookWithSecret is returned only on creation or explicit secret rotation.
 type WebhookWithSecret struct {
 	WebhookInfo
-	SignatureKey string `json:"signatureKey"`
+	SignatureKey string `json:"signatureKey,omitempty"`
 }
 
 // CreateWebhookInput defines parameters for RegisterWebhook.
@@ -199,6 +199,8 @@ type deliveryJob struct {
 // Manager manages tenant-isolated lifecycle events and async signed webhook delivery.
 type Manager struct {
 	mu           sync.RWMutex
+	saveMu       sync.Mutex
+	closeMu      sync.RWMutex
 	dir          string
 	key          []byte
 	maxWebhooks  int
@@ -290,10 +292,13 @@ func (m *Manager) Close() {
 	if m == nil {
 		return
 	}
+	m.closeMu.Lock()
 	if m.closed.Swap(true) {
+		m.closeMu.Unlock()
 		return
 	}
 	close(m.stopCh)
+	m.closeMu.Unlock()
 	m.wg.Wait()
 }
 
@@ -334,16 +339,43 @@ func buildSSRFClient(timeout time.Duration, allowPrivate bool) *http.Client {
 	}
 }
 
+var blockedCIDRs = func() []netip.Prefix {
+	raw := []string{
+		"100.64.0.0/10",  // RFC 6598 CGNAT
+		"192.0.0.0/24",   // IETF Protocol Assignments
+		"198.18.0.0/15",  // Benchmarking
+		"240.0.0.0/4",    // Reserved
+		"64:ff9b::/96",   // NAT64
+		"64:ff9b:1::/48", // Local-Use NAT64
+	}
+	out := make([]netip.Prefix, 0, len(raw))
+	for _, s := range raw {
+		if p, err := netip.ParsePrefix(s); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}()
+
 func isBlockedIP(addr netip.Addr) bool {
 	if addr.Is4In6() {
 		addr = addr.Unmap()
 	}
-	return addr.IsLoopback() ||
+	if !addr.IsGlobalUnicast() ||
+		addr.IsLoopback() ||
 		addr.IsPrivate() ||
 		addr.IsLinkLocalUnicast() ||
 		addr.IsLinkLocalMulticast() ||
 		addr.IsMulticast() ||
-		addr.IsUnspecified()
+		addr.IsUnspecified() {
+		return true
+	}
+	for _, p := range blockedCIDRs {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveKEK(dir string, explicit []byte) ([]byte, error) {
@@ -472,12 +504,17 @@ func (m *Manager) saveWebhooksLocked() error {
 	return atomicWriteFile(filepath.Join(m.dir, webhooksFileName), data, 0o600)
 }
 
-func (m *Manager) saveEventsLocked() error {
-	data, err := json.Marshal(eventDiskState{Events: m.events})
+func (m *Manager) saveEventsSnapshot(eventsCopy []storedEvent) {
+	m.saveMu.Lock()
+	defer m.saveMu.Unlock()
+	data, err := json.Marshal(eventDiskState{Events: eventsCopy})
 	if err != nil {
-		return err
+		slog.Warn("failed to marshal events state", "err", err)
+		return
 	}
-	return atomicWriteFile(filepath.Join(m.dir, eventsFileName), data, 0o600)
+	if err := atomicWriteFile(filepath.Join(m.dir, eventsFileName), data, 0o600); err != nil {
+		slog.Warn("failed to persist events state", "err", err)
+	}
 }
 
 func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
@@ -525,7 +562,7 @@ func newSignatureKey() string {
 
 func (m *Manager) validateWebhookURL(rawURL string) error {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || u.User != nil {
 		return ErrInvalidWebhook
 	}
 	scheme := strings.ToLower(u.Scheme)
@@ -812,7 +849,7 @@ func (m *Manager) Emit(tenantHash, eventType, sandboxID, templateID, buildID, ex
 			m.events = filtered
 		}
 	}
-	_ = m.saveEventsLocked()
+	eventsSnapshot := append([]storedEvent(nil), m.events...)
 
 	var targets []*storedWebhook
 	for _, w := range m.webhooks {
@@ -823,11 +860,18 @@ func (m *Manager) Emit(tenantHash, eventType, sandboxID, templateID, buildID, ex
 	}
 	m.mu.Unlock()
 
-	if len(targets) == 0 || m.closed.Load() {
+	m.saveEventsSnapshot(eventsSnapshot)
+
+	if len(targets) == 0 {
 		return ev
 	}
 	payload, err := json.Marshal(ev)
 	if err != nil {
+		return ev
+	}
+	m.closeMu.RLock()
+	defer m.closeMu.RUnlock()
+	if m.closed.Load() {
 		return ev
 	}
 	for _, w := range targets {

@@ -228,6 +228,22 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&buf, "# TYPE cubepod_desktop_activations_total counter\n")
 	fmt.Fprintf(&buf, "cubepod_desktop_activations_total{result=\"ok\"} %d\n", m.DesktopActivationsOK.Load())
 	fmt.Fprintf(&buf, "cubepod_desktop_activations_total{result=\"unsupported\"} %d\n", m.DesktopActivationsUnsupported.Load())
+
+	if evMgr := s.events.Load(); evMgr != nil {
+		fmt.Fprintf(&buf, "# HELP cubepod_events_recorded_total Total sandbox lifecycle events recorded\n")
+		fmt.Fprintf(&buf, "# TYPE cubepod_events_recorded_total counter\n")
+		fmt.Fprintf(&buf, "cubepod_events_recorded_total %d\n", evMgr.EventsRecordedTotal.Load())
+
+		fmt.Fprintf(&buf, "# HELP cubepod_webhook_deliveries_total Total webhook delivery attempts by result\n")
+		fmt.Fprintf(&buf, "# TYPE cubepod_webhook_deliveries_total counter\n")
+		fmt.Fprintf(&buf, "cubepod_webhook_deliveries_total{result=\"ok\"} %d\n", evMgr.WebhookDeliveriesOK.Load())
+		fmt.Fprintf(&buf, "cubepod_webhook_deliveries_total{result=\"failed\"} %d\n", evMgr.WebhookDeliveriesFailed.Load())
+		fmt.Fprintf(&buf, "cubepod_webhook_deliveries_total{result=\"dropped\"} %d\n", evMgr.WebhookDeliveriesDrop.Load())
+
+		fmt.Fprintf(&buf, "# HELP cubepod_webhook_queue_depth Current number of queued webhook deliveries\n")
+		fmt.Fprintf(&buf, "# TYPE cubepod_webhook_queue_depth gauge\n")
+		fmt.Fprintf(&buf, "cubepod_webhook_queue_depth %d\n", evMgr.QueueDepth())
+	}
 	fmt.Fprintf(&buf, "cubepod_desktop_activations_total{result=\"error\"} %d\n", m.DesktopActivationsError.Load())
 
 	// Gauges
