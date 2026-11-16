@@ -2733,3 +2733,66 @@ func TestReconciler_SyncFromKube_WarmPoolDeletion_UnsanitizedPoolName(t *testing
 		t.Fatalf("expected standby warm pod cleaned up after deletion, still found %d", len(podsAfter))
 	}
 }
+
+func TestWithDefaultEgressImage(t *testing.T) {
+	ctx := context.Background()
+	memKube := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+		controller.WithDefaultEgressImage("hub.example.com/cubepod-egress:v0.5.1"),
+	)
+
+	tplDefault := sampleTemplate()
+	tplDefault.Egress.Enabled = true
+	tplDefault.Egress.Image = ""
+	r.RegisterTemplate("egress-default-img", tplDefault)
+
+	if _, err := r.Reconcile(ctx, "egress-default-box", v1alpha1.PodBoxSpec{
+		TemplateRef:      "egress-default-img",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	pod, ok := memKube.GetPod("cubepod-workloads", "egress-default-box")
+	if !ok {
+		t.Fatal("expected pod in MemoryKubeClient")
+	}
+	var gotImg string
+	for _, c := range pod.Containers {
+		if c.Name == "egress" {
+			gotImg = c.Image
+		}
+	}
+	if gotImg != "hub.example.com/cubepod-egress:v0.5.1" {
+		t.Fatalf("egress container image = %q; want hub.example.com/cubepod-egress:v0.5.1", gotImg)
+	}
+
+	// Explicit template egress.image should not be overwritten by defaultEgressImage.
+	tplExplicit := sampleTemplate()
+	tplExplicit.Egress.Enabled = true
+	tplExplicit.Egress.Image = "custom/egress:v9"
+	r.RegisterTemplate("egress-explicit-img", tplExplicit)
+
+	if _, err := r.Reconcile(ctx, "egress-explicit-box", v1alpha1.PodBoxSpec{
+		TemplateRef:      "egress-explicit-img",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}); err != nil {
+		t.Fatalf("Reconcile explicit failed: %v", err)
+	}
+	podExp, ok := memKube.GetPod("cubepod-workloads", "egress-explicit-box")
+	if !ok {
+		t.Fatal("expected explicit pod in MemoryKubeClient")
+	}
+	gotImg = ""
+	for _, c := range podExp.Containers {
+		if c.Name == "egress" {
+			gotImg = c.Image
+		}
+	}
+	if gotImg != "custom/egress:v9" {
+		t.Fatalf("explicit egress container image = %q; want custom/egress:v9", gotImg)
+	}
+}

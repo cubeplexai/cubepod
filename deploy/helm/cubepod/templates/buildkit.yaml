@@ -70,6 +70,7 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/component: buildkit
     spec:
+      {{- include "cubepod.podImagePullSecrets" . | nindent 6 }}
       {{- with .Values.templateBuild.buildkit.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -19,6 +19,12 @@ spec:
         app.kubernetes.io/component: gateway
     spec:
       serviceAccountName: {{ include "cubepod.serviceAccountName" . }}
+      {{- include "cubepod.podImagePullSecrets" . | nindent 6 }}
+      {{- $pullSecretsCSV := include "cubepod.imagePullSecretsCSV" . }}
+      {{- $tplPullSecret := include "cubepod.effectiveTemplatePullSecret" . }}
+      {{- $stateDir := include "cubepod.effectiveGatewayStateDir" . }}
+      {{- $hasEnv := or .Values.gateway.panelSecret .Values.e2bVolumes.enabled .Values.egress.caSecretName $stateDir .Values.gateway.webhookAllowPrivate .Values.gateway.secretsKeySecret .Values.gateway.eventsKeySecret }}
+      {{- $hasVolumes := or .Values.e2bVolumes.enabled .Values.egress.caSecretName .Values.gateway.persistence.enabled }}
       containers:
         - name: gateway
           image: "{{ .Values.gateway.image.registry }}/{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}"
@@ -26,14 +32,53 @@ spec:
           args:
             - "--addr=:{{ .Values.gateway.port }}"
             - "--namespace={{ .Values.controller.workloadNamespace }}"
+            - "--storage-class={{ .Values.storage.storageClassName }}"
+            - "--volume-mode={{ .Values.storage.volumeMode }}"
+            - "--runtime-class={{ .Values.runtime.runtimeClassName }}"
+            - "--podd-image={{ .Values.runtime.poddInjectorImage }}"
+            - "--sandbox-image={{ .Values.runtime.defaultSandboxImage }}"
+            - "--egress-image={{ include "cubepod.egressImage" . }}"
+            - "--live-pod-routing={{ .Values.gateway.livePodRouting }}"
+            {{- if $pullSecretsCSV }}
+            - "--image-pull-secrets={{ $pullSecretsCSV }}"
+            {{- end }}
+            {{- if $tplPullSecret }}
+            - "--template-pull-secret={{ $tplPullSecret }}"
+            {{- end }}
             - "--e2b-template-api={{ .Values.featureGates.e2bTemplateAPI }}"
             - "--template-build={{ .Values.templateBuild.enabled }}"
             - "--template-probe-timeout={{ .Values.templateBuild.probeTimeout }}"
             - "--controller-url=http://{{ include "cubepod.fullname" . }}-controller:{{ .Values.controller.healthzPort }}"
+            {{- if $stateDir }}
+            - "--state-dir={{ $stateDir }}"
+            {{- end }}
+          {{- if $hasEnv }}
           env:
             {{- if .Values.gateway.panelSecret }}
             - name: CUBEPOD_PANEL_SECRET
               value: {{ .Values.gateway.panelSecret | quote }}
+            {{- end }}
+            {{- if $stateDir }}
+            - name: CUBEPOD_STATE
+              value: {{ $stateDir | quote }}
+            {{- end }}
+            {{- if .Values.gateway.webhookAllowPrivate }}
+            - name: CUBEPOD_WEBHOOK_ALLOW_PRIVATE
+              value: "1"
+            {{- end }}
+            {{- if .Values.gateway.secretsKeySecret }}
+            - name: CUBEPOD_SECRETS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gateway.secretsKeySecret | quote }}
+                  key: key
+            {{- end }}
+            {{- if .Values.gateway.eventsKeySecret }}
+            - name: CUBEPOD_EVENTS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.gateway.eventsKeySecret | quote }}
+                  key: key
             {{- end }}
             {{- if .Values.e2bVolumes.enabled }}
             - name: CUBEPOD_E2B_VOLUME_DIR
@@ -43,10 +88,19 @@ spec:
             - name: CUBEPOD_E2B_SHARED_PVC
               value: {{ .Values.e2bVolumes.pvcName | quote }}
             {{- end }}
-          {{- if .Values.e2bVolumes.enabled }}
+            {{- include "cubepod.egressCAEnv" . | nindent 12 }}
+          {{- end }}
+          {{- if $hasVolumes }}
           volumeMounts:
+            {{- if .Values.gateway.persistence.enabled }}
+            - name: gateway-state
+              mountPath: {{ $stateDir | quote }}
+            {{- end }}
+            {{- if .Values.e2bVolumes.enabled }}
             - name: e2b-volumes
               mountPath: /var/lib/cubepod/e2b-volumes
+            {{- end }}
+            {{- include "cubepod.egressCAVolumeMount" . | nindent 12 }}
           {{- end }}
           ports:
             - name: http
@@ -66,9 +120,17 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.gateway.resources | nindent 12 }}
-      {{- if .Values.e2bVolumes.enabled }}
+      {{- if $hasVolumes }}
       volumes:
+        {{- if .Values.gateway.persistence.enabled }}
+        - name: gateway-state
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-gateway-state" (include "cubepod.fullname" .)) .Values.gateway.persistence.existingClaim | quote }}
+        {{- end }}
+        {{- if .Values.e2bVolumes.enabled }}
         - name: e2b-volumes
           persistentVolumeClaim:
             claimName: {{ .Values.e2bVolumes.pvcName }}
+        {{- end }}
+        {{- include "cubepod.egressCAVolume" . | nindent 8 }}
       {{- end }}

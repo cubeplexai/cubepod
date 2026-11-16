@@ -1,6 +1,8 @@
 global:
   imageRegistry: "ghcr.io"
   repository: "cubeplexai"
+  # Optional list of Kubernetes imagePullSecrets attached to control-plane and sandbox Pods
+  imagePullSecrets: []
 
 runtime:
   runtimeClassName: "kata-qemu"
@@ -9,6 +11,8 @@ runtime:
   poddInjectorImage: "ghcr.io/cubeplexai/cubepod-podd:v0.5.1"
   # Default workload sandbox image (clean OS/tooling image without podd baked in)
   defaultSandboxImage: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.4.0"
+  # Optional single imagePullSecret name attached to sandbox Pods (when templateBuild.registry.pullSecret is unset)
+  templatePullSecret: ""
 
 storage:
   # SPDK NVMe-oF Raw Block StorageClass (Longhorn V2 or OpenEBS Mayastor) or Filesystem
@@ -29,6 +33,20 @@ gateway:
     tag: "v0.5.1"
     pullPolicy: "IfNotPresent"
   port: 8080
+  livePodRouting: true
+  # Optional state directory for local templates, secrets, and events (defaults to /var/lib/cubepod/state when persistence is enabled)
+  stateDir: ""
+  webhookAllowPrivate: false
+  # Optional Kubernetes Secrets holding 32-byte base64/64-hex keys (secret key: "key")
+  secretsKeySecret: ""
+  eventsKeySecret: ""
+  persistence:
+    # Note: with ReadWriteOnce storage, set gateway.replicaCount=1
+    enabled: false
+    existingClaim: ""
+    storageClassName: ""
+    size: "10Gi"
+    accessMode: "ReadWriteOnce"
   service:
     type: "ClusterIP"
     port: 8080
@@ -70,6 +88,10 @@ egress:
     tag: "v0.5.1"
   port: 18080
   exchangeUrl: "https://cubeplex-backend.cubeplex.svc:8443/api/v1/internal/egress/exchange"
+  # Optional existing Secret in the release namespace containing ca.crt and ca.key for egress mTLS
+  caSecretName: ""
+  # Mount ca.crt as CUBEPOD_EGRESS_UPSTREAM_CA_FILE into egress sidecars
+  upstreamCAEnabled: false
 
 featureGates:
   # Turning on changes GET /templates from the wrapped stub to a JSON array

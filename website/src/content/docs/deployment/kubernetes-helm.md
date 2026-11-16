@@ -3,7 +3,7 @@ title: Kubernetes & Helm Deployment
 description: Deploy the CubePod operator, gateway, egress proxy, CRDs, and optional rootless BuildKit builder on Kubernetes using Helm.
 ---
 
-For Kubernetes deployments, CubePod is packaged as Helm chart `cubepod` (`version: 0.5.1`, `appVersion: "0.5.1"`) under `deploy/helm/cubepod/`. It installs the Custom Resource Definitions (`PodBox`, `PodTemplate`, `PodWarmPool`), RBAC rules, workload namespace, Control Plane Gateway, Kubernetes Controller, and—when enabled—an isolated rootless BuildKit builder deployment.
+For Kubernetes deployments, CubePod is packaged as Helm chart `cubepod` (`version: 0.5.1`, `appVersion: "0.5.1"`) under `deploy/helm/cubepod/`. It installs the Custom Resource Definitions (`PodBox`, `PodTemplate`, `PodWarmPool`, `SandboxWebhook`), RBAC rules, workload namespace, Control Plane Gateway, Kubernetes Controller, and—when enabled—an isolated rootless BuildKit builder deployment.
 
 For the exhaustive key-by-key schema generated directly from `deploy/helm/cubepod/values.yaml`, see the [Helm Values Reference](/reference/helm-values/) and [CRD Reference](/reference/crds/).
 
@@ -31,11 +31,12 @@ helm install cubepod ./deploy/helm/cubepod \
   --create-namespace
 ```
 
-Helm automatically installs the three CRDs in `deploy/helm/cubepod/crds/` on a fresh `helm install`:
+Helm automatically installs the four CRDs in `deploy/helm/cubepod/crds/` on a fresh `helm install`:
 
 - `cubepod.io_podboxes.yaml`
 - `cubepod.io_podtemplates.yaml`
 - `cubepod.io_podwarmpools.yaml`
+- `cubepod.io_sandboxwebhooks.yaml`
 
 :::note
 Helm skips upgrading files inside `crds/` on subsequent `helm upgrade` runs. When upgrading CubePod, apply updated CRD manifests explicitly before running `helm upgrade`:
@@ -59,9 +60,10 @@ flowchart TB
 | Template File | Resources Created | Notes |
 | :--- | :--- | :--- |
 | `namespace.yaml` | `Namespace` (`controller.workloadNamespace`, default `cubepod-workloads`) | Labeled `cubepod.io/role: workloads` |
-| `rbac.yaml` | `ServiceAccount`, `ClusterRole` (`<fullname>-controller`), `ClusterRoleBinding` | Grants CRUD on `pods`, `pods/exec`, `pods/log`, `persistentvolumeclaims`, `events`, `configmaps`, `secrets` and `cubepod.io`/`pod.cubeplex.ai` resources + statuses; read access to `apps` `deployments`/`statefulsets` |
-| `gateway-deployment.yaml` | `Deployment` (`gateway.replicaCount`, default `2`) | Serves `/health` liveness (`initialDelaySeconds: 5, periodSeconds: 10`) & readiness (`initialDelaySeconds: 2, periodSeconds: 5`); sets `CUBEPOD_PANEL_SECRET` if configured |
-| `controller-deployment.yaml` | `Deployment` (`controller.replicaCount`, forced to `1` when `templateBuild.enabled` is true) | Serves `/livez` and `/healthz`; reconciles on `--sync-interval` (`5s`); mounts `cubepod-template-context` PVC when `templateBuild.enabled` is true |
+| `rbac.yaml` | `ServiceAccount`, `ClusterRole` (`<fullname>-controller`), `ClusterRoleBinding` | Grants CRUD on `pods`, `pods/exec`, `pods/log`, `persistentvolumeclaims`, `events`, `configmaps`, `secrets` and `cubepod.io`/`pod.cubeplex.ai` resources (`podboxes`, `podtemplates`, `podwarmpools`, `sandboxwebhooks`) + statuses; read access to `apps` `deployments`/`statefulsets` |
+| `gateway-deployment.yaml` | `Deployment` (`gateway.replicaCount`, default `2`) | Serves `/health` liveness (`initialDelaySeconds: 5, periodSeconds: 10`) & readiness (`initialDelaySeconds: 2, periodSeconds: 5`); wires runtime/storage/egress flags, `global.imagePullSecrets`, `egress.caSecretName`, and optional `gateway.persistence` |
+| `controller-deployment.yaml` | `Deployment` (`controller.replicaCount`, forced to `1` when `templateBuild.enabled` is true) | Serves `/livez` and `/healthz`; reconciles on `--sync-interval` (`5s`); wires runtime/storage/egress flags, `global.imagePullSecrets`, `egress.caSecretName`, and mounts `cubepod-template-context` PVC when `templateBuild.enabled` is true |
+| `gateway-state-pvc.yaml` | `PersistentVolumeClaim` (`<fullname>-gateway-state`, optional) | Rendered when `gateway.persistence.enabled: true` and `existingClaim` is empty; persists Gateway `stateDir` (templates, E2B secrets, events/webhooks) |
 | `service.yaml` | `<fullname>-gateway` (`:8080`), `<fullname>-controller` (`:8081`) | Both default to `ClusterIP`; `gateway.service.nodePort` supported when switching to `NodePort` |
 | `buildkit.yaml` | `Deployment`, `Service` (`:1234`), 2 `PVC`s, `NetworkPolicy` | Rendered only when `templateBuild.enabled: true` |
 

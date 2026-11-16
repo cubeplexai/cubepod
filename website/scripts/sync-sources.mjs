@@ -66,6 +66,11 @@ function syncScalarBundle() {
 // 3. Parse CRDs in deploy/helm/cubepod/crds/*.yaml and emit reference/crds.md (EN + ZH)
 const CRD_FIELD_DESCRIPTIONS = {
   // PodBox
+  'spec.e2bVolumeMounts': 'Official E2B RWX volume mounts attached to the sandbox container.',
+  'spec.e2bVolumeMounts[].volumeID': '32-character hexadecimal E2B volume identifier.',
+  'spec.e2bVolumeMounts[].pvcName': 'Shared ReadWriteMany PVC name hosting E2B volumes.',
+  'spec.e2bVolumeMounts[].subPath': 'Subdirectory path inside the shared PVC for this volume.',
+  'spec.e2bVolumeMounts[].path': 'Absolute mount path inside the sandbox container.',
   'spec.templateRef': 'Name of the `PodTemplate` defining runtime class, base OCI image, storage, and egress defaults.',
   'spec.warmPoolRef': 'Optional `PodWarmPool` name to claim a pre-attached standby MicroVM in `< 50ms`.',
   'spec.desiredState': 'Target sandbox compute state (`Running` or `Paused`). Setting `Paused` deletes the Pod (0 CPU/RAM) while retaining PVCs.',
@@ -86,6 +91,8 @@ const CRD_FIELD_DESCRIPTIONS = {
   'spec.networkPolicy.secretBindings[].placeholder': 'Opaque `cpodref_...` token exposed to guest processes instead of the real credential.',
   'spec.networkPolicy.secretBindings[].allowedHosts': 'Destination hostnames permitted to receive the substituted real credential.',
   'spec.networkPolicy.secretBindings[].allowedHeaders': 'Optional HTTP headers allowed for substitution (e.g., `Authorization`, `x-api-key`).',
+  'spec.networkPolicy.headerTransforms': 'Host-scoped HTTP header transformations applied by `cubepod-egress`.',
+  'spec.networkPolicy.secretRefBindings': 'Tenant-scoped zero-trust secret reference bindings resolved from vault over per-pod mTLS.',
   'status.phase': 'Observed `PodBox` phase (`Pending`, `Provisioning`, `Running`, `Pausing`, `Paused`, `Resuming`, `ResettingRootFS`, `Failed`, `Terminated`).',
   'status.podName': 'Name of the currently bound Kubernetes Kata Pod (empty when `Paused`).',
   'status.podIP': 'Cluster IP of the active sandbox Pod used by `cubepod-gateway` to proxy `podd` (`:49983`) and panel ports.',
@@ -139,6 +146,15 @@ const CRD_FIELD_DESCRIPTIONS = {
   'spec.replicas': 'Target count of pre-formatted, pre-pivoted standby MicroVM Pods kept ready to claim.',
   'status.readyReplicas': 'Number of standby Pods that passed `podd` readiness checks.',
   'status.availableReplicas': 'Number of standby Pods immediately available for `< 50ms` sandbox claiming.',
+  // SandboxWebhook
+  'spec.tenantHash': 'SHA-256 tenant hash scoping the webhook subscription.',
+  'spec.name': 'Human-readable webhook subscription name.',
+  'spec.url': 'HTTPS (or private HTTP when allowed) destination URL receiving signed lifecycle events.',
+  'spec.events': 'Subscribed sandbox lifecycle event types.',
+  'spec.enabled': 'Whether webhook delivery is active.',
+  'spec.secretName': 'Kubernetes Secret name holding the HMAC signing secret.',
+  'status.lastDeliveryTime': 'Timestamp of the most recent webhook delivery attempt.',
+  'status.consecutiveFailures': 'Number of consecutive failed webhook deliveries.',
 };
 
 function flattenSchema(schema, prefix, requiredSet, rows) {
@@ -182,6 +198,7 @@ function renderCRDMarkdown(locale) {
     'cubepod.io_podboxes.yaml',
     'cubepod.io_podtemplates.yaml',
     'cubepod.io_podwarmpools.yaml',
+    'cubepod.io_sandboxwebhooks.yaml',
   ];
   const isZh = locale === 'zh';
 
@@ -190,8 +207,8 @@ function renderCRDMarkdown(locale) {
     `title: ${isZh ? 'Kubernetes CRD 字段字典 (v1alpha1)' : 'Kubernetes CRDs (v1alpha1)'}`,
     `description: ${
       isZh
-        ? '自动同步自 deploy/helm/cubepod/crds/ 的 PodBox、PodTemplate 与 PodWarmPool 完整字段字典。'
-        : 'Auto-generated field reference for PodBox, PodTemplate, and PodWarmPool from deploy/helm/cubepod/crds/.'
+        ? '自动同步自 deploy/helm/cubepod/crds/ 的 PodBox、PodTemplate、PodWarmPool 与 SandboxWebhook 完整字段字典。'
+        : 'Auto-generated field reference for PodBox, PodTemplate, PodWarmPool, and SandboxWebhook from deploy/helm/cubepod/crds/.'
     }`,
     'editUrl: false',
     '---',
