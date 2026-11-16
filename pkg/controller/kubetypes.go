@@ -101,6 +101,22 @@ type coreV1SecurityContext struct {
 	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
 }
 
+// coreV1HTTPGetAction represents an HTTPGet probe action.
+type coreV1HTTPGetAction struct {
+	Path string `json:"path"`
+	Port int    `json:"port"`
+}
+
+// coreV1Probe represents a Kubernetes container probe.
+type coreV1Probe struct {
+	HTTPGet             *coreV1HTTPGetAction `json:"httpGet,omitempty"`
+	InitialDelaySeconds int32                `json:"initialDelaySeconds,omitempty"`
+	PeriodSeconds       int32                `json:"periodSeconds,omitempty"`
+	TimeoutSeconds      int32                `json:"timeoutSeconds,omitempty"`
+	SuccessThreshold    int32                `json:"successThreshold,omitempty"`
+	FailureThreshold    int32                `json:"failureThreshold,omitempty"`
+}
+
 // coreV1Container represents a single container that is expected to be run on the host.
 type coreV1Container struct {
 	Name            string                      `json:"name"`
@@ -113,6 +129,18 @@ type coreV1Container struct {
 	Resources       *coreV1ResourceRequirements `json:"resources,omitempty"`
 	Env             []coreV1EnvVar              `json:"env,omitempty"`
 	SecurityContext *coreV1SecurityContext      `json:"securityContext,omitempty"`
+	ReadinessProbe  *coreV1Probe                `json:"readinessProbe,omitempty"`
+}
+
+type coreV1PodCondition struct {
+	Type   string `json:"type"`
+	Status string `json:"status"`
+}
+
+type coreV1PodStatus struct {
+	Phase      string               `json:"phase,omitempty"`
+	PodIP      string               `json:"podIP,omitempty"`
+	Conditions []coreV1PodCondition `json:"conditions,omitempty"`
 }
 
 // coreV1PodSpec is a description of a pod.
@@ -127,10 +155,11 @@ type coreV1PodSpec struct {
 
 // coreV1Pod represents a Kubernetes v1 Pod JSON payload.
 type coreV1Pod struct {
-	APIVersion string         `json:"apiVersion"`
-	Kind       string         `json:"kind"`
-	Metadata   coreV1Metadata `json:"metadata"`
-	Spec       coreV1PodSpec  `json:"spec"`
+	APIVersion string           `json:"apiVersion"`
+	Kind       string           `json:"kind"`
+	Metadata   coreV1Metadata   `json:"metadata"`
+	Spec       coreV1PodSpec    `json:"spec"`
+	Status     *coreV1PodStatus `json:"status,omitempty"`
 }
 
 // toCoreV1PVC converts a BlockPVCManifest into a Kubernetes v1 PersistentVolumeClaim payload.
@@ -227,6 +256,22 @@ func toCoreV1Container(c ContainerManifest) coreV1Container {
 			sc.Privileged = &priv
 		}
 		res.SecurityContext = sc
+	}
+	if c.ReadinessProbe != nil {
+		probe := &coreV1Probe{
+			InitialDelaySeconds: c.ReadinessProbe.InitialDelaySeconds,
+			PeriodSeconds:       c.ReadinessProbe.PeriodSeconds,
+			TimeoutSeconds:      c.ReadinessProbe.TimeoutSeconds,
+			SuccessThreshold:    c.ReadinessProbe.SuccessThreshold,
+			FailureThreshold:    c.ReadinessProbe.FailureThreshold,
+		}
+		if c.ReadinessProbe.HTTPGet != nil {
+			probe.HTTPGet = &coreV1HTTPGetAction{
+				Path: c.ReadinessProbe.HTTPGet.Path,
+				Port: c.ReadinessProbe.HTTPGet.Port,
+			}
+		}
+		res.ReadinessProbe = probe
 	}
 	return res
 }

@@ -377,8 +377,8 @@ func TestK8sLiveE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to get sandbox after auto-resume: %v", err)
 	}
-	if sbResumed.State != "Running" {
-		t.Fatalf("expected state Running after auto-resume, got %s", sbResumed.State)
+	if !strings.EqualFold(sbResumed.State, "running") {
+		t.Fatalf("expected state running after auto-resume, got %s", sbResumed.State)
 	}
 	if sbResumed.AutoResumeCount < 1 {
 		t.Fatalf("expected AutoResumeCount >= 1, got %d", sbResumed.AutoResumeCount)

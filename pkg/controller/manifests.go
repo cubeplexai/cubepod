@@ -136,6 +136,22 @@ type EnvVar struct {
 	Value string `json:"value"`
 }
 
+// HTTPGetAction describes an HTTP GET probe target.
+type HTTPGetAction struct {
+	Path string `json:"path"`
+	Port int    `json:"port"`
+}
+
+// ProbeSpec describes a container liveness or readiness probe.
+type ProbeSpec struct {
+	HTTPGet             *HTTPGetAction `json:"httpGet,omitempty"`
+	InitialDelaySeconds int32          `json:"initialDelaySeconds,omitempty"`
+	PeriodSeconds       int32          `json:"periodSeconds,omitempty"`
+	TimeoutSeconds      int32          `json:"timeoutSeconds,omitempty"`
+	SuccessThreshold    int32          `json:"successThreshold,omitempty"`
+	FailureThreshold    int32          `json:"failureThreshold,omitempty"`
+}
+
 // ContainerManifest represents a container specification within a Pod.
 type ContainerManifest struct {
 	Name            string                        `json:"name"`
@@ -150,6 +166,7 @@ type ContainerManifest struct {
 	Privileged      bool                          `json:"privileged,omitempty"`
 	RunAsUser       *int64                        `json:"runAsUser,omitempty"`
 	RunAsGroup      *int64                        `json:"runAsGroup,omitempty"`
+	ReadinessProbe  *ProbeSpec                    `json:"readinessProbe,omitempty"`
 }
 
 // VolumeManifest represents a Pod volume definition.
@@ -171,6 +188,8 @@ type PodManifest struct {
 	Containers       []ContainerManifest `json:"containers"`
 	Volumes          []VolumeManifest    `json:"volumes"`
 	ImagePullSecrets []string            `json:"imagePullSecrets,omitempty"`
+	PodIP            string              `json:"podIP,omitempty"`
+	NotReady         bool                `json:"notReady,omitempty"`
 }
 
 // BuildBlockPVCs generates volumeMode: Block or Filesystem PVC specifications for RootFS Upper and Workspace.
@@ -521,6 +540,19 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 			Name:  "CUBEPOD_RUN_AS_USERNAME",
 			Value: tpl.RunAsUsername,
 		})
+	}
+
+	// Kubelet probes podd /health on :49983 so Pod Ready reflects completed
+	// block formatting and pivot_root (preventing premature WarmPool claims).
+	mainContainer.ReadinessProbe = &ProbeSpec{
+		HTTPGet: &HTTPGetAction{
+			Path: "/health",
+			Port: 49983,
+		},
+		InitialDelaySeconds: 1,
+		PeriodSeconds:       1,
+		TimeoutSeconds:      1,
+		FailureThreshold:    60,
 	}
 
 	// Official E2B volumes are filesystem mounts in addition to rootfs and
