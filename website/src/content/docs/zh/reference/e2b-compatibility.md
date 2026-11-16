@@ -8,9 +8,9 @@ description: 官方 E2B SDK 与 CubePod Gateway 的兼容性矩阵与行为差�
 CubePod 实现了核心 E2B REST 与 Connect-RPC 端点，允许使用官方 E2B 客户端 SDK 的团队将流量重定向至私有化部署的 CubePod 实例。然而，CubePod **并非**托管版 E2B Cloud 的逐行克隆：它构建在基于 Kata Containers 微虚拟机的双块卷持久化架构之上，具备不同的生命周期语义、双卷存储模型与面向企业部署的扩展接口。
 
 :::note[测试验证状态与证据说明]
-- **集成测试套件**：仓库在 `test/e2b-compat/` 下包含自动化 Python 兼容性测试套件（`test_official_e2b_sync.py`、`test_official_e2b_async.py`、`test_official_code_interpreter.py`、`test_official_e2b_templates.py`、`test_streaming_realtime.py`、`test_timeout_and_zombie_kill.py`、`test_multimodal_data_science.py`、`test_concurrent_sandboxes_isolation.py`）。
-- **测试执行状态**：仓库中存在的测试文件代表为 CEP-0018 与 CEP-0019 编写的测试覆盖范围；**它们并不代表在本次文档编写过程中执行了端到端运行验证**。维护者可在本地或测试环境通过 `make test-e2b-compat`（`bash test/e2b-compat/run_tests.sh`）对实时网关运行验证。
-- **CI 流水线范围**：在 `.github/workflows/ci.yml` 中，`make test-e2b-compat` 当前**未**接入默认的 GitHub Actions 自动化流水线（默认流水线运行单元测试、SDK 单元测试以及多进程 `make test-e2e`）。
+- **集成测试套件**：仓库在 `test/e2b-compat/` 下包含 9 个自动化 Python 兼容性测试文件（共 34 个 pytest 用例：`test_official_e2b_sync.py`、`test_official_e2b_async.py`、`test_official_e2b_extended.py`、`test_official_code_interpreter.py`、`test_official_e2b_templates.py`、`test_streaming_realtime.py`、`test_timeout_and_zombie_kill.py`、`test_multimodal_data_science.py`、`test_concurrent_sandboxes_isolation.py`）。
+- **测试边界说明**：`make test-e2b-compat`（`bash test/e2b-compat/run_tests.sh`）使用官方 Python `e2b` 与 `e2b-code-interpreter` SDK 对接内嵌 `LiveGateway`（编译并拉起真实 Go `bin/cubepod-gateway` 二进制 + 进程内 Python Connect-RPC/`/execute` 测试桩，而非完整的 Kubernetes/Kata 微虚拟机集群）。
+- **CI 流水线**：已在 [.github/workflows/ci.yml](https://github.com/cubeplexai/cubepod/blob/main/.github/workflows/ci.yml) 中配置 `e2b-compat-ci` 任务，与 Rust/Go/SDK 单元测试及多进程 `make test-e2e` 一并自动执行。
 - **官方 JS/TS SDK**：仓库中**不存在**针对官方 `@e2b/code-interpreter` 或 `e2b` npm 包的自动化测试。因此，官方 TypeScript/JavaScript E2B SDK 兼容性标记为**未测试（Untested）**。
 - **Agent 框架**：上层编排框架（LangChain、LlamaIndex、AutoGen、CrewAI、OpenHands、Smolagents）在此仓库中没有专门的集成测试用例，标记为**未测试（Untested）**。
 :::
@@ -116,7 +116,7 @@ export E2B_API_KEY="cpod_test_api_key"
 | `sandbox.commands.run(..., background=True)` | `POST /sandboxes/{id}/commands`（`background: true`）<br/>Connect-RPC `/process.Process/Start` | **兼容** | `pkg/gateway/commands.go`<br/>`pkg/gateway/connectrpc.go`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | 在 Guest 内创建后台进程组并返回含 `pid` 的句柄。 |
 | 日志流式推送与回调（`on_stdout`、`on_stderr`） | `GET /sandboxes/{id}/commands/{cmdId}/logs`<br/>`GET /sandboxes/{id}/commands/{cmdId}/stream`<br/>Connect-RPC `/process.Process/Connect` | **兼容** | `pkg/gateway/commands.go`<br/>`pkg/gateway/connectrpc.go`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | 实时将命令输出增量推送给 `on_stdout` / `on_stderr` 回调。 |
 | `sandbox.commands.kill(pid)` | `POST /sandboxes/{id}/commands/{cmdId}/kill`<br/>Connect-RPC `/process.Process/SendSignal` | **兼容** | `pkg/gateway/commands.go`<br/>`pkg/gateway/connectrpc.go`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | 终止后台进程组并在停止后返回 `True`。 |
-| `sandbox.pty` / 交互式伪终端 | Connect-RPC `/process.Process/{Start,Connect,SendInput,StreamInput,Update,SendSignal}`（`pty: true`） | **部分兼容** | `pkg/gateway/connectrpc.go`<br/>`crates/podd/src/commands.rs`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | **对用户的影响：** 交互式 PTY 创建、标准输入、窗口大小调整（resize）、信号发送与 64 KiB 重连回放均可正常使用，但不支持半双工关闭标准输入（`CloseStdin` 返回 `501 Not Implemented`）。 |
+| `sandbox.pty` / 交互式伪终端 | Connect-RPC `/process.Process/*`（`pty: true`）：<br/>`Start`, `Connect`, `SendInput`,<br/>`StreamInput`, `Update`, `SendSignal` | **部分兼容** | `pkg/gateway/connectrpc.go`<br/>`crates/podd/src/commands.rs`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | **对用户的影响：** 交互式 PTY 创建、标准输入、窗口大小调整（resize）、信号发送与 64 KiB 重连回放均可正常使用，但不支持半双工关闭标准输入（`CloseStdin` 返回 `501 Not Implemented`）。 |
 
 ---
 
@@ -126,10 +126,10 @@ export E2B_API_KEY="cpod_test_api_key"
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `sandbox.files.write(path, data)` | `PUT /sandboxes/{id}/files`<br/>`PUT /files`<br/>Connect-RPC `/filesystem.Filesystem/Write` | **兼容** | `pkg/gateway/files.go`<br/>`pkg/gateway/connectrpc.go`<br/>`test/e2b-compat/test_official_e2b_sync.py`<br/>`test/e2b-compat/test_official_e2b_async.py`<br/>`test/e2b-compat/test_concurrent_sandboxes_isolation.py` | `e2b>=2.0.0`（依赖下限，非已测版本全集） | 写入文件时可创建父目录。`pkg/gateway/files.go` 中的路径检查会尝试拒绝包含 `..` 的路径段；`test/e2b-compat` 覆盖的是向 `/workspace` 写入文本和二进制内容，并未枚举路径穿越用例。上传文件默认所有者为 `1000:1000`。 |
 | `sandbox.files.read(path)` | `GET /sandboxes/{id}/files`<br/>`GET /files`<br/>Connect-RPC `/filesystem.Filesystem/Read` | **兼容** | `pkg/gateway/files.go`<br/>`pkg/gateway/connectrpc.go`<br/>`test/e2b-compat/test_official_e2b_sync.py`<br/>`test/e2b-compat/test_official_e2b_async.py`<br/>`test/e2b-compat/test_concurrent_sandboxes_isolation.py` | `e2b>=2.0.0`（依赖下限，非已测版本全集） | 从沙箱持久化 `/workspace` 或 RootFS 读取原始文件字节流（支持文本及 `format="bytes"` 二进制读取）。 |
-| `sandbox.files.list(path)` | `GET /sandboxes/{id}/files/list`<br/>`GET /files/list`<br/>Connect-RPC `/filesystem.Filesystem/{List,ListDir}` | **兼容** | `pkg/gateway/files.go`<br/>`pkg/gateway/connectrpc.go`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | 返回目录条目列表及元数据（`name`、`size`、`isDir`、`permissions`）。 |
+| `sandbox.files.list(path)` | `GET /sandboxes/{id}/files/list`<br/>`GET /files/list`<br/>Connect-RPC `/filesystem.Filesystem/*`：<br/>`List`, `ListDir` | **兼容** | `pkg/gateway/files.go`<br/>`pkg/gateway/connectrpc.go`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | 返回目录条目列表及元数据（`name`、`size`、`isDir`、`permissions`）。 |
 | `sandbox.files.remove(path)` | `DELETE /sandboxes/{id}/files`<br/>`DELETE /files`<br/>Connect-RPC `/filesystem.Filesystem/Remove` | **兼容** | `pkg/gateway/files.go`<br/>`pkg/gateway/connectrpc.go`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | 递归删除沙箱内的目标文件或目录。 |
 | `sandbox.files.make_dir(path)` | Connect-RPC `/filesystem.Filesystem/MakeDir` | **兼容** | `pkg/gateway/connectrpc.go`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | 递归创建目录（权限 `0755`，默认归属 `1000:1000`）。 |
-| `sandbox.files.watch_dir(path)` | Connect-RPC `/filesystem.Filesystem/{WatchDir,CreateWatcher,GetWatcherEvents,RemoveWatcher}` | **兼容** | `pkg/gateway/watch.go`<br/>`pkg/gateway/connectrpc.go`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | 实时监听目录创建/写入/删除事件并支持流式与轮询拉取。 |
+| `sandbox.files.watch_dir(path)` | Connect-RPC `/filesystem.Filesystem/*`：<br/>`WatchDir`, `CreateWatcher`,<br/>`GetWatcherEvents`, `RemoveWatcher` | **兼容** | `pkg/gateway/watch.go`<br/>`pkg/gateway/connectrpc.go`<br/>`test/e2b-compat/test_official_e2b_extended.py` | `e2b>=2.0.0` | 实时监听目录创建/写入/删除事件并支持流式与轮询拉取。 |
 
 ---
 
