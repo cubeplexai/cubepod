@@ -175,6 +175,7 @@ export E2B_API_KEY="cpod_test_api_key"
 | **Agent 编排框架**（LangChain、LlamaIndex、AutoGen、CrewAI、OpenHands、Smolagents） | **未测试** | 仓库内尚未集成针对各第三方框架的端到端测试套件。 |
 | **官方 E2B Volumes API**（`POST /volumes`、`/volumecontent/{id}/*`、`volumeMounts`） | **部分兼容** | **对用户的影响：** 卷管理与文件读写在 `e2b>=2.0.0` 下可用，但调用 `vol.write_file()` / `vol.read_file()` 连接自建网关时必须显式传入 `api_url`（否则官方 SDK 默认请求 `e2b.app`）。在 Kubernetes 集群上挂载卷到沙箱需要配置集群级 RWX 共享存储，否则创建带 `volumeMounts` 的沙箱会返回 `501 Not Implemented`。 |
 | **官方 E2B Secrets API**（`POST /secrets`、`GET /secrets`、`POST /secrets/{id}`、`DELETE /secrets/{id}`、`network.rules`） | **部分兼容** | **对用户的影响：** 单实例网关支持 Write-Only 密钥增删改查（`Secret.create`/`list`/`get_info`/`update`/`destroy`/`fill`）与 `network.rules` 请求头注入；暂不支持多副本 Kubernetes Gateway 之间的密钥状态同步，且本地 Docker 模式下不运行出站代理，无法对容器出站流量执行密钥头注入。 |
+| **沙箱生命周期事件与 Webhook**（`POST/GET /webhooks`、`PATCH/DELETE /webhooks/{id}`、`GET /events`、`GET /sandboxes/{id}/events`） | **部分兼容** | **对用户的影响：** 支持发送带 `e2b-signature` 签名的 E2B `v1` 生命周期事件（`created`、`paused`、`resumed`、`updated`、`forked`、`killed`），其中暂停与恢复模式固定为 `pause_mode: "filesystem"` 与 `resume_mode: "reboot"`。目前事件历史与 Webhook 配置仅支持单实例网关本地持久化（多副本 Kubernetes HA 共享将在 Beta 支持）。 |
 | **官方 E2B `sandbox.git` 助手** | **未测试** | 上游文档将 `sandbox.git` 说明为已弃用的 SDK 助手，它绑定在命令执行器上（`Git` 由 `Commands` 对象构造），并不是专用 HTTP Git 接口。`test/e2b-compat` 没有调用 `sandbox.git`。通过 `sandbox.commands.run()` 执行 `git` 只是普通 shell 命令路径，不能证明官方 git helper 兼容（例如 clone 选项、凭据助手、`dangerously_authenticate`、结构化 status/branch API 等）。 |
 
 ---
