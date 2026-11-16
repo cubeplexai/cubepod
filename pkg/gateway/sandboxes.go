@@ -655,8 +655,10 @@ func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
+	wireRec := *rec
+	wireRec.State = strings.ToLower(wireRec.State)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(rec)
+	_ = json.NewEncoder(w).Encode(&wireRec)
 }
 
 func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {

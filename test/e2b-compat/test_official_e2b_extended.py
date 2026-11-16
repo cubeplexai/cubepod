@@ -120,9 +120,9 @@ def test_sandbox_get_list_connect_and_host(direct_gateway_url: str) -> None:
         reconnected = Sandbox.connect(sbx.sandbox_id)
         assert reconnected.sandbox_id == sbx.sandbox_id
 
-        # Sandbox.get_info() calls GET /sandboxes/{id}, which currently returns capitalized "Running"
-        with pytest.raises(ValueError, match="is not a valid SandboxState"):
-            Sandbox.get_info(sbx.sandbox_id)
+        # Sandbox.get_info() calls GET /sandboxes/{id} (lowercase state)
+        info = Sandbox.get_info(sbx.sandbox_id)
+        assert info.sandbox_id == sbx.sandbox_id
 
         host = sbx.get_host(8080)
         assert sbx.sandbox_id in host and "8080" in host
