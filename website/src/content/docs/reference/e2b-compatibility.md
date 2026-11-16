@@ -7,12 +7,10 @@ This reference summarizes compatibility and behavioral differences between offic
 
 CubePod implements core E2B REST and Connect-RPC endpoints to allow teams using official E2B client SDKs to redirect traffic to a self-hosted CubePod instance. However, CubePod is **not** an identical replica of hosted E2B Cloud: it is built on a persistent dual-volume Kata Containers MicroVM architecture with distinct lifecycle semantics, a two-volume storage model, and extension APIs.
 
-:::note[Verification and Test Status]
-- **Integration Test Suite**: The repository contains 9 automated Python compatibility test suites (34 pytest cases) under `test/e2b-compat/` (`test_official_e2b_sync.py`, `test_official_e2b_async.py`, `test_official_e2b_extended.py`, `test_official_code_interpreter.py`, `test_official_e2b_templates.py`, `test_streaming_realtime.py`, `test_timeout_and_zombie_kill.py`, `test_multimodal_data_science.py`, `test_concurrent_sandboxes_isolation.py`).
-- **Test Harness Scope**: `make test-e2b-compat` (`bash test/e2b-compat/run_tests.sh`) tests the official Python `e2b` and `e2b-code-interpreter` SDKs against an embedded `LiveGateway` (launching the real compiled `bin/cubepod-gateway` Go binary alongside an in-process Python Connect-RPC/`/execute` harness rather than a full Kubernetes/Kata VM cluster).
-- **CI Pipeline**: Wired into `.github/workflows/ci.yml` (`e2b-compat-ci` job), running alongside Rust/Go/SDK unit tests and multi-process `make test-e2e`.
-- **Official JS/TS SDK**: Zero automated tests exist in the repository for the official `@e2b/code-interpreter` or `e2b` npm packages. Official TypeScript/JavaScript E2B SDK compatibility is therefore marked **Untested**.
-- **Agent Frameworks**: Higher-level orchestration frameworks (LangChain, LlamaIndex, AutoGen, CrewAI, OpenHands, Smolagents) lack dedicated integration test suites in this repository and are marked **Untested**.
+:::note[Compatibility Coverage at a Glance]
+- **Official Python SDKs (Verified in CI)**: Every push and pull request runs `make test-e2b-compat` (34 automated tests covering `e2b` sync/async and `e2b-code-interpreter` against `cubepod-gateway` with an in-process data-plane harness), alongside full Rust + Go runtime integration tests (`make test-e2e`). You can also point [`test/e2b-compat/`](https://github.com/cubeplexai/cubepod/tree/main/test/e2b-compat) at your own deployment via `CUBEPOD_GATEWAY_URL`.
+- **Official JS / TypeScript SDK (`Untested`)**: Upstream `@e2b/code-interpreter` and `e2b` npm packages are not yet covered by automated compatibility tests in CI. For TypeScript projects today, you can use CubePod's tested native **[TypeScript SDK](/sdks/typescript/)**.
+- **Agent Frameworks (`Untested`)**: Higher-level frameworks (LangChain, LlamaIndex, AutoGen, CrewAI, OpenHands, Smolagents) can connect via the E2B-compatible endpoints above, though dedicated framework integration suites are not yet included in this repository.
 :::
 
 ---

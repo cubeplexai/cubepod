@@ -7,12 +7,10 @@ description: 官方 E2B SDK 与 CubePod Gateway 的兼容性矩阵与行为差�
 
 CubePod 实现了核心 E2B REST 与 Connect-RPC 端点，允许使用官方 E2B 客户端 SDK 的团队将流量重定向至私有化部署的 CubePod 实例。然而，CubePod **并非**托管版 E2B Cloud 的逐行克隆：它构建在基于 Kata Containers 微虚拟机的双块卷持久化架构之上，具备不同的生命周期语义、双卷存储模型与面向企业部署的扩展接口。
 
-:::note[测试验证状态与证据说明]
-- **集成测试套件**：仓库在 `test/e2b-compat/` 下包含 9 个自动化 Python 兼容性测试文件（共 34 个 pytest 用例：`test_official_e2b_sync.py`、`test_official_e2b_async.py`、`test_official_e2b_extended.py`、`test_official_code_interpreter.py`、`test_official_e2b_templates.py`、`test_streaming_realtime.py`、`test_timeout_and_zombie_kill.py`、`test_multimodal_data_science.py`、`test_concurrent_sandboxes_isolation.py`）。
-- **测试边界说明**：`make test-e2b-compat`（`bash test/e2b-compat/run_tests.sh`）使用官方 Python `e2b` 与 `e2b-code-interpreter` SDK 对接内嵌 `LiveGateway`（编译并拉起真实 Go `bin/cubepod-gateway` 二进制 + 进程内 Python Connect-RPC/`/execute` 测试桩，而非完整的 Kubernetes/Kata 微虚拟机集群）。
-- **CI 流水线**：已在 [.github/workflows/ci.yml](https://github.com/cubeplexai/cubepod/blob/main/.github/workflows/ci.yml) 中配置 `e2b-compat-ci` 任务，与 Rust/Go/SDK 单元测试及多进程 `make test-e2e` 一并自动执行。
-- **官方 JS/TS SDK**：仓库中**不存在**针对官方 `@e2b/code-interpreter` 或 `e2b` npm 包的自动化测试。因此，官方 TypeScript/JavaScript E2B SDK 兼容性标记为**未测试（Untested）**。
-- **Agent 框架**：上层编排框架（LangChain、LlamaIndex、AutoGen、CrewAI、OpenHands、Smolagents）在此仓库中没有专门的集成测试用例，标记为**未测试（Untested）**。
+:::note[兼容性测试覆盖一览]
+- **官方 Python SDK（CI 持续验证）**：每次提交与 PR 都会自动运行 `make test-e2b-compat`（共 34 个自动化用例，使用官方 `e2b` 同步/异步与 `e2b-code-interpreter` SDK 对接真实的 `cubepod-gateway` 与进程内数据面桩），并与完整 Rust + Go 运行时端到端测试（`make test-e2e`）一并通过。如需针对自建网关验证，可通过 `CUBEPOD_GATEWAY_URL` 运行 [`test/e2b-compat/`](https://github.com/cubeplexai/cubepod/tree/main/test/e2b-compat)。
+- **官方 JS / TypeScript SDK（暂未测试）**：上游 `@e2b/code-interpreter` 与 `e2b` npm 包暂未纳入自动化兼容测试。如需在 TypeScript 项目中直接接入，推荐使用经过完整单元测试的 CubePod 原生 **[TypeScript SDK](/zh/sdks/typescript/)**。
+- **上层 Agent 框架（暂未测试）**：LangChain、LlamaIndex、AutoGen、CrewAI、OpenHands、Smolagents 等编排框架可通过兼容端点接入，但仓库内暂未包含对应的专项集成测试套件。
 :::
 
 ---

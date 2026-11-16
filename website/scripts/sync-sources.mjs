@@ -463,7 +463,10 @@ function syncCEPs() {
       `  order: ${parseInt(num, 10)}`,
       '---',
       '',
-      `> **Source**: [\`docs/enhancements/${dirName}/README.md\`](https://github.com/cubeplexai/cubepod/blob/main/docs/enhancements/${dirName}/README.md) · **Status**: \`${status}\` · **Area**: \`${area}\` · **Milestone**: \`${milestone}\``,
+      `> - **Source**: [\`docs/enhancements/${dirName}/README.md\`](https://github.com/cubeplexai/cubepod/blob/main/docs/enhancements/${dirName}/README.md)`,
+      `> - **Status**: \`${status}\``,
+      `> - **Area**: \`${area}\``,
+      `> - **Milestone**: \`${milestone}\``,
       '',
       '',
     ].join('\n');
