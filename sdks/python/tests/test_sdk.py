@@ -1178,7 +1178,10 @@ class TestV04FeaturesAsync(unittest.IsolatedAsyncioTestCase):
 
         for state in ("Stopped", "Terminated", "Failed", "Killed", "Succeed"):
             self.assertTrue(SandboxInfo("id", "tpl", state).is_terminal)
-        for state in ("Running", "Paused", "Creating", "Starting"):
+        # 0.5.1 get/list-v2 responses lowercase state via strings.ToLower.
+        for state in ("stopped", "terminated", "failed", "killed", "succeed", "FAILED"):
+            self.assertTrue(SandboxInfo("id", "tpl", state).is_terminal)
+        for state in ("Running", "Paused", "Creating", "Starting", "running", "paused"):
             self.assertFalse(SandboxInfo("id", "tpl", state).is_terminal)
 
     async def test_execute_and_start_command_optional_uid_gid_and_timeout(self) -> None:

@@ -21,7 +21,7 @@ class NetworkPolicySpec(TypedDict, total=False):
     secretBindings: list[dict[str, Any]]
 
 
-_TERMINAL_STATES = frozenset({"Stopped", "Terminated", "Failed", "Killed", "Succeed"})
+_TERMINAL_STATES = frozenset({"stopped", "terminated", "failed", "killed", "succeed"})
 
 
 @dataclass
@@ -37,7 +37,7 @@ class SandboxInfo:
     @property
     def is_terminal(self) -> bool:
         """Return True if the sandbox is in a terminal lifecycle state."""
-        return self.state in _TERMINAL_STATES
+        return self.state.casefold() in _TERMINAL_STATES
 
 
 @dataclass
