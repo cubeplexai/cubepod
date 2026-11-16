@@ -1,0 +1,33 @@
+title: "Official E2B Secrets API and Zero-Trust Secret Store Integration"
+cep-number: "0027"
+authors:
+  - "@cubepod-maintainers"
+owning-area: "gateway"
+participating-areas:
+  - "egress"
+  - "controller"
+  - "sdk"
+status: "implementable"
+creation-date: "2026-11-15"
+reviewers:
+  - "@cubepod-maintainers"
+approvers:
+  - "@cubepod-maintainers"
+stage: "alpha"
+latest-milestone: "v0.5"
+milestone:
+  alpha: "v0.5"
+  beta: "v0.6"
+  stable: "v1.0"
+feature-gates:
+  - name: "E2BSecretsAPI"
+    components:
+      - "cubepod-gateway"
+      - "cubepod-egress"
+      - "cubepod-controller"
+disable-supported: true
+metrics:
+  - "cubepod_secrets_operations_total"
+  - "cubepod_secrets_store_count"
+  - "cubepod_egress_secret_exchanges_total"
+  - "cubepod_egress_secret_denied_total"
