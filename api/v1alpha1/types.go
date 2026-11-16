@@ -403,3 +403,37 @@ type PodTemplateList struct {
 	Metadata   ObjectMeta    `json:"metadata,omitempty"`
 	Items      []PodTemplate `json:"items"`
 }
+
+// SandboxWebhookSpec defines a tenant-scoped webhook subscription (CEP-0028).
+// The HMAC signatureKey is isolated in the referenced Kubernetes Secret (SecretName).
+type SandboxWebhookSpec struct {
+	TenantHash string   `json:"tenantHash"`
+	Name       string   `json:"name"`
+	URL        string   `json:"url"`
+	Events     []string `json:"events"`
+	Enabled    bool     `json:"enabled"`
+	SecretName string   `json:"secretName"`
+}
+
+// SandboxWebhookStatus tracks delivery health for a SandboxWebhook.
+type SandboxWebhookStatus struct {
+	LastDeliveryTime    *time.Time `json:"lastDeliveryTime,omitempty"`
+	ConsecutiveFailures int        `json:"consecutiveFailures,omitempty"`
+}
+
+// SandboxWebhook is the Custom Resource representing a tenant webhook subscription.
+type SandboxWebhook struct {
+	APIVersion string               `json:"apiVersion,omitempty"`
+	Kind       string               `json:"kind,omitempty"`
+	Metadata   ObjectMeta           `json:"metadata"`
+	Spec       SandboxWebhookSpec   `json:"spec"`
+	Status     SandboxWebhookStatus `json:"status,omitempty"`
+}
+
+// SandboxWebhookList is a list of SandboxWebhook Custom Resources.
+type SandboxWebhookList struct {
+	APIVersion string           `json:"apiVersion,omitempty"`
+	Kind       string           `json:"kind,omitempty"`
+	Metadata   ObjectMeta       `json:"metadata,omitempty"`
+	Items      []SandboxWebhook `json:"items"`
+}

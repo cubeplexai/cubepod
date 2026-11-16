@@ -19,6 +19,7 @@ import (
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
+	"github.com/cubeplexai/cubepod/pkg/events"
 	"github.com/cubeplexai/cubepod/pkg/secret"
 	"github.com/cubeplexai/cubepod/pkg/volume"
 )
@@ -522,6 +523,10 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ownerTenant := ""
+	if key := managementAPIKey(r); key != "" {
+		ownerTenant = events.TenantHash(key)
+	}
 	now := time.Now().UTC()
 	endAt := now.Add(time.Duration(timeoutSecs) * time.Second)
 	rec := &SandboxRecord{
@@ -545,6 +550,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		LastActivityAt:   &now,
 		TimeoutSeconds:   timeoutSecs,
 		WorkspaceDir:     workspaceDir,
+		OwnerTenantHash:  ownerTenant,
 	}
 
 	if s.livePodRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
@@ -598,6 +604,8 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.sandboxes[id] = rec
 	s.mu.Unlock()
+
+	s.emitSandboxEvent(rec.OwnerTenantHash, events.EventCreated, rec, nil)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -703,6 +711,10 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.emitSandboxEvent(rec.OwnerTenantHash, events.EventPaused, rec, &events.EventData{
+		PauseMode: "filesystem",
+		Execution: executionDataForRecord(rec),
+	})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rec)
 }
@@ -744,6 +756,11 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if wasPaused {
+		s.emitSandboxEvent(rec.OwnerTenantHash, events.EventResumed, rec, &events.EventData{
+			ResumeMode: "reboot",
+		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rec)
@@ -813,6 +830,8 @@ func (s *Server) handleSetTimeout(w http.ResponseWriter, r *http.Request) {
 	rec.TimeoutSeconds = secs
 	s.recordActivity(rec)
 	s.mu.Unlock()
+
+	s.emitSandboxEvent(rec.OwnerTenantHash, events.EventUpdated, rec, nil)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rec)
@@ -887,6 +906,9 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	s.emitSandboxEvent(rec.OwnerTenantHash, events.EventUpdated, rec, &events.EventData{
+		Reason: "RootfsReset",
+	})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rec)
 }
@@ -968,6 +990,7 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		LastActivityAt:   &now,
 		TimeoutSeconds:   parent.TimeoutSeconds,
 		WorkspaceDir:     workspaceDir,
+		OwnerTenantHash:  parent.OwnerTenantHash,
 	}
 
 	if s.runtime != nil {
@@ -986,6 +1009,8 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.sandboxes[childID] = child
 	s.mu.Unlock()
+
+	s.emitSandboxEvent(child.OwnerTenantHash, events.EventForked, child, nil)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1013,6 +1038,12 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 
 	// Revoke secrets associated with this sandbox
 	s.vault.RevokeSandbox(id)
+
+	if ok && rec != nil {
+		s.emitSandboxEvent(rec.OwnerTenantHash, events.EventKilled, rec, &events.EventData{
+			Execution: executionDataForRecord(rec),
+		})
+	}
 
 	if ok && rec != nil && rec.WorkspaceDir != "" && (rec.VolumeKey == "" || deleteVolumes) {
 		_ = os.RemoveAll(filepath.Dir(rec.WorkspaceDir))

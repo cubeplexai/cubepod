@@ -27,6 +27,7 @@ import (
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/egress"
+	"github.com/cubeplexai/cubepod/pkg/events"
 	"github.com/cubeplexai/cubepod/pkg/runtime"
 	"github.com/cubeplexai/cubepod/pkg/secret"
 	"github.com/cubeplexai/cubepod/pkg/volume"
@@ -60,6 +61,7 @@ type SandboxRecord struct {
 	AutoResumeCount  int                         `json:"autoResumeCount"`
 	Reason           string                      `json:"reason,omitempty"`
 	WorkspaceDir     string                      `json:"-"`
+	OwnerTenantHash  string                      `json:"-"`
 }
 
 // ptyReplayCap is the Connect replay tail for a live PTY. Older bytes are dropped.
@@ -263,6 +265,7 @@ type Server struct {
 	httpClient       *http.Client
 	e2b              atomic.Pointer[volume.Store]
 	secrets          atomic.Pointer[secret.Store]
+	events           atomic.Pointer[events.Manager]
 	e2bDir           string
 	e2bCfg           volume.Config
 	e2bMaxFileBytes  int64
@@ -474,6 +477,15 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /secrets/{secretID}", s.handleGetSecret)
 	mux.HandleFunc("POST /secrets/{secretID}", s.handleUpdateSecret)
 	mux.HandleFunc("DELETE /secrets/{secretID}", s.handleDeleteSecret)
+
+	// Sandbox Lifecycle Events and Signed Webhooks (CEP-0028).
+	mux.HandleFunc("POST /webhooks", s.handleCreateWebhook)
+	mux.HandleFunc("GET /webhooks", s.handleListWebhooks)
+	mux.HandleFunc("GET /webhooks/{webhookID}", s.handleGetWebhook)
+	mux.HandleFunc("PATCH /webhooks/{webhookID}", s.handleUpdateWebhook)
+	mux.HandleFunc("DELETE /webhooks/{webhookID}", s.handleDeleteWebhook)
+	mux.HandleFunc("GET /events", s.handleListEvents)
+	mux.HandleFunc("GET /sandboxes/{sandboxID}/events", s.handleListSandboxEvents)
 	mux.HandleFunc("GET /volumecontent/{volumeID}/file", s.handleGetVolumeFile)
 	mux.HandleFunc("PUT /volumecontent/{volumeID}/file", s.handlePutVolumeFile)
 	mux.HandleFunc("GET /volumecontent/{volumeID}/dir", s.handleGetVolumeDir)

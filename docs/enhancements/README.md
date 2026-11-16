@@ -39,5 +39,5 @@ This directory contains all **CubePod Enhancement Proposals (CEPs)**—the offic
 | **[CEP-0025](0025-e2b-volumes/README.md)** | Official E2B 2.64.0 Volume API, Durable Store, and Sandbox Mounts | `implemented` | `v0.4.0` | [`pkg/volume/`](../../pkg/volume/) & [`pkg/gateway/`](../../pkg/gateway/volumes.go) & [`pkg/runtime/`](../../pkg/runtime/docker.go) |
 | **[CEP-0026](0026-k8s-kata-e2b-volumes/README.md)** | Kubernetes Kata & CSI Block Integration for Official E2B Volumes | `implemented` | `v0.5.0` | [`crates/podd-init/`](../../crates/podd-init/src/main.rs) & [`pkg/controller/`](../../pkg/controller/manifests.go) & [`pkg/gateway/`](../../pkg/gateway/volumes.go) |
 | **[CEP-0027](0027-e2b-secrets-api/README.md)** | Official E2B Secrets API and Zero-Trust Secret Store Integration | `implemented` | `v0.5.0` | [`pkg/secret/`](../../pkg/secret/) & [`pkg/gateway/`](../../pkg/gateway/) & [`pkg/egress/`](../../pkg/egress/) |
-| **[CEP-0028](0028-sandbox-events-and-webhooks/README.md)** | Sandbox Lifecycle Events and Signed Webhook Delivery | `implementable` | `v0.6.0` | [`pkg/events/`](../../pkg/events/) & [`pkg/gateway/`](../../pkg/gateway/) |
+| **[CEP-0028](0028-sandbox-events-and-webhooks/README.md)** | Sandbox Lifecycle Events and Signed Webhook Delivery | `implemented` | `v0.6.0` | [`pkg/events/`](../../pkg/events/) & [`pkg/gateway/`](../../pkg/gateway/) |
 

@@ -6,7 +6,7 @@ owning-area: "gateway"
 participating-areas:
   - "controller"
   - "sdk"
-status: "implementable"
+status: "implemented"
 creation-date: "2026-11-16"
 reviewers:
   - "@cubepod-maintainers"
