@@ -28,6 +28,7 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/egress"
 	"github.com/cubeplexai/cubepod/pkg/runtime"
+	"github.com/cubeplexai/cubepod/pkg/secret"
 	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
@@ -261,6 +262,7 @@ type Server struct {
 	probeTimeout     time.Duration
 	httpClient       *http.Client
 	e2b              atomic.Pointer[volume.Store]
+	secrets          atomic.Pointer[secret.Store]
 	e2bDir           string
 	e2bCfg           volume.Config
 	e2bMaxFileBytes  int64
@@ -464,6 +466,13 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /volumes", s.handleListVolumes)
 	mux.HandleFunc("GET /volumes/{volumeID}", s.handleGetVolume)
 	mux.HandleFunc("DELETE /volumes/{volumeID}", s.handleDeleteVolume)
+
+	// Official E2B Secrets management (write-only, tenant-isolated).
+	mux.HandleFunc("POST /secrets", s.handleCreateSecret)
+	mux.HandleFunc("GET /secrets", s.handleListSecrets)
+	mux.HandleFunc("GET /secrets/{secretID}", s.handleGetSecret)
+	mux.HandleFunc("POST /secrets/{secretID}", s.handleUpdateSecret)
+	mux.HandleFunc("DELETE /secrets/{secretID}", s.handleDeleteSecret)
 	mux.HandleFunc("GET /volumecontent/{volumeID}/file", s.handleGetVolumeFile)
 	mux.HandleFunc("PUT /volumecontent/{volumeID}/file", s.handlePutVolumeFile)
 	mux.HandleFunc("GET /volumecontent/{volumeID}/dir", s.handleGetVolumeDir)

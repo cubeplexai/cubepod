@@ -1579,8 +1579,145 @@ paths:
                 items:
                   $ref: "#/components/schemas/TemplateTagInfo"
 
+  /secrets:
+    post:
+      summary: Create a tenant-isolated write-only secret
+      operationId: createSecret
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSecretRequest"
+      responses:
+        "201":
+          description: Secret created (metadata only; value is never returned)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretInfo"
+    get:
+      summary: List tenant secrets (metadata only)
+      operationId: listSecrets
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 100
+        - name: nextToken
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Secret metadata page
+          headers:
+            X-Next-Token:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SecretInfo"
+
+  /secrets/{secretID}:
+    get:
+      summary: Get secret metadata by ID (never returns value)
+      operationId: getSecret
+      parameters:
+        - name: secretID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Secret metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretInfo"
+    post:
+      summary: Rotate/update an existing secret value
+      operationId: updateSecret
+      parameters:
+        - name: secretID
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSecretRequest"
+      responses:
+        "200":
+          description: Updated secret metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretInfo"
+    delete:
+      summary: Delete a secret and revoke active sandbox bindings
+      operationId: deleteSecret
+      parameters:
+        - name: secretID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Secret deleted
+
 components:
   schemas:
+    SecretInfo:
+      type: object
+      required:
+        - id
+        - name
+        - version
+        - createdAt
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        version:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    CreateSecretRequest:
+      type: object
+      required:
+        - name
+        - value
+      properties:
+        name:
+          type: string
+        value:
+          type: string
+          writeOnly: true
+    UpdateSecretRequest:
+      type: object
+      required:
+        - value
+      properties:
+        value:
+          type: string
+          writeOnly: true
     CreateSandboxRequest:
       type: object
       properties:
@@ -1609,6 +1746,32 @@ components:
           description: E2B canonical alias for envVars
           additionalProperties:
             type: string
+        network:
+          type: object
+          description: Official E2B network rules and ${e2b.secrets.<name>} header transforms
+          properties:
+            allowOut:
+              type: array
+              items:
+                type: string
+            denyOut:
+              type: array
+              items:
+                type: string
+            rules:
+              type: object
+              additionalProperties:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    transform:
+                      type: object
+                      properties:
+                        headers:
+                          type: object
+                          additionalProperties:
+                            type: string
         volumeMounts:
           type: array
           description: Official E2B 2.64.0 mounts. name is the volume name, not the volume ID.

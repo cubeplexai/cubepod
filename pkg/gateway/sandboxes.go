@@ -19,6 +19,7 @@ import (
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
+	"github.com/cubeplexai/cubepod/pkg/secret"
 	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
@@ -33,6 +34,7 @@ type createSandboxReq struct {
 	Env_Vars      map[string]string           `json:"env_vars,omitempty"`
 	AutoPause     *bool                       `json:"autoPause,omitempty"`
 	AutoResume    any                         `json:"autoResume,omitempty"`
+	Network       *e2bNetworkSpec             `json:"network,omitempty"`
 	NetworkPolicy *v1alpha1.NetworkPolicySpec `json:"networkPolicy,omitempty"`
 	Extension     struct {
 		VolumeKey      string                      `json:"volumeKey,omitempty"`
@@ -40,6 +42,8 @@ type createSandboxReq struct {
 		SecretBindings []struct {
 			EnvName        string   `json:"envName"`
 			RawSecret      string   `json:"rawSecret"`
+			SecretName     string   `json:"secretName,omitempty"`
+			SecretID       string   `json:"secretID,omitempty"`
 			AllowedHosts   []string `json:"allowedHosts"`
 			AllowedHeaders []string `json:"allowedHeaders"`
 		} `json:"secretBindings,omitempty"`
@@ -93,6 +97,32 @@ func cloneNetworkPolicy(p *v1alpha1.NetworkPolicySpec) *v1alpha1.NetworkPolicySp
 				sbCopy.AllowedHeaders = append([]string(nil), sb.AllowedHeaders...)
 			}
 			cp.SecretBindings[i] = sbCopy
+		}
+	}
+	if len(p.HeaderTransforms) > 0 {
+		cp.HeaderTransforms = make([]v1alpha1.HeaderTransformRule, len(p.HeaderTransforms))
+		for i, ht := range p.HeaderTransforms {
+			htCopy := v1alpha1.HeaderTransformRule{Host: ht.Host}
+			if ht.Headers != nil {
+				htCopy.Headers = make(map[string]string, len(ht.Headers))
+				for k, v := range ht.Headers {
+					htCopy.Headers[k] = v
+				}
+			}
+			cp.HeaderTransforms[i] = htCopy
+		}
+	}
+	if len(p.SecretRefBindings) > 0 {
+		cp.SecretRefBindings = make([]v1alpha1.SecretRefBinding, len(p.SecretRefBindings))
+		for i, rb := range p.SecretRefBindings {
+			rbCopy := rb
+			if len(rb.AllowedHosts) > 0 {
+				rbCopy.AllowedHosts = append([]string(nil), rb.AllowedHosts...)
+			}
+			if len(rb.AllowedHeaders) > 0 {
+				rbCopy.AllowedHeaders = append([]string(nil), rb.AllowedHeaders...)
+			}
+			cp.SecretRefBindings[i] = rbCopy
 		}
 	}
 	return &cp
@@ -382,6 +412,23 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	id := fmt.Sprintf("cpod-%d", time.Now().UnixNano())
+	resolvedNetPolicy, secretEnvVars, secErr := s.resolveSandboxSecretsAndNetwork(managementAPIKey(r), id, &req, netPolicy)
+	if secErr != nil {
+		if s.vault != nil {
+			s.vault.RevokeSandbox(id)
+		}
+		switch {
+		case errors.Is(secErr, secret.ErrUnauthorized):
+			writeError(w, http.StatusUnauthorized, "API key is required")
+		case errors.Is(secErr, secret.ErrNotFound):
+			writeError(w, http.StatusNotFound, "secret not found")
+		default:
+			writeError(w, http.StatusBadRequest, secErr.Error())
+		}
+		return
+	}
+	netPolicy = resolvedNetPolicy
+
 	spec := v1alpha1.PodBoxSpec{
 		TemplateRef:      req.TemplateID,
 		DesiredState:     v1alpha1.DesiredStateRunning,
@@ -392,15 +439,15 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		NetworkPolicy:    cloneNetworkPolicy(netPolicy),
 	}
 
-	// Official E2B volume mounts must be present on the pod at create time, so
-	// a pre-warmed standby (no official PVCs) cannot be claimed.
-	if len(plannedMounts) > 0 {
+	// Official E2B volume mounts or per-sandbox network/secret policies must be
+	// present on the pod at create time, so a pre-warmed standby cannot be claimed.
+	if len(plannedMounts) > 0 || netPolicy != nil {
 		spec.WarmPoolRef = ""
 	}
 
-	// Automatic WarmPool Claim: skip when deterministic VolumeKey is requested
-	// because standby warm pods already mount an ephemeral workspace PVC.
-	if spec.WarmPoolRef == "" && volumeKey == "" && len(plannedMounts) == 0 {
+	// Automatic WarmPool Claim: skip when deterministic VolumeKey, official mounts,
+	// or custom network/secret policies are requested.
+	if spec.WarmPoolRef == "" && volumeKey == "" && len(plannedMounts) == 0 && netPolicy == nil {
 		warmPoolName := s.reconciler.FindAvailableWarmPool(req.TemplateID)
 		if warmPoolName == "" {
 			// Run a quick SyncFromKube to discover any newly added standby pods from the controller before falling back to cold start
@@ -413,6 +460,9 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.commitSandboxVolumeMounts(id, managementAPIKey(r), plannedMounts); err != nil {
+		if s.vault != nil {
+			s.vault.RevokeSandbox(id)
+		}
 		if errors.Is(err, volume.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "volume not found")
 			return
@@ -472,13 +522,6 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Register any secret bindings with Vault
-	for _, sb := range req.Extension.SecretBindings {
-		if sb.RawSecret != "" {
-			_, _ = s.vault.BindSecret(id, sb.EnvName, sb.RawSecret, sb.AllowedHosts, sb.AllowedHeaders)
-		}
-	}
-
 	now := time.Now().UTC()
 	endAt := now.Add(time.Duration(timeoutSecs) * time.Second)
 	rec := &SandboxRecord{
@@ -517,7 +560,16 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		_ = waitForPoddReady(r.Context(), rec.PoddURL, healthTimeout)
 	}
 
-	if err := s.startRuntimeSandbox(r.Context(), rec, "", mergeSandboxEnv(req)); err != nil {
+	mergedEnv := mergeSandboxEnv(req)
+	if len(secretEnvVars) > 0 {
+		if mergedEnv == nil {
+			mergedEnv = make(map[string]string, len(secretEnvVars))
+		}
+		for k, v := range secretEnvVars {
+			mergedEnv[k] = v
+		}
+	}
+	if err := s.startRuntimeSandbox(r.Context(), rec, "", mergedEnv); err != nil {
 		s.rollbackCreatedSandbox(r.Context(), id)
 		writeError(w, http.StatusInternalServerError, "failed to start sandbox runtime")
 		return

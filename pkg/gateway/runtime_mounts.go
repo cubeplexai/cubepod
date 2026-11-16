@@ -99,6 +99,9 @@ func (s *Server) rollbackCreatedSandbox(ctx context.Context, sandboxID string) {
 	}
 	s.releaseSandboxVolumeMounts(sandboxID)
 	s.releaseLocalSandbox(sandboxID)
+	if s.vault != nil {
+		s.vault.RevokeSandbox(sandboxID)
+	}
 }
 
 func (s *Server) startRuntimeSandbox(ctx context.Context, rec *SandboxRecord, image string, env map[string]string) error {

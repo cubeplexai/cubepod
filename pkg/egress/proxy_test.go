@@ -3,6 +3,7 @@ package egress_test
 import (
 	"bufio"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -472,5 +473,118 @@ func TestEgressProxy_RejectsHostAndURLMismatch(t *testing.T) {
 
 	if deniedHits != 0 {
 		t.Fatalf("denied upstream received %d hits; want 0", deniedHits)
+	}
+}
+
+func TestVaultManagedSecretRotationRevocationAndMITMTransforms(t *testing.T) {
+	var seenAuth string
+	var authCount int
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authCount = len(r.Header.Values("Authorization"))
+		seenAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	upstreamHostPort := strings.TrimPrefix(upstream.URL, "https://")
+	upstreamPool := x509.NewCertPool()
+	upstreamPool.AddCert(upstream.Certificate())
+
+	vault := egress.NewVault()
+	ca, err := egress.NewCA()
+	if err != nil {
+		t.Fatalf("NewCA: %v", err)
+	}
+	mitmCA, err := egress.NewCA()
+	if err != nil {
+		t.Fatalf("NewCA mitm: %v", err)
+	}
+
+	ph, err := vault.BindManagedSecret("sbx-1", "tenant-a", "sec_123", "", "sk-v1", []string{"example.com"}, []string{"Authorization"})
+	if err != nil {
+		t.Fatalf("BindManagedSecret: %v", err)
+	}
+
+	proxy := egress.NewEgressProxy(egress.EgressProxyConfig{
+		SandboxID:        "sbx-1",
+		MITMCA:           mitmCA,
+		UpstreamRootCAs:  upstreamPool,
+		UpstreamDialAddr: map[string]string{"example.com:443": upstreamHostPort},
+		ExchangeHandler:  egress.VaultExchangeHandler(vault, ca),
+		Policy: v1alpha1.NetworkPolicySpec{
+			DefaultAction: v1alpha1.NetworkDefaultDeny,
+			AllowHosts:    []string{"example.com"},
+			HeaderTransforms: []v1alpha1.HeaderTransformRule{
+				{
+					Host: "example.com",
+					Headers: map[string]string{
+						"Authorization": "Bearer " + ph,
+					},
+				},
+			},
+		},
+	})
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+	proxyURL, _ := url.Parse(proxySrv.URL)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{RootCAs: mitmCA.CertPool()},
+		},
+	}
+
+	// 1. Transform overwrites spoofed Authorization header and exchanges v1
+	req1, _ := http.NewRequest(http.MethodGet, "https://example.com/v1/charges", nil)
+	req1.Header.Set("Authorization", "Bearer spoofed")
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatalf("client.Do 1: %v", err)
+	}
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK || seenAuth != "Bearer sk-v1" || authCount != 1 {
+		t.Fatalf("step 1: status=%d auth=%q count=%d", resp1.StatusCode, seenAuth, authCount)
+	}
+
+	// 2. Rotate secret -> next request receives sk-v2
+	if n := vault.UpdateSecretByRef("tenant-a", "sec_123", "sk-v2"); n != 1 {
+		t.Fatalf("UpdateSecretByRef updated %d; want 1", n)
+	}
+	req2, _ := http.NewRequest(http.MethodGet, "https://example.com/v1/charges", nil)
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("client.Do 2: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK || seenAuth != "Bearer sk-v2" {
+		t.Fatalf("step 2: status=%d auth=%q", resp2.StatusCode, seenAuth)
+	}
+
+	// 3. CRLF secret value must fail closed with 403
+	if n := vault.UpdateSecretByRef("tenant-a", "sec_123", "sk-bad\r\nX-Injected: 1"); n != 1 {
+		t.Fatalf("UpdateSecretByRef bad value count = %d", n)
+	}
+	req3, _ := http.NewRequest(http.MethodGet, "https://example.com/v1/charges", nil)
+	resp3, err := client.Do(req3)
+	if err != nil {
+		t.Fatalf("client.Do 3: %v", err)
+	}
+	_ = resp3.Body.Close()
+	if resp3.StatusCode != http.StatusForbidden {
+		t.Fatalf("step 3 CRLF status = %d; want 403", resp3.StatusCode)
+	}
+
+	// 4. Revoke secret -> fails closed with 403
+	if n := vault.RevokeSecretByRef("tenant-a", "sec_123"); n != 1 {
+		t.Fatalf("RevokeSecretByRef revoked %d; want 1", n)
+	}
+	req4, _ := http.NewRequest(http.MethodGet, "https://example.com/v1/charges", nil)
+	resp4, err := client.Do(req4)
+	if err != nil {
+		t.Fatalf("client.Do 4: %v", err)
+	}
+	_ = resp4.Body.Close()
+	if resp4.StatusCode != http.StatusForbidden {
+		t.Fatalf("step 4 revoked status = %d; want 403", resp4.StatusCode)
 	}
 }

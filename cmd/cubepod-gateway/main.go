@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -212,6 +214,34 @@ func main() {
 			os.Exit(1)
 		}
 		slog.Info("E2B volume store enabled", "dir", volDir, "dockerVolumes", vcfg.DockerVolumes)
+	}
+
+	secretsDir := strings.TrimSpace(os.Getenv("CUBEPOD_SECRETS_DIR"))
+	if secretsDir == "" && volDir != "" {
+		secretsDir = filepath.Join(filepath.Dir(volDir), "secrets")
+	}
+	if secretsDir != "" && !strings.EqualFold(secretsDir, "disabled") {
+		scfg := gateway.E2BSecretConfig{Dir: secretsDir}
+		if rawKey := strings.TrimSpace(os.Getenv("CUBEPOD_SECRETS_KEY")); rawKey != "" {
+			if decoded, err := base64.StdEncoding.DecodeString(rawKey); err == nil && len(decoded) == 32 {
+				scfg.EncryptionKey = decoded
+			} else if decoded, err := hex.DecodeString(rawKey); err == nil && len(decoded) == 32 {
+				scfg.EncryptionKey = decoded
+			} else {
+				slog.Error("CUBEPOD_SECRETS_KEY must be a 32-byte base64 or 64-char hex key")
+				os.Exit(1)
+			}
+		}
+		if rawMax := strings.TrimSpace(os.Getenv("CUBEPOD_MAX_SECRETS_PER_TENANT")); rawMax != "" {
+			if n, err := strconv.Atoi(rawMax); err == nil && n > 0 {
+				scfg.MaxSecretsPerTenant = n
+			}
+		}
+		if err := gw.ConfigureE2BSecrets(scfg); err != nil {
+			slog.Error("failed to configure E2B secret store", "dir", secretsDir, "err", err)
+			os.Exit(1)
+		}
+		slog.Info("E2B secret store enabled", "dir", secretsDir)
 	}
 
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("CUBEPOD_RUNTIME")), "docker") {
