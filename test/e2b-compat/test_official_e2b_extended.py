@@ -256,3 +256,139 @@ def test_official_secret_crud_and_fill(direct_gateway_url: str) -> None:
         assert Secret.fill(sec_name) == f"${{e2b.secrets.{sec_name}}}"
     finally:
         Secret.destroy(info.secret_id)
+
+
+def test_sandbox_get_metrics(direct_gateway_url: str) -> None:
+    from datetime import datetime, timedelta, timezone
+    from e2b import Sandbox
+    from e2b.sandbox.sandbox_api import SandboxMetrics
+
+    sbx = Sandbox.create("base", timeout=300)
+    try:
+        instance_metrics = sbx.get_metrics()
+        assert len(instance_metrics) >= 1
+
+        static_metrics = Sandbox.get_metrics(sbx.sandbox_id)
+        assert len(static_metrics) >= 1
+
+        m = static_metrics[-1]
+        assert isinstance(m, SandboxMetrics)
+        assert isinstance(m.timestamp, datetime)
+        assert m.cpu_count > 0
+        assert m.cpu_used_pct >= 0.0
+        assert m.mem_total > 0
+        assert 0 <= m.mem_used <= m.mem_total
+        assert m.mem_cache >= 0
+        assert m.disk_total > 0
+        assert m.disk_used >= 0
+
+        now = datetime.now(timezone.utc)
+        windowed = Sandbox.get_metrics(
+            sbx.sandbox_id,
+            start=now - timedelta(minutes=5),
+            end=now + timedelta(minutes=5),
+        )
+        assert len(windowed) >= 1
+    finally:
+        sbx.kill()
+
+
+def test_sandbox_network_allow_deny_and_secret_fill_e2e(direct_gateway_url: str) -> None:
+    import json
+    import urllib.error
+    from e2b import Sandbox, SandboxException, Secret
+
+    sec_name = f"compat_net_sec_{int(time.time() * 1000)}"
+    info = Secret.create(sec_name, "sk_compat_net_v1")
+    sbx = None
+    try:
+        sbx = Sandbox.create(
+            "base",
+            timeout=300,
+            network={
+                "allow_out": ["api.example.com"],
+                "deny_out": ["0.0.0.0/0"],
+                "rules": {
+                    "api.example.com": [
+                        {
+                            "transform": {
+                                "headers": {
+                                    "Authorization": f"Bearer {Secret.fill(sec_name)}",
+                                }
+                            }
+                        }
+                    ]
+                },
+            },
+        )
+        res = sbx.commands.run("echo net_policy_ok")
+        assert res.exit_code == 0
+        assert "net_policy_ok" in res.stdout
+
+        with urllib.request.urlopen(f"{direct_gateway_url}/sandboxes/{sbx.sandbox_id}", timeout=5) as resp:
+            detail = json.loads(resp.read().decode("utf-8"))
+
+        policy = detail.get("networkPolicy") or {}
+        assert (policy.get("defaultAction") or "").lower() == "deny"
+        assert "api.example.com" in (policy.get("allowHosts") or [])
+
+        transforms = policy.get("headerTransforms") or []
+        assert len(transforms) == 1
+        auth_val = transforms[0]["headers"]["Authorization"]
+        assert auth_val.startswith("Bearer cpodref_")
+        assert "sk_compat_net_v1" not in json.dumps(detail)
+
+        placeholder = auth_val.removeprefix("Bearer ")
+        exchange_req = urllib.request.Request(
+            f"{direct_gateway_url}/internal/v1/egress/exchange",
+            data=json.dumps({
+                "sandboxID": sbx.sandbox_id,
+                "placeholder": placeholder,
+                "sniHost": "api.example.com",
+                "headerName": "Authorization",
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(exchange_req, timeout=5) as resp:
+            exchanged = json.loads(resp.read().decode("utf-8"))
+        assert exchanged["secret"] == "sk_compat_net_v1"
+
+        Secret.update(info.secret_id, "sk_compat_net_v2")
+        with urllib.request.urlopen(exchange_req, timeout=5) as resp:
+            exchanged_v2 = json.loads(resp.read().decode("utf-8"))
+        assert exchanged_v2["secret"] == "sk_compat_net_v2"
+
+        Secret.destroy(info.secret_id)
+        try:
+            urllib.request.urlopen(exchange_req, timeout=5)
+            raise AssertionError("expected HTTP 403 after secret destroy")
+        except urllib.error.HTTPError as err:
+            assert err.code == 403
+
+        try:
+            Sandbox.create(
+                "base",
+                timeout=60,
+                network={
+                    "allow_out": ["api.example.com"],
+                    "rules": {
+                        "api.example.com": [
+                            {"transform": {"headers": {"Authorization": f"Bearer {Secret.fill(sec_name)}"}}}
+                        ]
+                    },
+                },
+            )
+            raise AssertionError("expected Sandbox.create to fail for destroyed secret")
+        except SandboxException:
+            pass
+    finally:
+        if sbx is not None:
+            try:
+                sbx.kill()
+            except Exception:
+                pass
+        try:
+            Secret.destroy(info.secret_id)
+        except Exception:
+            pass

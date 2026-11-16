@@ -1,14 +1,21 @@
 package k8s_e2e_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/client"
 	"github.com/cubeplexai/cubepod/pkg/controller"
 )
@@ -584,4 +591,839 @@ func TestK8sWarmPoolClaimLive(t *testing.T) {
 		t.Fatalf("command execution on claimed warm sandbox failed: %v", err)
 	}
 	t.Logf("[K8s-WarmPool] Claimed sandbox command output: %s", strings.TrimSpace(res.Output))
+}
+
+type connectFrame struct {
+	Flag    byte
+	Payload []byte
+}
+
+func makeConnectFrame(payload []byte, endStream bool) []byte {
+	var flag byte
+	if endStream {
+		flag = 0x02
+	}
+	out := make([]byte, 5+len(payload))
+	out[0] = flag
+	binary.BigEndian.PutUint32(out[1:5], uint32(len(payload)))
+	copy(out[5:], payload)
+	return out
+}
+
+func readNextConnectFrame(r io.Reader) (*connectFrame, error) {
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, err
+	}
+	length := binary.BigEndian.Uint32(header[1:5])
+	payload := make([]byte, length)
+	if length > 0 {
+		if _, err := io.ReadFull(r, payload); err != nil {
+			return nil, err
+		}
+	}
+	return &connectFrame{
+		Flag:    header[0],
+		Payload: payload,
+	}, nil
+}
+
+func postSandboxConnectJSON(ctx context.Context, httpClient *http.Client, gatewayURL, sandboxID, rpcPath string, reqBody any) (int, []byte, error) {
+	raw, err := json.Marshal(reqBody)
+	if err != nil {
+		return 0, nil, err
+	}
+	u := strings.TrimRight(gatewayURL, "/") + "/sandboxes/" + sandboxID + rpcPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(raw))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("E2b-Sandbox-Id", sandboxID)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, body, err
+}
+
+func startSandboxConnectStream(ctx context.Context, httpClient *http.Client, gatewayURL, sandboxID, rpcPath string, reqBody any) (*http.Response, <-chan struct {
+	frame *connectFrame
+	err   error
+}, error) {
+	raw, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, nil, err
+	}
+	framed := makeConnectFrame(raw, false)
+	u := strings.TrimRight(gatewayURL, "/") + "/sandboxes/" + sandboxID + rpcPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(framed))
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Content-Type", "application/connect+json")
+	req.Header.Set("E2b-Sandbox-Id", sandboxID)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	type frameResult struct {
+		frame *connectFrame
+		err   error
+	}
+	ch := make(chan struct {
+		frame *connectFrame
+		err   error
+	}, 32)
+	go func() {
+		defer close(ch)
+		for {
+			f, err := readNextConnectFrame(resp.Body)
+			ch <- frameResult{frame: f, err: err}
+			if err != nil || (f != nil && f.Flag&0x02 != 0) {
+				return
+			}
+		}
+	}()
+	return resp, ch, nil
+}
+
+func requireLiveE2EConfig(t *testing.T) clusterConfig {
+	t.Helper()
+	if os.Getenv("CUBEPOD_K8S_E2E") != "1" {
+		t.Skip("Skipping live Kubernetes E2E tests: set CUBEPOD_K8S_E2E=1 to run against live cluster")
+	}
+	cfg := loadClusterConfig(t)
+	if cfg.GatewayURL == "" {
+		t.Fatal("set CUBEPOD_GATEWAY_URL, or expose svc/cubepod-gateway as NodePort or LoadBalancer")
+	}
+	if cfg.SandboxImage == "" {
+		t.Fatal("set CUBEPOD_SANDBOX_IMAGE, or pass -sandbox-image on the cubepod-gateway Deployment")
+	}
+	return cfg
+}
+
+func doGatewayJSON(ctx context.Context, httpClient *http.Client, method, url, apiKey string, body any) (int, []byte, error) {
+	var reader io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		if err != nil {
+			return 0, nil, err
+		}
+		reader = bytes.NewReader(raw)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, url, reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	respBytes, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, respBytes, err
+}
+
+func hasMountFlags(mountLine string, required ...string) bool {
+	for _, flag := range required {
+		found := false
+		for _, tok := range strings.FieldsFunc(mountLine, func(r rune) bool {
+			return r == ',' || r == ' ' || r == '\t' || r == '(' || r == ')'
+		}) {
+			if tok == flag {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func discoverControllerFlag(ctx context.Context, cfg clusterConfig, flagName string) string {
+	if cfg.GatewayName == "" {
+		return ""
+	}
+	ctrl := siblingName(cfg.GatewayName, "gateway", "controller")
+	if ctrl == "" {
+		ctrl = "cubepod-controller"
+	}
+	args, err := deploymentArgs(ctx, cfg.SystemNamespace, ctrl)
+	if err != nil {
+		return ""
+	}
+	return flagValue(args, flagName)
+}
+
+func TestConnectFrameAndMountFlagHelpers(t *testing.T) {
+	framed := makeConnectFrame([]byte(`{"ok":true}`), false)
+	f, err := readNextConnectFrame(bytes.NewReader(framed))
+	if err != nil {
+		t.Fatalf("readNextConnectFrame: %v", err)
+	}
+	if f.Flag != 0 || string(f.Payload) != `{"ok":true}` {
+		t.Fatalf("unexpected frame: flag=%d payload=%q", f.Flag, f.Payload)
+	}
+
+	end := makeConnectFrame([]byte(`{}`), true)
+	fEnd, err := readNextConnectFrame(bytes.NewReader(end))
+	if err != nil {
+		t.Fatalf("readNextConnectFrame end: %v", err)
+	}
+	if fEnd.Flag != 0x02 {
+		t.Fatalf("expected flag 0x02, got %d", fEnd.Flag)
+	}
+
+	if !hasMountFlags("rw,nosuid,nodev,relatime", "nosuid", "nodev") {
+		t.Fatal("expected hasMountFlags to match nosuid,nodev")
+	}
+	if hasMountFlags("rw,relatime", "nosuid", "nodev") {
+		t.Fatal("expected hasMountFlags to reject missing nosuid,nodev")
+	}
+}
+
+// TestK8sLiveE2EPTY verifies interactive PTY creation, stdin input, resize,
+// output streaming, and signal/kill on a live Kubernetes Pod.
+func TestK8sLiveE2EPTY(t *testing.T) {
+	cfg := requireLiveE2EConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+
+	c := client.New(cfg.GatewayURL, client.WithTimeout(3*time.Minute))
+	sb, err := c.CreateSandbox(ctx, client.CreateSandboxRequest{
+		TemplateID: cfg.SandboxImage,
+		Metadata:   map[string]string{"env": "k8s-e2e", "feature": "pty"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox: %v", err)
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_ = c.DeleteSandboxWithOptions(cctx, sb.SandboxID, true)
+	}()
+
+	streamClient := &http.Client{}
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+
+	resp, frameCh, err := startSandboxConnectStream(ctx, streamClient, cfg.GatewayURL, sb.SandboxID, "/process.Process/Start", map[string]any{
+		"process": map[string]any{
+			"cmd":  "/bin/bash",
+			"args": []string{"-i"},
+		},
+		"pty": map[string]any{
+			"size": map[string]any{"cols": 80, "rows": 24},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PTY Start: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("PTY Start status=%d body=%s", resp.StatusCode, b)
+	}
+
+	var pid int
+	startDeadline := time.NewTimer(15 * time.Second)
+	for pid == 0 {
+		select {
+		case res, ok := <-frameCh:
+			if !ok || res.err != nil {
+				startDeadline.Stop()
+				t.Fatalf("PTY stream ended before start event: ok=%v err=%v", ok, res.err)
+			}
+			var ev struct {
+				Event struct {
+					Start struct {
+						Pid int `json:"pid"`
+					} `json:"start"`
+				} `json:"event"`
+			}
+			if json.Unmarshal(res.frame.Payload, &ev) == nil && ev.Event.Start.Pid > 0 {
+				pid = ev.Event.Start.Pid
+			}
+		case <-startDeadline.C:
+			t.Fatal("timed out waiting for PTY start event")
+		}
+	}
+	startDeadline.Stop()
+
+	sendPTYInput := func(input string) {
+		t.Helper()
+		status, body, err := postSandboxConnectJSON(ctx, httpClient, cfg.GatewayURL, sb.SandboxID, "/process.Process/SendInput", map[string]any{
+			"process": map[string]any{"pid": pid},
+			"input":   map[string]any{"pty": base64.StdEncoding.EncodeToString([]byte(input))},
+		})
+		if err != nil || status != http.StatusOK {
+			t.Fatalf("PTY SendInput failed: status=%d err=%v body=%s", status, err, body)
+		}
+	}
+
+	var accumulated string
+	waitPTYOutput := func(substr string) {
+		t.Helper()
+		if strings.Contains(accumulated, substr) {
+			return
+		}
+		timer := time.NewTimer(15 * time.Second)
+		defer timer.Stop()
+		for {
+			select {
+			case res, ok := <-frameCh:
+				if !ok || res.err != nil {
+					t.Fatalf("PTY stream ended before %q observed (got %q): ok=%v err=%v", substr, accumulated, ok, res.err)
+				}
+				if res.frame.Flag == 0 {
+					var ev struct {
+						Event struct {
+							Data struct {
+								Pty string `json:"pty"`
+							} `json:"data"`
+						} `json:"event"`
+					}
+					if json.Unmarshal(res.frame.Payload, &ev) == nil && ev.Event.Data.Pty != "" {
+						if rawOut, decErr := base64.StdEncoding.DecodeString(ev.Event.Data.Pty); decErr == nil {
+							accumulated += string(rawOut)
+							if strings.Contains(accumulated, substr) {
+								return
+							}
+						}
+					}
+				}
+			case <-timer.C:
+				t.Fatalf("timed out waiting for PTY output %q; accumulated=%q", substr, accumulated)
+			}
+		}
+	}
+
+	sendPTYInput("echo PTY_READY && stty size\n")
+	waitPTYOutput("PTY_READY")
+	waitPTYOutput("24 80")
+
+	resizeStatus, resizeBody, err := postSandboxConnectJSON(ctx, httpClient, cfg.GatewayURL, sb.SandboxID, "/process.Process/Update", map[string]any{
+		"process": map[string]any{"pid": pid},
+		"pty":     map[string]any{"size": map[string]any{"cols": 120, "rows": 40}},
+	})
+	if err != nil || resizeStatus != http.StatusOK {
+		t.Fatalf("PTY resize failed: status=%d err=%v body=%s", resizeStatus, err, resizeBody)
+	}
+	sendPTYInput("stty size\n")
+	waitPTYOutput("40 120")
+
+	killStatus, killBody, err := postSandboxConnectJSON(ctx, httpClient, cfg.GatewayURL, sb.SandboxID, "/process.Process/SendSignal", map[string]any{
+		"process": map[string]any{"pid": pid},
+		"signal":  9,
+	})
+	if err != nil || killStatus != http.StatusOK {
+		t.Fatalf("PTY SendSignal failed: status=%d err=%v body=%s", killStatus, err, killBody)
+	}
+
+	closeTimer := time.NewTimer(15 * time.Second)
+	defer closeTimer.Stop()
+	for {
+		select {
+		case res, ok := <-frameCh:
+			if !ok || errors.Is(res.err, io.EOF) || (res.frame != nil && res.frame.Flag&0x02 != 0) {
+				t.Logf("[K8s-E2E] PTY verified (pid=%d, resize 24x80 -> 40x120, kill)", pid)
+				return
+			}
+			if res.err != nil {
+				t.Fatalf("PTY stream error after SendSignal: %v", res.err)
+			}
+		case <-closeTimer.C:
+			t.Fatal("timed out waiting for PTY stream to terminate after SendSignal")
+		}
+	}
+}
+
+// TestK8sLiveE2EWatchAndMakeDir verifies recursive filesystem.Filesystem/WatchDir
+// events, MakeDir, and polling watcher RPCs on a live Kubernetes Pod.
+func TestK8sLiveE2EWatchAndMakeDir(t *testing.T) {
+	cfg := requireLiveE2EConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+
+	c := client.New(cfg.GatewayURL, client.WithTimeout(3*time.Minute))
+	sb, err := c.CreateSandbox(ctx, client.CreateSandboxRequest{
+		TemplateID: cfg.SandboxImage,
+		Metadata:   map[string]string{"env": "k8s-e2e", "feature": "watch-makedir"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox: %v", err)
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_ = c.DeleteSandboxWithOptions(cctx, sb.SandboxID, true)
+	}()
+
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	streamClient := &http.Client{}
+
+	watchRoot := "/workspace/k8s-watch-root"
+	subDir := watchRoot + "/nested"
+	mkStatus, mkBody, err := postSandboxConnectJSON(ctx, httpClient, cfg.GatewayURL, sb.SandboxID, "/filesystem.Filesystem/MakeDir", map[string]any{
+		"path": subDir,
+	})
+	if err != nil || mkStatus != http.StatusOK {
+		t.Fatalf("MakeDir %s failed: status=%d err=%v body=%s", subDir, mkStatus, err, mkBody)
+	}
+
+	resp, frameCh, err := startSandboxConnectStream(ctx, streamClient, cfg.GatewayURL, sb.SandboxID, "/filesystem.Filesystem/WatchDir", map[string]any{
+		"path":      watchRoot,
+		"recursive": true,
+	})
+	if err != nil {
+		t.Fatalf("WatchDir start: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotImplemented {
+		t.Skip("Skipping WatchDir E2E: E2BFilesystemWatch gate is disabled on cluster")
+	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("WatchDir status=%d body=%s", resp.StatusCode, b)
+	}
+
+	startTimer := time.NewTimer(15 * time.Second)
+	started := false
+	for !started {
+		select {
+		case res, ok := <-frameCh:
+			if !ok || res.err != nil {
+				startTimer.Stop()
+				t.Fatalf("WatchDir ended before start frame: ok=%v err=%v", ok, res.err)
+			}
+			if res.frame.Flag == 0 && bytes.Contains(res.frame.Payload, []byte("start")) {
+				started = true
+			}
+		case <-startTimer.C:
+			t.Fatal("timed out waiting for WatchDir start frame")
+		}
+	}
+	startTimer.Stop()
+
+	if err := c.WriteFile(ctx, sb.SandboxID, subDir+"/event.txt", []byte("watch-payload"), "0644"); err != nil {
+		t.Fatalf("WriteFile inside watched dir: %v", err)
+	}
+
+	eventTimer := time.NewTimer(15 * time.Second)
+	defer eventTimer.Stop()
+	sawEvent := false
+	for !sawEvent {
+		select {
+		case res, ok := <-frameCh:
+			if !ok || res.err != nil {
+				t.Fatalf("WatchDir stream closed before filesystem event: ok=%v err=%v", ok, res.err)
+			}
+			if res.frame.Flag == 0 && bytes.Contains(res.frame.Payload, []byte("event.txt")) {
+				sawEvent = true
+			}
+		case <-eventTimer.C:
+			t.Fatal("timed out waiting for recursive WatchDir event for event.txt")
+		}
+	}
+
+	// Also verify unary CreateWatcher -> GetWatcherEvents -> RemoveWatcher
+	cwStatus, cwBody, err := postSandboxConnectJSON(ctx, httpClient, cfg.GatewayURL, sb.SandboxID, "/filesystem.Filesystem/CreateWatcher", map[string]any{
+		"path":      watchRoot,
+		"recursive": true,
+	})
+	if err != nil || cwStatus != http.StatusOK {
+		t.Fatalf("CreateWatcher failed: status=%d err=%v body=%s", cwStatus, err, cwBody)
+	}
+	var created struct {
+		WatcherID string `json:"watcherId"`
+	}
+	if err := json.Unmarshal(cwBody, &created); err != nil || created.WatcherID == "" {
+		t.Fatalf("invalid CreateWatcher response: err=%v body=%s", err, cwBody)
+	}
+
+	if err := c.WriteFile(ctx, sb.SandboxID, subDir+"/poll.txt", []byte("poll-payload"), "0644"); err != nil {
+		t.Fatalf("WriteFile for CreateWatcher: %v", err)
+	}
+	pollDeadline := time.Now().Add(10 * time.Second)
+	sawPoll := false
+	for time.Now().Before(pollDeadline) && !sawPoll {
+		gwStatus, gwBody, err := postSandboxConnectJSON(ctx, httpClient, cfg.GatewayURL, sb.SandboxID, "/filesystem.Filesystem/GetWatcherEvents", map[string]any{
+			"watcherId": created.WatcherID,
+		})
+		if err != nil || gwStatus != http.StatusOK {
+			t.Fatalf("GetWatcherEvents failed: status=%d err=%v body=%s", gwStatus, err, gwBody)
+		}
+		if bytes.Contains(gwBody, []byte("poll.txt")) {
+			sawPoll = true
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	if !sawPoll {
+		t.Fatalf("expected GetWatcherEvents to observe poll.txt")
+	}
+
+	rwStatus, rwBody, err := postSandboxConnectJSON(ctx, httpClient, cfg.GatewayURL, sb.SandboxID, "/filesystem.Filesystem/RemoveWatcher", map[string]any{
+		"watcherId": created.WatcherID,
+	})
+	if err != nil || rwStatus != http.StatusOK {
+		t.Fatalf("RemoveWatcher failed: status=%d err=%v body=%s", rwStatus, err, rwBody)
+	}
+	t.Logf("[K8s-E2E] MakeDir + recursive WatchDir + CreateWatcher/GetWatcherEvents/RemoveWatcher verified")
+}
+
+// TestK8sLiveE2EVolumeMountsAndFork verifies E2B volumeMounts on a live Kata Pod:
+// nosuid,nodev mount flags, shared RWX persistence, ForkFrom inheritance, and RWO fork conflict.
+func TestK8sLiveE2EVolumeMountsAndFork(t *testing.T) {
+	cfg := requireLiveE2EConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	c := client.New(cfg.GatewayURL, client.WithTimeout(3*time.Minute))
+	kubeClient, err := controller.NewRESTKubeClientFromEnv()
+	if err != nil {
+		t.Fatalf("NewRESTKubeClientFromEnv: %v", err)
+	}
+	httpClient := &http.Client{Timeout: 2 * time.Minute}
+	apiKey := getenv("CUBEPOD_API_KEY", "cpod_k8s_e2e_key")
+
+	volName := fmt.Sprintf("k8s-e2e-vol-%d", time.Now().UnixNano())
+	volStatus, volBody, err := doGatewayJSON(ctx, httpClient, http.MethodPost, strings.TrimRight(cfg.GatewayURL, "/")+"/volumes", apiKey, map[string]string{
+		"name": volName,
+	})
+	if err != nil {
+		t.Fatalf("POST /volumes: %v", err)
+	}
+	if volStatus == http.StatusNotImplemented || volStatus == http.StatusNotFound {
+		t.Skipf("Skipping E2B volumeMounts E2E: volume store unavailable on cluster (HTTP %d: %s)", volStatus, volBody)
+	}
+	if volStatus != http.StatusCreated && volStatus != http.StatusOK {
+		t.Fatalf("POST /volumes status=%d body=%s", volStatus, volBody)
+	}
+	var vol struct {
+		VolumeID string `json:"volumeID"`
+		Name     string `json:"name"`
+		Token    string `json:"token"`
+	}
+	if err := json.Unmarshal(volBody, &vol); err != nil || vol.VolumeID == "" {
+		t.Fatalf("decode volume response: err=%v body=%s", err, volBody)
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_, _, _ = doGatewayJSON(cctx, httpClient, http.MethodDelete, strings.TrimRight(cfg.GatewayURL, "/")+"/volumes/"+vol.VolumeID, apiKey, nil)
+	}()
+
+	seedReq, err := http.NewRequestWithContext(ctx, http.MethodPut, strings.TrimRight(cfg.GatewayURL, "/")+"/volumecontent/"+vol.VolumeID+"/file?path=/seed.txt", strings.NewReader("seed-from-volume-api"))
+	if err != nil {
+		t.Fatalf("seed volume request: %v", err)
+	}
+	seedReq.Header.Set("Authorization", "Bearer "+vol.Token)
+	seedResp, err := httpClient.Do(seedReq)
+	if err != nil {
+		t.Fatalf("PUT volume seed file: %v", err)
+	}
+	seedResp.Body.Close()
+	if seedResp.StatusCode != http.StatusCreated && seedResp.StatusCode != http.StatusOK {
+		t.Fatalf("PUT volume seed file status=%d", seedResp.StatusCode)
+	}
+
+	sbxStatus, sbxBody, err := doGatewayJSON(ctx, httpClient, http.MethodPost, strings.TrimRight(cfg.GatewayURL, "/")+"/sandboxes", apiKey, map[string]any{
+		"templateID": cfg.SandboxImage,
+		"volumeMounts": []map[string]string{
+			{"name": volName, "path": "/mnt/shared"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("POST /sandboxes with volumeMounts: %v", err)
+	}
+	if sbxStatus == http.StatusNotImplemented {
+		t.Skipf("Skipping E2B volumeMounts E2E: K8sE2BVolumeMounts gate or shared RWX PVC not configured (%s)", sbxBody)
+	}
+	if sbxStatus != http.StatusCreated && sbxStatus != http.StatusOK {
+		t.Fatalf("POST /sandboxes with volumeMounts status=%d body=%s", sbxStatus, sbxBody)
+	}
+	var parent client.SandboxRecord
+	if err := json.Unmarshal(sbxBody, &parent); err != nil || parent.SandboxID == "" {
+		t.Fatalf("decode parent sandbox: err=%v body=%s", err, sbxBody)
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_ = c.DeleteSandboxWithOptions(cctx, parent.SandboxID, true)
+	}()
+
+	parentBox, err := kubeClient.GetPodBox(ctx, cfg.Namespace, parent.SandboxID)
+	if err != nil {
+		t.Fatalf("GetPodBox parent: %v", err)
+	}
+	if len(parentBox.Spec.E2BVolumeMounts) != 1 || parentBox.Spec.E2BVolumeMounts[0].Path != "/mnt/shared" {
+		t.Fatalf("expected parent PodBox E2BVolumeMounts at /mnt/shared, got %+v", parentBox.Spec.E2BVolumeMounts)
+	}
+
+	mountRes, err := c.RunCommand(ctx, parent.SandboxID, client.RunCommandRequest{
+		Command: "grep ' /mnt/shared ' /proc/mounts",
+	})
+	if err != nil || mountRes.ExitCode == nil || *mountRes.ExitCode != 0 {
+		t.Fatalf("inspect /proc/mounts failed: err=%v res=%+v", err, mountRes)
+	}
+	if !hasMountFlags(mountRes.Output, "nosuid", "nodev") {
+		t.Fatalf("expected /mnt/shared mount flags to include nosuid,nodev, got: %s", mountRes.Output)
+	}
+
+	readSeed, err := c.ReadFile(ctx, parent.SandboxID, "/mnt/shared/seed.txt")
+	if err != nil || string(readSeed) != "seed-from-volume-api" {
+		t.Fatalf("read /mnt/shared/seed.txt: err=%v content=%q", err, string(readSeed))
+	}
+
+	persistPayload := []byte("rwx-shared-from-parent")
+	if err := c.WriteFile(ctx, parent.SandboxID, "/mnt/shared/from-parent.txt", persistPayload, "0644"); err != nil {
+		t.Fatalf("write /mnt/shared/from-parent.txt: %v", err)
+	}
+
+	// Fork parent and verify E2BVolumeMounts inheritance + shared RWX persistence
+	child, err := c.ForkSandbox(ctx, parent.SandboxID)
+	if err != nil {
+		t.Fatalf("ForkSandbox with E2B volumeMounts: %v", err)
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_ = c.DeleteSandboxWithOptions(cctx, child.SandboxID, true)
+	}()
+
+	childBox, err := kubeClient.GetPodBox(ctx, cfg.Namespace, child.SandboxID)
+	if err != nil {
+		t.Fatalf("GetPodBox child: %v", err)
+	}
+	if childBox.Spec.ForkFrom == nil || childBox.Spec.ForkFrom.PodBoxName != parent.SandboxID {
+		t.Fatalf("expected child ForkFrom.PodBoxName=%s, got %+v", parent.SandboxID, childBox.Spec.ForkFrom)
+	}
+	if len(childBox.Spec.E2BVolumeMounts) != 1 || childBox.Spec.E2BVolumeMounts[0].PVCName != parentBox.Spec.E2BVolumeMounts[0].PVCName {
+		t.Fatalf("expected child PodBox to inherit E2BVolumeMounts, got %+v", childBox.Spec.E2BVolumeMounts)
+	}
+
+	childShared, err := c.ReadFile(ctx, child.SandboxID, "/mnt/shared/from-parent.txt")
+	if err != nil || string(childShared) != string(persistPayload) {
+		t.Fatalf("child RWX read mismatch: err=%v content=%q", err, string(childShared))
+	}
+
+	// Verify volume deletion returns 409 Conflict while sandboxes still mount it
+	delBusyStatus, delBusyBody, err := doGatewayJSON(ctx, httpClient, http.MethodDelete, strings.TrimRight(cfg.GatewayURL, "/")+"/volumes/"+vol.VolumeID, apiKey, nil)
+	if err != nil {
+		t.Fatalf("DELETE busy volume: %v", err)
+	}
+	if delBusyStatus != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict deleting mounted volume, got %d (%s)", delBusyStatus, delBusyBody)
+	}
+
+	// RWO fork conflict check: a PodBox referencing a per-volume non-shared RWO PVC must reject fork with 409 Conflict.
+	rwoBoxName := fmt.Sprintf("k8s-rwo-fork-chk-%d", time.Now().UnixNano())
+	rwoBox := v1alpha1.PodBox{
+		APIVersion: v1alpha1.CRDGroup + "/" + v1alpha1.GroupVersion,
+		Kind:       "PodBox",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      rwoBoxName,
+			Namespace: cfg.Namespace,
+		},
+		Spec: v1alpha1.PodBoxSpec{
+			TemplateRef:      cfg.SandboxImage,
+			DesiredState:     v1alpha1.DesiredStatePaused,
+			RootfsGeneration: 1,
+			E2BVolumeMounts: []v1alpha1.E2BVolumeMount{
+				{VolumeID: "vol-rwo-check", PVCName: "e2bvol-rwo-check", Path: "/mnt/rwo"},
+			},
+		},
+	}
+	if err := kubeClient.UpsertPodBox(ctx, rwoBox); err != nil {
+		t.Fatalf("UpsertPodBox for RWO fork conflict check: %v", err)
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_ = kubeClient.DeletePodBox(cctx, cfg.Namespace, rwoBoxName)
+	}()
+
+	rwoForkStatus, rwoForkBody, err := doGatewayJSON(ctx, httpClient, http.MethodPost, strings.TrimRight(cfg.GatewayURL, "/")+"/sandboxes/"+rwoBoxName+"/fork", apiKey, nil)
+	if err != nil {
+		t.Fatalf("POST RWO fork: %v", err)
+	}
+	if rwoForkStatus == http.StatusNotFound {
+		t.Logf("[K8s-E2E] Skipping RWO fork 409 check (StatelessGatewayHA disabled on gateway)")
+	} else if rwoForkStatus != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict for RWO E2B PVC fork, got %d (%s)", rwoForkStatus, rwoForkBody)
+	}
+	t.Logf("[K8s-E2E] E2B volumeMounts (nosuid,nodev, RWX persistence, ForkFrom inheritance, RWO conflict) verified")
+}
+
+// TestK8sLiveE2ETemplateBuild verifies in-cluster BuildKit Template.build status
+// transitions (building -> ready), or skips cleanly if BuildKit/registry are not configured.
+func TestK8sLiveE2ETemplateBuild(t *testing.T) {
+	cfg := requireLiveE2EConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	buildEnabled := os.Getenv("CUBEPOD_K8S_TEMPLATE_BUILD") == "1" ||
+		(discoverControllerFlag(ctx, cfg, "-template-build") == "true" && discoverControllerFlag(ctx, cfg, "-template-registry") != "")
+	if !buildEnabled {
+		t.Skip("Skipping live Template.build E2E: set CUBEPOD_K8S_TEMPLATE_BUILD=1 (or configure -template-build=true and -template-registry on cubepod-controller)")
+	}
+
+	c := client.New(cfg.GatewayURL, client.WithTimeout(3*time.Minute))
+	kubeClient, err := controller.NewRESTKubeClientFromEnv()
+	if err != nil {
+		t.Fatalf("NewRESTKubeClientFromEnv: %v", err)
+	}
+
+	tplName := fmt.Sprintf("k8s-e2e-tpl-%d", time.Now().UnixNano())
+	res, err := c.BuildTemplate(ctx, client.BuildTemplateRequest{
+		Name:      tplName,
+		FromImage: cfg.SandboxImage,
+		Steps: []client.BuildStep{
+			{Type: "ENV", Args: []string{"CUBEPOD_BUILD_E2E", "ok"}},
+		},
+		NoWait: true,
+	})
+	if err != nil {
+		var apiErr *client.APIError
+		if errors.As(err, &apiErr) && (apiErr.StatusCode == http.StatusNotImplemented || apiErr.StatusCode == http.StatusNotFound) {
+			t.Skipf("Skipping live Template.build E2E: gateway template build API disabled (%v)", err)
+		}
+		t.Fatalf("BuildTemplate: %v", err)
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_ = c.DeleteTemplate(cctx, res.TemplateID, true)
+	}()
+
+	sawBuilding := false
+	ready := false
+	deadline := time.Now().Add(8 * time.Minute)
+	for time.Now().Before(deadline) {
+		st, err := c.GetTemplateBuildStatus(ctx, res.TemplateID, res.BuildID)
+		if err != nil {
+			t.Fatalf("GetTemplateBuildStatus: %v", err)
+		}
+		switch st.Status {
+		case "building", "waiting":
+			sawBuilding = true
+		case "ready":
+			ready = true
+		case "error":
+			msg := ""
+			if st.Reason != nil {
+				msg = st.Reason.Message
+			}
+			t.Fatalf("template build failed: %s", msg)
+		}
+		if ready {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !ready {
+		t.Fatalf("template %s build %s did not reach ready within timeout", res.TemplateID, res.BuildID)
+	}
+
+	if podTpl, err := kubeClient.GetPodTemplate(ctx, cfg.Namespace, res.TemplateID); err == nil && podTpl != nil {
+		if podTpl.Status.BuildStatus != v1alpha1.BuildStatusReady {
+			t.Fatalf("expected PodTemplate.Status.BuildStatus=ready, got %q", podTpl.Status.BuildStatus)
+		}
+	}
+	t.Logf("[K8s-E2E] Template.build verified (templateID=%s buildID=%s sawBuilding=%v -> ready)", res.TemplateID, res.BuildID, sawBuilding)
+}
+
+// TestK8sLiveE2EVolumeSnapshotFork verifies CSI VolumeSnapshot CoW fork flow,
+// gated on CUBEPOD_VOLUME_SNAPSHOT_CLASS (or controller -volume-snapshot-class).
+func TestK8sLiveE2EVolumeSnapshotFork(t *testing.T) {
+	cfg := requireLiveE2EConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	snapClass := os.Getenv("CUBEPOD_VOLUME_SNAPSHOT_CLASS")
+	if snapClass == "" {
+		snapClass = os.Getenv("CUBEPOD_K8S_SNAPSHOT_CLASS")
+	}
+	if snapClass == "" && discoverControllerFlag(ctx, cfg, "-fork-mode") == "snapshot" {
+		snapClass = discoverControllerFlag(ctx, cfg, "-volume-snapshot-class")
+	}
+	if snapClass == "" {
+		t.Skip("Skipping VolumeSnapshot fork E2E: set CUBEPOD_VOLUME_SNAPSHOT_CLASS to run against cluster with CSI VolumeSnapshotClass")
+	}
+
+	c := client.New(cfg.GatewayURL, client.WithTimeout(3*time.Minute))
+	kubeClient, err := controller.NewRESTKubeClientFromEnv()
+	if err != nil {
+		t.Fatalf("NewRESTKubeClientFromEnv: %v", err)
+	}
+
+	parent, err := c.CreateSandbox(ctx, client.CreateSandboxRequest{
+		TemplateID: cfg.SandboxImage,
+		Metadata:   map[string]string{"env": "k8s-e2e", "feature": "snapshot-fork"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSandbox parent: %v", err)
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_ = c.DeleteSandboxWithOptions(cctx, parent.SandboxID, true)
+	}()
+
+	if err := c.WriteFile(ctx, parent.SandboxID, "/workspace/snap-parent.txt", []byte("snapshot-ws-v1"), "0644"); err != nil {
+		t.Fatalf("WriteFile workspace: %v", err)
+	}
+	if err := c.WriteFile(ctx, parent.SandboxID, "/var/tmp/snap-rootfs.txt", []byte("snapshot-rootfs-v1"), "0644"); err != nil {
+		t.Fatalf("WriteFile rootfs: %v", err)
+	}
+
+	child, err := c.ForkSandbox(ctx, parent.SandboxID)
+	if err != nil {
+		t.Fatalf("ForkSandbox: %v", err)
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_ = c.DeleteSandboxWithOptions(cctx, child.SandboxID, true)
+	}()
+
+	wsData, err := c.ReadFile(ctx, child.SandboxID, "/workspace/snap-parent.txt")
+	if err != nil || string(wsData) != "snapshot-ws-v1" {
+		t.Fatalf("child workspace snapshot fork mismatch: err=%v content=%q", err, string(wsData))
+	}
+	rfData, err := c.ReadFile(ctx, child.SandboxID, "/var/tmp/snap-rootfs.txt")
+	if err != nil || string(rfData) != "snapshot-rootfs-v1" {
+		t.Fatalf("child rootfs snapshot fork mismatch: err=%v content=%q", err, string(rfData))
+	}
+
+	// Verify CoW isolation between parent and child
+	if err := c.WriteFile(ctx, child.SandboxID, "/workspace/snap-child-only.txt", []byte("child-only"), "0644"); err != nil {
+		t.Fatalf("WriteFile child-only: %v", err)
+	}
+	if _, err := c.ReadFile(ctx, parent.SandboxID, "/workspace/snap-child-only.txt"); err == nil {
+		t.Fatalf("expected child-only file not to appear in parent sandbox")
+	}
+
+	childWsPVC, err := kubeClient.GetPVC(ctx, cfg.Namespace, child.SandboxID+"-workspace-pvc")
+	if err != nil {
+		t.Fatalf("GetPVC child workspace: %v", err)
+	}
+	specMap, _ := childWsPVC["spec"].(map[string]any)
+	ds, _ := specMap["dataSource"].(map[string]any)
+	if ds == nil || ds["kind"] != "VolumeSnapshot" {
+		t.Fatalf("expected child PVC dataSource.kind=VolumeSnapshot (snapshotClass=%s), got %+v", snapClass, specMap["dataSource"])
+	}
+	t.Logf("[K8s-E2E] VolumeSnapshot CoW fork verified (parent=%s child=%s dataSource=%+v)", parent.SandboxID, child.SandboxID, ds)
 }
