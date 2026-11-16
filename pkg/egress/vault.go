@@ -23,6 +23,8 @@ var (
 // SecretBinding represents an opaque secret bound to a sandbox, destination hosts, and headers.
 type SecretBinding struct {
 	SandboxID      string
+	TenantHash     string
+	SecretID       string
 	EnvName        string
 	RawSecret      string
 	AllowedHosts   []string
@@ -48,6 +50,12 @@ const DefaultPlaceholderPrefix = "cpodref_"
 // BindSecret mints a unique cpodref_<32-char-base32> placeholder bound to the given sandbox,
 // environment variable name, raw secret, allowed SNI hosts, and allowed HTTP headers.
 func (v *Vault) BindSecret(sandboxID, envName, rawSecret string, allowedHosts, allowedHeaders []string) (string, error) {
+	return v.BindManagedSecret(sandboxID, "", "", envName, rawSecret, allowedHosts, allowedHeaders)
+}
+
+// BindManagedSecret mints a unique cpodref_<32-char-base32> placeholder linked to an optional
+// durable tenant secret (tenantHash, secretID) so rotations and revocations propagate in real time.
+func (v *Vault) BindManagedSecret(sandboxID, tenantHash, secretID, envName, rawSecret string, allowedHosts, allowedHeaders []string) (string, error) {
 	if sandboxID == "" {
 		return "", errors.New("sandboxID cannot be empty")
 	}
@@ -72,6 +80,8 @@ func (v *Vault) BindSecret(sandboxID, envName, rawSecret string, allowedHosts, a
 	v.mu.Lock()
 	v.bindings[placeholder] = &SecretBinding{
 		SandboxID:      sandboxID,
+		TenantHash:     tenantHash,
+		SecretID:       secretID,
 		EnvName:        envName,
 		RawSecret:      rawSecret,
 		AllowedHosts:   hostsCopy,
@@ -148,6 +158,40 @@ func (v *Vault) RevokeSecret(placeholder string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	delete(v.bindings, placeholder)
+}
+
+// UpdateSecretByRef rotates RawSecret for all active bindings referencing (tenantHash, secretID).
+func (v *Vault) UpdateSecretByRef(tenantHash, secretID, newRawSecret string) int {
+	if tenantHash == "" || secretID == "" || newRawSecret == "" {
+		return 0
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	updated := 0
+	for _, binding := range v.bindings {
+		if binding.TenantHash == tenantHash && binding.SecretID == secretID {
+			binding.RawSecret = newRawSecret
+			updated++
+		}
+	}
+	return updated
+}
+
+// RevokeSecretByRef revokes all active bindings referencing (tenantHash, secretID).
+func (v *Vault) RevokeSecretByRef(tenantHash, secretID string) int {
+	if tenantHash == "" || secretID == "" {
+		return 0
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	revoked := 0
+	for placeholder, binding := range v.bindings {
+		if binding.TenantHash == tenantHash && binding.SecretID == secretID {
+			delete(v.bindings, placeholder)
+			revoked++
+		}
+	}
+	return revoked
 }
 
 // Count returns the total number of active secret bindings in the vault.

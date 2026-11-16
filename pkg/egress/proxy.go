@@ -367,6 +367,9 @@ func (p *EgressProxy) replaceHeaderPlaceholders(ctx context.Context, src http.He
 					return nil, fmt.Errorf("header %q: %w", key, err)
 				}
 				p.metrics.IncSecretExchange("ok")
+				if strings.ContainsAny(realSecret, "\r\n\x00") {
+					return nil, fmt.Errorf("header %q: exchanged secret contains invalid control characters", key)
+				}
 				replacedVal = replacedVal[:idx] + realSecret + replacedVal[end:]
 				searchFrom = idx + len(realSecret)
 			}
@@ -722,6 +725,8 @@ func (p *EgressProxy) serveMITMTLS(clientConn net.Conn, sniHost, port string) {
 			return
 		}
 
+		applyHeaderTransforms(req.Header, p.GetPolicy(), sniHost)
+
 		newHeaders, err := p.replaceHeaderPlaceholders(req.Context(), req.Header, sniHost)
 		if err != nil {
 			_ = req.Body.Close()
@@ -880,13 +885,13 @@ func (p *EgressProxy) shouldMITM(policy v1alpha1.NetworkPolicySpec, sniHost stri
 	if p.mitmCA == nil {
 		return false
 	}
-	if hostMatchesSecretBinding(policy, sniHost) {
+	if hostMatchesSecretBinding(policy, sniHost) || hostMatchesHeaderTransform(policy, sniHost) {
 		return true
 	}
 	p.mu.RLock()
 	hasExchange := p.exchangeURL != "" || p.exchangeHandler != nil
 	p.mu.RUnlock()
-	return hasExchange && len(policy.SecretBindings) == 0
+	return hasExchange && len(policy.SecretBindings) == 0 && len(policy.HeaderTransforms) == 0
 }
 
 func hostMatchesSecretBinding(policy v1alpha1.NetworkPolicySpec, host string) bool {
@@ -898,6 +903,28 @@ func hostMatchesSecretBinding(policy v1alpha1.NetworkPolicySpec, host string) bo
 		}
 	}
 	return false
+}
+
+func hostMatchesHeaderTransform(policy v1alpha1.NetworkPolicySpec, host string) bool {
+	for _, ht := range policy.HeaderTransforms {
+		if MatchHost(host, ht.Host) {
+			return true
+		}
+	}
+	return false
+}
+
+// applyHeaderTransforms overwrites configured headers on requests matching SNI host
+// before cpodref_ placeholder exchange runs.
+func applyHeaderTransforms(headers http.Header, policy v1alpha1.NetworkPolicySpec, host string) {
+	for _, ht := range policy.HeaderTransforms {
+		if !MatchHost(host, ht.Host) {
+			continue
+		}
+		for k, v := range ht.Headers {
+			headers.Set(k, v)
+		}
+	}
 }
 
 func splitHostPortDefault(raw, defaultPort string) (string, string) {

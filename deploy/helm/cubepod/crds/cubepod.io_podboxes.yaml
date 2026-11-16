@@ -132,6 +132,44 @@ spec:
                             type: array
                             items:
                               type: string
+                    headerTransforms:
+                      type: array
+                      items:
+                        type: object
+                        required:
+                          - host
+                          - headers
+                        properties:
+                          host:
+                            type: string
+                          headers:
+                            type: object
+                            additionalProperties:
+                              type: string
+                    secretRefBindings:
+                      type: array
+                      items:
+                        type: object
+                        required:
+                          - placeholder
+                          - tenantHash
+                          - secretID
+                          - allowedHosts
+                        properties:
+                          placeholder:
+                            type: string
+                          tenantHash:
+                            type: string
+                          secretID:
+                            type: string
+                          allowedHosts:
+                            type: array
+                            items:
+                              type: string
+                          allowedHeaders:
+                            type: array
+                            items:
+                              type: string
             status:
               type: object
               properties:

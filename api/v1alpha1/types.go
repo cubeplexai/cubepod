@@ -203,14 +203,33 @@ type NetworkEgressRule struct {
 	Target string `json:"target"`
 }
 
+// HeaderTransformRule injects or rewrites HTTP headers on outbound HTTPS requests matching Host.
+// Header values must contain only cpodref_ placeholders, never plaintext secrets.
+type HeaderTransformRule struct {
+	Host    string            `json:"host"`
+	Headers map[string]string `json:"headers"`
+}
+
+// SecretRefBinding records non-secret metadata on PodBox so any HA gateway replica
+// can re-hydrate egress.Vault from a shared secret store on cache miss.
+type SecretRefBinding struct {
+	Placeholder    string   `json:"placeholder"`
+	TenantHash     string   `json:"tenantHash"`
+	SecretID       string   `json:"secretID"`
+	AllowedHosts   []string `json:"allowedHosts"`
+	AllowedHeaders []string `json:"allowedHeaders,omitempty"`
+}
+
 // NetworkPolicySpec configures per-sandbox DNS/nftables filtering and upstream proxy routing.
 type NetworkPolicySpec struct {
-	DefaultAction  NetworkDefaultAction `json:"defaultAction"`
-	AllowHosts     []string             `json:"allowHosts,omitempty"`
-	DenyHosts      []string             `json:"denyHosts,omitempty"`
-	Egress         []NetworkEgressRule  `json:"egress,omitempty"`
-	UpstreamProxy  string               `json:"upstreamProxy,omitempty"`
-	SecretBindings []SecretBinding      `json:"secretBindings,omitempty"`
+	DefaultAction     NetworkDefaultAction  `json:"defaultAction"`
+	AllowHosts        []string              `json:"allowHosts,omitempty"`
+	DenyHosts         []string              `json:"denyHosts,omitempty"`
+	Egress            []NetworkEgressRule   `json:"egress,omitempty"`
+	UpstreamProxy     string                `json:"upstreamProxy,omitempty"`
+	SecretBindings    []SecretBinding       `json:"secretBindings,omitempty"`
+	HeaderTransforms  []HeaderTransformRule `json:"headerTransforms,omitempty"`
+	SecretRefBindings []SecretRefBinding    `json:"secretRefBindings,omitempty"`
 }
 
 // E2BVolumeMount attaches one official E2B volume to the sandbox container.
