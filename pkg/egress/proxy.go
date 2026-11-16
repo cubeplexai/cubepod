@@ -68,9 +68,9 @@ func (v *Vault) RestoreManagedSecret(placeholder, sandboxID, tenantHash, secretI
 
 	v.mu.Lock()
 	if v.bindings == nil {
-		v.bindings = make(map[string]*SecretBinding)
+		v.bindings = make(map[vaultKey]*SecretBinding)
 	}
-	v.bindings[placeholder] = &SecretBinding{
+	v.bindings[vaultKey{sandboxID: sandboxID, placeholder: placeholder}] = &SecretBinding{
 		SandboxID:      sandboxID,
 		TenantHash:     tenantHash,
 		SecretID:       secretID,
@@ -120,6 +120,7 @@ func VaultExchangeHandlerWithRehydrator(vault *Vault, ca *CA, rehydrate VaultReh
 		}
 
 		var req ExchangeRequest
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
 			return
@@ -158,9 +159,9 @@ func VaultExchangeHandlerWithRehydrator(vault *Vault, ca *CA, rehydrate VaultReh
 			sniHost = req.Host
 		}
 
-		// 2. Perform zero-trust exchange via Vault (with optional HA re-hydration on cache miss)
+		// 2. Perform zero-trust exchange via Vault (with optional HA re-hydration on cache miss or inherited fork binding)
 		secret, err := vault.Exchange(clientSandboxID, req.Placeholder, sniHost, req.HeaderName)
-		if errors.Is(err, ErrUnknownPlaceholder) && rehydrate != nil {
+		if (errors.Is(err, ErrUnknownPlaceholder) || errors.Is(err, ErrSandboxMismatch)) && rehydrate != nil {
 			if rErr := rehydrate(r.Context(), clientSandboxID, req.Placeholder); rErr == nil {
 				secret, err = vault.Exchange(clientSandboxID, req.Placeholder, sniHost, req.HeaderName)
 			}

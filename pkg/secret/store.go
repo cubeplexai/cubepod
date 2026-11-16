@@ -337,6 +337,7 @@ func (m *storeMetrics) snapshot() map[string]map[string]uint64 {
 // Store manages tenant-isolated E2B secrets backed by a durable Backend.
 type Store struct {
 	mu        sync.RWMutex
+	syncMu    sync.Mutex
 	backend   Backend
 	maxPerTen int
 	byID      map[string]*StoredSecret
@@ -468,6 +469,9 @@ func (s *Store) Sync(ctx context.Context) error {
 	if s.backend == nil {
 		return nil
 	}
+	s.syncMu.Lock()
+	defer s.syncMu.Unlock()
+
 	seqBefore := s.writeSeq.Load()
 	records, err := s.backend.LoadAll(ctx)
 	if err != nil {

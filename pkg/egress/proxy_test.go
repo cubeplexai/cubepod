@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -701,4 +703,51 @@ func TestVaultExchangeHandlerRehydrationAndStrictMTLS(t *testing.T) {
 	if resp3.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden for unknown placeholder, got %d", resp3.StatusCode)
 	}
+}
+
+func TestVault_ConcurrentExchangeAndRotateAndForkedPlaceholderIsolation(t *testing.T) {
+	vault := egress.NewVault()
+	ph, err := vault.BindManagedSecret("parent-sbx", "tenant-a", "sec_race", "OPENAI_API_KEY", "sk-v0", []string{"api.openai.com"}, []string{"Authorization"})
+	if err != nil {
+		t.Fatalf("BindManagedSecret: %v", err)
+	}
+
+	// Forked child restores same inherited placeholder without clobbering parent binding.
+	if err := vault.RestoreManagedSecret(ph, "child-sbx", "tenant-a", "sec_race", "", "sk-v0", []string{"api.openai.com"}, []string{"Authorization"}); err != nil {
+		t.Fatalf("RestoreManagedSecret child: %v", err)
+	}
+	if _, err := vault.Exchange("attacker-sbx", ph, "api.openai.com", "Authorization"); !errors.Is(err, egress.ErrSandboxMismatch) {
+		t.Fatalf("expected ErrSandboxMismatch for unbound sandbox, got %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		sbx := "parent-sbx"
+		if g%2 == 1 {
+			sbx = "child-sbx"
+		}
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				sec, exErr := vault.Exchange(id, ph, "api.openai.com", "Authorization")
+				if exErr != nil || sec == "" {
+					t.Errorf("Exchange(%s) failed: sec=%q err=%v", id, sec, exErr)
+					return
+				}
+			}
+		}(sbx)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 1; i <= 50; i++ {
+			n := vault.UpdateSecretByRef("tenant-a", "sec_race", fmt.Sprintf("sk-v%d", i))
+			if n != 2 {
+				t.Errorf("expected UpdateSecretByRef to update both parent and child bindings, got %d", n)
+				return
+			}
+		}
+	}()
+	wg.Wait()
 }

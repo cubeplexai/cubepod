@@ -110,32 +110,42 @@ func (s *Server) rehydrateVaultBinding(ctx context.Context, sandboxID, placehold
 	if err != nil || box == nil || box.Spec.NetworkPolicy == nil {
 		return egress.ErrUnknownPlaceholder
 	}
-	_ = st.Sync(ctx)
 
-	for _, rb := range box.Spec.NetworkPolicy.SecretRefBindings {
-		if rb.Placeholder != placeholder {
-			continue
+	var matched *v1alpha1.SecretRefBinding
+	for i := range box.Spec.NetworkPolicy.SecretRefBindings {
+		if box.Spec.NetworkPolicy.SecretRefBindings[i].Placeholder == placeholder {
+			matched = &box.Spec.NetworkPolicy.SecretRefBindings[i]
+			break
 		}
-		_, val, err := st.ResolveByTenantID(rb.TenantHash, rb.SecretID)
-		if err != nil {
-			return err
-		}
-		raw := val.Raw()
-		if !isValidHeaderValue(raw) {
-			return errors.New("secret value contains invalid control characters")
-		}
-		return s.vault.RestoreManagedSecret(
-			rb.Placeholder,
-			sandboxID,
-			rb.TenantHash,
-			rb.SecretID,
-			"",
-			raw,
-			rb.AllowedHosts,
-			rb.AllowedHeaders,
-		)
 	}
-	return egress.ErrUnknownPlaceholder
+	if matched == nil {
+		return egress.ErrUnknownPlaceholder
+	}
+
+	_, val, err := st.ResolveByTenantID(matched.TenantHash, matched.SecretID)
+	if errors.Is(err, secret.ErrNotFound) {
+		if syncErr := st.Sync(ctx); syncErr != nil {
+			return syncErr
+		}
+		_, val, err = st.ResolveByTenantID(matched.TenantHash, matched.SecretID)
+	}
+	if err != nil {
+		return err
+	}
+	raw := val.Raw()
+	if !isValidHeaderValue(raw) {
+		return errors.New("secret value contains invalid control characters")
+	}
+	return s.vault.RestoreManagedSecret(
+		matched.Placeholder,
+		sandboxID,
+		matched.TenantHash,
+		matched.SecretID,
+		"",
+		raw,
+		matched.AllowedHosts,
+		matched.AllowedHeaders,
+	)
 }
 
 func (s *Server) requireSecretStore(w http.ResponseWriter) (*secret.Store, bool) {
