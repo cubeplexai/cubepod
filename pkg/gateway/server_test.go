@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2431,5 +2433,148 @@ func TestGateway_ResolveSandbox_PreservesStateWhenPodBoxPhaseEmpty(t *testing.T)
 	}
 	if fetched.State != "running" {
 		t.Fatalf("expected state %q when PodBox.Status.Phase is empty, got %q", "running", fetched.State)
+	}
+}
+
+type slowEnsurePodKubeClient struct {
+	*controller.MemoryKubeClient
+	blockEnsure  atomic.Bool
+	enteredOnce  sync.Once
+	entered      chan struct{}
+	release      chan struct{}
+	deleteCalled atomic.Int32
+}
+
+func (c *slowEnsurePodKubeClient) EnsurePod(ctx context.Context, pod controller.PodManifest) (string, error) {
+	if c.blockEnsure.Load() {
+		c.enteredOnce.Do(func() {
+			close(c.entered)
+		})
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return c.MemoryKubeClient.EnsurePod(ctx, pod)
+}
+
+func (c *slowEnsurePodKubeClient) DeletePod(ctx context.Context, namespace, name string) error {
+	c.deleteCalled.Add(1)
+	return c.MemoryKubeClient.DeletePod(ctx, namespace, name)
+}
+
+func TestGateway_HealthDoesNotBlockDuringSlowReconcile(t *testing.T) {
+	slowKube := &slowEnsurePodKubeClient{
+		MemoryKubeClient: controller.NewMemoryKubeClient(),
+		entered:          make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	reconciler := controller.NewReconciler(controller.WithKubeClient(slowKube))
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	createResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"cubeplex-ubuntu24-desktop"}`))
+	if err != nil {
+		t.Fatalf("POST /sandboxes failed: %v", err)
+	}
+	defer createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 Created, got %d", createResp.StatusCode)
+	}
+	var created gateway.SandboxRecord
+	if err := json.NewDecoder(createResp.Body).Decode(&created); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+
+	// Gate next EnsurePod during reset-rootfs.
+	slowKube.blockEnsure.Store(true)
+
+	var wg sync.WaitGroup
+	var resetStatus int
+	var resetErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp, err := http.Post(ts.URL+"/sandboxes/"+created.SandboxID+"/reset-rootfs", "application/json", nil)
+		if err != nil {
+			resetErr = err
+			return
+		}
+		resetStatus = resp.StatusCode
+		_ = resp.Body.Close()
+	}()
+
+	select {
+	case <-slowKube.entered:
+	case <-time.After(3 * time.Second):
+		close(slowKube.release)
+		t.Fatalf("timed out waiting for reset-rootfs to enter EnsurePod")
+	}
+
+	// Reset DeletePod count only after reset-rootfs has deleted the old pod and blocked in EnsurePod.
+	slowKube.deleteCalled.Store(0)
+
+	// Health endpoint must respond immediately without waiting for slow Reconcile.
+	fastClient := &http.Client{Timeout: 100 * time.Millisecond}
+	start := time.Now()
+	healthResp, err := fastClient.Get(ts.URL + "/health")
+	if err != nil {
+		close(slowKube.release)
+		t.Fatalf("GET /health blocked during slow reconcile: %v", err)
+	}
+	_ = healthResp.Body.Close()
+	if healthResp.StatusCode != http.StatusOK {
+		close(slowKube.release)
+		t.Fatalf("expected 200 OK from /health, got %d", healthResp.StatusCode)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		close(slowKube.release)
+		t.Fatalf("GET /health took too long (%v) during slow reconcile", elapsed)
+	}
+
+	// Concurrent lifecycle operation on the SAME sandbox must serialize behind lockSandboxOp.
+	var pauseStatus int
+	var pauseErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp, err := http.Post(ts.URL+"/sandboxes/"+created.SandboxID+"/pause", "application/json", nil)
+		if err != nil {
+			pauseErr = err
+			return
+		}
+		pauseStatus = resp.StatusCode
+		_ = resp.Body.Close()
+	}()
+
+	time.Sleep(30 * time.Millisecond)
+	if calls := slowKube.deleteCalled.Load(); calls != 0 {
+		close(slowKube.release)
+		t.Fatalf("expected pause to wait for in-flight reset-rootfs via lockSandboxOp, got %d DeletePod calls", calls)
+	}
+
+	close(slowKube.release)
+	wg.Wait()
+
+	if resetErr != nil || resetStatus != http.StatusOK {
+		t.Fatalf("reset-rootfs failed: status=%d err=%v", resetStatus, resetErr)
+	}
+	if pauseErr != nil || pauseStatus != http.StatusOK {
+		t.Fatalf("pause failed: status=%d err=%v", pauseStatus, pauseErr)
+	}
+
+	getResp, err := http.Get(ts.URL + "/sandboxes/" + created.SandboxID)
+	if err != nil {
+		t.Fatalf("GET /sandboxes/%s failed: %v", created.SandboxID, err)
+	}
+	defer getResp.Body.Close()
+	var fetched gateway.SandboxRecord
+	if err := json.NewDecoder(getResp.Body).Decode(&fetched); err != nil {
+		t.Fatalf("decode get response: %v", err)
+	}
+	if !strings.EqualFold(fetched.State, "paused") {
+		t.Fatalf("expected final state Paused, got %q", fetched.State)
 	}
 }
