@@ -65,15 +65,15 @@ with Sandbox.create() as sbx:
 
 | 协议面 | 已实现端点 | CubePod 内部行为 |
 | :--- | :--- | :--- |
-| **控制面** | `POST /sandboxes`、`POST/GET /v2/sandboxes`、`GET /sandboxes`、`GET /sandboxes/{id}`、`DELETE /sandboxes/{id}` | 创建或列举 `PodBox` 沙箱；响应体包含 E2B 必填字段（`sandboxID`、`templateID`、`clientID`、`envdVersion`、`state`、`startedAt`、`endAt`、`cpuCount`、`memoryMB`、`diskSizeMB`）。 |
-| **生命周期与租约** | `POST /sandboxes/{id}/refreshes`、`POST /sandboxes/{id}/timeout`、`POST /sandboxes/{id}/pause`、`POST /sandboxes/{id}/connect`、`POST /v2/sandboxes/{id}/connect` | 续期超时或租约时间；暂停时释放 Pod 算力并保留双 PVC；收到 `connect` 或数据面流量时透明自动唤醒。 |
-| **命令执行与流式日志** | `POST /sandboxes/{id}/commands`、`POST /sandboxes/{id}/commands/run`、`GET .../logs?cursor=N`、`POST .../kill`、Connect-RPC `/process.Process/{Start,SendSignal,Connect,List,SendInput,StreamInput,Update}` | 在 Guest 内默认以非特权 UID/GID `1000:1000`（`cubeplex`）运行命令与交互式 PTY 会话，支持游标增量拉取、64 KiB PTY 重连回放、窗口 resize 及 PGID 进程组级清理。 |
-| **文件系统与归档同步** | `PUT/GET/DELETE /sandboxes/{id}/files`、`GET .../files/list`、`POST .../files/archive-sync`、Connect-RPC `/filesystem.Filesystem/{Read,Write,List,ListDir,Stat,Remove,MakeDir,WatchDir,CreateWatcher,GetWatcherEvents,RemoveWatcher}` | 直接读写持久化 `/workspace` 或 RootFS 文件、基于 `inotify` 的目录变更监听，并支持带路径穿越防护的 `.tar`/`.tar.gz` 批量目录同步。 |
-| **持久化卷与内容传输** | `POST/GET/DELETE /volumes`、`/volumecontent/{id}/{file,dir,path}`、`POST /sandboxes` 的 `volumeMounts` | 管理租户隔离的持久化 E2B 卷及文件内容上传下载，支持挂载至 Docker 与 K8s Kata 沙箱（K8s 需配置 `CUBEPOD_K8S_E2B_VOLUME_MOUNTS=1` 与 `CUBEPOD_E2B_SHARED_PVC`）。 |
-| **密钥与网络规则注入** | `POST/GET /secrets`、`GET/POST/DELETE /secrets/{id}`、`network.rules.*.transform.headers`（`${e2b.secrets.<name>}`） | 以 AES-256-GCM 加密存储 Write-Only 密钥，并在创建沙箱时将 `${e2b.secrets.<name>}` 解析为每沙箱 `cpodref_` 占位符，由 `cubepod-egress` 通过 mTLS 实时替换注入。 |
-| **有状态代码解释器** | `POST /sandboxes/{id}/execute`、`POST /sandboxes/{id}/code/execute`、`POST /execute` | 管理 `podd` 内部 6 种语言解释器上下文（`python`、`bash`、`javascript`、`typescript`、`r`、`java`）。上下文生命周期在沙箱内维护。 |
-| **子域名端口路由** | `Host: <port>-<sandboxID>.<domain>` 与 `GET/POST /sandboxes/{id}/endpoints/{port}` | 自动唤醒已暂停沙箱，将 `/envd/*` 路径转发至 `podd`（`:49983`），并反代应用端口或签发 `/panel/{token}/` 访问地址。 |
-| **模板目录与构建** | `/templates`、`/v2/templates`、`/v3/templates`、`/templates/{id}/builds/{buildID}/status`、`/templates/{id}/files/{hash}` | 启用 `--e2b-template-api=true` 与 `--template-build=true` 后即可使用 BuildKit 或本地 Docker 执行镜像构建。 |
+| **控制面** | `POST /sandboxes`<br/>`POST / GET /v2/sandboxes`<br/>`GET /sandboxes`<br/>`GET /sandboxes/{id}`<br/>`DELETE /sandboxes/{id}` | 创建或列举 `PodBox` 沙箱；响应体包含 E2B 必填字段（`sandboxID`、`templateID`、`clientID`、`envdVersion`、`state`、`startedAt`、`endAt`、`cpuCount`、`memoryMB`、`diskSizeMB`）。 |
+| **生命周期与租约** | `POST /sandboxes/{id}/refreshes`<br/>`POST /sandboxes/{id}/timeout`<br/>`POST /sandboxes/{id}/pause`<br/>`POST /sandboxes/{id}/connect`<br/>`POST /v2/sandboxes/{id}/connect` | 续期超时或租约时间；暂停时释放 Pod 算力并保留双 PVC；收到 `connect` 或数据面流量时透明自动唤醒。 |
+| **命令执行与流式日志** | `POST /sandboxes/{id}/commands`<br/>`POST /sandboxes/{id}/commands/run`<br/>`GET .../logs?cursor=N`<br/>`POST .../kill`<br/>Connect-RPC `/process.Process/*`:<br/>`Start`, `SendSignal`, `Connect`, `List`,<br/>`SendInput`, `StreamInput`, `Update` | 在 Guest 内默认以非特权 UID/GID `1000:1000`（`cubeplex`）运行命令与交互式 PTY 会话，支持游标增量拉取、64 KiB PTY 重连回放、窗口 resize 及 PGID 进程组级清理。 |
+| **文件系统与归档同步** | `PUT / GET / DELETE /sandboxes/{id}/files`<br/>`GET .../files/list`<br/>`POST .../files/archive-sync`<br/>Connect-RPC `/filesystem.Filesystem/*`:<br/>`Read`, `Write`, `List`, `ListDir`, `Stat`,<br/>`Remove`, `MakeDir`, `WatchDir`,<br/>`CreateWatcher`, `GetWatcherEvents`, `RemoveWatcher` | 直接读写持久化 `/workspace` 或 RootFS 文件、基于 `inotify` 的目录变更监听，并支持带路径穿越防护的 `.tar`/`.tar.gz` 批量目录同步。 |
+| **持久化卷与内容传输** | `POST / GET / DELETE /volumes`<br/>`/volumecontent/{id}/file`<br/>`/volumecontent/{id}/dir`<br/>`/volumecontent/{id}/path`<br/>`POST /sandboxes` 的 `volumeMounts` | 管理租户隔离的持久化 E2B 卷及文件内容上传下载，支持挂载至 Docker 与 K8s Kata 沙箱（K8s 需配置 `CUBEPOD_K8S_E2B_VOLUME_MOUNTS=1` 与 `CUBEPOD_E2B_SHARED_PVC`）。 |
+| **密钥与网络规则注入** | `POST / GET /secrets`<br/>`GET / POST / DELETE /secrets/{id}`<br/>`network.rules.*.transform.headers`<br/>(`${e2b.secrets.<name>}`) | 以 AES-256-GCM 加密存储 Write-Only 密钥，并在创建沙箱时将 `${e2b.secrets.<name>}` 解析为每沙箱 `cpodref_` 占位符，由 `cubepod-egress` 通过 mTLS 实时替换注入。 |
+| **有状态代码解释器** | `POST /sandboxes/{id}/execute`<br/>`POST /sandboxes/{id}/code/execute`<br/>`POST /execute` | 管理 `podd` 内部 6 种语言解释器上下文（`python`、`bash`、`javascript`、`typescript`、`r`、`java`）。上下文生命周期在沙箱内维护。 |
+| **子域名端口路由** | `Host: <port>-<sandboxID>.<domain>`<br/>`GET / POST /sandboxes/{id}/endpoints/{port}` | 自动唤醒已暂停沙箱，将 `/envd/*` 路径转发至 `podd`（`:49983`），并反代应用端口或签发 `/panel/{token}/` 访问地址。 |
+| **模板目录与构建** | `/templates`, `/v2/templates`, `/v3/templates`<br/>`/templates/{id}/builds/{buildID}/status`<br/>`/templates/{id}/files/{hash}` | 启用 `--e2b-template-api=true` 与 `--template-build=true` 后即可使用 BuildKit 或本地 Docker 执行镜像构建。 |
 
 ## 超越 E2B 的 CubePod 扩展能力
 

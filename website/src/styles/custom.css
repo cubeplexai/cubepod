@@ -288,3 +288,11 @@ main:has(.cp-otel) .sl-container,
 .sl-markdown-content code {
   font-family: var(--sl-font-mono);
 }
+
+.sl-markdown-content td:not(:where(.not-content *)) {
+  vertical-align: top;
+}
+
+.sl-markdown-content td :where(code):not(:where(.not-content *)) {
+  overflow-wrap: anywhere;
+}
