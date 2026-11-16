@@ -14,7 +14,7 @@ import (
 func TestBuildKataPod_NoHardcodedImagePullSecrets(t *testing.T) {
 	tpl := sampleTemplate()
 	spec := v1alpha1.PodBoxSpec{RootfsGeneration: 1}
-	status := v1alpha1.PodBoxStatus{PodName: "pull-box-kata-pod"}
+	status := v1alpha1.PodBoxStatus{PodName: "pull-box"}
 
 	podDefault := controller.BuildKataPod("pull-box", tpl, spec, status)
 	if len(podDefault.ImagePullSecrets) != 0 {
@@ -40,9 +40,12 @@ func TestBuildKataPod_NoHardcodedImagePullSecrets(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Reconcile failed: %v", err)
 	}
-	reconciledPod, ok := memKube.GetPod("cubepod-workloads", "pull-reconcile-box-kata-pod")
+	reconciledPod, ok := memKube.GetPod("cubepod-workloads", "pull-reconcile-box")
 	if !ok {
 		t.Fatal("expected pod in MemoryKubeClient")
+	}
+	if reconciledPod.Name != "pull-reconcile-box" {
+		t.Fatalf("expected pod name pull-reconcile-box without -kata-pod suffix, got %s", reconciledPod.Name)
 	}
 	wantReconciled := []string{"tpl-pull", "cluster-pull-1", "cluster-pull-2"}
 	if !slices.Equal(reconciledPod.ImagePullSecrets, wantReconciled) {
@@ -166,7 +169,7 @@ func TestSanitizeLabelValue_AndWarmPoolTemplateLabels(t *testing.T) {
 		TemplateRef:      "--repo/ubuntu:24.04--",
 		RootfsGeneration: 1,
 	}
-	pod := controller.BuildKataPod("box-label-1", tpl, spec, v1alpha1.PodBoxStatus{PodName: "box-label-1-kata-pod"})
+	pod := controller.BuildKataPod("box-label-1", tpl, spec, v1alpha1.PodBoxStatus{PodName: "box-label-1"})
 	if pod.Labels["cubepod.io/warmpool"] != "org-pool-v1" {
 		t.Fatalf("warmpool label = %q; want org-pool-v1", pod.Labels["cubepod.io/warmpool"])
 	}
@@ -183,7 +186,7 @@ func TestBuildKataPod_EgressEnvVars(t *testing.T) {
 		ExchangeURL: "https://192.168.1.215:9443/api/v1/internal/egress/exchange",
 	}
 	spec := v1alpha1.PodBoxSpec{RootfsGeneration: 1}
-	pod := controller.BuildKataPod("box-egress-1", tpl, spec, v1alpha1.PodBoxStatus{PodName: "box-egress-1-kata-pod"})
+	pod := controller.BuildKataPod("box-egress-1", tpl, spec, v1alpha1.PodBoxStatus{PodName: "box-egress-1"})
 
 	var mainC *controller.ContainerManifest
 	for i := range pod.Containers {

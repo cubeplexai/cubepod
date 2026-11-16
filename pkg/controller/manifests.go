@@ -373,7 +373,7 @@ func BuildKataPod(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha1.Po
 
 	podName := status.PodName
 	if podName == "" {
-		podName = fmt.Sprintf("%s-kata-pod", boxName)
+		podName = boxName
 	}
 
 	rtClass := tpl.RuntimeClassName

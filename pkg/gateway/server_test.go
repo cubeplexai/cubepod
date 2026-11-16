@@ -1123,7 +1123,7 @@ func TestGateway_CreateSandbox_SyncFromKube_DiscoversWarmPool(t *testing.T) {
 	}
 
 	standbyPod := controller.PodManifest{
-		Name:      "gateway-discovered-pool-warm-1-kata-pod",
+		Name:      "gateway-discovered-pool-warm-1",
 		Namespace: "cubepod-workloads",
 		Labels: map[string]string{
 			"cubepod.io/warmpool": "gateway-discovered-pool",
@@ -1159,7 +1159,7 @@ func TestGateway_CreateSandbox_SyncFromKube_DiscoversWarmPool(t *testing.T) {
 	if box.Reason != "WarmPoolClaimed" {
 		t.Fatalf("expected WarmPoolClaimed reason via discovered warm pool, got %s", box.Reason)
 	}
-	if box.PodName != "gateway-discovered-pool-warm-1-kata-pod" {
+	if box.PodName != "gateway-discovered-pool-warm-1" {
 		t.Fatalf("expected claimed standby pod name, got %s", box.PodName)
 	}
 }
@@ -1579,7 +1579,7 @@ func TestGateway_CreateSandbox_CASFailureRefreshesFromKubeAndClaims(t *testing.T
 	_ = memKube.PatchPodLabels(ctx, "cubepod-workloads", pod1Name, pod1.Labels)
 
 	// 3. Controller scales up / adds a second standby pod2 in K8s
-	pod2Name := "cas-gw-pool-warm-2-kata-pod"
+	pod2Name := "cas-gw-pool-warm-2"
 	pod2 := controller.PodManifest{
 		Name:      pod2Name,
 		Namespace: "cubepod-workloads",
@@ -1720,7 +1720,7 @@ func TestGateway_CreateWarmPool_RunsSyncFromKubeFirst(t *testing.T) {
 
 	// Pre-populate an existing pod in Kubernetes with high-water warm index 42
 	existingPod := controller.PodManifest{
-		Name:      "test-pool-warm-42-kata-pod",
+		Name:      "test-pool-warm-42",
 		Namespace: "cubepod-workloads",
 		Labels: map[string]string{
 			"cubepod.io/warmpool":   "test-pool",
@@ -1770,7 +1770,7 @@ func TestGateway_CreateWarmPool_RunsSyncFromKubeFirst(t *testing.T) {
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 total entries (1 claimed from sync, 1 newly created), got %d", len(entries))
 	}
-	if entries[1].PodName != "test-pool-warm-43-kata-pod" {
+	if entries[1].PodName != "test-pool-warm-43" {
 		t.Fatalf("expected warmCounter to advance past 42 to 43, got: %s", entries[1].PodName)
 	}
 }

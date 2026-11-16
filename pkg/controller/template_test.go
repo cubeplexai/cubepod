@@ -1506,7 +1506,7 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Reconcile box-pinned failed: %v", err)
 		}
-		podManifest := r.KubeClient().(*controller.MemoryKubeClient).Pods["cubepod-workloads/box-pinned-kata-pod"]
+		podManifest := r.KubeClient().(*controller.MemoryKubeClient).Pods["cubepod-workloads/box-pinned"]
 		if !slices.Contains(podManifest.ImagePullSecrets, "cubepod-template-pull") {
 			t.Fatalf("expected cubepod-template-pull secret on sandbox pod, got %v", podManifest.ImagePullSecrets)
 		}

@@ -18,7 +18,7 @@ func TestBuildKataPod_BlockMode_PrivilegedAndDevices(t *testing.T) {
 	}
 	spec := v1alpha1.PodBoxSpec{}
 	status := v1alpha1.PodBoxStatus{
-		PodName:          "block-box-kata-pod",
+		PodName:          "block-box",
 		RootfsPVCName:    "block-box-rootfs-pvc",
 		WorkspacePVCName: "block-box-workspace-pvc",
 	}
@@ -162,7 +162,7 @@ func TestEnsurePod_SerializesSecurityContextPrivileged(t *testing.T) {
 			}
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"metadata": map[string]any{"name": "test-box-kata-pod"},
+				"metadata": map[string]any{"name": "test-box"},
 				"status":   map[string]any{"podIP": "10.244.1.88"},
 			})
 			return
@@ -177,7 +177,7 @@ func TestEnsurePod_SerializesSecurityContextPrivileged(t *testing.T) {
 	}
 	spec := v1alpha1.PodBoxSpec{}
 	status := v1alpha1.PodBoxStatus{
-		PodName:          "test-box-kata-pod",
+		PodName:          "test-box",
 		RootfsPVCName:    "test-box-rootfs-pvc",
 		WorkspacePVCName: "test-box-workspace-pvc",
 	}

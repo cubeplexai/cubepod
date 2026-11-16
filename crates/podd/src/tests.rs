@@ -2224,6 +2224,52 @@ fn test_resolve_default_credentials_cases() {
         .expect("wait sh override");
     assert!(out2.status.success());
     assert_eq!(String::from_utf8_lossy(&out2.stdout), "/custom/override");
+
+    // 7. Image ENV HOME is preserved for the default template user unless switching users
+    let workspace_env = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USER" => Some(current_euid.to_string()),
+        "HOME" => Some("/workspace".to_string()),
+        _ => None,
+    };
+    let preserved = crate::startcmd::resolve_command_credentials_with_env(
+        workspace_env,
+        Some(current_euid),
+        None,
+        None,
+        0,
+        0,
+    )
+    .expect("resolve same template user");
+    assert_eq!(preserved.home_dir.as_deref(), Some("/workspace"));
+
+    // Plain image without custom HOME (containerd defaults PID 1 HOME=/root) falls back to passwd for non-root uid
+    let containerd_default_env = |k: &str| match k {
+        "CUBEPOD_RUN_AS_USER" => Some("1000".to_string()),
+        "HOME" => Some("/root".to_string()),
+        _ => None,
+    };
+    let non_root_fallback = crate::startcmd::resolve_command_credentials_with_env(
+        containerd_default_env,
+        Some(1000),
+        None,
+        None,
+        0,
+        0,
+    )
+    .expect("resolve non-root fallback");
+    assert_ne!(non_root_fallback.home_dir.as_deref(), Some("/root"));
+
+    // Explicitly switching away from template user (e.g. as_root uid=0) uses target user's passwd HOME
+    let switched_to_root = crate::startcmd::resolve_command_credentials_with_env(
+        workspace_env,
+        Some(0),
+        Some(0),
+        None,
+        0,
+        0,
+    )
+    .expect("resolve explicit root switch");
+    assert_eq!(switched_to_root.home_dir.as_deref(), Some("/root"));
 }
 
 #[test]

@@ -404,7 +404,7 @@ func TestRESTKubeClient_PodBox_CRUD(t *testing.T) {
 		},
 		Status: v1alpha1.PodBoxStatus{
 			Phase:          v1alpha1.PodBoxPhaseRunning,
-			PodName:        "test-box-1-kata-pod",
+			PodName:        "test-box-1",
 			PodIP:          "10.244.1.20",
 			LastActivityAt: &now,
 		},
@@ -642,8 +642,8 @@ func TestReconciler_SyncFromKube_Recovery(t *testing.T) {
 	if recAlpha.Phase != v1alpha1.PodBoxPhaseRunning {
 		t.Errorf("expected box-alpha recovered phase Running, got %s", recAlpha.Phase)
 	}
-	if recAlpha.PodName != "box-alpha-kata-pod" {
-		t.Errorf("expected box-alpha podName box-alpha-kata-pod, got %s", recAlpha.PodName)
+	if recAlpha.PodName != "box-alpha" {
+		t.Errorf("expected box-alpha podName box-alpha, got %s", recAlpha.PodName)
 	}
 
 	recBeta, ok := r2.GetBox("box-beta")
@@ -912,7 +912,7 @@ func TestReconciler_SyncFromKube_WarmPoolSpecAndCounter(t *testing.T) {
 		},
 		Status: v1alpha1.PodBoxStatus{
 			Phase:   v1alpha1.PodBoxPhaseRunning,
-			PodName: "sync-pool-warm-7-kata-pod",
+			PodName: "sync-pool-warm-7",
 		},
 	}
 	if err := client.UpsertPodBox(ctx, box); err != nil {

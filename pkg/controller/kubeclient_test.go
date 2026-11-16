@@ -267,8 +267,8 @@ func TestReconciler_WithRESTKubeClient_FullLifecycle(t *testing.T) {
 	if _, ok := mock.pvcs["sandbox-app-workspace-pvc"]; !ok {
 		t.Fatal("expected sandbox-app-workspace-pvc created in APIServer")
 	}
-	if _, ok := mock.pods["sandbox-app-kata-pod"]; !ok {
-		t.Fatal("expected sandbox-app-kata-pod created in APIServer")
+	if _, ok := mock.pods["sandbox-app"]; !ok {
+		t.Fatal("expected sandbox-app created in APIServer")
 	}
 	mock.mu.RUnlock()
 
@@ -285,13 +285,13 @@ func TestReconciler_WithRESTKubeClient_FullLifecycle(t *testing.T) {
 	mock.mu.RLock()
 	var podDeleted bool
 	for _, p := range mock.deletedPods {
-		if p == "sandbox-app-kata-pod" {
+		if p == "sandbox-app" {
 			podDeleted = true
 			break
 		}
 	}
 	if !podDeleted {
-		t.Fatal("expected sandbox-app-kata-pod deleted on pause")
+		t.Fatal("expected sandbox-app deleted on pause")
 	}
 	if _, ok := mock.pvcs["sandbox-app-rootfs-pvc"]; !ok {
 		t.Fatal("rootfs PVC must remain intact on pause")
@@ -640,7 +640,7 @@ func TestReconciler_DeleteBox(t *testing.T) {
 	mock.mu.RLock()
 	var ephPodDeleted, ephRootDeleted, ephWsDeleted bool
 	for _, p := range mock.deletedPods {
-		if p == "box-ephemeral-kata-pod" {
+		if p == "box-ephemeral" {
 			ephPodDeleted = true
 		}
 	}
@@ -654,7 +654,7 @@ func TestReconciler_DeleteBox(t *testing.T) {
 	}
 	mock.mu.RUnlock()
 	if !ephPodDeleted {
-		t.Fatal("expected box-ephemeral-kata-pod to be deleted")
+		t.Fatal("expected box-ephemeral to be deleted")
 	}
 	if !ephRootDeleted || !ephWsDeleted {
 		t.Fatalf("expected both PVCs deleted for ephemeral sandbox with deleteVolumes=false, got deletedPVCs: %v", mock.deletedPVCs)
@@ -681,13 +681,13 @@ func TestReconciler_DeleteBox(t *testing.T) {
 	mock.mu.RLock()
 	var podDeleted, keepRootDeleted bool
 	for _, p := range mock.deletedPods {
-		if p == "box-keep-pvc-kata-pod" {
+		if p == "box-keep-pvc" {
 			podDeleted = true
 			break
 		}
 	}
 	if !podDeleted {
-		t.Fatal("expected box-keep-pvc-kata-pod to be deleted")
+		t.Fatal("expected box-keep-pvc to be deleted")
 	}
 	for _, p := range mock.deletedPVCs {
 		if p == "box-keep-pvc-rootfs-pvc" {
