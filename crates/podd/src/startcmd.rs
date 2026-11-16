@@ -883,6 +883,74 @@ fn apply_resolved_credentials(cmd: &mut Command, resolved: &ResolvedCredentials)
     }
 }
 
+fn preserve_inherited_home(
+    inherited_home: Option<&str>,
+    target_uid: Option<u32>,
+) -> Option<String> {
+    let trimmed = inherited_home?.trim();
+    if trimmed.is_empty() || trimmed == "/" {
+        return None;
+    }
+    // Containerd sets HOME=/root for PID 1 when the OCI image omits ENV HOME;
+    // avoid leaking /root to a non-root user.
+    if target_uid != Some(0) && trimmed == "/root" {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Resolve command credentials and effective `HOME` using `get_env`, preserving an
+/// explicit container `ENV HOME` (such as `/workspace`) when running as the template's
+/// default user rather than clobbering it with `/etc/passwd`.
+pub fn resolve_command_credentials_with_env<F: Fn(&str) -> Option<String>>(
+    get_env: F,
+    req_uid: Option<u32>,
+    req_gid: Option<u32>,
+    req_user: Option<&str>,
+    euid: u32,
+    egid: u32,
+) -> Result<ResolvedCredentials, String> {
+    let mut default_creds = TemplateUserCredentials::from_env_getter(&get_env);
+    let default_uid = resolve_credentials_with_euid(&default_creds, euid, egid)
+        .ok()
+        .and_then(|r| r.uid);
+
+    let (mut resolved, switching_user) = if let Some(uid) = req_uid {
+        let switching = default_uid.map_or(uid != euid, |du| du != uid);
+        (resolve_for_uid(uid, req_gid, euid, egid), switching)
+    } else if let Some(user_spec) = req_user.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let (uid, gid, home_dir, username) = resolve_user_spec(user_spec, req_gid)?;
+        let switching = default_uid.map_or(uid != euid, |du| du != uid);
+        (
+            ResolvedCredentials {
+                uid: Some(uid),
+                gid: Some(gid),
+                home_dir: Some(home_dir),
+                username: Some(username),
+            },
+            switching,
+        )
+    } else {
+        if req_gid.is_some() {
+            default_creds.gid = req_gid;
+        }
+        (
+            resolve_credentials_with_euid(&default_creds, euid, egid)?,
+            false,
+        )
+    };
+
+    if !switching_user {
+        if let Some(inherited_home) =
+            preserve_inherited_home(get_env("HOME").as_deref(), resolved.uid)
+        {
+            resolved.home_dir = Some(inherited_home);
+        }
+    }
+
+    Ok(resolved)
+}
+
 /// Configure credentials and `HOME`/`USER`/`LOGNAME` environment variables on `cmd`.
 /// Call this *before* applying caller `envs` overrides so explicit env vars win.
 /// Explicit `req_uid` / `req_user` override `CUBEPOD_RUN_AS_*` environment variables.
@@ -894,24 +962,14 @@ pub fn configure_command_credentials(
 ) -> Result<ResolvedCredentials, String> {
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
-
-    let resolved = if let Some(uid) = req_uid {
-        resolve_for_uid(uid, req_gid, euid, egid)
-    } else if let Some(user_spec) = req_user.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let (uid, gid, home_dir, username) = resolve_user_spec(user_spec, req_gid)?;
-        ResolvedCredentials {
-            uid: Some(uid),
-            gid: Some(gid),
-            home_dir: Some(home_dir),
-            username: Some(username),
-        }
-    } else {
-        let mut creds = TemplateUserCredentials::from_env();
-        if req_gid.is_some() {
-            creds.gid = req_gid;
-        }
-        resolve_credentials_with_euid(&creds, euid, egid)?
-    };
+    let resolved = resolve_command_credentials_with_env(
+        |k| env::var(k).ok(),
+        req_uid,
+        req_gid,
+        req_user,
+        euid,
+        egid,
+    )?;
 
     apply_resolved_credentials(cmd, &resolved);
     Ok(resolved)
@@ -1003,7 +1061,7 @@ pub fn spawn_start_cmd(config: &StartCmdConfig) -> StartCmdStatus {
         }
     }
 
-    let resolved = match resolve_credentials(&config.credentials) {
+    let mut resolved = match resolve_credentials(&config.credentials) {
         Ok(r) => r,
         Err(err_msg) => {
             let msg = format!("{}\n", err_msg);
@@ -1011,6 +1069,11 @@ pub fn spawn_start_cmd(config: &StartCmdConfig) -> StartCmdStatus {
             return StartCmdStatus::UsernameResolutionFailed(err_msg);
         }
     };
+    if let Some(inherited_home) =
+        preserve_inherited_home(env::var("HOME").ok().as_deref(), resolved.uid)
+    {
+        resolved.home_dir = Some(inherited_home);
+    }
 
     let current_euid = unsafe { libc::geteuid() };
     let current_egid = unsafe { libc::getegid() };

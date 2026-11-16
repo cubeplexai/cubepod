@@ -133,7 +133,7 @@ func TestK8sPerformanceBenchmark(t *testing.T) {
 		_ = c.DeleteSandboxWithOptions(cleanupCtx, sbCold.SandboxID, true)
 	}()
 
-	podName := fmt.Sprintf("%s-kata-pod", sbCold.SandboxID)
+	podName := sbCold.SandboxID
 	if podObj, err := kubeClient.GetPod(ctx, cfg.Namespace, podName); err == nil {
 		if specMap, ok := podObj["spec"].(map[string]any); ok {
 			if rc, _ := specMap["runtimeClassName"].(string); rc != "" {

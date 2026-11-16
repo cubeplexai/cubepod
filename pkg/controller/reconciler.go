@@ -689,7 +689,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 			_ = r.kubeClient.EnsurePVC(ctx, wsPVC)
 
 			dummyStatus := v1alpha1.PodBoxStatus{
-				PodName:          fmt.Sprintf("%s-kata-pod", entryID),
+				PodName:          entryID,
 				RootfsPVCName:    rootfsPVC.Name,
 				WorkspacePVCName: wsPVC.Name,
 				Phase:            v1alpha1.PodBoxPhaseRunning,
@@ -1032,7 +1032,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			}
 			status = &v1alpha1.PodBoxStatus{
 				Phase:             v1alpha1.PodBoxPhaseProvisioning,
-				PodName:           fmt.Sprintf("%s-kata-pod", name),
+				PodName:           name,
 				RootfsPVCName:     rootfsName,
 				WorkspacePVCName:  WorkspacePVCName(name, spec),
 				ObservedRootfsGen: spec.RootfsGeneration,
@@ -1133,7 +1133,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		}
 		status.Phase = v1alpha1.PodBoxPhaseRunning
 		if status.PodName == "" {
-			status.PodName = fmt.Sprintf("%s-kata-pod", name)
+			status.PodName = name
 		}
 		podArgs := append([]string{r.volumeMode, r.templatePullSecret}, r.defaultImagePullSecrets...)
 		podManifest := BuildKataPod(name, tpl, spec, *status, podArgs...)
@@ -1523,7 +1523,7 @@ func (r *Reconciler) rollbackColdCreateLocked(ctx context.Context, name string, 
 			targetPod = status.PodName
 		}
 		if targetPod == "" {
-			targetPod = fmt.Sprintf("%s-kata-pod", name)
+			targetPod = name
 		}
 		_ = r.kubeClient.DeletePod(cleanupCtx, r.namespace, targetPod)
 		if status != nil {
@@ -1791,7 +1791,13 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 					}
 					updatedEntries = append(updatedEntries, entry)
 				} else {
-					entryID := strings.TrimSuffix(pod.Name, "-kata-pod")
+					entryID := ""
+					if pod.Labels != nil {
+						entryID = pod.Labels["pod.cubeplex.ai/box"]
+					}
+					if entryID == "" {
+						entryID = strings.TrimSuffix(pod.Name, "-kata-pod")
+					}
 					tplRef := ""
 					if pod.Labels != nil {
 						tplRef = pod.Labels["cubepod.io/template"]

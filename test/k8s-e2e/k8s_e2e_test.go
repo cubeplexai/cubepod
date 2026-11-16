@@ -81,7 +81,7 @@ func TestK8sLiveE2E(t *testing.T) {
 		_ = c.DeleteSandboxWithOptions(cleanupCtx, sandboxID, true)
 	}()
 
-	podName := fmt.Sprintf("%s-kata-pod", sandboxID)
+	podName := sandboxID
 	rootfsPVCName := fmt.Sprintf("%s-rootfs-pvc", sandboxID)
 	workspacePVCName := fmt.Sprintf("%s-workspace-pvc", sandboxID)
 

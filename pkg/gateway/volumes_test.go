@@ -719,9 +719,9 @@ func TestE2BVolumeSandboxCreateMountsOnPod(t *testing.T) {
 	if sb.SandboxID == "" {
 		t.Fatal("missing sandbox id")
 	}
-	pod, ok := mem.GetPod("cubepod-workloads", sb.SandboxID+"-kata-pod")
+	pod, ok := mem.GetPod("cubepod-workloads", sb.SandboxID)
 	if !ok {
-		t.Fatalf("expected pod %s-kata-pod, pods=%v", sb.SandboxID, podNames(mem))
+		t.Fatalf("expected pod %s, pods=%v", sb.SandboxID, podNames(mem))
 	}
 	pvc := "e2bvol-" + vol.VolumeID
 	var sawVol, sawMount, sawWS bool
@@ -883,9 +883,9 @@ func TestE2BVolumeLiveK8sRWXEnabledAndFork(t *testing.T) {
 		t.Fatalf("unexpected PodBox E2BVolumeMount: %+v", gotMount)
 	}
 
-	pod, ok := mem.GetPod("cubepod-workloads", sb.SandboxID+"-kata-pod")
+	pod, ok := mem.GetPod("cubepod-workloads", sb.SandboxID)
 	if !ok {
-		t.Fatalf("expected pod %s-kata-pod", sb.SandboxID)
+		t.Fatalf("expected pod %s", sb.SandboxID)
 	}
 	stagingPath := "/run/cubepod/volumes/" + vol.VolumeID
 	wantEnv := `[{"volume_id":"` + vol.VolumeID + `","staging_path":"` + stagingPath + `","target_path":"/mnt/dataset"}]`

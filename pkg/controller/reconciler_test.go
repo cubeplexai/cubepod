@@ -135,7 +135,7 @@ func TestBuildKataPod_RuntimeInjectionAndDevices(t *testing.T) {
 		RootfsGeneration: 1,
 	}
 	status := v1alpha1.PodBoxStatus{
-		PodName:          "kata-box-kata-pod",
+		PodName:          "kata-box",
 		RootfsPVCName:    "kata-box-rootfs-pvc",
 		WorkspacePVCName: "kata-box-workspace-pvc",
 	}
@@ -146,8 +146,8 @@ func TestBuildKataPod_RuntimeInjectionAndDevices(t *testing.T) {
 	if pod.RuntimeClassName != "kata-qemu" {
 		t.Fatalf("expected RuntimeClassName kata-qemu, got %s", pod.RuntimeClassName)
 	}
-	if pod.Name != "kata-box-kata-pod" {
-		t.Fatalf("expected Pod name kata-box-kata-pod, got %s", pod.Name)
+	if pod.Name != "kata-box" {
+		t.Fatalf("expected Pod name kata-box, got %s", pod.Name)
 	}
 
 	// Volumes check: must have emptyDir for /opt/cubepod/bin and PVCs for rootfs and workspace
@@ -256,7 +256,7 @@ func TestBuildKataPod_EgressSidecar(t *testing.T) {
 		},
 	}
 	status := v1alpha1.PodBoxStatus{
-		PodName:          "egress-box-kata-pod",
+		PodName:          "egress-box",
 		RootfsPVCName:    "egress-box-rootfs-pvc",
 		WorkspacePVCName: "egress-box-workspace-pvc",
 	}
@@ -733,8 +733,8 @@ func TestReconciler_SyncFromKube_WarmPoolDeletionCleanup(t *testing.T) {
 	if unclaimedPodName == "" {
 		t.Fatal("expected to find unclaimed pod in kubeClient")
 	}
-	// PodName is <entryID>-kata-pod, PVCs are <entryID>-rootfs-pvc and <entryID>-workspace-pvc
-	entryID := strings.TrimSuffix(unclaimedPodName, "-kata-pod")
+	// PodName is <entryID>, PVCs are <entryID>-rootfs-pvc and <entryID>-workspace-pvc
+	entryID := unclaimedPodName
 	unclaimedRootfsPVC = entryID + "-rootfs-pvc"
 	unclaimedWorkspacePVC = entryID + "-workspace-pvc"
 
@@ -906,7 +906,7 @@ func TestBuildKataPod_ClaimLabels(t *testing.T) {
 	}
 	claimStatus := v1alpha1.PodBoxStatus{
 		Reason:  "WarmPoolClaimed",
-		PodName: "my-pool-warm-1-kata-pod",
+		PodName: "my-pool-warm-1",
 	}
 	claimedPod := controller.BuildKataPod("sandbox-claimer", tpl, claimSpec, claimStatus, "Filesystem")
 	if claimedPod.Labels["cubepod.io/claimed"] != "true" {
@@ -1027,7 +1027,7 @@ func TestReconciler_SyncFromKube_RebuildsEntriesAndCounter(t *testing.T) {
 
 	// 2. Pre-populate 2 pods: pod-1 is claimed, pod-2 is standby
 	pod1 := controller.PodManifest{
-		Name:      "rebuild-pool-warm-1-kata-pod",
+		Name:      "rebuild-pool-warm-1",
 		Namespace: "cubepod-workloads",
 		Labels: map[string]string{
 			"cubepod.io/warmpool":   "rebuild-pool",
@@ -1037,7 +1037,7 @@ func TestReconciler_SyncFromKube_RebuildsEntriesAndCounter(t *testing.T) {
 		},
 	}
 	pod2 := controller.PodManifest{
-		Name:      "rebuild-pool-warm-2-kata-pod",
+		Name:      "rebuild-pool-warm-2",
 		Namespace: "cubepod-workloads",
 		Labels: map[string]string{
 			"cubepod.io/warmpool": "rebuild-pool",
@@ -1082,7 +1082,7 @@ func TestReconciler_SyncFromKube_RebuildsEntriesAndCounter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimWarmPod failed: %v", err)
 	}
-	if claimed.PodName != "rebuild-pool-warm-2-kata-pod" {
+	if claimed.PodName != "rebuild-pool-warm-2" {
 		t.Fatalf("expected to claim pod 2, got %s", claimed.PodName)
 	}
 
@@ -1107,11 +1107,11 @@ func TestReconciler_SyncFromKube_RebuildsEntriesAndCounter(t *testing.T) {
 		t.Fatalf("ListPods failed: %v", err)
 	}
 	for _, p := range pods {
-		if strings.Contains(p.Name, "-warm-1-") || strings.Contains(p.Name, "-warm-2-") {
+		if strings.HasSuffix(p.Name, "-warm-1") || strings.HasSuffix(p.Name, "-warm-2") {
 			continue
 		}
 		// Any newly created pod should have index >= 3
-		if !strings.Contains(p.Name, "-warm-3-") && !strings.Contains(p.Name, "-warm-4-") {
+		if !strings.HasSuffix(p.Name, "-warm-3") && !strings.HasSuffix(p.Name, "-warm-4") {
 			t.Errorf("unexpected pod name created: %s", p.Name)
 		}
 	}
@@ -1168,7 +1168,7 @@ func TestReconciler_WarmPool_EnsurePodConflictClaimedNotAdopted(t *testing.T) {
 	memKube := controller.NewMemoryKubeClient()
 
 	// Pre-populate an existing pod that was already created and claimed
-	podName := "conflict-pool-warm-1-kata-pod"
+	podName := "conflict-pool-warm-1"
 	existingPod := controller.PodManifest{
 		Name:      podName,
 		Namespace: "cubepod-workloads",
@@ -1204,8 +1204,8 @@ func TestReconciler_WarmPool_EnsurePodConflictClaimedNotAdopted(t *testing.T) {
 	}
 
 	entries := r.GetWarmPoolEntries("conflict-pool")
-	if len(entries) != 1 || entries[0].PodName != "conflict-pool-warm-2-kata-pod" {
-		t.Fatalf("expected replacement entry conflict-pool-warm-2-kata-pod, got %+v", entries)
+	if len(entries) != 1 || entries[0].PodName != "conflict-pool-warm-2" {
+		t.Fatalf("expected replacement entry conflict-pool-warm-2, got %+v", entries)
 	}
 }
 
@@ -1302,7 +1302,7 @@ func TestReconciler_SyncFromKube_RefreshesExistingPodBoxStatus(t *testing.T) {
 		},
 		Status: v1alpha1.PodBoxStatus{
 			Phase:   v1alpha1.PodBoxPhasePaused,
-			PodName: "refresh-box-kata-pod",
+			PodName: "refresh-box",
 		},
 	}
 	if err := memKube.UpsertPodBox(ctx, pausedBox); err != nil {
@@ -1568,7 +1568,7 @@ func TestReconciler_WarmPool_409AdoptUnclaimed(t *testing.T) {
 	memKube := controller.NewMemoryKubeClient()
 
 	// Pre-populate an existing pod that was created and is unclaimed
-	podName := "adopt-pool-warm-1-kata-pod"
+	podName := "adopt-pool-warm-1"
 	existingPod := controller.PodManifest{
 		Name:      podName,
 		Namespace: "cubepod-workloads",
@@ -1619,7 +1619,7 @@ func TestReconciler_WarmPool_409ListPodsError(t *testing.T) {
 	}
 
 	// Pre-populate pod so EnsurePod returns 409
-	podName := "list-err-pool-warm-1-kata-pod"
+	podName := "list-err-pool-warm-1"
 	_ = memKube.Pods
 	if _, err := memKube.EnsurePod(ctx, controller.PodManifest{
 		Name:      podName,
@@ -1646,7 +1646,7 @@ func TestReconciler_WarmPool_409ListPodsError(t *testing.T) {
 		t.Fatalf("expected 1 available replica from warm-2, got %d", st.AvailableReplicas)
 	}
 	entries := r.GetWarmPoolEntries("list-err-pool")
-	if len(entries) != 1 || entries[0].PodName != "list-err-pool-warm-2-kata-pod" {
+	if len(entries) != 1 || entries[0].PodName != "list-err-pool-warm-2" {
 		t.Fatalf("expected entry to be warm-2, got: %+v", entries)
 	}
 }
@@ -1659,7 +1659,7 @@ func TestReconciler_WarmPool_409PodNotFoundInList(t *testing.T) {
 		emptyListPods:    true,
 	}
 
-	podName := "missing-pod-pool-warm-1-kata-pod"
+	podName := "missing-pod-pool-warm-1"
 	if _, err := memKube.EnsurePod(ctx, controller.PodManifest{
 		Name:      podName,
 		Namespace: "cubepod-workloads",
@@ -1994,7 +1994,7 @@ func TestReconcile_EgressSecretLifecycle(t *testing.T) {
 	}
 
 	// 3. Verify PodManifest wiring
-	pod, ok := memKube.GetPod("cubepod-workloads", boxName+"-kata-pod")
+	pod, ok := memKube.GetPod("cubepod-workloads", boxName)
 	if !ok {
 		t.Fatal("expected Pod manifest in MemoryKubeClient")
 	}
