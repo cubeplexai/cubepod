@@ -6,8 +6,11 @@ import { gunzipSync } from 'node:zlib';
 import {
   CubePodAPIError,
   CubePodClient,
+  CubepodClient,
   CubePodError,
   Sandbox,
+  Secret,
+  fillSecret,
 } from '../src/index.js';
 
 /**
@@ -844,6 +847,333 @@ test('Template v2/v3 catalog, encodeURIComponent alias escaping, X-Next-Token, 2
         return true;
       },
     );
+  } finally {
+    await srv.close();
+  }
+});
+
+
+test('Secrets, Volumes, Events, Webhooks, Metrics, and Desktop WebRTC', async () => {
+  /** @type {Array<{ method: string; pathname: string; search: string; headers: Record<string, string | string[] | undefined>; raw: Buffer }>} */
+  const requests = [];
+
+  const srv = await startServer(async (req, res) => {
+    const raw = await readBody(req);
+    const u = new URL(req.url ?? '/', 'http://127.0.0.1');
+    requests.push({
+      method: req.method ?? '',
+      pathname: u.pathname,
+      search: u.search,
+      headers: req.headers,
+      raw,
+    });
+
+    const bodyText = raw.toString('utf8');
+    const isJson = (req.headers['content-type'] ?? '').includes('application/json');
+    const parsed = isJson && bodyText ? JSON.parse(bodyText) : undefined;
+
+    res.setHeader('Content-Type', 'application/json');
+
+    // Secrets
+    if (req.method === 'POST' && u.pathname === '/secrets') {
+      assert.equal(req.headers['x-api-key'], 'cpod-ts-key');
+      res.statusCode = 201;
+      res.end(
+        JSON.stringify({
+          secretID: 'sec_ts_1',
+          name: parsed.name,
+          currentVersion: 1,
+          metadata: {},
+          createdAt: '2026-11-16T00:00:00Z',
+          updatedAt: '2026-11-16T00:00:00Z',
+        }),
+      );
+      return;
+    }
+    if (req.method === 'GET' && u.pathname === '/secrets') {
+      assert.equal(req.headers['x-api-key'], 'cpod-ts-key');
+      res.end(
+        JSON.stringify([
+          {
+            secretID: 'sec_ts_1',
+            name: 'stripe_key',
+            currentVersion: 1,
+            metadata: {},
+          },
+        ]),
+      );
+      return;
+    }
+    if (req.method === 'GET' && u.pathname === '/secrets/sec_ts_1') {
+      res.end(JSON.stringify({ secretID: 'sec_ts_1', name: 'stripe_key', currentVersion: 1 }));
+      return;
+    }
+    if (req.method === 'POST' && u.pathname === '/secrets/sec_ts_1') {
+      res.end(JSON.stringify({ secretID: 'sec_ts_1', name: 'stripe_key', currentVersion: 2 }));
+      return;
+    }
+    if (req.method === 'DELETE' && u.pathname === '/secrets/sec_ts_1') {
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    // Volumes
+    if (req.method === 'POST' && u.pathname === '/volumes') {
+      assert.equal(req.headers['x-api-key'], 'cpod-ts-key');
+      res.statusCode = 201;
+      res.end(JSON.stringify({ volumeID: 'vol_ts_1', name: parsed.name, token: 'vol_tok_ts' }));
+      return;
+    }
+    if (req.method === 'GET' && u.pathname === '/volumes') {
+      res.end(JSON.stringify([{ volumeID: 'vol_ts_1', name: 'assets' }]));
+      return;
+    }
+    if (req.method === 'GET' && u.pathname === '/volumes/vol_ts_1') {
+      res.end(JSON.stringify({ volumeID: 'vol_ts_1', name: 'assets', token: 'vol_tok_ts' }));
+      return;
+    }
+    if (req.method === 'DELETE' && u.pathname === '/volumes/vol_ts_1') {
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+    if (req.method === 'PUT' && u.pathname === '/volumecontent/vol_ts_1/file') {
+      assert.equal(req.headers.authorization, 'Bearer vol_tok_ts');
+      res.statusCode = 201;
+      res.end(
+        JSON.stringify({
+          name: 'notes.txt',
+          type: 'file',
+          path: u.searchParams.get('path'),
+          size: raw.length,
+          mode: 420,
+          uid: 1000,
+          gid: 1000,
+        }),
+      );
+      return;
+    }
+    if (req.method === 'GET' && u.pathname === '/volumecontent/vol_ts_1/file') {
+      assert.equal(req.headers.authorization, 'Bearer vol_tok_ts');
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.end(Buffer.from('volume-bytes-ok'));
+      return;
+    }
+
+    // Events & Webhooks
+    if (req.method === 'GET' && u.pathname === '/events') {
+      res.end(
+        JSON.stringify([
+          {
+            version: 'v1',
+            id: 'evt_ts_1',
+            type: 'sandbox.lifecycle.created',
+            timestamp: '2026-11-16T01:00:00Z',
+            eventCategory: 'lifecycle',
+            eventLabel: 'create',
+            sandboxId: 'cpod-ts-1',
+            eventData: null,
+          },
+        ]),
+      );
+      return;
+    }
+    if (req.method === 'GET' && u.pathname === '/sandboxes/cpod-ts-1/events') {
+      res.end(
+        JSON.stringify([
+          {
+            version: 'v1',
+            id: 'evt_ts_2',
+            type: 'sandbox.lifecycle.paused',
+            timestamp: '2026-11-16T01:05:00Z',
+            eventCategory: 'lifecycle',
+            eventLabel: 'pause',
+            sandboxId: 'cpod-ts-1',
+            eventData: { pause_mode: 'filesystem' },
+          },
+        ]),
+      );
+      return;
+    }
+    if (req.method === 'POST' && u.pathname === '/webhooks') {
+      res.statusCode = 201;
+      res.end(
+        JSON.stringify({
+          id: 'whk_ts_1',
+          name: parsed.name,
+          url: parsed.url,
+          events: parsed.events,
+          enabled: parsed.enabled,
+          signatureKey: 'whsec_ts_1',
+        }),
+      );
+      return;
+    }
+    if (req.method === 'GET' && u.pathname === '/webhooks') {
+      res.end(
+        JSON.stringify([
+          {
+            id: 'whk_ts_1',
+            name: 'ts-hook',
+            url: 'https://example.com/hook',
+            events: ['sandbox.lifecycle.created'],
+            enabled: true,
+          },
+        ]),
+      );
+      return;
+    }
+    if (req.method === 'GET' && u.pathname === '/webhooks/whk_ts_1') {
+      res.end(
+        JSON.stringify({
+          id: 'whk_ts_1',
+          name: 'ts-hook',
+          url: 'https://example.com/hook',
+          events: ['sandbox.lifecycle.created'],
+          enabled: true,
+        }),
+      );
+      return;
+    }
+    if (req.method === 'PATCH' && u.pathname === '/webhooks/whk_ts_1') {
+      res.end(
+        JSON.stringify({
+          id: 'whk_ts_1',
+          name: 'ts-hook',
+          url: parsed.url ?? 'https://example.com/hook',
+          events: parsed.events ?? ['sandbox.lifecycle.created'],
+          enabled: parsed.enabled ?? true,
+          signatureKey: parsed.rotateSecret ? 'whsec_ts_rotated' : undefined,
+        }),
+      );
+      return;
+    }
+    if (req.method === 'DELETE' && u.pathname === '/webhooks/whk_ts_1') {
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    // Sandbox & Metrics & Desktop
+    if (req.method === 'POST' && u.pathname === '/sandboxes') {
+      res.statusCode = 201;
+      res.end(JSON.stringify({ sandboxID: 'cpod-ts-1', templateID: 'base', state: 'Running' }));
+      return;
+    }
+    if (req.method === 'GET' && u.pathname === '/sandboxes/cpod-ts-1/metrics') {
+      res.end(
+        JSON.stringify([
+          {
+            timestamp: '2026-11-16T02:00:00Z',
+            timestampUnix: 1794794400,
+            cpuCount: 2,
+            cpuUsedPct: 33.5,
+            memUsed: 134217728,
+            memTotal: 536870912,
+            memCache: 16777216,
+            diskUsed: 104857600,
+            diskTotal: 10737418240,
+          },
+        ]),
+      );
+      return;
+    }
+    if (req.method === 'POST' && u.pathname === '/sandboxes/cpod-ts-1/desktop/start') {
+      res.end(
+        JSON.stringify({
+          status: 'running',
+          desktopUrl: '/panel/d1/vnc.html?autoconnect=true&resize=scale',
+          terminalUrl: '/panel/t1/',
+          cdpUrl: '/panel/c1/',
+          webrtcUrl: '/panel/w1/',
+          transportUsed: 'webrtc',
+          expiresAt: '2026-11-16T03:00:00Z',
+        }),
+      );
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ error: 'not found' }));
+  });
+
+  try {
+    assert.equal(Secret.fill('stripe_key'), '${e2b.secrets.stripe_key}');
+    assert.equal(fillSecret('stripe_key'), '${e2b.secrets.stripe_key}');
+    assert.equal(CubepodClient, CubePodClient);
+
+    const client = new CubePodClient({ baseUrl: srv.baseUrl, apiKey: 'cpod-ts-key' });
+    assert.equal(client.fillSecret('openai_key'), '${e2b.secrets.openai_key}');
+
+    // Secrets
+    const sec = await client.createSecret('stripe_key', 'sk_test_1');
+    assert.equal(sec.secretId, 'sec_ts_1');
+    assert.equal(sec.version, 1);
+
+    const secs = await client.listSecrets({ limit: 25, nextToken: 'tok-1' });
+    assert.equal(secs.length, 1);
+    assert.equal(requests.at(-1)?.search, '?limit=25&nextToken=tok-1');
+
+    assert.equal((await client.getSecret('sec_ts_1')).name, 'stripe_key');
+    assert.equal((await client.updateSecret('sec_ts_1', 'sk_test_2')).currentVersion, 2);
+    await client.deleteSecret('sec_ts_1');
+
+    // Volumes
+    const vol = await client.createVolume('assets');
+    assert.equal(vol.volumeId, 'vol_ts_1');
+    assert.equal(vol.token, 'vol_tok_ts');
+    assert.equal((await client.listVolumes()).length, 1);
+    assert.equal((await client.getVolume('vol_ts_1')).token, 'vol_tok_ts');
+
+    const entry = await client.writeVolumeFile('vol_ts_1', '/notes.txt', 'hello-ts', { force: true });
+    assert.equal(entry.path, '/notes.txt');
+    assert.equal(entry.size, 8);
+    const readBytes = await client.readVolumeFile('vol_ts_1', '/notes.txt', { token: vol.token });
+    assert.equal(Buffer.from(readBytes).toString('utf8'), 'volume-bytes-ok');
+    await client.deleteVolume('vol_ts_1');
+
+    // Events & Webhooks
+    const evts = await client.listEvents({ sandboxId: 'cpod-ts-1', limit: 10 });
+    assert.equal(evts.length, 1);
+    assert.equal(evts[0].type, 'sandbox.lifecycle.created');
+    assert.equal(requests.at(-1)?.search, '?sandboxID=cpod-ts-1&limit=10');
+
+    const wh = await client.createWebhook({
+      name: 'ts-hook',
+      url: 'https://example.com/hook',
+      events: ['sandbox.lifecycle.created'],
+    });
+    assert.equal(wh.signatureKey, 'whsec_ts_1');
+    assert.equal((await client.listWebhooks()).length, 1);
+    assert.equal((await client.getWebhook('whk_ts_1')).id, 'whk_ts_1');
+    const whRot = await client.updateWebhook('whk_ts_1', { enabled: false, rotateSecret: true });
+    assert.equal(whRot.enabled, false);
+    assert.equal(whRot.signatureKey, 'whsec_ts_rotated');
+    await client.deleteWebhook('whk_ts_1');
+
+    // Sandbox metrics, events, desktop WebRTC, and network/volumeMounts
+    const sbx = await Sandbox.create('base', {
+      client,
+      network: { allowOut: ['api.stripe.com'], denyOut: ['0.0.0.0/0'] },
+      volumeMounts: [{ name: 'assets', path: '/mnt/assets' }],
+    });
+    const metrics = await sbx.getMetrics({ start: 1794790800, end: new Date('2026-11-16T02:00:00Z') });
+    assert.equal(metrics.length, 1);
+    assert.equal(metrics[0].cpuCount, 2);
+    assert.equal(metrics[0].cpuUsedPct, 33.5);
+    assert.equal(
+      requests.at(-1)?.search,
+      '?start=1794790800&end=2026-11-16T02%3A00%3A00.000Z',
+    );
+
+    const sbxEvts = await sbx.listEvents();
+    assert.equal(sbxEvts.length, 1);
+    assert.equal(sbxEvts[0].id, 'evt_ts_2');
+
+    const desk = await sbx.startDesktop({ transport: 'webrtc' });
+    assert.equal(desk.transportUsed, 'webrtc');
+    assert.equal(desk.webrtcUrl, '/panel/w1/');
   } finally {
     await srv.close();
   }
