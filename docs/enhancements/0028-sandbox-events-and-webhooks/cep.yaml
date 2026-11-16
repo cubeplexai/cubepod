@@ -1,0 +1,29 @@
+title: "Sandbox Lifecycle Events and Signed Webhook Delivery"
+cep-number: "0028"
+authors:
+  - "@cubepod-maintainers"
+owning-area: "gateway"
+participating-areas:
+  - "controller"
+  - "sdk"
+status: "implementable"
+creation-date: "2026-11-16"
+reviewers:
+  - "@cubepod-maintainers"
+approvers:
+  - "@cubepod-maintainers"
+stage: "alpha"
+latest-milestone: "v0.6"
+milestone:
+  alpha: "v0.6"
+  beta: "v0.7"
+  stable: "v1.0"
+feature-gates:
+  - name: "SandboxEventsAndWebhooks"
+    components:
+      - "cubepod-gateway"
+disable-supported: true
+metrics:
+  - "cubepod_events_recorded_total"
+  - "cubepod_webhook_deliveries_total"
+  - "cubepod_webhook_queue_depth"
