@@ -3,7 +3,7 @@ title: E2B Compatibility Guide
 description: Point official E2B Python and TypeScript SDKs to CubePod using standard environment variables.
 ---
 
-CubePod implements core E2B REST and Connect-RPC endpoints as designed in [CEP-0018](/ceps/0018-e2b-protocol-compatibility/) and [CEP-0019](/ceps/0019-e2b-template-api/). Official E2B Python and TypeScript SDK clients can be redirected from hosted E2B to a self-hosted CubePod instance by configuring environment variables.
+CubePod implements the core E2B REST and Connect-RPC endpoints, allowing existing E2B SDK workflows to target a self-hosted CubePod cluster by configuring standard environment variables.
 
 :::tip[Detailed Compatibility Matrix & Architectural Differences]
 This page provides a concise setup guide for environment variables and minimal code examples. For the full per-method compatibility matrix, architectural differences (such as compute scale-to-zero vs memory snapshots), tested version constraints, and untested areas, see the **[E2B Compatibility Reference](/reference/e2b-compatibility/)**.

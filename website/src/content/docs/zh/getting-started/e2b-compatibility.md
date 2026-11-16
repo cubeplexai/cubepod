@@ -3,7 +3,7 @@ title: E2B 快速兼容接入
 description: 通过环境变量将官方 E2B Python 与 TypeScript SDK 接入 CubePod。
 ---
 
-依据 **[CEP-0018](/ceps/0018-e2b-protocol-compatibility/)** 与 **[CEP-0019](/ceps/0019-e2b-template-api/)** 设计规范，CubePod 实现了核心 E2B REST 与 Connect-RPC 接口。使用官方 E2B Python 或 TypeScript SDK 的工作流只需配置对应环境变量，即可将请求目标从托管 E2B 重定向至自建持久化 Kata 微虚拟机平台。
+CubePod 兼容核心 E2B REST 与 Connect-RPC 协议接口。现有的官方 E2B Python / TypeScript SDK 工作流只需配置对应环境变量，即可直接接入自建的 CubePod 持久化微虚拟机集群。
 
 :::tip[详细兼容矩阵与架构差异参考]
 本页为环境变量配置与极简调用代码的快速指引。关于按方法划分的详细兼容性矩阵、计算缩容至零 vs 物理内存快照等架构差异、实测版本约束及未测试边界，请参阅 **[E2B 兼容性与差异参考](/zh/reference/e2b-compatibility/)**。
