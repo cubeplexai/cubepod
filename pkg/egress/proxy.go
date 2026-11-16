@@ -42,15 +42,81 @@ type ExchangeResponse struct {
 	Error       string   `json:"error,omitempty"`
 }
 
+// VaultRehydrator attempts to re-hydrate a missing Vault binding (e.g., after an HA gateway
+// replica failover) for (sandboxID, placeholder). Returning nil indicates the binding has been
+// restored in Vault and Vault.Exchange should be retried.
+type VaultRehydrator func(ctx context.Context, sandboxID, placeholder string) error
+
+// RestoreManagedSecret restores an existing placeholder binding into the Vault
+// (used during HA cache-miss re-hydration from PodBox.Spec.NetworkPolicy.SecretRefBindings).
+func (v *Vault) RestoreManagedSecret(placeholder, sandboxID, tenantHash, secretID, envName, rawSecret string, allowedHosts, allowedHeaders []string) error {
+	if placeholder == "" {
+		return errors.New("placeholder cannot be empty")
+	}
+	if sandboxID == "" {
+		return errors.New("sandboxID cannot be empty")
+	}
+	if rawSecret == "" {
+		return errors.New("rawSecret cannot be empty")
+	}
+
+	hostsCopy := make([]string, len(allowedHosts))
+	copy(hostsCopy, allowedHosts)
+
+	headersCopy := make([]string, len(allowedHeaders))
+	copy(headersCopy, allowedHeaders)
+
+	v.mu.Lock()
+	if v.bindings == nil {
+		v.bindings = make(map[string]*SecretBinding)
+	}
+	v.bindings[placeholder] = &SecretBinding{
+		SandboxID:      sandboxID,
+		TenantHash:     tenantHash,
+		SecretID:       secretID,
+		EnvName:        envName,
+		RawSecret:      rawSecret,
+		AllowedHosts:   hostsCopy,
+		AllowedHeaders: headersCopy,
+	}
+	v.mu.Unlock()
+	return nil
+}
+
 // VaultExchangeHandler returns an http.HandlerFunc implementing the mTLS secret exchange endpoint.
-// It verifies the requesting sandbox identity via the mTLS peer certificate CommonName (or
-// X-CubePod-Sandbox-ID when running over local loopback trust in tests), validates
-// (sandboxID, placeholder, sniHost, headerName) via vault.Exchange(...), and returns the real secret.
+// When ca is non-nil, strict mTLS is enforced (requiring a verified peer certificate). When ca is nil
+// (local/unit testing), it falls back to X-CubePod-Sandbox-ID or req.SandboxID if no peer cert is present.
 func VaultExchangeHandler(vault *Vault, ca *CA) http.HandlerFunc {
+	return VaultExchangeHandlerWithRehydrator(vault, ca, nil)
+}
+
+// VaultExchangeHandlerWithRehydrator returns an http.HandlerFunc implementing the mTLS secret
+// exchange endpoint with an optional cache-miss rehydrator callback for HA gateway replicas.
+func VaultExchangeHandlerWithRehydrator(vault *Vault, ca *CA, rehydrate VaultRehydrator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
+		}
+
+		// 1. Extract sandboxID from mTLS peer certificate CommonName.
+		// When ca != nil, strict mTLS is required and non-mTLS header/body fallbacks are rejected.
+		var clientSandboxID string
+		if ca != nil {
+			if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+				http.Error(w, "mTLS client certificate required", http.StatusForbidden)
+				return
+			}
+			if len(r.TLS.VerifiedChains) == 0 {
+				if _, err := r.TLS.PeerCertificates[0].Verify(x509.VerifyOptions{
+					Roots:     ca.CertPool(),
+					KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+				}); err != nil {
+					http.Error(w, "invalid mTLS client certificate", http.StatusForbidden)
+					return
+				}
+			}
+			clientSandboxID = r.TLS.PeerCertificates[0].Subject.CommonName
 		}
 
 		var req ExchangeRequest
@@ -59,16 +125,16 @@ func VaultExchangeHandler(vault *Vault, ca *CA) http.HandlerFunc {
 			return
 		}
 
-		// 1. Extract sandboxID from mTLS peer certificate CommonName
-		var clientSandboxID string
-		if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
-			clientSandboxID = r.TLS.PeerCertificates[0].Subject.CommonName
-		}
-		if clientSandboxID == "" {
-			clientSandboxID = r.Header.Get("X-CubePod-Sandbox-ID")
-		}
-		if clientSandboxID == "" {
-			clientSandboxID = req.SandboxID
+		if ca == nil {
+			if r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+				clientSandboxID = r.TLS.PeerCertificates[0].Subject.CommonName
+			}
+			if clientSandboxID == "" {
+				clientSandboxID = r.Header.Get("X-CubePod-Sandbox-ID")
+			}
+			if clientSandboxID == "" {
+				clientSandboxID = req.SandboxID
+			}
 		}
 
 		if clientSandboxID == "" {
@@ -76,9 +142,14 @@ func VaultExchangeHandler(vault *Vault, ca *CA) http.HandlerFunc {
 			return
 		}
 
-		// If sandboxID was also sent in the request body, it must match client certificate
+		// If sandboxID was also sent in the request body, it must match client identity
 		if req.SandboxID != "" && req.SandboxID != clientSandboxID {
 			http.Error(w, "sandbox identity mismatch", http.StatusForbidden)
+			return
+		}
+
+		if vault == nil {
+			http.Error(w, "egress vault is not initialized", http.StatusInternalServerError)
 			return
 		}
 
@@ -87,8 +158,13 @@ func VaultExchangeHandler(vault *Vault, ca *CA) http.HandlerFunc {
 			sniHost = req.Host
 		}
 
-		// 2. Perform zero-trust exchange via Vault
+		// 2. Perform zero-trust exchange via Vault (with optional HA re-hydration on cache miss)
 		secret, err := vault.Exchange(clientSandboxID, req.Placeholder, sniHost, req.HeaderName)
+		if errors.Is(err, ErrUnknownPlaceholder) && rehydrate != nil {
+			if rErr := rehydrate(r.Context(), clientSandboxID, req.Placeholder); rErr == nil {
+				secret, err = vault.Exchange(clientSandboxID, req.Placeholder, sniHost, req.HeaderName)
+			}
+		}
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)

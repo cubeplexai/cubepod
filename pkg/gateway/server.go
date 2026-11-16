@@ -258,6 +258,7 @@ type Server struct {
 	panelSecret      []byte
 	vault            *egress.Vault
 	ca               *egress.CA
+	strictEgressMTLS bool
 	livePodRouting   bool
 	metrics          *Metrics
 	e2bTemplateAPI   bool
@@ -293,7 +294,12 @@ func (s *Server) Runtime() runtime.Backend {
 // NewServer constructs a new Gateway Server.
 func NewServer(reconciler *controller.Reconciler) *Server {
 	v := egress.NewVault()
-	ca, _ := egress.NewCA()
+	var ca *egress.CA
+	if reconciler != nil && reconciler.EgressCA() != nil {
+		ca = reconciler.EgressCA()
+	} else {
+		ca, _ = egress.NewCA()
+	}
 	e2bAPI := false
 	tplBuild := false
 	if reconciler != nil {
@@ -689,8 +695,28 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
+// SetStrictEgressMTLS configures whether /internal/v1/egress/exchange on the main listener
+// requires verified mTLS client certificates (rejecting header/body fallbacks).
+func (s *Server) SetStrictEgressMTLS(strict bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.strictEgressMTLS = strict
+}
+
+// EgressExchangeHandler returns the strict-mTLS Vault exchange handler with HA re-hydration.
+func (s *Server) EgressExchangeHandler() http.HandlerFunc {
+	return egress.VaultExchangeHandlerWithRehydrator(s.vault, s.ca, s.rehydrateVaultBinding)
+}
+
 func (s *Server) handleEgressExchange(w http.ResponseWriter, r *http.Request) {
-	h := egress.VaultExchangeHandler(s.vault, s.ca)
+	s.mu.RLock()
+	strict := s.strictEgressMTLS
+	s.mu.RUnlock()
+	var ca *egress.CA
+	if strict {
+		ca = s.ca
+	}
+	h := egress.VaultExchangeHandlerWithRehydrator(s.vault, ca, s.rehydrateVaultBinding)
 	h(w, r)
 }
 

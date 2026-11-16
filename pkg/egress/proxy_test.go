@@ -2,6 +2,7 @@ package egress_test
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -201,7 +202,10 @@ func TestEgressProxyPolicyEnforcement(t *testing.T) {
 
 func TestVaultExchangeHandlerDirect(t *testing.T) {
 	vault := egress.NewVault()
-	ca, _ := egress.NewCA()
+	ca, err := egress.NewCA()
+	if err != nil {
+		t.Fatalf("NewCA failed: %v", err)
+	}
 
 	sandboxID := "sbx-direct-01"
 	ph, err := vault.BindSecret(sandboxID, "KEY", "secret-xyz", []string{"api.example.com"}, []string{"Authorization"})
@@ -209,30 +213,65 @@ func TestVaultExchangeHandlerDirect(t *testing.T) {
 		t.Fatalf("BindSecret failed: %v", err)
 	}
 
-	handler := egress.VaultExchangeHandler(vault, ca)
-
-	// Test with loopback header X-CubePod-Sandbox-ID
 	payload := fmt.Sprintf(`{"sandboxID":"%s","placeholder":"%s","sniHost":"api.example.com","headerName":"Authorization"}`, sandboxID, ph)
+
+	// 1. When ca != nil, non-mTLS requests (even with X-CubePod-Sandbox-ID / req.SandboxID) MUST be rejected with 403
+	strictHandler := egress.VaultExchangeHandler(vault, ca)
+	reqNoTLS := httptest.NewRequest(http.MethodPost, "/internal/v1/egress/exchange", strings.NewReader(payload))
+	reqNoTLS.Header.Set("Content-Type", "application/json")
+	reqNoTLS.Header.Set("X-CubePod-Sandbox-ID", sandboxID)
+	recNoTLS := httptest.NewRecorder()
+	strictHandler.ServeHTTP(recNoTLS, reqNoTLS)
+	if recNoTLS.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for non-mTLS when ca != nil, got %d: %s", recNoTLS.Code, recNoTLS.Body.String())
+	}
+
+	// 2. When ca != nil, real mTLS with client certificate succeeds
+	srvTLS, err := ca.ServerTLSConfig("127.0.0.1", "localhost")
+	if err != nil {
+		t.Fatalf("ServerTLSConfig failed: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(strictHandler)
+	srv.TLS = srvTLS
+	srv.StartTLS()
+	defer srv.Close()
+
+	certPEM, keyPEM, err := ca.MintSandboxCert(sandboxID, time.Hour)
+	if err != nil {
+		t.Fatalf("MintSandboxCert failed: %v", err)
+	}
+	clientTLS, err := ca.ClientTLSConfig(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("ClientTLSConfig failed: %v", err)
+	}
+	mtlsClient := &http.Client{Transport: &http.Transport{TLSClientConfig: clientTLS}}
+	resp, err := mtlsClient.Post(srv.URL+"/internal/v1/egress/exchange", "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("mTLS Post failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "secret-xyz") {
+		t.Fatalf("expected 200 OK with secret over mTLS, got %d: %s", resp.StatusCode, string(body))
+	}
+
+	// 3. When ca == nil (local/unit test mode), loopback header X-CubePod-Sandbox-ID fallback works
+	localHandler := egress.VaultExchangeHandler(vault, nil)
 	req := httptest.NewRequest(http.MethodPost, "/internal/v1/egress/exchange", strings.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-CubePod-Sandbox-ID", sandboxID)
 	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), "secret-xyz") {
-		t.Fatalf("expected secret in response: %s", rec.Body.String())
+	localHandler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "secret-xyz") {
+		t.Fatalf("expected 200 OK with secret when ca == nil, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	// Test sandbox mismatch
+	// 4. Test sandbox mismatch when ca == nil
 	reqMismatch := httptest.NewRequest(http.MethodPost, "/internal/v1/egress/exchange", strings.NewReader(payload))
 	reqMismatch.Header.Set("Content-Type", "application/json")
 	reqMismatch.Header.Set("X-CubePod-Sandbox-ID", "imposter")
 	recMismatch := httptest.NewRecorder()
-
-	handler.ServeHTTP(recMismatch, reqMismatch)
+	localHandler.ServeHTTP(recMismatch, reqMismatch)
 	if recMismatch.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 Forbidden on sandbox mismatch, got %d", recMismatch.Code)
 	}
@@ -490,10 +529,6 @@ func TestVaultManagedSecretRotationRevocationAndMITMTransforms(t *testing.T) {
 	upstreamPool.AddCert(upstream.Certificate())
 
 	vault := egress.NewVault()
-	ca, err := egress.NewCA()
-	if err != nil {
-		t.Fatalf("NewCA: %v", err)
-	}
 	mitmCA, err := egress.NewCA()
 	if err != nil {
 		t.Fatalf("NewCA mitm: %v", err)
@@ -509,7 +544,7 @@ func TestVaultManagedSecretRotationRevocationAndMITMTransforms(t *testing.T) {
 		MITMCA:           mitmCA,
 		UpstreamRootCAs:  upstreamPool,
 		UpstreamDialAddr: map[string]string{"example.com:443": upstreamHostPort},
-		ExchangeHandler:  egress.VaultExchangeHandler(vault, ca),
+		ExchangeHandler:  egress.VaultExchangeHandler(vault, nil),
 		Policy: v1alpha1.NetworkPolicySpec{
 			DefaultAction: v1alpha1.NetworkDefaultDeny,
 			AllowHosts:    []string{"example.com"},
@@ -586,5 +621,84 @@ func TestVaultManagedSecretRotationRevocationAndMITMTransforms(t *testing.T) {
 	_ = resp4.Body.Close()
 	if resp4.StatusCode != http.StatusForbidden {
 		t.Fatalf("step 4 revoked status = %d; want 403", resp4.StatusCode)
+	}
+}
+
+func TestVaultExchangeHandlerRehydrationAndStrictMTLS(t *testing.T) {
+	vault := egress.NewVault()
+	ca, err := egress.NewCA()
+	if err != nil {
+		t.Fatalf("NewCA: %v", err)
+	}
+
+	sandboxID := "sbx-rehydrate-1"
+	placeholder := "cpodref_ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+	rehydrateCalls := 0
+	rehydrate := func(_ context.Context, sbxID, ph string) error {
+		rehydrateCalls++
+		if sbxID != sandboxID || ph != placeholder {
+			return egress.ErrUnknownPlaceholder
+		}
+		return vault.RestoreManagedSecret(ph, sbxID, "tenant-a", "sec_1", "", "sk-rehydrated-999", []string{"api.openai.com"}, []string{"Authorization"})
+	}
+
+	srvTLS, err := ca.ServerTLSConfig("127.0.0.1", "localhost")
+	if err != nil {
+		t.Fatalf("ServerTLSConfig: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(egress.VaultExchangeHandlerWithRehydrator(vault, ca, rehydrate))
+	srv.TLS = srvTLS
+	srv.StartTLS()
+	defer srv.Close()
+
+	certPEM, keyPEM, err := ca.MintSandboxCert(sandboxID, time.Hour)
+	if err != nil {
+		t.Fatalf("MintSandboxCert: %v", err)
+	}
+	clientTLS, err := ca.ClientTLSConfig(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("ClientTLSConfig: %v", err)
+	}
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: clientTLS}}
+
+	payload := fmt.Sprintf(`{"sandboxID":"%s","placeholder":"%s","sniHost":"api.openai.com","headerName":"Authorization"}`, sandboxID, placeholder)
+
+	// First call hits cache miss -> triggers rehydrate -> succeeds 200
+	resp1, err := client.Post(srv.URL+"/internal/v1/egress/exchange", "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("Post 1: %v", err)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK || !strings.Contains(string(body1), "sk-rehydrated-999") {
+		t.Fatalf("expected 200 OK with rehydrated secret, got %d: %s", resp1.StatusCode, string(body1))
+	}
+	if rehydrateCalls != 1 {
+		t.Fatalf("expected 1 rehydrate call, got %d", rehydrateCalls)
+	}
+
+	// Second call hits Vault cache directly without calling rehydrate again
+	resp2, err := client.Post(srv.URL+"/internal/v1/egress/exchange", "application/json", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("Post 2: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK on cached exchange, got %d", resp2.StatusCode)
+	}
+	if rehydrateCalls != 1 {
+		t.Fatalf("expected cached exchange not to call rehydrate again, got %d", rehydrateCalls)
+	}
+
+	// Unknown placeholder where rehydrate returns error -> fails closed 403
+	badPayload := fmt.Sprintf(`{"sandboxID":"%s","placeholder":"cpodref_UNKNOWN000000000000000000000000","sniHost":"api.openai.com","headerName":"Authorization"}`, sandboxID)
+	resp3, err := client.Post(srv.URL+"/internal/v1/egress/exchange", "application/json", strings.NewReader(badPayload))
+	if err != nil {
+		t.Fatalf("Post 3: %v", err)
+	}
+	_ = resp3.Body.Close()
+	if resp3.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for unknown placeholder, got %d", resp3.StatusCode)
 	}
 }

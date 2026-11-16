@@ -1,8 +1,9 @@
-// Package secret implements the tenant-isolated, AES-256-GCM encrypted
-// durable store for official E2B /secrets management (CEP-0027).
+// Package secret implements the tenant-isolated, durable secret store
+// for official E2B /secrets management (CEP-0027).
 package secret
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -20,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -79,16 +81,8 @@ type SecretInfo struct {
 	UpdatedAt time.Time         `json:"updatedAt"`
 }
 
-// Config configures the encrypted durable secret store.
-type Config struct {
-	// EncryptionKey is an optional 32-byte AES-256 key. If empty, a key is
-	// loaded from or generated at <dir>/.kek with 0600 permissions.
-	EncryptionKey []byte
-	// MaxSecretsPerTenant caps secrets per tenant (default 100).
-	MaxSecretsPerTenant int
-}
-
-type storedSecret struct {
+// StoredSecret represents a durable secret record persisted by a Backend.
+type StoredSecret struct {
 	TenantHash string     `json:"tenantHash"`
 	ID         string     `json:"id"`
 	Name       string     `json:"name"`
@@ -98,6 +92,26 @@ type storedSecret struct {
 	Value      string     `json:"value"`
 }
 
+// Backend abstracts durable persistence for E2B secrets (local encrypted file or K8s Secrets).
+type Backend interface {
+	LoadAll(ctx context.Context) ([]StoredSecret, error)
+	Put(ctx context.Context, rec StoredSecret) error
+	Delete(ctx context.Context, id string) error
+}
+
+// Config configures the durable secret store.
+type Config struct {
+	// EncryptionKey is an optional 32-byte AES-256 key for FileBackend. If empty, a key is
+	// loaded from or generated at <dir>/.kek with 0600 permissions.
+	EncryptionKey []byte
+	// MaxSecretsPerTenant caps secrets per tenant (default 100).
+	MaxSecretsPerTenant int
+	// OnUpdate is invoked when Sync detects a secret value or version update from another replica.
+	OnUpdate func(tenantHash, secretID string, value SecretValue)
+	// OnRevoke is invoked when Sync detects a secret deletion from another replica.
+	OnRevoke func(tenantHash, secretID string)
+}
+
 type encryptedEnvelope struct {
 	Version    int    `json:"version"`
 	Nonce      string `json:"nonce"`
@@ -105,18 +119,233 @@ type encryptedEnvelope struct {
 }
 
 type diskState struct {
-	Secrets []storedSecret `json:"secrets"`
+	Secrets []StoredSecret `json:"secrets"`
 }
 
-// Store manages tenant-isolated E2B secrets encrypted at rest with AES-256-GCM.
+// FileBackend persists all secrets in an AES-256-GCM encrypted JSON envelope under dir.
+type FileBackend struct {
+	mu      sync.Mutex
+	dir     string
+	key     []byte
+	records map[string]StoredSecret
+}
+
+// NewFileBackend initializes an AES-256-GCM encrypted file backend under dir.
+func NewFileBackend(dir string, encryptionKey []byte) (*FileBackend, error) {
+	if strings.TrimSpace(dir) == "" {
+		return nil, errors.New("secret store dir is required")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("create secret dir: %w", err)
+	}
+	key, err := resolveKEK(dir, encryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	return &FileBackend{
+		dir:     dir,
+		key:     key,
+		records: make(map[string]StoredSecret),
+	}, nil
+}
+
+// LoadAll reads and decrypts all secrets from secrets.enc.json.
+func (b *FileBackend) LoadAll(_ context.Context) ([]StoredSecret, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	path := filepath.Join(b.dir, secretsFileName)
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		b.records = make(map[string]StoredSecret)
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read secrets store: %w", err)
+	}
+
+	var env encryptedEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("decode secrets envelope: %w", err)
+	}
+	nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
+	if err != nil {
+		return nil, fmt.Errorf("decode secrets nonce: %w", err)
+	}
+	ct, err := base64.StdEncoding.DecodeString(env.Ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("decode secrets ciphertext: %w", err)
+	}
+
+	block, err := aes.NewCipher(b.key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	plain, err := gcm.Open(nil, nonce, ct, nil)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt secrets store: %w", err)
+	}
+
+	var state diskState
+	if err := json.Unmarshal(plain, &state); err != nil {
+		return nil, fmt.Errorf("decode secrets state: %w", err)
+	}
+
+	next := make(map[string]StoredSecret, len(state.Secrets))
+	for _, rec := range state.Secrets {
+		next[rec.ID] = rec
+	}
+	b.records = next
+	return state.Secrets, nil
+}
+
+// Put writes or updates a secret and atomically persists the encrypted envelope.
+func (b *FileBackend) Put(_ context.Context, rec StoredSecret) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	prev, existed := b.records[rec.ID]
+	b.records[rec.ID] = rec
+	if err := b.saveLocked(); err != nil {
+		if existed {
+			b.records[rec.ID] = prev
+		} else {
+			delete(b.records, rec.ID)
+		}
+		return err
+	}
+	return nil
+}
+
+// Delete removes a secret and atomically persists the encrypted envelope.
+func (b *FileBackend) Delete(_ context.Context, id string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	prev, existed := b.records[id]
+	if !existed {
+		return nil
+	}
+	delete(b.records, id)
+	if err := b.saveLocked(); err != nil {
+		b.records[id] = prev
+		return err
+	}
+	return nil
+}
+
+func (b *FileBackend) saveLocked() error {
+	state := diskState{
+		Secrets: make([]StoredSecret, 0, len(b.records)),
+	}
+	for _, rec := range b.records {
+		state.Secrets = append(state.Secrets, rec)
+	}
+	sort.Slice(state.Secrets, func(i, j int) bool {
+		return state.Secrets[i].ID < state.Secrets[j].ID
+	})
+
+	plain, err := json.Marshal(state)
+	if err != nil {
+		return err
+	}
+
+	block, err := aes.NewCipher(b.key)
+	if err != nil {
+		return err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return err
+	}
+	ct := gcm.Seal(nil, nonce, plain, nil)
+
+	env := encryptedEnvelope{
+		Version:    1,
+		Nonce:      base64.StdEncoding.EncodeToString(nonce),
+		Ciphertext: base64.StdEncoding.EncodeToString(ct),
+	}
+	data, err := json.Marshal(env)
+	if err != nil {
+		return err
+	}
+
+	path := filepath.Join(b.dir, secretsFileName)
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+type opCounterPair struct {
+	ok  atomic.Uint64
+	err atomic.Uint64
+}
+
+func (p *opCounterPair) record(err error) {
+	if err != nil {
+		p.err.Add(1)
+	} else {
+		p.ok.Add(1)
+	}
+}
+
+type storeMetrics struct {
+	create  opCounterPair
+	list    opCounterPair
+	get     opCounterPair
+	update  opCounterPair
+	delete  opCounterPair
+	resolve opCounterPair
+}
+
+func (m *storeMetrics) snapshot() map[string]map[string]uint64 {
+	return map[string]map[string]uint64{
+		"create":  {"ok": m.create.ok.Load(), "error": m.create.err.Load()},
+		"list":    {"ok": m.list.ok.Load(), "error": m.list.err.Load()},
+		"get":     {"ok": m.get.ok.Load(), "error": m.get.err.Load()},
+		"update":  {"ok": m.update.ok.Load(), "error": m.update.err.Load()},
+		"delete":  {"ok": m.delete.ok.Load(), "error": m.delete.err.Load()},
+		"resolve": {"ok": m.resolve.ok.Load(), "error": m.resolve.err.Load()},
+	}
+}
+
+// Store manages tenant-isolated E2B secrets backed by a durable Backend.
 type Store struct {
 	mu        sync.RWMutex
-	dir       string
-	key       []byte
+	backend   Backend
 	maxPerTen int
-	byID      map[string]*storedSecret
+	byID      map[string]*StoredSecret
 	byTenName map[string]string // tenantHash + "\x00" + name -> id
 	nowFn     func() time.Time
+	writeSeq  atomic.Uint64
+	metrics   storeMetrics
+	onUpdate  func(tenantHash, secretID string, value SecretValue)
+	onRevoke  func(tenantHash, secretID string)
 }
 
 // TenantHash derives a stable opaque tenant identifier from an API key.
@@ -125,34 +354,34 @@ func TenantHash(apiKey string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Open opens or initializes an encrypted secret store under dir.
+// Open opens or initializes an AES-256-GCM encrypted file-backed secret store under dir.
 func Open(dir string, cfg Config) (*Store, error) {
-	if strings.TrimSpace(dir) == "" {
-		return nil, errors.New("secret store dir is required")
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create secret dir: %w", err)
-	}
-
-	key, err := resolveKEK(dir, cfg.EncryptionKey)
+	backend, err := NewFileBackend(dir, cfg.EncryptionKey)
 	if err != nil {
 		return nil, err
 	}
+	return OpenWithBackend(backend, cfg)
+}
 
+// OpenWithBackend initializes a secret Store backed by the provided Backend and performs an initial load.
+func OpenWithBackend(backend Backend, cfg Config) (*Store, error) {
+	if backend == nil {
+		return nil, errors.New("secret backend is required")
+	}
 	maxPerTen := cfg.MaxSecretsPerTenant
 	if maxPerTen <= 0 {
 		maxPerTen = DefaultMaxSecretsPerTenant
 	}
-
 	st := &Store{
-		dir:       dir,
-		key:       key,
+		backend:   backend,
 		maxPerTen: maxPerTen,
-		byID:      make(map[string]*storedSecret),
+		byID:      make(map[string]*StoredSecret),
 		byTenName: make(map[string]string),
 		nowFn:     func() time.Time { return time.Now().UTC() },
+		onUpdate:  cfg.OnUpdate,
+		onRevoke:  cfg.OnRevoke,
 	}
-	if err := st.load(); err != nil {
+	if err := st.loadInitial(context.Background()); err != nil {
 		return nil, err
 	}
 	return st, nil
@@ -198,116 +427,125 @@ func resolveKEK(dir string, explicit []byte) ([]byte, error) {
 	return key, nil
 }
 
-func (s *Store) load() error {
-	path := filepath.Join(s.dir, secretsFileName)
-	raw, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("read secrets store: %w", err)
-	}
-
-	var env encryptedEnvelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return fmt.Errorf("decode secrets envelope: %w", err)
-	}
-	nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
-	if err != nil {
-		return fmt.Errorf("decode secrets nonce: %w", err)
-	}
-	ct, err := base64.StdEncoding.DecodeString(env.Ciphertext)
-	if err != nil {
-		return fmt.Errorf("decode secrets ciphertext: %w", err)
-	}
-
-	block, err := aes.NewCipher(s.key)
+func (s *Store) loadInitial(ctx context.Context) error {
+	records, err := s.backend.LoadAll(ctx)
 	if err != nil {
 		return err
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
-	plain, err := gcm.Open(nil, nonce, ct, nil)
-	if err != nil {
-		return fmt.Errorf("decrypt secrets store: %w", err)
-	}
-
-	var state diskState
-	if err := json.Unmarshal(plain, &state); err != nil {
-		return fmt.Errorf("decode secrets state: %w", err)
-	}
-	for i := range state.Secrets {
-		rec := state.Secrets[i]
-		cp := rec
+	for i := range records {
+		cp := records[i]
+		if cp.ID == "" {
+			continue
+		}
 		s.byID[cp.ID] = &cp
 		s.byTenName[tenNameKey(cp.TenantHash, cp.Name)] = cp.ID
 	}
 	return nil
 }
 
-func (s *Store) saveLocked() error {
-	state := diskState{
-		Secrets: make([]storedSecret, 0, len(s.byID)),
-	}
-	for _, rec := range s.byID {
-		state.Secrets = append(state.Secrets, *rec)
-	}
-	sort.Slice(state.Secrets, func(i, j int) bool {
-		return state.Secrets[i].ID < state.Secrets[j].ID
-	})
+// SetSyncCallbacks configures callbacks invoked when Sync observes updates or deletions from other replicas.
+func (s *Store) SetSyncCallbacks(onUpdate func(tenantHash, secretID string, value SecretValue), onRevoke func(tenantHash, secretID string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onUpdate = onUpdate
+	s.onRevoke = onRevoke
+}
 
-	plain, err := json.Marshal(state)
-	if err != nil {
-		return err
-	}
+type syncedUpdate struct {
+	tenantHash string
+	secretID   string
+	value      SecretValue
+}
 
-	block, err := aes.NewCipher(s.key)
-	if err != nil {
-		return err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return err
-	}
-	ct := gcm.Seal(nil, nonce, plain, nil)
+type syncedRevoke struct {
+	tenantHash string
+	secretID   string
+}
 
-	env := encryptedEnvelope{
-		Version:    1,
-		Nonce:      base64.StdEncoding.EncodeToString(nonce),
-		Ciphertext: base64.StdEncoding.EncodeToString(ct),
+// Sync refreshes the in-memory store from the underlying Backend and invokes
+// update/revoke callbacks for any rotations or deletions made by other replicas.
+func (s *Store) Sync(ctx context.Context) error {
+	if s.backend == nil {
+		return nil
 	}
-	data, err := json.Marshal(env)
+	seqBefore := s.writeSeq.Load()
+	records, err := s.backend.LoadAll(ctx)
 	if err != nil {
 		return err
 	}
 
-	path := filepath.Join(s.dir, secretsFileName)
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
+	nextByID := make(map[string]*StoredSecret, len(records))
+	nextByTenName := make(map[string]string, len(records))
+	for i := range records {
+		cp := records[i]
+		if cp.ID == "" {
+			continue
+		}
+		nextByID[cp.ID] = &cp
+		nextByTenName[tenNameKey(cp.TenantHash, cp.Name)] = cp.ID
 	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
+
+	s.mu.Lock()
+	if s.writeSeq.Load() != seqBefore {
+		s.mu.Unlock()
+		return nil
 	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
+	var updates []syncedUpdate
+	var revokes []syncedRevoke
+	for id, oldRec := range s.byID {
+		newRec, exists := nextByID[id]
+		if !exists {
+			revokes = append(revokes, syncedRevoke{tenantHash: oldRec.TenantHash, secretID: oldRec.ID})
+			continue
+		}
+		if newRec.Version != oldRec.Version || newRec.Value != oldRec.Value {
+			updates = append(updates, syncedUpdate{
+				tenantHash: newRec.TenantHash,
+				secretID:   newRec.ID,
+				value:      SecretValue(newRec.Value),
+			})
+		}
 	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
+	s.byID = nextByID
+	s.byTenName = nextByTenName
+	onUpdate := s.onUpdate
+	onRevoke := s.onRevoke
+	s.mu.Unlock()
+
+	for _, u := range updates {
+		if onUpdate != nil {
+			onUpdate(u.tenantHash, u.secretID, u.value)
+		}
 	}
-	return os.Rename(tmp, path)
+	for _, r := range revokes {
+		if onRevoke != nil {
+			onRevoke(r.tenantHash, r.secretID)
+		}
+	}
+	return nil
+}
+
+// StartSync runs a periodic Sync loop in the background until ctx is cancelled.
+func (s *Store) StartSync(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				syncCtx, cancel := context.WithTimeout(ctx, interval)
+				if err := s.Sync(syncCtx); err != nil && ctx.Err() == nil {
+					slog.Warn("E2B secret store sync failed", "err", err)
+				}
+				cancel()
+			}
+		}
+	}()
 }
 
 func tenNameKey(tenantHash, name string) string {
@@ -339,7 +577,7 @@ func newSecretID() (string, error) {
 	return "sec_" + hex.EncodeToString(b[:]), nil
 }
 
-func toInfo(rec *storedSecret) SecretInfo {
+func toInfo(rec *StoredSecret) SecretInfo {
 	updated := rec.CreatedAt
 	if rec.UpdatedAt != nil {
 		updated = *rec.UpdatedAt
@@ -355,7 +593,9 @@ func toInfo(rec *storedSecret) SecretInfo {
 }
 
 // Create stores a new secret for the tenant identified by apiKey.
-func (s *Store) Create(apiKey, name, value string) (SecretInfo, error) {
+func (s *Store) Create(apiKey, name, value string) (info SecretInfo, err error) {
+	defer func() { s.metrics.create.record(err) }()
+
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
 		return SecretInfo{}, err
@@ -386,7 +626,7 @@ func (s *Store) Create(apiKey, name, value string) (SecretInfo, error) {
 		return SecretInfo{}, err
 	}
 
-	rec := &storedSecret{
+	rec := &StoredSecret{
 		TenantHash: tenant,
 		ID:         id,
 		Name:       name,
@@ -397,16 +637,19 @@ func (s *Store) Create(apiKey, name, value string) (SecretInfo, error) {
 	s.byID[id] = rec
 	s.byTenName[tenNameKey(tenant, name)] = id
 
-	if err := s.saveLocked(); err != nil {
+	if err := s.backend.Put(context.Background(), *rec); err != nil {
 		delete(s.byID, id)
 		delete(s.byTenName, tenNameKey(tenant, name))
 		return SecretInfo{}, err
 	}
+	s.writeSeq.Add(1)
 	return toInfo(rec), nil
 }
 
 // List returns paginated secret metadata (never values) for the tenant.
-func (s *Store) List(apiKey string, limit int, nextToken string) ([]SecretInfo, string, error) {
+func (s *Store) List(apiKey string, limit int, nextToken string) (items []SecretInfo, next string, err error) {
+	defer func() { s.metrics.list.record(err) }()
+
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
 		return nil, "", err
@@ -431,7 +674,6 @@ func (s *Store) List(apiKey string, limit int, nextToken string) ([]SecretInfo, 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var items []SecretInfo
 	for _, rec := range s.byID {
 		if rec.TenantHash == tenant {
 			items = append(items, toInfo(rec))
@@ -448,16 +690,15 @@ func (s *Store) List(apiKey string, limit int, nextToken string) ([]SecretInfo, 
 		return []SecretInfo{}, "", nil
 	}
 	end := offset + limit
-	var outNext string
 	if end < len(items) {
-		outNext = base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(end)))
+		next = base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(end)))
 	} else {
 		end = len(items)
 	}
-	return items[offset:end], outNext, nil
+	return items[offset:end], next, nil
 }
 
-func (s *Store) findLocked(tenant, idOrName string) (*storedSecret, bool) {
+func (s *Store) findLocked(tenant, idOrName string) (*StoredSecret, bool) {
 	if rec, ok := s.byID[idOrName]; ok && rec.TenantHash == tenant {
 		return rec, true
 	}
@@ -470,7 +711,9 @@ func (s *Store) findLocked(tenant, idOrName string) (*storedSecret, bool) {
 }
 
 // Get returns secret metadata (never value) for secretID or name owned by the tenant.
-func (s *Store) Get(apiKey, secretID string) (SecretInfo, error) {
+func (s *Store) Get(apiKey, secretID string) (info SecretInfo, err error) {
+	defer func() { s.metrics.get.record(err) }()
+
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
 		return SecretInfo{}, err
@@ -486,7 +729,9 @@ func (s *Store) Get(apiKey, secretID string) (SecretInfo, error) {
 }
 
 // Update rotates an existing secret's value and increments its version.
-func (s *Store) Update(apiKey, secretID, value string) (SecretInfo, error) {
+func (s *Store) Update(apiKey, secretID, value string) (info SecretInfo, err error) {
+	defer func() { s.metrics.update.record(err) }()
+
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
 		return SecretInfo{}, err
@@ -512,17 +757,20 @@ func (s *Store) Update(apiKey, secretID, value string) (SecretInfo, error) {
 	rec.Version++
 	rec.UpdatedAt = &now
 
-	if err := s.saveLocked(); err != nil {
+	if err := s.backend.Put(context.Background(), *rec); err != nil {
 		rec.Value = prevVal
 		rec.Version = prevVer
 		rec.UpdatedAt = prevUpd
 		return SecretInfo{}, err
 	}
+	s.writeSeq.Add(1)
 	return toInfo(rec), nil
 }
 
 // Delete removes a secret owned by the tenant.
-func (s *Store) Delete(apiKey, secretID string) (SecretInfo, error) {
+func (s *Store) Delete(apiKey, secretID string) (info SecretInfo, err error) {
+	defer func() { s.metrics.delete.record(err) }()
+
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
 		return SecretInfo{}, err
@@ -535,20 +783,23 @@ func (s *Store) Delete(apiKey, secretID string) (SecretInfo, error) {
 	if !ok {
 		return SecretInfo{}, ErrNotFound
 	}
-	info := toInfo(rec)
+	info = toInfo(rec)
 	delete(s.byID, rec.ID)
 	delete(s.byTenName, tenNameKey(tenant, rec.Name))
 
-	if err := s.saveLocked(); err != nil {
+	if err := s.backend.Delete(context.Background(), rec.ID); err != nil {
 		s.byID[rec.ID] = rec
 		s.byTenName[tenNameKey(tenant, rec.Name)] = rec.ID
 		return SecretInfo{}, err
 	}
+	s.writeSeq.Add(1)
 	return info, nil
 }
 
 // ResolveByName looks up a secret by name for the tenant and returns its metadata and redacted SecretValue.
-func (s *Store) ResolveByName(apiKey, name string) (SecretInfo, SecretValue, error) {
+func (s *Store) ResolveByName(apiKey, name string) (info SecretInfo, val SecretValue, err error) {
+	defer func() { s.metrics.resolve.record(err) }()
+
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
 		return SecretInfo{}, "", err
@@ -569,7 +820,9 @@ func (s *Store) ResolveByName(apiKey, name string) (SecretInfo, SecretValue, err
 }
 
 // ResolveByID looks up a secret by ID for the tenant and returns its metadata and redacted SecretValue.
-func (s *Store) ResolveByID(apiKey, secretID string) (SecretInfo, SecretValue, error) {
+func (s *Store) ResolveByID(apiKey, secretID string) (info SecretInfo, val SecretValue, err error) {
+	defer func() { s.metrics.resolve.record(err) }()
+
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
 		return SecretInfo{}, "", err
@@ -585,9 +838,36 @@ func (s *Store) ResolveByID(apiKey, secretID string) (SecretInfo, SecretValue, e
 	return toInfo(rec), SecretValue(rec.Value), nil
 }
 
+// ResolveByTenantID looks up a secret by pre-hashed tenantHash and secretID
+// (used for HA Vault re-hydration from PodBox SecretRefBindings).
+func (s *Store) ResolveByTenantID(tenantHash, secretID string) (info SecretInfo, val SecretValue, err error) {
+	defer func() { s.metrics.resolve.record(err) }()
+
+	if strings.TrimSpace(tenantHash) == "" || strings.TrimSpace(secretID) == "" {
+		return SecretInfo{}, "", ErrNotFound
+	}
+
+	s.mu.RLock()
+	rec, ok := s.byID[secretID]
+	if ok && rec.TenantHash == tenantHash {
+		info = toInfo(rec)
+		val = SecretValue(rec.Value)
+		s.mu.RUnlock()
+		return info, val, nil
+	}
+	s.mu.RUnlock()
+
+	return SecretInfo{}, "", ErrNotFound
+}
+
 // Count returns the total number of secrets stored across all tenants.
 func (s *Store) Count() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return len(s.byID)
+}
+
+// OperationsSnapshot returns a thread-safe copy of secret operation counts by operation and status ("ok"/"error").
+func (s *Store) OperationsSnapshot() map[string]map[string]uint64 {
+	return s.metrics.snapshot()
 }

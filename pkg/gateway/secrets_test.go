@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
+	"github.com/cubeplexai/cubepod/pkg/egress"
 	"github.com/cubeplexai/cubepod/pkg/gateway"
 )
 
@@ -336,5 +339,176 @@ func TestE2BSecretsQuotaControlCharsAndVolumeFailureRollback(t *testing.T) {
 	}
 	if got := srv.Vault().Count(); got != 0 {
 		t.Fatalf("expected 0 vault bindings after rollback, got %d", got)
+	}
+}
+
+func TestHAVaultRehydrationStrictMTLSAndKubeSync(t *testing.T) {
+	ctx := context.Background()
+	sharedKube := controller.NewMemoryKubeClient()
+
+	ca, err := egress.NewCA()
+	if err != nil {
+		t.Fatalf("NewCA: %v", err)
+	}
+
+	// Replica 1
+	rec1 := controller.NewReconciler(
+		controller.WithKubeClient(sharedKube),
+		controller.WithNamespace("default"),
+		controller.WithEgressCA(ca),
+	)
+	srv1 := gateway.NewServer(rec1)
+	srv1.SetWorkspaceBaseDir(t.TempDir())
+	if err := srv1.ConfigureE2BSecrets(gateway.E2BSecretConfig{
+		Backend:    "k8s",
+		KubeClient: sharedKube,
+		Namespace:  "default",
+	}); err != nil {
+		t.Fatalf("srv1 ConfigureE2BSecrets: %v", err)
+	}
+	h1 := srv1.Handler()
+
+	// 1. Replica 1 creates secret & sandbox with ${e2b.secrets.openai_key}
+	rrSec := doJSONReq(t, h1, http.MethodPost, "/secrets", "tenant-ha", map[string]string{
+		"name":  "openai_key",
+		"value": "sk-ha-v1",
+	})
+	if rrSec.Code != http.StatusCreated {
+		t.Fatalf("create secret = %d (%s)", rrSec.Code, rrSec.Body.String())
+	}
+	var secInfo struct {
+		ID string `json:"secretID"`
+	}
+	_ = json.Unmarshal(rrSec.Body.Bytes(), &secInfo)
+
+	rrCreate := doJSONReq(t, h1, http.MethodPost, "/sandboxes", "tenant-ha", map[string]any{
+		"templateID": "base",
+		"network": map[string]any{
+			"allowOut": []string{"api.openai.com"},
+			"denyOut":  []string{"0.0.0.0/0"},
+			"rules": map[string]any{
+				"api.openai.com": []map[string]any{
+					{"transform": map[string]any{"headers": map[string]string{"Authorization": "Bearer ${e2b.secrets.openai_key}"}}},
+				},
+			},
+		},
+	})
+	if rrCreate.Code != http.StatusCreated {
+		t.Fatalf("POST /sandboxes = %d (%s)", rrCreate.Code, rrCreate.Body.String())
+	}
+	var sbx struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	_ = json.Unmarshal(rrCreate.Body.Bytes(), &sbx)
+
+	box, err := sharedKube.GetPodBox(ctx, "default", sbx.SandboxID)
+	if err != nil {
+		t.Fatalf("GetPodBox: %v", err)
+	}
+	if len(box.Spec.NetworkPolicy.SecretRefBindings) != 1 {
+		t.Fatalf("expected 1 SecretRefBinding on PodBox, got %+v", box.Spec.NetworkPolicy.SecretRefBindings)
+	}
+	placeholder := box.Spec.NetworkPolicy.SecretRefBindings[0].Placeholder
+
+	// 2. Replica 2 starts fresh with an empty Vault, sharing sharedKube & EgressCA
+	rec2 := controller.NewReconciler(
+		controller.WithKubeClient(sharedKube),
+		controller.WithNamespace("default"),
+		controller.WithEgressCA(ca),
+	)
+	srv2 := gateway.NewServer(rec2)
+	srv2.SetStrictEgressMTLS(true)
+	srv2.SetWorkspaceBaseDir(t.TempDir())
+	if err := srv2.ConfigureE2BSecrets(gateway.E2BSecretConfig{
+		Backend:    "k8s",
+		KubeClient: sharedKube,
+		Namespace:  "default",
+	}); err != nil {
+		t.Fatalf("srv2 ConfigureE2BSecrets: %v", err)
+	}
+	if srv2.Vault().Count() != 0 {
+		t.Fatalf("expected fresh replica 2 Vault to be empty, got %d", srv2.Vault().Count())
+	}
+
+	// Non-mTLS request to Replica 2 (even with X-CubePod-Sandbox-ID & body sandboxID) MUST be rejected with 403
+	rrNoMTLS := doJSONReq(t, srv2.Handler(), http.MethodPost, "/internal/v1/egress/exchange", "", map[string]string{
+		"sandboxID":   sbx.SandboxID,
+		"placeholder": placeholder,
+		"sniHost":     "api.openai.com",
+		"headerName":  "Authorization",
+	})
+	if rrNoMTLS.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for non-mTLS exchange when EgressCA is configured, got %d", rrNoMTLS.Code)
+	}
+
+	// Real mTLS listener for Replica 2's EgressExchangeHandler
+	srvTLS, err := ca.ServerTLSConfig("127.0.0.1", "localhost")
+	if err != nil {
+		t.Fatalf("ServerTLSConfig: %v", err)
+	}
+	ts2 := httptest.NewUnstartedServer(srv2.EgressExchangeHandler())
+	ts2.TLS = srvTLS
+	ts2.StartTLS()
+	defer ts2.Close()
+
+	certPEM, keyPEM, err := ca.MintSandboxCert(sbx.SandboxID, time.Hour)
+	if err != nil {
+		t.Fatalf("MintSandboxCert: %v", err)
+	}
+	clientTLS, err := ca.ClientTLSConfig(certPEM, keyPEM)
+	if err != nil {
+		t.Fatalf("ClientTLSConfig: %v", err)
+	}
+	mtlsClient := &http.Client{Transport: &http.Transport{TLSClientConfig: clientTLS}}
+
+	exPayload := `{"sandboxID":"` + sbx.SandboxID + `","placeholder":"` + placeholder + `","sniHost":"api.openai.com","headerName":"Authorization"}`
+
+	// 3. Replica 2 re-hydrates Vault on cache miss from PodBox.Spec.NetworkPolicy.SecretRefBindings + KubeSecretBackend
+	resp1, err := mtlsClient.Post(ts2.URL+"/internal/v1/egress/exchange", "application/json", strings.NewReader(exPayload))
+	if err != nil {
+		t.Fatalf("mTLS Post 1: %v", err)
+	}
+	body1, _ := io.ReadAll(resp1.Body)
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusOK || !strings.Contains(string(body1), "sk-ha-v1") {
+		t.Fatalf("expected 200 OK with sk-ha-v1 after rehydration, got %d: %s", resp1.StatusCode, string(body1))
+	}
+	if srv2.Vault().Count() != 1 {
+		t.Fatalf("expected Replica 2 Vault to hold 1 rehydrated binding, got %d", srv2.Vault().Count())
+	}
+
+	// 4. Replica 1 rotates secret -> Replica 2 Sync propagates rotation into Replica 2's rehydrated Vault
+	if rrUpd := doJSONReq(t, h1, http.MethodPost, "/secrets/"+secInfo.ID, "tenant-ha", map[string]string{
+		"value": "sk-ha-v2",
+	}); rrUpd.Code != http.StatusOK {
+		t.Fatalf("rotate on replica 1 = %d", rrUpd.Code)
+	}
+	if err := srv2.SecretStore().Sync(ctx); err != nil {
+		t.Fatalf("srv2 Sync (rotate): %v", err)
+	}
+	resp2, err := mtlsClient.Post(ts2.URL+"/internal/v1/egress/exchange", "application/json", strings.NewReader(exPayload))
+	if err != nil {
+		t.Fatalf("mTLS Post 2: %v", err)
+	}
+	body2, _ := io.ReadAll(resp2.Body)
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK || !strings.Contains(string(body2), "sk-ha-v2") {
+		t.Fatalf("expected 200 OK with sk-ha-v2 after sync, got %d: %s", resp2.StatusCode, string(body2))
+	}
+
+	// 5. Replica 1 deletes secret -> Replica 2 Sync revokes binding -> exchange fails closed with 403
+	if rrDel := doJSONReq(t, h1, http.MethodDelete, "/secrets/"+secInfo.ID, "tenant-ha", nil); rrDel.Code != http.StatusNoContent {
+		t.Fatalf("delete on replica 1 = %d", rrDel.Code)
+	}
+	if err := srv2.SecretStore().Sync(ctx); err != nil {
+		t.Fatalf("srv2 Sync (delete): %v", err)
+	}
+	resp3, err := mtlsClient.Post(ts2.URL+"/internal/v1/egress/exchange", "application/json", strings.NewReader(exPayload))
+	if err != nil {
+		t.Fatalf("mTLS Post 3: %v", err)
+	}
+	_ = resp3.Body.Close()
+	if resp3.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden after secret delete sync, got %d", resp3.StatusCode)
 	}
 }
