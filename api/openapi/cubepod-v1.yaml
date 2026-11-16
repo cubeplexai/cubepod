@@ -23,6 +23,12 @@ tags:
     description: Build, manage, and tag sandbox rootfs and image templates.
   - name: WarmPools
     description: Register and inspect pre-warmed standby MicroVM pools.
+  - name: Secrets
+    description: Create, list, update, and delete tenant-isolated write-only secrets.
+  - name: Webhooks
+    description: Register, list, update, and delete sandbox lifecycle webhook subscriptions.
+  - name: Events
+    description: List tenant and per-sandbox lifecycle events.
   - name: System
     description: Health checks, OpenAPI schema discovery, and internal zero-trust egress exchange.
 
@@ -1581,7 +1587,10 @@ paths:
 
   /secrets:
     post:
-      summary: Create a tenant-isolated write-only secret
+      tags:
+        - Secrets
+      summary: Create secret
+      description: Create a tenant-isolated write-only secret (metadata only; value is never returned)
       operationId: createSecret
       requestBody:
         required: true
@@ -1597,7 +1606,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/SecretInfo"
     get:
-      summary: List tenant secrets (metadata only)
+      tags:
+        - Secrets
+      summary: List secrets
+      description: List tenant secrets (metadata only; secret values are never returned)
       operationId: listSecrets
       parameters:
         - name: limit
@@ -1627,7 +1639,10 @@ paths:
 
   /secrets/{secretID}:
     get:
-      summary: Get secret metadata by ID (never returns value)
+      tags:
+        - Secrets
+      summary: Get secret
+      description: Get secret metadata by ID (never returns secret value)
       operationId: getSecret
       parameters:
         - name: secretID
@@ -1643,7 +1658,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/SecretInfo"
     post:
-      summary: Rotate/update an existing secret value
+      tags:
+        - Secrets
+      summary: Update secret
+      description: Rotate or update an existing secret value
       operationId: updateSecret
       parameters:
         - name: secretID
@@ -1665,7 +1683,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/SecretInfo"
     delete:
-      summary: Delete a secret and revoke active sandbox bindings
+      tags:
+        - Secrets
+      summary: Delete secret
+      description: Delete a secret and revoke active sandbox bindings
       operationId: deleteSecret
       parameters:
         - name: secretID
@@ -1679,7 +1700,10 @@ paths:
 
   /webhooks:
     post:
-      summary: Register a tenant-scoped webhook subscription
+      tags:
+        - Webhooks
+      summary: Create webhook
+      description: Register a tenant-scoped webhook subscription (returns signatureKey once)
       operationId: createWebhook
       responses:
         "201":
@@ -1689,7 +1713,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/WebhookWithSecret"
     get:
-      summary: List tenant webhooks (omits signatureKey)
+      tags:
+        - Webhooks
+      summary: List webhooks
+      description: List tenant webhooks (omits signatureKey)
       operationId: listWebhooks
       responses:
         "200":
@@ -1703,7 +1730,10 @@ paths:
 
   /webhooks/{webhookID}:
     get:
-      summary: Get webhook metadata (omits signatureKey)
+      tags:
+        - Webhooks
+      summary: Get webhook
+      description: Get webhook metadata (omits signatureKey)
       operationId: getWebhook
       parameters:
         - name: webhookID
@@ -1719,7 +1749,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/WebhookInfo"
     patch:
-      summary: Update webhook URL, events, enabled flag, or rotate signatureKey
+      tags:
+        - Webhooks
+      summary: Update webhook
+      description: Update webhook URL, events, enabled flag, or rotate signatureKey
       operationId: updateWebhook
       parameters:
         - name: webhookID
@@ -1735,7 +1768,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/WebhookWithSecret"
     delete:
-      summary: Delete webhook subscription
+      tags:
+        - Webhooks
+      summary: Delete webhook
+      description: Delete a webhook subscription
       operationId: deleteWebhook
       parameters:
         - name: webhookID
@@ -1749,7 +1785,10 @@ paths:
 
   /events:
     get:
-      summary: List tenant sandbox lifecycle events (E2B v1 schema)
+      tags:
+        - Events
+      summary: List events
+      description: List tenant sandbox lifecycle events (E2B v1 schema)
       operationId: listEvents
       parameters:
         - name: sandboxID
@@ -1784,7 +1823,10 @@ paths:
 
   /sandboxes/{sandboxID}/events:
     get:
-      summary: List lifecycle events for a single sandbox
+      tags:
+        - Events
+      summary: List sandbox events
+      description: List lifecycle events for a single sandbox
       operationId: listSandboxEvents
       parameters:
         - name: sandboxID
