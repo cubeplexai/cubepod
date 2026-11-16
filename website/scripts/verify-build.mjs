@@ -65,6 +65,7 @@ function main() {
     'llms.txt',
     'llms-full.txt',
     'robots.txt',
+    '_worker.js',
     'sitemap-index.xml',
     'sitemap-0.xml',
     'pagefind/pagefind.js',

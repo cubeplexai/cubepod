@@ -118,7 +118,7 @@ jobs:
                   print(f"Failed to create Pages project HTTP {create_exc.code}: {create_exc.read().decode('utf-8', 'replace')}", file=sys.stderr)
                   sys.exit(1)
 
-          custom_domains = ["cubepod.dev"]
+          custom_domains = ["cubepod.dev", "www.cubepod.dev"]
           dom_list_req = urllib.request.Request(
               f"https://api.cloudflare.com/client/v4/accounts/{account_id}/pages/projects/{project}/domains",
               headers={"Authorization": f"Bearer {token}"},
