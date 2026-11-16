@@ -7,7 +7,7 @@ participating-areas:
   - "egress"
   - "controller"
   - "sdk"
-status: "implementable"
+status: "implemented"
 creation-date: "2026-11-15"
 reviewers:
   - "@cubepod-maintainers"

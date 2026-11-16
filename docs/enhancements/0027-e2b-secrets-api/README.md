@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `alpha` | `implementable` | `2026-11-15` | `2026-11-15` | `gateway` |
+| `alpha` | `implemented` | `2026-11-15` | `2026-11-15` | `gateway` |
 
 ## Table of Contents
 
@@ -329,6 +329,7 @@ sequenceDiagram
 ## Implementation History
 
 - `2026-11-15`: CEP-0027 drafted and marked `implementable`.
+- `2026-11-15`: Alpha implementation merged in PR #73 (`pkg/secret`, `pkg/egress`, `pkg/gateway`, `api/v1alpha1`, CRD & OpenAPI); marked `implemented`.
 
 ---
 
