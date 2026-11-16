@@ -30,7 +30,7 @@ gateway:
   podDisruptionBudget:
     # When null/omitted, enabled automatically when gateway.replicaCount > 1.
     enabled: null
-    minAvailable: 1
+    minAvailable: null
   image:
     registry: "ghcr.io"
     repository: "cubeplexai/cubepod-gateway"

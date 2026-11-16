@@ -892,6 +892,9 @@ test('Secrets, Volumes, Events, Webhooks, Metrics, and Desktop WebRTC', async ()
     }
     if (req.method === 'GET' && u.pathname === '/secrets') {
       assert.equal(req.headers['x-api-key'], 'cpod-ts-key');
+      if (u.searchParams.has('limit')) {
+        res.setHeader('X-Next-Token', 'sec-ts-next-2');
+      }
       res.end(
         JSON.stringify([
           {
@@ -963,6 +966,9 @@ test('Secrets, Volumes, Events, Webhooks, Metrics, and Desktop WebRTC', async ()
 
     // Events & Webhooks
     if (req.method === 'GET' && u.pathname === '/events') {
+      if (u.searchParams.has('limit')) {
+        res.setHeader('X-Next-Token', 'evt-ts-next-2');
+      }
       res.end(
         JSON.stringify([
           {
@@ -980,6 +986,9 @@ test('Secrets, Volumes, Events, Webhooks, Metrics, and Desktop WebRTC', async ()
       return;
     }
     if (req.method === 'GET' && u.pathname === '/sandboxes/cpod-ts-1/events') {
+      if (u.searchParams.has('limit')) {
+        res.setHeader('X-Next-Token', 'sbx-evt-ts-next-2');
+      }
       res.end(
         JSON.stringify([
           {
@@ -1111,6 +1120,9 @@ test('Secrets, Volumes, Events, Webhooks, Metrics, and Desktop WebRTC', async ()
     assert.equal(sec.secretId, 'sec_ts_1');
     assert.equal(sec.version, 1);
 
+    const secsPage = await client.listSecretsPage({ limit: 25, nextToken: 'tok-1' });
+    assert.equal(secsPage.nextToken, 'sec-ts-next-2');
+    assert.equal(secsPage.items.length, 1);
     const secs = await client.listSecrets({ limit: 25, nextToken: 'tok-1' });
     assert.equal(secs.length, 1);
     assert.equal(requests.at(-1)?.search, '?limit=25&nextToken=tok-1');
@@ -1134,6 +1146,9 @@ test('Secrets, Volumes, Events, Webhooks, Metrics, and Desktop WebRTC', async ()
     await client.deleteVolume('vol_ts_1');
 
     // Events & Webhooks
+    const evtsPage = await client.listEventsPage({ sandboxId: 'cpod-ts-1', limit: 10 });
+    assert.equal(evtsPage.nextToken, 'evt-ts-next-2');
+    assert.equal(evtsPage.items.length, 1);
     const evts = await client.listEvents({ sandboxId: 'cpod-ts-1', limit: 10 });
     assert.equal(evts.length, 1);
     assert.equal(evts[0].type, 'sandbox.lifecycle.created');
@@ -1167,9 +1182,18 @@ test('Secrets, Volumes, Events, Webhooks, Metrics, and Desktop WebRTC', async ()
       '?start=1794790800&end=2026-11-16T02%3A00%3A00.000Z',
     );
 
+    const sbxEvtsPage = await sbx.listEventsPage({ limit: 5 });
+    assert.equal(sbxEvtsPage.nextToken, 'sbx-evt-ts-next-2');
+    assert.equal(sbxEvtsPage.items.length, 1);
     const sbxEvts = await sbx.listEvents();
     assert.equal(sbxEvts.length, 1);
     assert.equal(sbxEvts[0].id, 'evt_ts_2');
+
+    await assert.rejects(() => sbx.getMetrics({ start: /** @type {any} */ (true) }), TypeError);
+    await assert.rejects(
+      () => client.getSecret('missing_secret'),
+      (err) => err instanceof CubePodAPIError && err.statusCode === 404,
+    );
 
     const desk = await sbx.startDesktop({ transport: 'webrtc' });
     assert.equal(desk.transportUsed, 'webrtc');

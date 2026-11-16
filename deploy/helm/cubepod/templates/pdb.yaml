@@ -19,8 +19,10 @@ spec:
   maxUnavailable: {{ $pdb.maxUnavailable }}
   {{- else if and (hasKey $pdb "minAvailable") (not (kindIs "invalid" $pdb.minAvailable)) }}
   minAvailable: {{ $pdb.minAvailable }}
-  {{- else }}
+  {{- else if gt (int .Values.gateway.replicaCount) 1 }}
   minAvailable: 1
+  {{- else }}
+  maxUnavailable: 1
   {{- end }}
   selector:
     matchLabels:

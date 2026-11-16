@@ -28,13 +28,14 @@ from ._helpers import (
     _parse_command_info,
     _parse_command_logs,
     _parse_desktop_session,
+    _parse_event_page,
     _parse_execution_result,
     _parse_file_entries,
     _parse_info,
-    _parse_lifecycle_event,
     _parse_panel_endpoint,
     _parse_sandbox_metric,
     _parse_secret_info,
+    _parse_secret_page,
     _parse_volume_entry,
     _parse_volume_info,
     _parse_webhook_info,
@@ -44,6 +45,7 @@ from .models import (
     CommandInfo,
     CommandLogs,
     DesktopSession,
+    EventPage,
     ExecutionResult,
     FileEntry,
     LifecycleEvent,
@@ -53,6 +55,7 @@ from .models import (
     SandboxMetric,
     Secret,
     SecretInfo,
+    SecretPage,
     VolumeEntry,
     VolumeInfo,
     WebhookInfo,
@@ -262,7 +265,7 @@ class AsyncCubePod:
         )
         resp = await self._request(
             "POST",
-            f"/sandboxes/{sandbox_id}/desktop/start",
+            f"/sandboxes/{quote(sandbox_id, safe='')}/desktop/start",
             json=payload,
         )
         resp.raise_for_status()
@@ -270,13 +273,13 @@ class AsyncCubePod:
 
     async def get_desktop_status(self, sandbox_id: str) -> dict[str, Any]:
         """Fetch interactive desktop daemon status for a sandbox."""
-        resp = await self._request("GET", f"/sandboxes/{sandbox_id}/desktop/status")
+        resp = await self._request("GET", f"/sandboxes/{quote(sandbox_id, safe='')}/desktop/status")
         resp.raise_for_status()
         return _json_dict(resp)
 
     async def stop_desktop(self, sandbox_id: str) -> dict[str, Any]:
         """Stop the interactive desktop stack inside a sandbox."""
-        resp = await self._request("POST", f"/sandboxes/{sandbox_id}/desktop/stop")
+        resp = await self._request("POST", f"/sandboxes/{quote(sandbox_id, safe='')}/desktop/stop")
         resp.raise_for_status()
         if resp.content:
             return _json_dict(resp)
@@ -824,13 +827,13 @@ class AsyncCubePod:
         resp.raise_for_status()
         return _parse_secret_info(_json_dict(resp))
 
-    async def list_secrets(
+    async def list_secrets_page(
         self,
         *,
         limit: int | None = None,
         next_token: str | None = None,
-    ) -> builtins.list[SecretInfo]:
-        """List secrets (metadata only) for the current API key tenant."""
+    ) -> SecretPage:
+        """List secrets (metadata only) and return the next pagination token."""
         params: dict[str, Any] = {}
         if limit is not None:
             params["limit"] = limit
@@ -838,7 +841,16 @@ class AsyncCubePod:
             params["nextToken"] = next_token
         resp = await self._request("GET", "/secrets", params=params or None)
         resp.raise_for_status()
-        return [_parse_secret_info(item) for item in _json_list(resp, "secrets")]
+        return _parse_secret_page(resp)
+
+    async def list_secrets(
+        self,
+        *,
+        limit: int | None = None,
+        next_token: str | None = None,
+    ) -> builtins.list[SecretInfo]:
+        """List secrets (metadata only) for the current API key tenant."""
+        return (await self.list_secrets_page(limit=limit, next_token=next_token)).items
 
     async def get_secret(self, secret_id: str) -> SecretInfo:
         """Fetch metadata for a single secret by ID."""
@@ -957,15 +969,15 @@ class AsyncCubePod:
     # Events & Webhooks (CEP-0028)
     # ------------------------------------------------------------------
 
-    async def list_events(
+    async def list_events_page(
         self,
         *,
         sandbox_id: str | None = None,
         event_type: str | None = None,
         limit: int | None = None,
         next_token: str | None = None,
-    ) -> builtins.list[LifecycleEvent]:
-        """List sandbox lifecycle events for the current tenant."""
+    ) -> EventPage:
+        """List sandbox lifecycle events and return the next pagination token."""
         params: dict[str, Any] = {}
         if sandbox_id is not None:
             params["sandboxID"] = sandbox_id
@@ -977,17 +989,35 @@ class AsyncCubePod:
             params["nextToken"] = next_token
         resp = await self._request("GET", "/events", params=params or None)
         resp.raise_for_status()
-        return [_parse_lifecycle_event(item) for item in _json_list(resp, "events")]
+        return _parse_event_page(resp)
 
-    async def list_sandbox_events(
+    async def list_events(
+        self,
+        *,
+        sandbox_id: str | None = None,
+        event_type: str | None = None,
+        limit: int | None = None,
+        next_token: str | None = None,
+    ) -> builtins.list[LifecycleEvent]:
+        """List sandbox lifecycle events for the current tenant."""
+        return (
+            await self.list_events_page(
+                sandbox_id=sandbox_id,
+                event_type=event_type,
+                limit=limit,
+                next_token=next_token,
+            )
+        ).items
+
+    async def list_sandbox_events_page(
         self,
         sandbox_id: str,
         *,
         event_type: str | None = None,
         limit: int | None = None,
         next_token: str | None = None,
-    ) -> builtins.list[LifecycleEvent]:
-        """List lifecycle events scoped to a single sandbox."""
+    ) -> EventPage:
+        """List lifecycle events scoped to a single sandbox and return the next token."""
         params: dict[str, Any] = {}
         if event_type is not None:
             params["eventType"] = event_type
@@ -1001,7 +1031,25 @@ class AsyncCubePod:
             params=params or None,
         )
         resp.raise_for_status()
-        return [_parse_lifecycle_event(item) for item in _json_list(resp, "events")]
+        return _parse_event_page(resp)
+
+    async def list_sandbox_events(
+        self,
+        sandbox_id: str,
+        *,
+        event_type: str | None = None,
+        limit: int | None = None,
+        next_token: str | None = None,
+    ) -> builtins.list[LifecycleEvent]:
+        """List lifecycle events scoped to a single sandbox."""
+        return (
+            await self.list_sandbox_events_page(
+                sandbox_id,
+                event_type=event_type,
+                limit=limit,
+                next_token=next_token,
+            )
+        ).items
 
     async def create_webhook(
         self,

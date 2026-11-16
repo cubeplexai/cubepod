@@ -26,7 +26,8 @@ spec:
       {{- $e2bVolumesActive := eq (include "cubepod.e2bVolumesActive" .) "true" }}
       {{- $k8sE2BMounts := eq (include "cubepod.k8sE2BVolumeMountsEnabled" .) "true" }}
       {{- $secretsCfg := .Values.secrets | default dict }}
-      {{- $secretsEnabled := and (default true $secretsCfg.enabled) (default true .Values.featureGates.e2bSecretsAPI) }}
+      {{- $fg := .Values.featureGates | default dict }}
+      {{- $secretsEnabled := and (eq (include "cubepod.boolDefaultTrue" $secretsCfg.enabled) "true") (eq (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) "true") }}
       {{- $secretsBackend := default "k8s" $secretsCfg.backend }}
       {{- $secretsKeySecret := include "cubepod.secretsKeySecretName" . }}
       {{- $hasEnv := true }}
@@ -85,7 +86,7 @@ spec:
             - name: CUBEPOD_SECRETS_DIR
               value: {{ $secretsCfg.dir | quote }}
             {{- end }}
-            {{- if $secretsKeySecret }}
+            {{- if and (eq $secretsBackend "file") $secretsKeySecret }}
             - name: CUBEPOD_SECRETS_KEY
               valueFrom:
                 secretKeyRef:
@@ -150,7 +151,7 @@ spec:
         {{- if $e2bVolumesActive }}
         - name: e2b-volumes
           persistentVolumeClaim:
-            claimName: {{ .Values.e2bVolumes.pvcName }}
+            claimName: {{ .Values.e2bVolumes.pvcName | quote }}
         {{- end }}
         {{- include "cubepod.egressCAVolume" . | nindent 8 }}
       {{- end }}

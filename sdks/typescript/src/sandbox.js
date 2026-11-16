@@ -256,6 +256,17 @@ export class Sandbox {
   }
 
   /**
+   * List lifecycle events for this sandbox with pagination metadata (`GET /sandboxes/{sandboxID}/events`).
+   *
+   * @param {import('./client.d.ts').ListSandboxEventsOptions} [filterOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').EventPage>}
+   */
+  async listEventsPage(filterOptions = {}, options = {}) {
+    return this.client.listSandboxEventsPage(this.sandboxId, filterOptions, options);
+  }
+
+  /**
    * List lifecycle events for this sandbox (`GET /sandboxes/{sandboxID}/events`).
    *
    * @param {import('./client.d.ts').ListSandboxEventsOptions} [filterOptions]

@@ -11,6 +11,7 @@ import {
   DeleteSandboxOptions,
   DesktopSession,
   EndpointHost,
+  EventPage,
   ExecutionResult,
   FileEntry,
   ForkSandboxOptions,
@@ -102,6 +103,10 @@ export class Sandbox {
     options?: RequestOptions,
   ): Promise<PanelEndpoint>;
   getMetrics(metricsOptions?: GetMetricsOptions, options?: RequestOptions): Promise<SandboxMetric[]>;
+  listEventsPage(
+    filterOptions?: ListSandboxEventsOptions,
+    options?: RequestOptions,
+  ): Promise<EventPage>;
   listEvents(
     filterOptions?: ListSandboxEventsOptions,
     options?: RequestOptions,

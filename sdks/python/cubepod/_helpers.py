@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, cast
 
 import httpx
@@ -12,6 +12,7 @@ from .models import (
     CommandInfo,
     CommandLogs,
     DesktopSession,
+    EventPage,
     ExecutionResult,
     FileEntry,
     LifecycleEvent,
@@ -20,6 +21,7 @@ from .models import (
     SandboxInfo,
     SandboxMetric,
     SecretInfo,
+    SecretPage,
     VolumeEntry,
     VolumeInfo,
     WebhookInfo,
@@ -428,8 +430,41 @@ def _parse_sandbox_metric(data: dict[str, Any]) -> SandboxMetric:
 def _format_metric_time_param(value: int | float | str | datetime | None) -> str | None:
     if value is None:
         return None
+    if isinstance(value, bool):
+        raise TypeError("metric time must be an int, float, str, or datetime, not bool")
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
         return value.isoformat()
     if isinstance(value, (int, float)):
         return str(int(value))
     return str(value)
+
+
+def _extract_next_token(resp: httpx.Response, data: Any) -> str | None:
+    header_tok = (resp.headers.get("X-Next-Token") or "").strip()
+    if header_tok:
+        return header_tok
+    if isinstance(data, dict):
+        body_tok = data.get("nextToken")
+        if isinstance(body_tok, str) and body_tok.strip():
+            return body_tok.strip()
+    return None
+
+
+def _parse_secret_page(resp: httpx.Response) -> SecretPage:
+    data = resp.json()
+    raw_items = data if isinstance(data, list) else data.get("secrets", [])
+    return SecretPage(
+        items=[_parse_secret_info(item) for item in raw_items],
+        next_token=_extract_next_token(resp, data),
+    )
+
+
+def _parse_event_page(resp: httpx.Response) -> EventPage:
+    data = resp.json()
+    raw_items = data if isinstance(data, list) else data.get("events", [])
+    return EventPage(
+        items=[_parse_lifecycle_event(item) for item in raw_items],
+        next_token=_extract_next_token(resp, data),
+    )

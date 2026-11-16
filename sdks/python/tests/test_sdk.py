@@ -21,10 +21,12 @@ from cubepod import (
     CubePod,
     CubePodFileTooLargeError,
     DesktopSession,
+    EventPage,
     LifecycleEvent,
     SandboxMetric,
     Secret,
     SecretInfo,
+    SecretPage,
     SyncCubePod,
     CommandInfo,
     CommandLogs,
@@ -1580,6 +1582,7 @@ class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
                 {
                     "method": request.method,
                     "path": request.url.path,
+                    "raw_path": request.url.raw_path,
                     "query": dict(request.url.params),
                     "headers": dict(request.headers),
                     "content": request.content,
@@ -1605,8 +1608,10 @@ class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
                 )
             if method == "GET" and path == "/secrets":
                 self.assertEqual(request.headers.get("x-api-key"), "cpod-key-1")
+                headers = {"X-Next-Token": "sec-next-2"} if request.url.params.get("limit") else {}
                 return httpx.Response(
                     200,
+                    headers=headers,
                     json=[
                         {
                             "secretID": "sec_123",
@@ -1679,8 +1684,10 @@ class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
 
             # Events & Webhooks
             if method == "GET" and path == "/events":
+                headers = {"X-Next-Token": "evt-next-2"} if request.url.params.get("limit") else {}
                 return httpx.Response(
                     200,
+                    headers=headers,
                     json=[
                         {
                             "version": "v1",
@@ -1696,8 +1703,10 @@ class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
                     ],
                 )
             if method == "GET" and path == "/sandboxes/cpod-1/events":
+                headers = {"X-Next-Token": "sbx-evt-next-2"} if request.url.params.get("limit") else {}
                 return httpx.Response(
                     200,
+                    headers=headers,
                     json=[
                         {
                             "version": "v1",
@@ -1795,7 +1804,7 @@ class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
                         "state": "Running",
                     },
                 )
-            if method == "POST" and path == "/sandboxes/cpod-1/desktop/start":
+            if method == "POST" and path in ("/sandboxes/cpod-1/desktop/start", "/sandboxes/cpod/special/desktop/start"):
                 return httpx.Response(
                     200,
                     json={
@@ -1827,6 +1836,10 @@ class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sec.id, "sec_123")
             self.assertEqual(sec.version, 1)
 
+            secs_page = client.list_secrets_page(limit=10, next_token="cur-1")
+            self.assertIsInstance(secs_page, SecretPage)
+            self.assertEqual(secs_page.next_token, "sec-next-2")
+            self.assertEqual(len(secs_page.items), 1)
             secs = client.list_secrets(limit=10, next_token="cur-1")
             self.assertEqual(len(secs), 1)
             self.assertEqual(captured[-1]["query"], {"limit": "10", "nextToken": "cur-1"})
@@ -1853,11 +1866,17 @@ class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(data, b"hello volume bytes")
             client.delete_volume("vol_abc")
 
+            evts_page = client.list_events_page(sandbox_id="cpod-1", event_type="sandbox.lifecycle.created", limit=50)
+            self.assertIsInstance(evts_page, EventPage)
+            self.assertEqual(evts_page.next_token, "evt-next-2")
+            self.assertEqual(len(evts_page.items), 1)
             evts = client.list_events(sandbox_id="cpod-1", event_type="sandbox.lifecycle.created", limit=50)
             self.assertEqual(len(evts), 1)
             self.assertIsInstance(evts[0], LifecycleEvent)
             self.assertEqual(evts[0].type, "sandbox.lifecycle.created")
 
+            sbx_evts_page = client.list_sandbox_events_page("cpod-1", limit=10)
+            self.assertEqual(sbx_evts_page.next_token, "sbx-evt-next-2")
             sbx_evts = client.list_sandbox_events("cpod-1")
             self.assertEqual(len(sbx_evts), 1)
             self.assertEqual(sbx_evts[0].event_data, {"pause_mode": "filesystem"})
@@ -1888,6 +1907,15 @@ class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
                 {"start": "2026-11-16T01:00:00+00:00", "end": "1794798000"},
             )
 
+            naive_dt = datetime(2026, 11, 16, 1, 30)
+            client.get_metrics("cpod-1", start=naive_dt)
+            self.assertEqual(captured[-1]["query"], {"start": "2026-11-16T01:30:00+00:00"})
+
+            with self.assertRaises(TypeError):
+                client.get_metrics("cpod-1", start=True)
+            with self.assertRaises(httpx.HTTPStatusError):
+                client.get_secret("missing_sec")
+
             sbx = client.create(
                 "base",
                 network={"allowOut": ["api.openai.com"], "denyOut": ["0.0.0.0/0"]},
@@ -1898,16 +1926,19 @@ class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(create_body["volumeMounts"], [{"name": "datasets", "path": "/mnt/datasets"}])
             self.assertEqual(create_body["network"]["allowOut"], ["api.openai.com"])
 
-            desk = client.start_desktop("cpod-1", transport="webrtc")
+            desk = client.start_desktop("cpod/special", transport="webrtc")
             self.assertIsInstance(desk, DesktopSession)
             self.assertEqual(desk.transport_used, "webrtc")
             self.assertEqual(desk.webrtc_url, "/panel/tok4/")
+            self.assertEqual(captured[-1]["raw_path"], b"/sandboxes/cpod%2Fspecial/desktop/start")
 
     async def test_async_secrets_volumes_events_webhooks_metrics(self) -> None:
         captured: list[dict[str, Any]] = []
         async with AsyncCubePod(api_key="cpod-key-1", transport=httpx.MockTransport(self._make_handler(captured))) as client:
             sec = await client.create_secret("openai_api_key", "sk-123")
             self.assertEqual(sec.secret_id, "sec_123")
+            sec_page = await client.list_secrets_page(limit=5)
+            self.assertEqual(sec_page.next_token, "sec-next-2")
             self.assertEqual(len(await client.list_secrets()), 1)
             self.assertEqual((await client.get_secret("sec_123")).name, "openai_api_key")
             self.assertEqual((await client.update_secret("sec_123", "sk-new")).version, 2)
@@ -1922,6 +1953,10 @@ class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await client.read_volume_file("vol_abc", "/data.txt"), b"hello volume bytes")
             await client.delete_volume("vol_abc")
 
+            ev_page = await client.list_events_page(limit=5)
+            self.assertEqual(ev_page.next_token, "evt-next-2")
+            sbx_ev_page = await client.list_sandbox_events_page("cpod-1", limit=5)
+            self.assertEqual(sbx_ev_page.next_token, "sbx-evt-next-2")
             self.assertEqual(len(await client.list_events()), 1)
             self.assertEqual(len(await client.list_sandbox_events("cpod-1")), 1)
 
@@ -1935,3 +1970,5 @@ class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
             metrics = await client.get_metrics("cpod-1")
             self.assertEqual(len(metrics), 1)
             self.assertEqual(metrics[0].mem_total, 1073741824)
+            with self.assertRaises(TypeError):
+                await client.get_metrics("cpod-1", end=False)

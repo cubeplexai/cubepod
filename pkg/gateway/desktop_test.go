@@ -299,6 +299,7 @@ func TestDesktopTransportWebRTCAndFallback(t *testing.T) {
 	var mu sync.Mutex
 	nekoInstalled := true
 	var lastCmd string
+	lastStatusJSON := `{"status":"stopped","display":":99","resolution":"1280x800x24","transportUsed":"novnc","ports":{"desktop":8080,"terminal":7681,"cdp":9222},"pids":{}}`
 
 	mockPodd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -313,20 +314,25 @@ func TestDesktopTransportWebRTCAndFallback(t *testing.T) {
 			mu.Lock()
 			lastCmd = req.Command
 			hasNeko := nekoInstalled
-			mu.Unlock()
 
 			w.Header().Set("Content-Type", "application/json")
 			var statusJSON string
-			if strings.Contains(req.Command, "'webrtc'") && hasNeko {
-				statusJSON = fmt.Sprintf(
-					`{"status":"running","display":":99","resolution":"1280x800x24","transportUsed":"webrtc","ports":{"desktop":8080,"terminal":7681,"cdp":9222,"webrtc":%d},"pids":{"xvfb":10,"wm":11,"chromium":12,"vnc":13,"websockify":14,"ttyd":15,"neko":16}}`,
-					nekoPort,
-				)
-			} else if strings.Contains(req.Command, "'webrtc'") && !hasNeko {
-				statusJSON = `{"status":"running","display":":99","resolution":"1280x800x24","transportUsed":"novnc","fallbackReason":"neko_not_installed","ports":{"desktop":8080,"terminal":7681,"cdp":9222},"pids":{"xvfb":10,"wm":11,"chromium":12,"vnc":13,"websockify":14,"ttyd":15}}`
+			if strings.HasSuffix(req.Command, " status") {
+				statusJSON = lastStatusJSON
 			} else {
-				statusJSON = `{"status":"running","display":":99","resolution":"1280x800x24","transportUsed":"novnc","ports":{"desktop":8080,"terminal":7681,"cdp":9222},"pids":{"xvfb":10,"wm":11,"chromium":12,"vnc":13,"websockify":14,"ttyd":15}}`
+				if strings.Contains(req.Command, "'webrtc'") && hasNeko {
+					statusJSON = fmt.Sprintf(
+						`{"status":"running","display":":99","resolution":"1280x800x24","transportUsed":"webrtc","ports":{"desktop":8080,"terminal":7681,"cdp":9222,"webrtc":%d},"pids":{"xvfb":10,"wm":11,"chromium":12,"vnc":13,"websockify":14,"ttyd":15,"neko":16}}`,
+						nekoPort,
+					)
+				} else if strings.Contains(req.Command, "'webrtc'") && !hasNeko {
+					statusJSON = `{"status":"running","display":":99","resolution":"1280x800x24","transportUsed":"novnc","fallbackReason":"neko_not_installed","ports":{"desktop":8080,"terminal":7681,"cdp":9222},"pids":{"xvfb":10,"wm":11,"chromium":12,"vnc":13,"websockify":14,"ttyd":15}}`
+				} else {
+					statusJSON = `{"status":"running","display":":99","resolution":"1280x800x24","transportUsed":"novnc","ports":{"desktop":8080,"terminal":7681,"cdp":9222},"pids":{"xvfb":10,"wm":11,"chromium":12,"vnc":13,"websockify":14,"ttyd":15}}`
+				}
+				lastStatusJSON = statusJSON
 			}
+			mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"id":        "cmd-webrtc",
 				"exit_code": 0,
@@ -427,5 +433,46 @@ func TestDesktopTransportWebRTCAndFallback(t *testing.T) {
 	}
 	if !strings.HasPrefix(fbBody.DesktopURL, "/panel/") {
 		t.Fatalf("expected desktopUrl in fallback response, got %q", fbBody.DesktopURL)
+	}
+
+	// Case-insensitive "WebRTC" when Neko is installed + GET /desktop/status check
+	mu.Lock()
+	nekoInstalled = true
+	mu.Unlock()
+	mixedResp, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/desktop/start", "application/json", strings.NewReader(`{"transport":"WebRTC"}`))
+	if err != nil {
+		t.Fatalf("desktop/start WebRTC failed: %v", err)
+	}
+	var mixedBody struct {
+		TransportUsed string `json:"transportUsed"`
+		WebRTCURL     string `json:"webrtcUrl"`
+	}
+	if err := json.NewDecoder(mixedResp.Body).Decode(&mixedBody); err != nil {
+		_ = mixedResp.Body.Close()
+		t.Fatalf("decode WebRTC response: %v", err)
+	}
+	_ = mixedResp.Body.Close()
+	if mixedBody.TransportUsed != "webrtc" || !strings.HasPrefix(mixedBody.WebRTCURL, "/panel/") {
+		t.Fatalf("expected case-insensitive WebRTC start to succeed, got %+v", mixedBody)
+	}
+
+	statusResp, err := http.Get(ts.URL + "/sandboxes/" + rec.SandboxID + "/desktop/status")
+	if err != nil {
+		t.Fatalf("GET /desktop/status failed: %v", err)
+	}
+	var statusBody struct {
+		Status        string `json:"status"`
+		TransportUsed string `json:"transportUsed"`
+		Ports         struct {
+			WebRTC int `json:"webrtc"`
+		} `json:"ports"`
+	}
+	if err := json.NewDecoder(statusResp.Body).Decode(&statusBody); err != nil {
+		_ = statusResp.Body.Close()
+		t.Fatalf("decode desktop status response: %v", err)
+	}
+	_ = statusResp.Body.Close()
+	if statusBody.Status != "running" || statusBody.TransportUsed != "webrtc" || statusBody.Ports.WebRTC <= 0 {
+		t.Fatalf("expected GET /desktop/status to report running webrtc with port, got %+v", statusBody)
 	}
 }

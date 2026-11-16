@@ -85,6 +85,9 @@ json_escape() {
   local s="$1"
   s="${s//\\/\\\\}"
   s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
   printf '%s' "$s"
 }
 
@@ -122,22 +125,26 @@ get_daemon_pid() {
 
 resolve_neko_bin() {
   if [ -n "${CUBEPOD_NEKO_BIN:-}" ]; then
-    if [ -x "$CUBEPOD_NEKO_BIN" ]; then
+    if [ -f "$CUBEPOD_NEKO_BIN" ] && [ -x "$CUBEPOD_NEKO_BIN" ]; then
       printf '%s' "$CUBEPOD_NEKO_BIN"
       return 0
     fi
-    if command -v "$CUBEPOD_NEKO_BIN" >/dev/null 2>&1; then
-      command -v "$CUBEPOD_NEKO_BIN"
+    local resolved=""
+    resolved="$(command -v "$CUBEPOD_NEKO_BIN" 2>/dev/null || true)"
+    if [ -n "$resolved" ] && [ -f "$resolved" ] && [ -x "$resolved" ]; then
+      printf '%s' "$resolved"
       return 0
     fi
     return 1
   fi
-  if [ -x /usr/local/bin/neko ]; then
+  if [ -f /usr/local/bin/neko ] && [ -x /usr/local/bin/neko ]; then
     printf '%s' "/usr/local/bin/neko"
     return 0
   fi
-  if command -v neko >/dev/null 2>&1; then
-    command -v neko
+  local resolved=""
+  resolved="$(command -v neko 2>/dev/null || true)"
+  if [ -n "$resolved" ] && [ -f "$resolved" ] && [ -x "$resolved" ]; then
+    printf '%s' "$resolved"
     return 0
   fi
   return 1
@@ -321,6 +328,43 @@ emit_status_json() {
     "$pids_json"
 }
 
+stop_daemons() {
+  local pids_to_wait=()
+  local name pid
+
+  for name in "$@"; do
+    if pid="$(get_daemon_pid "$name")"; then
+      kill -TERM "$pid" 2>/dev/null || true
+      pids_to_wait+=("$pid")
+    fi
+  done
+
+  local i=0
+  while [ "$i" -lt 40 ] && [ "${#pids_to_wait[@]}" -gt 0 ]; do
+    local remaining=()
+    for pid in "${pids_to_wait[@]}"; do
+      if is_pid_alive "$pid"; then
+        remaining+=("$pid")
+      fi
+    done
+    pids_to_wait=("${remaining[@]}")
+    [ "${#pids_to_wait[@]}" -eq 0 ] && break
+    sleep 0.05
+    i=$((i + 1))
+  done
+
+  if [ "${#pids_to_wait[@]}" -gt 0 ]; then
+    for pid in "${pids_to_wait[@]}"; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done
+    sleep 0.05
+  fi
+
+  for name in "$@"; do
+    rm -f "${RUN_DIR}/${name}.pid"
+  done
+}
+
 cmd_start() {
   local resolution="$DEFAULT_RESOLUTION"
   local initial_url="$DEFAULT_URL"
@@ -409,7 +453,7 @@ cmd_start() {
       --no-first-run \
       --no-default-browser-check \
       --window-size="${RES_WIDTH},${RES_HEIGHT}" \
-      "$initial_url"
+      -- "$initial_url"
   fi
 
   if ! get_daemon_pid vnc >/dev/null; then
@@ -438,6 +482,8 @@ cmd_start() {
         NEKO_PASSWORD_ADMIN="${CUBEPOD_NEKO_PASSWORD_ADMIN:-admin}" \
         "$neko_bin" serve
     fi
+  else
+    stop_daemons neko
   fi
 
   emit_status_json "$resolution" "$DISPLAY_NUM" "$transport_used" "$fallback_reason"
@@ -445,49 +491,20 @@ cmd_start() {
 
 cmd_status() {
   load_state
-  emit_status_json "$SAVED_RESOLUTION" "$SAVED_DISPLAY" "$SAVED_TRANSPORT_USED" "$SAVED_FALLBACK_REASON" "$SAVED_TRANSPORT_USED" "$SAVED_FALLBACK_REASON"
+  emit_status_json "$SAVED_RESOLUTION" "$SAVED_DISPLAY" "$SAVED_TRANSPORT_USED" "$SAVED_FALLBACK_REASON"
 }
 
 cmd_stop() {
   load_state
 
   local stop_order=(neko ttyd websockify vnc chromium wm xvfb)
-  local pids_to_wait=()
-  local name pid
+  stop_daemons "${stop_order[@]}"
 
-  for name in "${stop_order[@]}"; do
-    if pid="$(get_daemon_pid "$name")"; then
-      kill -TERM "$pid" 2>/dev/null || true
-      pids_to_wait+=("$pid")
-    fi
-  done
+  SAVED_TRANSPORT_USED="novnc"
+  SAVED_FALLBACK_REASON=""
+  save_state "$SAVED_RESOLUTION" "$SAVED_DISPLAY" "novnc" ""
 
-  local i=0
-  while [ "$i" -lt 40 ] && [ "${#pids_to_wait[@]}" -gt 0 ]; do
-    local remaining=()
-    for pid in "${pids_to_wait[@]}"; do
-      if is_pid_alive "$pid"; then
-        remaining+=("$pid")
-      fi
-    done
-    pids_to_wait=("${remaining[@]}")
-    [ "${#pids_to_wait[@]}" -eq 0 ] && break
-    sleep 0.05
-    i=$((i + 1))
-  done
-
-  if [ "${#pids_to_wait[@]}" -gt 0 ]; then
-    for pid in "${pids_to_wait[@]}"; do
-      kill -KILL "$pid" 2>/dev/null || true
-    done
-    sleep 0.05
-  fi
-
-  for name in "${stop_order[@]}"; do
-    rm -f "${RUN_DIR}/${name}.pid"
-  done
-
-  emit_status_json "$SAVED_RESOLUTION" "$SAVED_DISPLAY"
+  emit_status_json "$SAVED_RESOLUTION" "$SAVED_DISPLAY" "novnc" ""
 }
 
 usage() {

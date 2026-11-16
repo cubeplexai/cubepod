@@ -198,6 +198,18 @@ class SandboxMetric:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class SecretPage:
+    items: list[SecretInfo]
+    next_token: str | None = None
+
+
+@dataclass
+class EventPage:
+    items: list[LifecycleEvent]
+    next_token: str | None = None
+
+
 def _build_tar_gz_bytes(
     files: dict[str, str | bytes],
     uid: int = 1000,

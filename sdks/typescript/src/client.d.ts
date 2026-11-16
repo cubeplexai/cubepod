@@ -458,6 +458,11 @@ export interface ListSecretsOptions extends RequestOptions {
   nextToken?: string;
 }
 
+export interface SecretPage {
+  items: SecretInfo[];
+  nextToken?: string;
+}
+
 export interface VolumeInfo {
   volumeId: string;
   name: string;
@@ -512,6 +517,11 @@ export interface ListSandboxEventsOptions extends RequestOptions {
 
 export interface ListEventsOptions extends ListSandboxEventsOptions {
   sandboxId?: string;
+}
+
+export interface EventPage {
+  items: LifecycleEvent[];
+  nextToken?: string;
 }
 
 export interface WebhookInfo {
@@ -680,6 +690,7 @@ export class CubePodClient {
 
   fillSecret(name: string): string;
   createSecret(name: string, value: string, options?: RequestOptions): Promise<SecretInfo>;
+  listSecretsPage(listOptions?: ListSecretsOptions, options?: RequestOptions): Promise<SecretPage>;
   listSecrets(listOptions?: ListSecretsOptions, options?: RequestOptions): Promise<SecretInfo[]>;
   getSecret(secretId: string, options?: RequestOptions): Promise<SecretInfo>;
   updateSecret(secretId: string, value: string, options?: RequestOptions): Promise<SecretInfo>;
@@ -701,7 +712,13 @@ export class CubePodClient {
     options?: ReadVolumeFileOptions,
   ): Promise<Uint8Array>;
 
+  listEventsPage(filterOptions?: ListEventsOptions, options?: RequestOptions): Promise<EventPage>;
   listEvents(filterOptions?: ListEventsOptions, options?: RequestOptions): Promise<LifecycleEvent[]>;
+  listSandboxEventsPage(
+    sandboxId: string,
+    filterOptions?: ListSandboxEventsOptions,
+    options?: RequestOptions,
+  ): Promise<EventPage>;
   listSandboxEvents(
     sandboxId: string,
     filterOptions?: ListSandboxEventsOptions,

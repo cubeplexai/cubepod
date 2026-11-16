@@ -371,19 +371,54 @@ assert d["transportUsed"] == "webrtc", d
 assert "neko" in d["pids"], d
 PY
 
+# Switching back from webrtc to novnc must stop neko cleanly
+NEKO_PID="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["pids"]["neko"])' "$OUT_I")"
+OUT_SWITCH_NOVNC="$("$CTL" start --transport novnc)"
+assert_single_line_json "$OUT_SWITCH_NOVNC"
+python3 - "$OUT_SWITCH_NOVNC" "$NEKO_PID" <<'PY'
+import json, os, sys
+d = json.loads(sys.argv[1])
+old_neko = int(sys.argv[2])
+assert d["status"] == "running", d
+assert d["transportUsed"] == "novnc", d
+assert "neko" not in d["pids"], d
+assert "webrtc" not in d["ports"], d
+try:
+    os.kill(old_neko, 0)
+    raise AssertionError("neko still alive after switching back to novnc")
+except ProcessLookupError:
+    pass
+PY
+
+# Start webrtc again, then stop and verify status resets transportUsed/fallbackReason
+OUT_I2="$("$CTL" start --transport webrtc)"
+assert_single_line_json "$OUT_I2"
 OUT_I_STOP="$("$CTL" stop)"
 assert_single_line_json "$OUT_I_STOP"
-python3 - "$OUT_I_STOP" "$OUT_I" <<'PY'
+python3 - "$OUT_I_STOP" "$OUT_I2" <<'PY'
 import json, os, sys
 stopped = json.loads(sys.argv[1])
 prev = json.loads(sys.argv[2])
 assert stopped["status"] == "stopped", stopped
 assert stopped["pids"] == {}, stopped
+assert stopped["transportUsed"] == "novnc", stopped
+assert "fallbackReason" not in stopped, stopped
 try:
     os.kill(prev["pids"]["neko"], 0)
     raise AssertionError("neko still alive after stop")
 except ProcessLookupError:
     pass
+PY
+
+OUT_I_POST_STOP_STATUS="$("$CTL" status)"
+assert_single_line_json "$OUT_I_POST_STOP_STATUS"
+python3 - "$OUT_I_POST_STOP_STATUS" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["status"] == "stopped", d
+assert d["transportUsed"] == "novnc", d
+assert "fallbackReason" not in d, d
+assert "webrtc" not in d["ports"], d
 PY
 
 echo "ALL TESTS PASSED"

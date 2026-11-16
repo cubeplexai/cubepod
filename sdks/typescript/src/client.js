@@ -223,8 +223,16 @@ function normalizeVolumeInfo(raw) {
  */
 function formatMetricTime(value) {
   if (value === undefined) return undefined;
+  if (typeof value === 'boolean') {
+    throw new TypeError('metric time must be a number, string, or Date, not boolean');
+  }
   if (value instanceof Date) return value.toISOString();
-  if (typeof value === 'number') return String(Math.trunc(value));
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new TypeError('metric time number must be finite');
+    }
+    return String(Math.trunc(value));
+  }
   return String(value);
 }
 
@@ -1694,13 +1702,13 @@ export class CubePodClient {
   }
 
   /**
-   * List tenant secrets (`GET /secrets`, metadata only).
+   * List tenant secrets with pagination metadata (`GET /secrets` and `X-Next-Token`).
    *
    * @param {import('./client.d.ts').ListSecretsOptions} [listOptions]
    * @param {import('./client.d.ts').RequestOptions} [options]
-   * @returns {Promise<import('./client.d.ts').SecretInfo[]>}
+   * @returns {Promise<import('./client.d.ts').SecretPage>}
    */
-  async listSecrets(listOptions = {}, options = {}) {
+  async listSecretsPage(listOptions = {}, options = {}) {
     const resp = await this._request('GET', '/secrets', {
       query: {
         limit: listOptions.limit,
@@ -1709,8 +1717,24 @@ export class CubePodClient {
       signal: options.signal ?? listOptions.signal,
     });
     const data = await readJsonOrUndefined(resp);
-    const items = Array.isArray(data) ? data : (data?.secrets ?? []);
-    return items.map(normalizeSecretInfo);
+    const rawItems = Array.isArray(data) ? data : (data?.secrets ?? []);
+    const rawNext = resp.headers.get('X-Next-Token') ?? data?.nextToken;
+    return {
+      items: rawItems.map(normalizeSecretInfo),
+      nextToken: rawNext ? String(rawNext) : undefined,
+    };
+  }
+
+  /**
+   * List tenant secrets (`GET /secrets`, metadata only).
+   *
+   * @param {import('./client.d.ts').ListSecretsOptions} [listOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').SecretInfo[]>}
+   */
+  async listSecrets(listOptions = {}, options = {}) {
+    const page = await this.listSecretsPage(listOptions, options);
+    return page.items;
   }
 
   /**
@@ -1901,13 +1925,13 @@ export class CubePodClient {
   // ---------------------------------------------------------------------------
 
   /**
-   * List tenant sandbox lifecycle events (`GET /events`).
+   * List tenant sandbox lifecycle events with pagination metadata (`GET /events`).
    *
    * @param {import('./client.d.ts').ListEventsOptions} [filterOptions]
    * @param {import('./client.d.ts').RequestOptions} [options]
-   * @returns {Promise<import('./client.d.ts').LifecycleEvent[]>}
+   * @returns {Promise<import('./client.d.ts').EventPage>}
    */
-  async listEvents(filterOptions = {}, options = {}) {
+  async listEventsPage(filterOptions = {}, options = {}) {
     const resp = await this._request('GET', '/events', {
       query: {
         sandboxID: filterOptions.sandboxId,
@@ -1918,18 +1942,34 @@ export class CubePodClient {
       signal: options.signal ?? filterOptions.signal,
     });
     const data = await readJsonOrUndefined(resp);
-    return Array.isArray(data) ? data : (data?.events ?? []);
+    const rawNext = resp.headers.get('X-Next-Token') ?? data?.nextToken;
+    return {
+      items: Array.isArray(data) ? data : (data?.events ?? []),
+      nextToken: rawNext ? String(rawNext) : undefined,
+    };
   }
 
   /**
-   * List lifecycle events for a single sandbox (`GET /sandboxes/{sandboxID}/events`).
+   * List tenant sandbox lifecycle events (`GET /events`).
+   *
+   * @param {import('./client.d.ts').ListEventsOptions} [filterOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').LifecycleEvent[]>}
+   */
+  async listEvents(filterOptions = {}, options = {}) {
+    const page = await this.listEventsPage(filterOptions, options);
+    return page.items;
+  }
+
+  /**
+   * List lifecycle events for a single sandbox with pagination metadata (`GET /sandboxes/{sandboxID}/events`).
    *
    * @param {string} sandboxId
    * @param {import('./client.d.ts').ListSandboxEventsOptions} [filterOptions]
    * @param {import('./client.d.ts').RequestOptions} [options]
-   * @returns {Promise<import('./client.d.ts').LifecycleEvent[]>}
+   * @returns {Promise<import('./client.d.ts').EventPage>}
    */
-  async listSandboxEvents(sandboxId, filterOptions = {}, options = {}) {
+  async listSandboxEventsPage(sandboxId, filterOptions = {}, options = {}) {
     const resp = await this._request(
       'GET',
       `/sandboxes/${encodeURIComponent(sandboxId)}/events`,
@@ -1944,7 +1984,24 @@ export class CubePodClient {
       },
     );
     const data = await readJsonOrUndefined(resp);
-    return Array.isArray(data) ? data : (data?.events ?? []);
+    const rawNext = resp.headers.get('X-Next-Token') ?? data?.nextToken;
+    return {
+      items: Array.isArray(data) ? data : (data?.events ?? []),
+      nextToken: rawNext ? String(rawNext) : undefined,
+    };
+  }
+
+  /**
+   * List lifecycle events for a single sandbox (`GET /sandboxes/{sandboxID}/events`).
+   *
+   * @param {string} sandboxId
+   * @param {import('./client.d.ts').ListSandboxEventsOptions} [filterOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').LifecycleEvent[]>}
+   */
+  async listSandboxEvents(sandboxId, filterOptions = {}, options = {}) {
+    const page = await this.listSandboxEventsPage(sandboxId, filterOptions, options);
+    return page.items;
   }
 
   /**
