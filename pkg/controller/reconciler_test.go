@@ -2857,3 +2857,400 @@ func TestWarmPoolClaim_SkipsRedundantEnsurePodAndSetsReadinessProbe(t *testing.T
 		t.Fatalf("expected WarmPool claim to skip redundant EnsurePod (calls=%d; want 1)", ck.ensurePodCalls)
 	}
 }
+
+type snapshotRecordingKubeClient struct {
+	*controller.MemoryKubeClient
+	createdSnaps  []controller.VolumeSnapshot
+	waitedSnaps   []string
+	deletedSnaps  []string
+	failWaitName  string
+	failEnsurePod bool
+}
+
+func (s *snapshotRecordingKubeClient) EnsureVolumeSnapshot(ctx context.Context, snap controller.VolumeSnapshot) error {
+	s.createdSnaps = append(s.createdSnaps, snap)
+	return s.MemoryKubeClient.EnsureVolumeSnapshot(ctx, snap)
+}
+
+func (s *snapshotRecordingKubeClient) WaitVolumeSnapshotReady(ctx context.Context, ns, name string) error {
+	s.waitedSnaps = append(s.waitedSnaps, name)
+	if s.failWaitName != "" && name == s.failWaitName {
+		return fmt.Errorf("injected snapshot wait error for %s", name)
+	}
+	return s.MemoryKubeClient.WaitVolumeSnapshotReady(ctx, ns, name)
+}
+
+func (s *snapshotRecordingKubeClient) DeleteVolumeSnapshot(ctx context.Context, ns, name string) error {
+	s.deletedSnaps = append(s.deletedSnaps, name)
+	return s.MemoryKubeClient.DeleteVolumeSnapshot(ctx, ns, name)
+}
+
+func (s *snapshotRecordingKubeClient) EnsurePod(ctx context.Context, pod controller.PodManifest) (string, error) {
+	if s.failEnsurePod {
+		return "", fmt.Errorf("injected EnsurePod failure")
+	}
+	return s.MemoryKubeClient.EnsurePod(ctx, pod)
+}
+
+func TestReconcile_ForkFrom_SnapshotMode_LifecycleAndCleanup(t *testing.T) {
+	ctx := context.Background()
+	mk := controller.NewMemoryKubeClient()
+	recKC := &snapshotRecordingKubeClient{MemoryKubeClient: mk}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(recKC),
+		controller.WithForkMode("snapshot", "longhorn-v2-snapclass"),
+	)
+
+	parentSpec := v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}
+	if _, err := r.Reconcile(ctx, "parent-snap", parentSpec); err != nil {
+		t.Fatalf("parent v1 reconcile failed: %v", err)
+	}
+	parentSpec.RootfsGeneration = 2
+	if _, err := r.Reconcile(ctx, "parent-snap", parentSpec); err != nil {
+		t.Fatalf("parent v2 reconcile failed: %v", err)
+	}
+
+	childSpec := v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: "parent-snap"},
+	}
+	if _, err := r.Reconcile(ctx, "child-snap", childSpec); err != nil {
+		t.Fatalf("child snapshot fork failed: %v", err)
+	}
+
+	if len(recKC.createdSnaps) != 2 {
+		t.Fatalf("expected 2 VolumeSnapshots created, got %d", len(recKC.createdSnaps))
+	}
+	if recKC.createdSnaps[0].Spec.Source.PersistentVolumeClaimName != "parent-snap-rootfs-gen2-pvc" {
+		t.Fatalf("expected rootfs snapshot source parent-snap-rootfs-gen2-pvc, got %q", recKC.createdSnaps[0].Spec.Source.PersistentVolumeClaimName)
+	}
+	if recKC.createdSnaps[1].Spec.Source.PersistentVolumeClaimName != "parent-snap-workspace-pvc" {
+		t.Fatalf("expected workspace snapshot source parent-snap-workspace-pvc, got %q", recKC.createdSnaps[1].Spec.Source.PersistentVolumeClaimName)
+	}
+	for _, sn := range recKC.createdSnaps {
+		if sn.Spec.VolumeSnapshotClassName == nil || *sn.Spec.VolumeSnapshotClassName != "longhorn-v2-snapclass" {
+			t.Fatalf("expected volumeSnapshotClassName longhorn-v2-snapclass, got %v", sn.Spec.VolumeSnapshotClassName)
+		}
+	}
+	if len(recKC.waitedSnaps) != 2 {
+		t.Fatalf("expected 2 WaitVolumeSnapshotReady calls, got %v", recKC.waitedSnaps)
+	}
+
+	childRootPVC, ok := mk.GetPVC("cubepod-workloads", "child-snap-rootfs-pvc")
+	if !ok {
+		t.Fatal("expected child-snap-rootfs-pvc")
+	}
+	if childRootPVC.DataSourceSnapshot != "child-snap-rootfs-snap" ||
+		childRootPVC.DataSourceKind != "VolumeSnapshot" ||
+		childRootPVC.DataSourceAPIGroup != "snapshot.storage.k8s.io" ||
+		childRootPVC.DataSourcePVC != "" {
+		t.Fatalf("unexpected child rootfs PVC dataSource: %+v", childRootPVC)
+	}
+
+	childWsPVC, ok := mk.GetPVC("cubepod-workloads", "child-snap-workspace-pvc")
+	if !ok {
+		t.Fatal("expected child-snap-workspace-pvc")
+	}
+	if childWsPVC.DataSourceSnapshot != "child-snap-workspace-snap" ||
+		childWsPVC.DataSourceKind != "VolumeSnapshot" ||
+		childWsPVC.DataSourceAPIGroup != "snapshot.storage.k8s.io" {
+		t.Fatalf("unexpected child workspace PVC dataSource: %+v", childWsPVC)
+	}
+
+	// Temporary snapshots must be cleaned up upon completion
+	if len(recKC.deletedSnaps) != 2 {
+		t.Fatalf("expected 2 DeleteVolumeSnapshot cleanup calls, got %v", recKC.deletedSnaps)
+	}
+	if len(mk.VolumeSnapshots) != 0 {
+		t.Fatalf("expected 0 remaining VolumeSnapshots in memory, got %d", len(mk.VolumeSnapshots))
+	}
+
+	fm := r.ForkMetrics()
+	if fm.ForksTotal["snapshot"]["ok"] != 1 || fm.ForkDurationCount != 1 {
+		t.Fatalf("unexpected ForkMetrics after snapshot fork: %+v", fm)
+	}
+}
+
+func TestReconcile_ForkFrom_SnapshotMode_RollbackOnFailure(t *testing.T) {
+	ctx := context.Background()
+	mk := controller.NewMemoryKubeClient()
+	recKC := &snapshotRecordingKubeClient{MemoryKubeClient: mk}
+
+	r := controller.NewReconciler(
+		controller.WithKubeClient(recKC),
+		controller.WithForkMode("snapshot", "snap-class"),
+	)
+
+	if _, err := r.Reconcile(ctx, "snap-parent", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}); err != nil {
+		t.Fatalf("parent reconcile failed: %v", err)
+	}
+
+	// 1. WaitVolumeSnapshotReady fails -> cleans up snapshots and records error metric
+	recKC.failWaitName = "fail-wait-child-workspace-snap"
+	if _, err := r.Reconcile(ctx, "fail-wait-child", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: "snap-parent"},
+	}); err == nil {
+		t.Fatal("expected snapshot fork to fail on WaitVolumeSnapshotReady error")
+	}
+	if len(mk.VolumeSnapshots) != 0 {
+		t.Fatalf("expected temporary snapshots deleted on wait failure, got %d", len(mk.VolumeSnapshots))
+	}
+
+	// 2. EnsurePod fails after PVC creation -> rollback cleans PVCs and snapshots
+	recKC.failWaitName = ""
+	recKC.failEnsurePod = true
+	if _, err := r.Reconcile(ctx, "fail-pod-child", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: "snap-parent"},
+	}); err == nil {
+		t.Fatal("expected snapshot fork to fail on EnsurePod error")
+	}
+	if len(mk.VolumeSnapshots) != 0 {
+		t.Fatalf("expected temporary snapshots deleted on EnsurePod rollback, got %d", len(mk.VolumeSnapshots))
+	}
+	if _, ok := mk.GetPVC("cubepod-workloads", "fail-pod-child-rootfs-pvc"); ok {
+		t.Fatal("expected child rootfs PVC rolled back on EnsurePod error")
+	}
+
+	fm := r.ForkMetrics()
+	if fm.ForksTotal["snapshot"]["error"] != 2 || fm.ForkDurationCount != 2 {
+		t.Fatalf("expected 2 snapshot fork errors recorded, got %+v", fm)
+	}
+}
+
+func TestReconciler_TransparentEgressAndDefaultEgressOptions(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. DefaultEgressEnabled=true + TransparentEgress=false
+	mkOff := controller.NewMemoryKubeClient()
+	rOff := controller.NewReconciler(
+		controller.WithKubeClient(mkOff),
+		controller.WithEgressDefaults(true, "ghcr.io/cubeplexai/cubepod-egress:v0.6.0", "https://exchange.cubeplex.svc:8443"),
+		controller.WithTransparentEgress(false),
+	)
+	if !rOff.DefaultEgressEnabled() || rOff.TransparentEgressEnabled() {
+		t.Fatalf("unexpected flags: defaultEgress=%v transparent=%v", rOff.DefaultEgressEnabled(), rOff.TransparentEgressEnabled())
+	}
+
+	if _, err := rOff.Reconcile(ctx, "egress-default-off-trans", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	podOff, ok := mkOff.GetPod("cubepod-workloads", "egress-default-off-trans")
+	if !ok {
+		t.Fatal("expected pod in MemoryKubeClient")
+	}
+	if len(podOff.Containers) != 2 || podOff.Containers[1].Name != "egress" {
+		t.Fatalf("expected egress sidecar injected via DefaultEgressEnabled, got %+v", podOff.Containers)
+	}
+	egressOff := podOff.Containers[1]
+	if egressOff.Image != "ghcr.io/cubeplexai/cubepod-egress:v0.6.0" {
+		t.Fatalf("unexpected egress image: %q", egressOff.Image)
+	}
+	if v, exists := envValue(egressOff.Env, "EXCHANGE_URL"); !exists || v != "https://exchange.cubeplex.svc:8443" {
+		t.Fatalf("unexpected EXCHANGE_URL: %q (%v)", v, exists)
+	}
+	if _, exists := envValue(egressOff.Env, "CUBEPOD_TRANSPARENT"); exists {
+		t.Fatal("did not expect CUBEPOD_TRANSPARENT when WithTransparentEgress(false)")
+	}
+	if egressOff.SecurityContext != nil {
+		t.Fatalf("expected nil egress SecurityContext when WithTransparentEgress(false), got %+v", egressOff.SecurityContext)
+	}
+
+	// 2. DefaultEgressEnabled=true + TransparentEgress=true (default)
+	mkOn := controller.NewMemoryKubeClient()
+	rOn := controller.NewReconciler(
+		controller.WithKubeClient(mkOn),
+		controller.WithDefaultEgressEnabled(true),
+		controller.WithDefaultEgressImage("ghcr.io/cubeplexai/cubepod-egress:v0.6.0"),
+		controller.WithDefaultEgressExchangeURL("https://exchange.cubeplex.svc:8443"),
+	)
+	if !rOn.TransparentEgressEnabled() {
+		t.Fatal("expected TransparentEgressEnabled to default to true")
+	}
+	if _, err := rOn.Reconcile(ctx, "egress-default-on-trans", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	podOn, ok := mkOn.GetPod("cubepod-workloads", "egress-default-on-trans")
+	if !ok {
+		t.Fatal("expected pod in MemoryKubeClient")
+	}
+	egressOn := podOn.Containers[1]
+	if v, exists := envValue(egressOn.Env, "CUBEPOD_TRANSPARENT"); !exists || v != "1" {
+		t.Fatalf("expected CUBEPOD_TRANSPARENT=1, got (%q, %v)", v, exists)
+	}
+	if egressOn.SecurityContext == nil || egressOn.SecurityContext.Capabilities == nil ||
+		len(egressOn.SecurityContext.Capabilities.Add) != 1 || egressOn.SecurityContext.Capabilities.Add[0] != "NET_ADMIN" {
+		t.Fatalf("expected NET_ADMIN capability on egress container, got %+v", egressOn.SecurityContext)
+	}
+}
+
+func TestReconcileWarmPool_DefaultEgressSecretsCreatedAndCleaned(t *testing.T) {
+	ctx := context.Background()
+	mk := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(mk),
+		controller.WithDefaultEgressEnabled(true),
+	)
+
+	wp, err := r.ReconcileWarmPool(ctx, "egress-wp", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "ubuntu:24.04",
+		Replicas:    2,
+	})
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+	if wp.AvailableReplicas != 2 {
+		t.Fatalf("AvailableReplicas = %d; want 2", wp.AvailableReplicas)
+	}
+	for _, id := range []string{"egress-wp-warm-1", "egress-wp-warm-2"} {
+		if _, err := mk.GetSecret(ctx, "cubepod-workloads", id+"-egress-mtls"); err != nil {
+			t.Fatalf("expected standby egress mTLS secret for %s: %v", id, err)
+		}
+		if _, err := mk.GetSecret(ctx, "cubepod-workloads", id+"-egress-ca"); err != nil {
+			t.Fatalf("expected standby egress CA secret for %s: %v", id, err)
+		}
+	}
+
+	// Scale down removes standby egress secrets
+	if _, err := r.ReconcileWarmPool(ctx, "egress-wp", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "ubuntu:24.04",
+		Replicas:    1,
+	}); err != nil {
+		t.Fatalf("scale-down ReconcileWarmPool failed: %v", err)
+	}
+	if _, err := mk.GetSecret(ctx, "cubepod-workloads", "egress-wp-warm-1-egress-mtls"); err == nil {
+		t.Fatal("expected scaled-down warm pod egress-mtls secret to be deleted")
+	}
+
+	// Box with custom NetworkPolicy must cold-start with its own boxName secrets rather than claiming warm pod
+	customSt, err := r.Reconcile(ctx, "custom-net-box", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		WarmPoolRef:      "egress-wp",
+		NetworkPolicy:    &v1alpha1.NetworkPolicySpec{DefaultAction: "deny"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile custom-net-box failed: %v", err)
+	}
+	if customSt.PodName != "custom-net-box" {
+		t.Fatalf("expected custom NetworkPolicy box to cold-start on custom-net-box, got %q", customSt.PodName)
+	}
+	if _, err := mk.GetSecret(ctx, "cubepod-workloads", "custom-net-box-egress-mtls"); err != nil {
+		t.Fatalf("expected egress-mtls secret for custom-net-box: %v", err)
+	}
+
+	// Claim remaining warm pod and verify DeleteBox cleans up its standby egress secrets
+	claimedSt, err := r.Reconcile(ctx, "claimed-box", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		WarmPoolRef:      "egress-wp",
+	})
+	if err != nil {
+		t.Fatalf("Reconcile claimed-box failed: %v", err)
+	}
+	if claimedSt.PodName != "egress-wp-warm-2" {
+		t.Fatalf("expected claimed warm pod egress-wp-warm-2, got %q", claimedSt.PodName)
+	}
+	if err := r.DeleteBox(ctx, "claimed-box", true); err != nil {
+		t.Fatalf("DeleteBox failed: %v", err)
+	}
+	if _, err := mk.GetSecret(ctx, "cubepod-workloads", "egress-wp-warm-2-egress-mtls"); err == nil {
+		t.Fatal("expected DeleteBox to clean up claimed warm pod egress-mtls secret")
+	}
+}
+
+func TestReconcile_ForkFrom_SnapshotMode_LongNameHashAndFilesystemRejection(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Snapshot fork mode rejects volumeMode=Filesystem cleanly
+	mkFS := controller.NewMemoryKubeClient()
+	rFS := controller.NewReconciler(
+		controller.WithKubeClient(mkFS),
+		controller.WithVolumeMode("Filesystem"),
+		controller.WithForkMode("snapshot", "snap-class"),
+	)
+	if _, err := rFS.Reconcile(ctx, "fs-parent", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}); err != nil {
+		t.Fatalf("fs-parent Reconcile failed: %v", err)
+	}
+	if _, err := rFS.Reconcile(ctx, "fs-child", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: "fs-parent"},
+	}); err == nil {
+		t.Fatal("expected snapshot fork mode to reject volumeMode=Filesystem")
+	}
+
+	// 2. Long sandbox names (>51 chars) sharing a 50-char prefix produce distinct VolumeSnapshot names
+	mk := controller.NewMemoryKubeClient()
+	recKC := &snapshotRecordingKubeClient{MemoryKubeClient: mk}
+	r := controller.NewReconciler(
+		controller.WithKubeClient(recKC),
+		controller.WithForkMode("snapshot", "snap-class"),
+	)
+	if _, err := r.Reconcile(ctx, "parent-box", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}); err != nil {
+		t.Fatalf("parent Reconcile failed: %v", err)
+	}
+
+	sharedPrefix := strings.Repeat("a", 50)
+	childA := sharedPrefix + "-fork-alpha-123456"
+	childB := sharedPrefix + "-fork-bravo-789012"
+	for _, id := range []string{childA, childB} {
+		if _, err := r.Reconcile(ctx, id, v1alpha1.PodBoxSpec{
+			TemplateRef:      "ubuntu:24.04",
+			DesiredState:     v1alpha1.DesiredStateRunning,
+			RootfsGeneration: 1,
+			ForkFrom:         &v1alpha1.ForkSource{PodBoxName: "parent-box"},
+		}); err != nil {
+			t.Fatalf("fork %s failed: %v", id, err)
+		}
+	}
+	if len(recKC.createdSnaps) != 4 {
+		t.Fatalf("expected 4 snapshots created, got %d", len(recKC.createdSnaps))
+	}
+	seen := map[string]struct{}{}
+	for _, sn := range recKC.createdSnaps {
+		if len(sn.Metadata.Name) > 63 {
+			t.Fatalf("snapshot name exceeds 63 chars: %q (%d)", sn.Metadata.Name, len(sn.Metadata.Name))
+		}
+		if _, dup := seen[sn.Metadata.Name]; dup {
+			t.Fatalf("snapshot name collision: %q", sn.Metadata.Name)
+		}
+		seen[sn.Metadata.Name] = struct{}{}
+	}
+}

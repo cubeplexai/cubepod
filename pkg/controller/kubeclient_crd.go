@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
@@ -685,4 +686,130 @@ func (c *RESTKubeClient) DeleteSecret(ctx context.Context, namespace, name strin
 
 	body, _ := io.ReadAll(resp.Body)
 	return fmt.Errorf("DeleteSecret failed: status %d (%s)", resp.StatusCode, string(body))
+}
+
+// EnsureVolumeSnapshot creates a snapshot.storage.k8s.io/v1 VolumeSnapshot via POST.
+// A 409 Conflict response is treated as idempotent success.
+func (c *RESTKubeClient) EnsureVolumeSnapshot(ctx context.Context, snap VolumeSnapshot) error {
+	ns := c.resolveNamespace(snap.Metadata.Namespace)
+	snap.Metadata.Namespace = ns
+	name := snap.Metadata.Name
+	if name == "" {
+		return fmt.Errorf("VolumeSnapshot metadata.name is required")
+	}
+	if snap.APIVersion == "" {
+		snap.APIVersion = "snapshot.storage.k8s.io/v1"
+	}
+	if snap.Kind == "" {
+		snap.Kind = "VolumeSnapshot"
+	}
+
+	reqURL := fmt.Sprintf("%s/apis/snapshot.storage.k8s.io/v1/namespaces/%s/volumesnapshots", c.baseURL, ns)
+	payload, err := json.Marshal(snap)
+	if err != nil {
+		return fmt.Errorf("failed to marshal VolumeSnapshot JSON: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPost, reqURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("EnsureVolumeSnapshot POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusConflict {
+		return nil
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("VolumeSnapshot %w: status 404 (%s)", ErrCRDNotInstalled, string(body))
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("EnsureVolumeSnapshot failed: status %d (%s)", resp.StatusCode, string(body))
+}
+
+// GetVolumeSnapshot retrieves a snapshot.storage.k8s.io/v1 VolumeSnapshot by namespace and name.
+func (c *RESTKubeClient) GetVolumeSnapshot(ctx context.Context, namespace, name string) (*VolumeSnapshot, error) {
+	ns := c.resolveNamespace(namespace)
+	reqURL := fmt.Sprintf("%s/apis/snapshot.storage.k8s.io/v1/namespaces/%s/volumesnapshots/%s", c.baseURL, ns, name)
+
+	resp, err := c.doRequest(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GetVolumeSnapshot GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("volumesnapshot %s/%s not found (404)", ns, name)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GetVolumeSnapshot failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	var snap VolumeSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
+		return nil, fmt.Errorf("failed to decode VolumeSnapshot: %w", err)
+	}
+	return &snap, nil
+}
+
+// WaitVolumeSnapshotReady polls a VolumeSnapshot until status.readyToUse is true or status.error is set.
+func (c *RESTKubeClient) WaitVolumeSnapshotReady(ctx context.Context, namespace, name string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ns := c.resolveNamespace(namespace)
+	interval := c.pollInterval
+	if interval <= 0 {
+		interval = 500 * time.Millisecond
+	}
+	timeout := c.pollTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+
+	pollCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		snap, err := c.GetVolumeSnapshot(pollCtx, ns, name)
+		if err == nil && snap != nil {
+			if snap.Status.Error != nil && snap.Status.Error.Message != "" {
+				return fmt.Errorf("volumesnapshot %s/%s failed: %s", ns, name, snap.Status.Error.Message)
+			}
+			if snap.Status.ReadyToUse != nil && *snap.Status.ReadyToUse {
+				return nil
+			}
+		}
+
+		select {
+		case <-pollCtx.Done():
+			return fmt.Errorf("timed out waiting for volumesnapshot %s/%s readyToUse (last err=%v)", ns, name, err)
+		case <-ticker.C:
+		}
+	}
+}
+
+// DeleteVolumeSnapshot removes a VolumeSnapshot by namespace and name, ignoring 404 NotFound.
+func (c *RESTKubeClient) DeleteVolumeSnapshot(ctx context.Context, namespace, name string) error {
+	ns := c.resolveNamespace(namespace)
+	reqURL := fmt.Sprintf("%s/apis/snapshot.storage.k8s.io/v1/namespaces/%s/volumesnapshots/%s", c.baseURL, ns, name)
+
+	resp, err := c.doRequest(ctx, http.MethodDelete, reqURL, nil)
+	if err != nil {
+		return fmt.Errorf("DeleteVolumeSnapshot DELETE failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted ||
+		resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("DeleteVolumeSnapshot failed: status %d (%s)", resp.StatusCode, string(body))
 }

@@ -438,3 +438,144 @@ func TestControllerManager_InternalTemplateBuildEndpoints(t *testing.T) {
 		t.Fatalf("expected last log entry on backward limit=1, got %+v", backResp.Logs)
 	}
 }
+
+type failForkEnsurePodKubeClient struct {
+	*controller.MemoryKubeClient
+	failPodName string
+}
+
+func (f *failForkEnsurePodKubeClient) EnsurePod(ctx context.Context, pod controller.PodManifest) (string, error) {
+	if pod.Name == f.failPodName {
+		return "", errors.New("injected EnsurePod fork failure")
+	}
+	return f.MemoryKubeClient.EnsurePod(ctx, pod)
+}
+
+func TestControllerManager_Metrics_WarmPoolAvailableAndForkMetrics(t *testing.T) {
+	kc := &failForkEnsurePodKubeClient{
+		MemoryKubeClient: controller.NewMemoryKubeClient(),
+		failPodName:      "child-snap-err",
+	}
+	ctx := context.Background()
+
+	// 1. Reconciler in pvc-clone mode: warmpool + parent + 1 pvc-clone fork
+	r := controller.NewReconciler(
+		controller.WithKubeClient(kc),
+		controller.WithForkMode("pvc-clone", ""),
+	)
+	if _, err := r.ReconcileWarmPool(ctx, "metrics-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "ubuntu:24.04",
+		Replicas:    2,
+	}); err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, "fork-parent", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}); err != nil {
+		t.Fatalf("parent reconcile failed: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, "child-pvc", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: "fork-parent"},
+	}); err != nil {
+		t.Fatalf("pvc-clone fork failed: %v", err)
+	}
+
+	// Switch same reconciler's fork mode by using WithForkMode on a second fork? Wait: test snapshot mode on a second reconciler,
+	// or re-verify both modes via Reconcile. Let's test snapshot ok + snapshot error on rSnap, and pvc_clone + warmpool on r!
+	mgr := controller.NewControllerManager(r, ":0", time.Second)
+	srv := httptest.NewServer(mgr.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics failed: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	body := string(raw)
+
+	for _, want := range []string{
+		"cubepod_warmpool_ready 2",
+		"cubepod_warmpool_available_replicas 2",
+		`cubepod_sandbox_forks_total{mode="pvc_clone",result="ok"} 1`,
+		`cubepod_sandbox_forks_total{mode="pvc_clone",result="error"} 0`,
+		`cubepod_sandbox_forks_total{mode="snapshot",result="ok"} 0`,
+		`cubepod_sandbox_forks_total{mode="snapshot",result="error"} 0`,
+		`cubepod_sandbox_fork_duration_seconds_bucket{le="+Inf"} 1`,
+		`cubepod_sandbox_fork_duration_seconds_count 1`,
+		`cubepod_sandbox_fork_duration_seconds_sum `,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("metrics output missing %q;\ngot:\n%s", want, body)
+		}
+	}
+
+	// 2. Snapshot mode Reconciler: 1 ok + 1 error
+	rSnap := controller.NewReconciler(
+		controller.WithKubeClient(kc),
+		controller.WithForkMode("snapshot", "snap-sc"),
+	)
+	if _, err := rSnap.Reconcile(ctx, "child-snap-ok", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: "fork-parent"},
+	}); err != nil {
+		t.Fatalf("snapshot fork ok failed: %v", err)
+	}
+	if _, err := rSnap.Reconcile(ctx, "child-snap-err", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: "fork-parent"},
+	}); err == nil {
+		t.Fatal("expected child-snap-err fork to fail")
+	}
+
+	mgrSnap := controller.NewControllerManager(rSnap, ":0", time.Second)
+	srvSnap := httptest.NewServer(mgrSnap.Handler())
+	defer srvSnap.Close()
+
+	resp2, err := http.Get(srvSnap.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics (snap) failed: %v", err)
+	}
+	raw2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	body2 := string(raw2)
+
+	for _, want := range []string{
+		`cubepod_sandbox_forks_total{mode="snapshot",result="ok"} 1`,
+		`cubepod_sandbox_forks_total{mode="snapshot",result="error"} 1`,
+		`cubepod_sandbox_fork_duration_seconds_bucket{le="+Inf"} 2`,
+		`cubepod_sandbox_fork_duration_seconds_count 2`,
+	} {
+		if !strings.Contains(body2, want) {
+			t.Errorf("snap metrics output missing %q;\ngot:\n%s", want, body2)
+		}
+	}
+
+	// 3. JSON metrics format also includes new metrics
+	reqJSON, _ := http.NewRequest(http.MethodGet, srv.URL+"/metrics", nil)
+	reqJSON.Header.Set("Accept", "application/json")
+	respJSON, err := http.DefaultClient.Do(reqJSON)
+	if err != nil {
+		t.Fatalf("GET /metrics JSON failed: %v", err)
+	}
+	defer respJSON.Body.Close()
+	var parsed map[string]any
+	if err := json.NewDecoder(respJSON.Body).Decode(&parsed); err != nil {
+		t.Fatalf("decode JSON metrics failed: %v", err)
+	}
+	if parsed["cubepod_warmpool_available_replicas"] != float64(2) {
+		t.Fatalf("expected cubepod_warmpool_available_replicas=2, got %v", parsed["cubepod_warmpool_available_replicas"])
+	}
+	if parsed["cubepod_sandbox_fork_duration_seconds_count"] != float64(1) {
+		t.Fatalf("expected cubepod_sandbox_fork_duration_seconds_count=1, got %v", parsed["cubepod_sandbox_fork_duration_seconds_count"])
+	}
+}

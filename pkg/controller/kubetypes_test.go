@@ -237,3 +237,69 @@ func TestToCoreV1Pod_PrivilegedContainerSerialization(t *testing.T) {
 		t.Fatalf("expected containers[0].securityContext.privileged=true, got %v", cObj["securityContext"])
 	}
 }
+
+func TestToCoreV1Container_CapabilitiesSecurityContext(t *testing.T) {
+	c := ContainerManifest{
+		Name:  "egress",
+		Image: "cubepod-egress:latest",
+		SecurityContext: &SecurityContextSpec{
+			Capabilities: &CapabilitiesSpec{
+				Add:  []string{"NET_ADMIN"},
+				Drop: []string{"ALL"},
+			},
+		},
+	}
+
+	v1c := toCoreV1Container(c)
+	if v1c.SecurityContext == nil || v1c.SecurityContext.Capabilities == nil {
+		t.Fatalf("expected SecurityContext.Capabilities to be populated, got %+v", v1c.SecurityContext)
+	}
+
+	raw, err := json.Marshal(v1c)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	sc := parsed["securityContext"].(map[string]any)
+	caps := sc["capabilities"].(map[string]any)
+	addList := caps["add"].([]any)
+	dropList := caps["drop"].([]any)
+	if len(addList) != 1 || addList[0] != "NET_ADMIN" {
+		t.Fatalf("expected securityContext.capabilities.add=[NET_ADMIN], got %v", addList)
+	}
+	if len(dropList) != 1 || dropList[0] != "ALL" {
+		t.Fatalf("expected securityContext.capabilities.drop=[ALL], got %v", dropList)
+	}
+}
+
+func TestToCoreV1PVC_VolumeSnapshotDataSource(t *testing.T) {
+	snapPVC := BlockPVCManifest{
+		Name:               "child-rootfs-pvc",
+		Namespace:          "cubepod-workloads",
+		StorageClassName:   "longhorn-v2",
+		VolumeMode:         "Block",
+		Size:               "10Gi",
+		AccessModes:        []string{"ReadWriteOnce"},
+		DataSourceSnapshot: "child-rootfs-snap",
+	}
+
+	v1SnapPVC := toCoreV1PVC(snapPVC, "cubepod-workloads")
+	raw, err := json.Marshal(v1SnapPVC)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+	spec := parsed["spec"].(map[string]any)
+	ds := spec["dataSource"].(map[string]any)
+	if ds["apiGroup"] != "snapshot.storage.k8s.io" || ds["kind"] != "VolumeSnapshot" || ds["name"] != "child-rootfs-snap" {
+		t.Fatalf("unexpected VolumeSnapshot dataSource: %v", ds)
+	}
+}
