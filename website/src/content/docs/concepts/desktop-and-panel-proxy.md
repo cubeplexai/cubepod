@@ -34,7 +34,7 @@ All desktop processes are managed by `/opt/cubepod/desktop/cubepod-desktop-ctl` 
 
 `cubepod-gateway` exposes three lifecycle endpoints (also available under `/v1/sandboxes/{id}/desktop/...`):
 
-- `POST /sandboxes/{id}/desktop/start` — validates resolution (`WxHx{16|24|32}`), auto-resumes the sandbox if `Paused`, verifies `/opt/cubepod/desktop/cubepod-desktop-ctl` exists (returning **`HTTP 422 desktop_not_installed`** on non-desktop images), starts the stack via `podd`, and returns ready URLs (`desktopUrl`, `terminalUrl`, `cdpUrl`).
+- `POST /sandboxes/{id}/desktop/start` — validates resolution (`WxHx{16|24|32}`) and optional `transport` (`"webrtc" | "novnc"`, *Added in v0.6.0*), auto-resumes the sandbox if `Paused`, verifies `/opt/cubepod/desktop/cubepod-desktop-ctl` exists (returning **`HTTP 422 desktop_not_installed`** on non-desktop images), starts the stack via `podd`, and returns ready URLs (`desktopUrl`, `terminalUrl`, `cdpUrl`, plus `transportUsed`, optional `webrtcUrl` on port `8081`, and `fallbackReason`). When `transport: "webrtc"` is requested on images without Neko/WebRTC binaries, `cubepod-desktop-ctl` and the gateway fall back gracefully to `noVNC` (`transportUsed: "novnc"`, `fallbackReason: "neko_not_installed"`).
 - `GET /sandboxes/{id}/desktop/status` — returns live status of `Xvfb`, `openbox`, `chromium`, `x11vnc`/`noVNC`, and `ttyd`.
 - `POST /sandboxes/{id}/desktop/stop` — gracefully tears down GUI daemons to reclaim RAM while preserving sandbox compute and files.
 

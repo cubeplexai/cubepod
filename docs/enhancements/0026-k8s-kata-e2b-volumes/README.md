@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `alpha` | `implemented` | `2026-11-15` | `2026-11-15` | `storage` (`controller`, `gateway`, `runtime`) |
+| `alpha` | `implemented` | `2026-11-15` | `2026-11-16` | `storage` (`controller`, `gateway`, `runtime`) |
 
 ## Table of Contents
 
@@ -36,12 +36,12 @@
 ## Release Signoff Checklist
 
 - [x] Enhancement design documented in `docs/enhancements/0026-k8s-kata-e2b-volumes/`
-- [ ] Shared RWX volume store backend integrated between `cubepod-gateway` and Kata Pods
-- [ ] `podd-init` single-threaded `pivot_root` E2B mount propagation with `MS_NOSUID | MS_NODEV` implemented
-- [ ] `PodBoxSpec.E2BVolumeMounts` controller staging mount + `/etc/cubepod/e2b-mounts.json` (or env spec) implemented
-- [ ] `ForkFrom` interaction with `E2BVolumeMounts` enforced and unit-tested
-- [ ] Live Kubernetes Kata + CSI E2E tests (`make test-k8s-e2e`) passing
-- [ ] Security invariants verified (AGENTS.md Invariants 1, 2, 3, and 4)
+- [x] Shared RWX volume store backend integrated between `cubepod-gateway` and Kata Pods (including Helm `e2bVolumes.rwxStorageClassName` auto-enabling `K8sE2BVolumeMounts`)
+- [x] `podd-init` single-threaded `pivot_root` E2B mount propagation with `MS_NOSUID | MS_NODEV` implemented (`crates/podd-init/src/main.rs`)
+- [x] `PodBoxSpec.E2BVolumeMounts` controller staging mount + `CUBEPOD_E2B_MOUNTS` / `/etc/cubepod/e2b-mounts.json` implemented (`pkg/controller/manifests.go`, `crates/podd-init/src/main.rs`)
+- [x] `ForkFrom` interaction with `E2BVolumeMounts` enforced and unit-tested (`pkg/gateway/volumes_test.go`)
+- [ ] Live Kubernetes Kata + CSI E2E tests (`make test-k8s-e2e`) passing *(pending live cluster verification with Kata + RWX CSI; unit tests and local E2E harnesses are implemented and passing)*
+- [x] Security invariants verified (AGENTS.md Invariants 1, 2, 3, and 4: reserved-path lexical rejection, single-threaded `podd-init`, `1000:1000` ownership, and `MS_NOSUID | MS_NODEV` remounts)
 
 ---
 
@@ -254,6 +254,7 @@ flowchart LR
 ## Implementation History
 
 - **2026-11-15**: Drafted CEP-0026 (`provisional`, `alpha`) as the Kubernetes Kata & CSI follow-up to CEP-0025.
+- **2026-11-16**: Core engineering and security invariant items implemented and unit-tested across `crates/podd-init`, `pkg/controller`, `pkg/gateway`, and Helm (`e2bVolumes.rwxStorageClassName` auto-enabling `K8sE2BVolumeMounts`, plus Prometheus bind-duration metrics). Live Kubernetes Kata + RWX CSI cluster E2E remains pending (`[ ]`).
 
 ---
 

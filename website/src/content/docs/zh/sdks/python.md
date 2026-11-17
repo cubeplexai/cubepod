@@ -217,8 +217,9 @@ desktop = await client.start_desktop(
     resolution="1280x800x24",
     initial_url="https://example.com",
     expires_in_seconds=3600,
+    transport="webrtc",  # 可选（"novnc" | "webrtc"，v0.6.0 新增；缺失组件时自动回退至 noVNC）
 )
-print(desktop.desktop_url, desktop.terminal_url, desktop.cdp_url)
+print(desktop.desktop_url, desktop.terminal_url, desktop.cdp_url, desktop.transport_used, desktop.webrtc_url)
 
 status = await client.get_desktop_status(box.sandbox_id)
 await client.stop_desktop(box.sandbox_id)
@@ -251,6 +252,50 @@ box = await client.create(
 ```
 
 完整的 mTLS 密钥交换流程请参阅[零信任出站代理与密钥隔离](/zh/concepts/zero-trust-egress/)。
+
+## 沙箱指标、密钥、持久化卷与生命周期事件 *(v0.6.0 新增)*
+
+`AsyncCubePod` 与 `CubePod` 均完整支持 `Secrets`、`Volumes`、`Events`/`Webhooks` 与 `get_metrics` 方法：
+
+```python
+from datetime import datetime, timezone
+from cubepod import Secret, fill_secret
+
+# 1. 查询沙箱 CPU / 内存 / 磁盘资源指标
+metrics = await client.get_metrics(
+    box.sandbox_id,
+    start=int(datetime.now(timezone.utc).timestamp()) - 300,
+)
+for m in metrics:
+    print(m.timestamp, m.cpu_used_pct, m.mem_used, m.disk_used)
+
+# 2. Write-Only 密钥与占位符生成（Secret.fill / fill_secret / client.fill_secret）
+sec = await client.create_secret("openai_key", os.environ["REAL_OPENAI_KEY"])
+placeholder = Secret.fill("openai_key")  # "${e2b.secrets.openai_key}"
+secrets = await client.list_secrets(limit=50)
+sec_meta = await client.get_secret(sec.secret_id)
+await client.update_secret(sec.secret_id, os.environ["NEW_OPENAI_KEY"])
+await client.delete_secret(sec.secret_id)
+
+# 3. 持久化 E2B 卷与文件内容 API
+vol = await client.create_volume("shared-datasets")
+await client.write_volume_file(vol.volume_id, "/prompt.txt", "hello volume")
+raw_data = await client.read_volume_file(vol.volume_id, "/prompt.txt")
+vols = await client.list_volumes()
+vol_info = await client.get_volume(vol.volume_id)
+await client.delete_volume(vol.volume_id)
+
+# 4. 生命周期事件与签名 Webhook 管理
+hook = await client.create_webhook(
+    name="lifecycle-audit",
+    url="https://hooks.example.com/cubepod",
+    events=["sandbox.lifecycle.created", "sandbox.lifecycle.paused", "sandbox.lifecycle.killed"],
+)
+events = await client.list_sandbox_events(box.sandbox_id, limit=20)
+all_events = await client.list_events(event_type="sandbox.lifecycle.paused")
+await client.update_webhook(hook.id, enabled=True, rotate_secret=True)
+await client.delete_webhook(hook.id)
+```
 
 ## WarmPool 预热池与模板管理
 
@@ -295,5 +340,9 @@ built = await client.build_template(
 | `CommandLogs` | `id`、`content`、`cursor`、`running`、`exit_code` |
 | `FileEntry` | `name`、`path`、`is_dir`、`size`、`mode`、`modified_at` |
 | `PanelEndpoint` | `url`、`token`、`expires_at` |
-| `DesktopSession` | `status`、`desktop_url`、`terminal_url`、`cdp_url`、`expires_at` |
+| `DesktopSession` | `status`、`desktop_url`、`terminal_url`、`cdp_url`、`webrtc_url`、`transport_used`、`fallback_reason`、`expires_at` |
+| `SandboxMetric` *(v0.6.0 新增)* | `timestamp`、`timestamp_unix`、`cpu_count`、`cpu_used_pct`、`mem_used`、`mem_total`、`mem_cache`、`disk_used`、`disk_total` |
+| `SecretInfo` *(v0.6.0 新增)* | `secret_id`（`.id`）、`name`、`current_version`（`.version`）、`metadata`、`created_at`、`updated_at` |
+| `VolumeInfo` / `VolumeEntry` *(v0.6.0 新增)* | `volume_id`、`name`、`token` / `name`、`type`、`path`、`size`、`mode`、`uid`、`gid` |
+| `LifecycleEvent` / `WebhookInfo` *(v0.6.0 新增)* | `id`、`type`、`timestamp`、`sandbox_id`、`event_data` / `id`、`name`、`url`、`events`、`enabled`、`signature_key` |
 | `CubePodFileTooLargeError` | `ValueError` 子类，当 `read_text_file` 超出 `max_bytes` 限制时抛出 |

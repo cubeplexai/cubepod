@@ -13,17 +13,12 @@ reviewers:
 approvers:
   - "@cubepod-maintainers"
 stage: "alpha"
-latest-milestone: "v0.6"
+latest-milestone: "v0.6.0"
 milestone:
-  alpha: "v0.6"
-  beta: "v0.7"
-  stable: "v1.0"
-feature-gates:
-  - name: "E2BSandboxMetrics"
-    components:
-      - "cubepod-gateway"
-      - "podd"
-      - "podd-init"
+  alpha: "v0.6.0"
+  beta: "v0.7.0"
+  stable: "v1.0.0"
+feature-gates: []
 disable-supported: false
 metrics:
   - "cubepod_e2b_requests_total"

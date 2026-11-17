@@ -345,6 +345,117 @@ function flattenValues(obj, prefix, comments, rows) {
   }
 }
 
+const HELM_VALUE_DESCRIPTIONS = {
+  'gateway.podDisruptionBudget.enabled': {
+    en: '*Added in v0.6.0.* Enable PodDisruptionBudget (`pdb.yaml`) for `cubepod-gateway`. When `null`/omitted, auto-enabled whenever `gateway.replicaCount > 1`.',
+    zh: '*v0.6.0 新增。* 是否为 `cubepod-gateway` 创建 PodDisruptionBudget（`pdb.yaml`）。为 `null` 或省略时，当 `gateway.replicaCount > 1` 会自动启用。',
+  },
+  'gateway.podDisruptionBudget.minAvailable': {
+    en: '*Added in v0.6.0.* Minimum available gateway Pods enforced by the PDB when `maxUnavailable` is unset.',
+    zh: '*v0.6.0 新增。* 未设置 `maxUnavailable` 时，PDB 要求的最少可用 Gateway Pod 数量。',
+  },
+  'gateway.secretsKeySecret': {
+    en: 'Legacy fallback Kubernetes Secret name (key `key`) for `CUBEPOD_SECRETS_KEY` when `secrets.existingSecret` is unset.',
+    zh: '当未配置 `secrets.existingSecret` 时，作为 `CUBEPOD_SECRETS_KEY` 的旧版回退 Secret 名称（键名 `key`）。',
+  },
+  'gateway.eventsKeySecret': {
+    en: 'Optional Kubernetes Secret name (key `key`) holding the 32-byte encryption key (`CUBEPOD_EVENTS_KEY`) for local persisted event/webhook state.',
+    zh: '可选 Kubernetes Secret 名称（键名 `key`），用于注入本地事件与 Webhook 持久化所需的 32 字节加密密钥（`CUBEPOD_EVENTS_KEY`）。',
+  },
+  'egress.enabled': {
+    en: 'Inject the `cubepod-egress` sidecar container by default on seeded and fallback templates.',
+    zh: '是否在默认与兜底模板中默认注入 `cubepod-egress` 出站边车容器。',
+  },
+  'egress.transparent': {
+    en: '*Changed in v0.6.0.* Enables `CUBEPOD_TRANSPARENT=1` and `NET_ADMIN` `nftables` interception in `cubepod-egress` sidecars (effective `TransparentEgress` requires both `egress.transparent` and `featureGates.transparentEgress` to be `true`).',
+    zh: '*v0.6.0 变更。* 是否在 `cubepod-egress` 边车中启用 `CUBEPOD_TRANSPARENT=1` 与 `NET_ADMIN` `nftables` 透明拦截（需同时开启 `egress.transparent` 与 `featureGates.transparentEgress`）。',
+  },
+  'egress.image.registry': {
+    en: 'OCI registry hosting the `cubepod-egress` sidecar image.',
+    zh: '`cubepod-egress` 边车镜像所在的 OCI 仓库地址。',
+  },
+  'egress.image.repository': {
+    en: 'Image repository name for `cubepod-egress`.',
+    zh: '`cubepod-egress` 边车镜像仓库路径。',
+  },
+  'egress.image.tag': {
+    en: 'Image tag for `cubepod-egress`.',
+    zh: '`cubepod-egress` 边车镜像标签。',
+  },
+  'egress.exchangeUrl': {
+    en: 'Default mTLS vault URL queried by `cubepod-egress` to exchange `cpodref_` placeholders.',
+    zh: '`cubepod-egress` 通过 mTLS 置换 `cpodref_` 占位符时默认访问的 Vault 地址。',
+  },
+  'secrets.enabled': {
+    en: '*Added in v0.6.0.* Enable the `/secrets` API store in `cubepod-gateway` (combined with `featureGates.e2bSecretsAPI`).',
+    zh: '*v0.6.0 新增。* 是否在 `cubepod-gateway` 中启用 `/secrets` 密钥存储（与 `featureGates.e2bSecretsAPI` 共同生效）。',
+  },
+  'secrets.backend': {
+    en: '*Added in v0.6.0.* Secret persistence backend: `"k8s"` (`KubeSecretBackend` for multi-replica HA via Kubernetes Secrets), `"file"`, or `"disabled"`.',
+    zh: '*v0.6.0 新增。* 密钥持久化后端：`"k8s"`（基于 Kubernetes Secret 的 `KubeSecretBackend` 多副本高可用）、`"file"` 或 `"disabled"`。',
+  },
+  'secrets.dir': {
+    en: '*Added in v0.6.0.* Filesystem directory (`CUBEPOD_SECRETS_DIR`) used when `secrets.backend` is `"file"`.',
+    zh: '*v0.6.0 新增。* 当 `secrets.backend` 为 `"file"` 时使用的本地密钥目录（`CUBEPOD_SECRETS_DIR`）。',
+  },
+  'secrets.existingSecret': {
+    en: '*Added in v0.6.0.* Existing Kubernetes Secret containing a 32-byte base64/64-hex key under `data.key` (overrides `gateway.secretsKeySecret`).',
+    zh: '*v0.6.0 新增。* 已存在的 Kubernetes Secret 名称（需在 `data.key` 中存放 32 字节 Base64 或 64 位 Hex 密钥，优先级高于 `gateway.secretsKeySecret`）。',
+  },
+  'secrets.encryptionKey': {
+    en: '*Added in v0.6.0.* Optional inline 32-byte base64/64-hex encryption key; creates `<fullname>-secrets-key` Secret when set without `existingSecret`.',
+    zh: '*v0.6.0 新增。* 可选内联 32 字节 Base64/64-Hex 加密密钥；未指定 `existingSecret` 时自动创建 `<fullname>-secrets-key` Secret。',
+  },
+  'featureGates.e2bTemplateAPI': {
+    en: '*Changed in v0.6.0.* Wired into `--feature-gate=E2BTemplateAPI=...` and `--e2b-template-api`; switches `GET /templates` to the E2B JSON array format.',
+    zh: '*v0.6.0 变更。* 同步注入 `--feature-gate=E2BTemplateAPI=...` 与 `--e2b-template-api`，开启后 `GET /templates` 返回 E2B JSON 数组格式。',
+  },
+  'featureGates.transparentEgress': {
+    en: '*Added in v0.6.0.* Wired into `--feature-gate=TransparentEgress=...` (combined with `egress.transparent`).',
+    zh: '*v0.6.0 新增。* 注入 `--feature-gate=TransparentEgress=...`（与 `egress.transparent` 联合生效）。',
+  },
+  'featureGates.desktopStack': {
+    en: '*Added in v0.6.0.* Wired into `--feature-gate=DesktopStack=...`; controls `/sandboxes/{id}/desktop/*` routes.',
+    zh: '*v0.6.0 新增。* 注入 `--feature-gate=DesktopStack=...`，控制 `/sandboxes/{id}/desktop/*` 接口。',
+  },
+  'featureGates.statelessGatewayHA': {
+    en: '*Added in v0.6.0.* Wired into `--feature-gate=StatelessGatewayHA=...`; controls Kubernetes CRD cache-miss reconstruction across gateway replicas.',
+    zh: '*v0.6.0 新增。* 注入 `--feature-gate=StatelessGatewayHA=...`，控制多副本网关基于 Kubernetes CRD 的缓存未命中重建。',
+  },
+  'featureGates.e2bFilesystemWatch': {
+    en: '*Added in v0.6.0.* Wired into `--feature-gate=E2BFilesystemWatch=...`; controls Connect-RPC filesystem directory watching.',
+    zh: '*v0.6.0 新增。* 注入 `--feature-gate=E2BFilesystemWatch=...`，控制 Connect-RPC 目录变更监听功能。',
+  },
+  'featureGates.e2bSecretsAPI': {
+    en: '*Added in v0.6.0.* Wired into `--feature-gate=E2BSecretsAPI=...`; controls `/secrets` management and `${e2b.secrets.<name>}` resolution.',
+    zh: '*v0.6.0 新增。* 注入 `--feature-gate=E2BSecretsAPI=...`，控制 `/secrets` 管理与 `${e2b.secrets.<name>}` 占位符解析。',
+  },
+  'featureGates.sandboxEventsAndWebhooks': {
+    en: '*Added in v0.6.0.* Wired into `--feature-gate=SandboxEventsAndWebhooks=...`; controls `/events` and `/webhooks` APIs.',
+    zh: '*v0.6.0 新增。* 注入 `--feature-gate=SandboxEventsAndWebhooks=...`，控制 `/events` 与 `/webhooks` 接口。',
+  },
+  'featureGates.k8sE2BVolumeMounts': {
+    en: '*Changed in v0.6.0.* Wired into `--feature-gate=K8sE2BVolumeMounts=...`; auto-enabled whenever `e2bVolumes.enabled` is `true` or `e2bVolumes.rwxStorageClassName` is non-empty.',
+    zh: '*v0.6.0 变更。* 注入 `--feature-gate=K8sE2BVolumeMounts=...`；当 `e2bVolumes.enabled` 为 `true` 或 `e2bVolumes.rwxStorageClassName` 非空时会自动开启。',
+  },
+  'e2bVolumes.enabled': {
+    en: 'Mount the shared RWX E2B volumes PVC (`CUBEPOD_E2B_VOLUME_DIR`) into `cubepod-gateway`. Automatically activated when `e2bVolumes.rwxStorageClassName` is set (*Changed in v0.6.0*).',
+    zh: '是否在 `cubepod-gateway` 中挂载共享 RWX E2B 卷 PVC（`CUBEPOD_E2B_VOLUME_DIR`）。自 *v0.6.0* 起，配置 `e2bVolumes.rwxStorageClassName` 时会自动激活。',
+  },
+  'e2bVolumes.pvcName': {
+    en: 'Shared `ReadWriteMany` PVC name mounted by `cubepod-gateway` and Kata sandbox Pods.',
+    zh: '供 `cubepod-gateway` 与 Kata 沙箱 Pod 共同挂载的 `ReadWriteMany` PVC 名称。',
+  },
+  'e2bVolumes.rwxStorageClassName': {
+    en: '*Changed in v0.6.0.* StorageClass for the shared `ReadWriteMany` E2B volume PVC (`e2b-volumes-pvc.yaml`). When non-empty, automatically activates `e2bVolumes` and enables `K8sE2BVolumeMounts`.',
+    zh: '*v0.6.0 变更。* 用于创建共享 `ReadWriteMany` E2B 卷 PVC（`e2b-volumes-pvc.yaml`）的 StorageClass。一旦设置为非空值，将自动激活 `e2bVolumes` 并开启 `K8sE2BVolumeMounts`。',
+  },
+  'e2bVolumes.size': {
+    en: 'Capacity requested for the shared `ReadWriteMany` E2B volumes PVC.',
+    zh: '共享 `ReadWriteMany` E2B 卷 PVC 申请的存储容量。',
+  },
+};
+
 function syncHelmValues() {
   const raw = fs.readFileSync(path.join(repoRoot, 'deploy', 'helm', 'cubepod', 'values.yaml'), 'utf8');
   const chartRaw = fs.readFileSync(path.join(repoRoot, 'deploy', 'helm', 'cubepod', 'Chart.yaml'), 'utf8');
@@ -376,13 +487,20 @@ function syncHelmValues() {
         ? `> 同步自 [\`deploy/helm/cubepod/values.yaml\`](https://github.com/cubeplexai/cubepod/blob/main/deploy/helm/cubepod/values.yaml)（Chart \`${chart.version}\` · App \`${chart.appVersion}\`）。`
         : `> Synced directly from [\`deploy/helm/cubepod/values.yaml\`](https://github.com/cubeplexai/cubepod/blob/main/deploy/helm/cubepod/values.yaml) (Chart \`${chart.version}\` · App \`${chart.appVersion}\`).`,
       '',
+      isZh
+        ? '> **v0.6.0 配置变更：** 新增 `gateway.podDisruptionBudget.*`（`pdb.yaml`）、`egress.transparent`、`secrets.*`（支持 `"k8s"` 多副本 HA 后端与密钥引用），统一通过 `--feature-gate` 注入 `featureGates.*`，且配置 `e2bVolumes.rwxStorageClassName` 后会自动激活 `e2bVolumes` 并开启 `K8sE2BVolumeMounts`。'
+        : '> **Changed / Added in v0.6.0:** Added `gateway.podDisruptionBudget.*` (`pdb.yaml`), `egress.transparent`, and `secrets.*` (`"k8s"` HA backend + encryption key Secret wiring); unified `featureGates.*` `--feature-gate` flags; and made setting `e2bVolumes.rwxStorageClassName` automatically activate `e2bVolumes` and `K8sE2BVolumeMounts`.',
+      '',
       isZh ? '## 参数列表' : '## Parameter Reference',
       '',
       isZh ? '| 参数键 | 类型 | 默认值 | 说明 |' : '| Key | Type | Default | Description |',
       '| :--- | :--- | :--- | :--- |',
     ];
     for (const r of rows) {
-      lines.push(`| ${r.key} | \`${r.type}\` | ${r.defaultVal} | ${escapeMdCell(r.desc)} |`);
+      const plainKey = r.key.replace(/^`|`$/g, '');
+      const overrideDesc = HELM_VALUE_DESCRIPTIONS[plainKey]?.[locale];
+      const finalDesc = overrideDesc || r.desc;
+      lines.push(`| ${r.key} | \`${r.type}\` | ${r.defaultVal} | ${escapeMdCell(finalDesc)} |`);
     }
     lines.push('');
     lines.push(isZh ? '## 原始 `values.yaml`' : '## Default `values.yaml`');
@@ -495,7 +613,7 @@ function syncCEPs() {
   const enIndex = [
     '---',
     'title: CubePod Enhancement Proposals (CEPs)',
-    `description: Complete index of all CubePod architecture and subsystem Enhancement Proposals (CEP-0001 through CEP-${indexEntries[indexEntries.length - 1]?.num || '0028'}).`,
+    `description: Complete index of all CubePod architecture and subsystem Enhancement Proposals (CEP-0001 through CEP-${indexEntries[indexEntries.length - 1]?.num || '0029'}).`,
     'editUrl: false',
     'sidebar:',
     '  label: CEP Index',
@@ -518,7 +636,7 @@ function syncCEPs() {
   const zhIndex = [
     '---',
     'title: CubePod 架构演进提案 (CEPs)',
-    `description: 同步自 docs/enhancements/ 的全部 CubePod 架构与子系统设计提案索引（CEP-0001 ~ CEP-${indexEntries[indexEntries.length - 1]?.num || '0028'}）。`,
+    `description: 同步自 docs/enhancements/ 的全部 CubePod 架构与子系统设计提案索引（CEP-0001 ~ CEP-${indexEntries[indexEntries.length - 1]?.num || '0029'}）。`,
     'editUrl: false',
     'sidebar:',
     '  label: CEP 提案总览',

@@ -9,16 +9,17 @@ participating-areas:
   - "controller"
 status: "implemented"
 creation-date: "2026-11-15"
+last-updated: "2026-11-16"
 reviewers:
   - "@xfgong"
 approvers:
   - "@xfgong"
 stage: "alpha"
-latest-milestone: "v0.4"
+latest-milestone: "v0.4.0"
 milestone:
-  alpha: "v0.4"
-  beta: "v0.5"
-  stable: "v1.0"
+  alpha: "v0.4.0"
+  beta: "v0.7.0"
+  stable: "v1.0.0"
 feature-gates:
   - name: "E2BVolumes"
     components:

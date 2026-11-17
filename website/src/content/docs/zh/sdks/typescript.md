@@ -105,6 +105,13 @@ console.log(endpointInfo.url);
 // 为 Web 服务、noVNC、ttyd 或 WebRTC 画面签发 HMAC-SHA256 /panel/{token}/ URL
 const panel = await sandbox.createEndpoint(8080, { expiresInSeconds: 3600 });
 console.log(panel.url, panel.expiresAt);
+
+// 按需启动交互式桌面（支持可选 transport: 'webrtc' | 'novnc'，v0.6.0 新增）
+const desktop = await sandbox.startDesktop({
+  resolution: '1280x800x24',
+  transport: 'webrtc',
+});
+console.log(desktop.transportUsed, desktop.webrtcUrl, desktop.desktopUrl);
 ```
 
 ## 命令执行与文件操作（保留默认 UID/GID）
@@ -197,6 +204,45 @@ const sandbox = await Sandbox.create('cubeplex-ubuntu24-desktop', {
     },
   ],
 });
+```
+
+## 沙箱指标、密钥、持久化卷与生命周期事件 *(v0.6.0 新增)*
+
+`CubePodClient` 与 `Sandbox` 完整提供资源指标、密钥管理、卷文件读写以及生命周期事件/Webhook 接口：
+
+```ts
+import { CubePodClient, Secret, fillSecret } from 'cubepod';
+
+const client = new CubePodClient({ baseUrl: 'http://localhost:8080' });
+
+// 1. 查询沙箱资源指标（Sandbox 实例可直接调用 sandbox.getMetrics(...)）
+const metrics = await sandbox.getMetrics({ start: Date.now() / 1000 - 300 });
+console.log(metrics[0]?.cpuUsedPct, metrics[0]?.memUsed, metrics[0]?.diskUsed);
+
+// 2. Write-Only 密钥与 Secret.fill / fillSecret 占位符助手
+const sec = await client.createSecret('openai_key', process.env.REAL_OPENAI_KEY!);
+const placeholder = Secret.fill('openai_key'); // "${e2b.secrets.openai_key}"
+const secrets = await client.listSecrets({ limit: 50 });
+await client.updateSecret(sec.secretId, process.env.NEW_OPENAI_KEY!);
+await client.deleteSecret(sec.secretId);
+
+// 3. 持久化 E2B 卷与文件内容读写
+const vol = await client.createVolume('shared-datasets');
+await client.writeVolumeFile(vol.volumeId, '/prompt.txt', 'hello volume');
+const bytes = await client.readVolumeFile(vol.volumeId, '/prompt.txt');
+const volumes = await client.listVolumes();
+await client.deleteVolume(vol.volumeId);
+
+// 4. 生命周期事件与签名 Webhook（Sandbox 实例可直接调用 sandbox.listEvents(...)）
+const hook = await client.createWebhook({
+  name: 'lifecycle-audit',
+  url: 'https://hooks.example.com/cubepod',
+  events: ['sandbox.lifecycle.created', 'sandbox.lifecycle.paused', 'sandbox.lifecycle.killed'],
+});
+const sbxEvents = await sandbox.listEvents({ limit: 20 });
+const allEvents = await client.listEvents({ eventType: 'sandbox.lifecycle.paused' });
+await client.updateWebhook(hook.id, { enabled: true, rotateSecret: true });
+await client.deleteWebhook(hook.id);
 ```
 
 ## 模板目录、构建与 WarmPool

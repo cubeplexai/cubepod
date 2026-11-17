@@ -3,12 +3,12 @@
 | Field | Value |
 | :--- | :--- |
 | **CEP Number** | `0020` |
-| **Status** | `implementable` (`alpha`) |
+| **Status** | `implemented` (`beta`) |
 | **Owning Area** | `egress` |
 | **Participating Areas** | `controller`, `gateway` |
 | **Authors** | @cubepod-maintainers |
 | **Created** | 2026-11-13 |
-| **Last Updated** | 2026-11-13 |
+| **Last Updated** | 2026-11-16 |
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)

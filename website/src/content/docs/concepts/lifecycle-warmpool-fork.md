@@ -33,10 +33,10 @@ stateDiagram-v2
 
 ### Idle Auto-Pause, Leases & Auto-Resume
 
-- **Idle Reaping (`ReapIdle`)**: `cubepod-controller` monitors `status.lastActivityAt` against `spec.lifecycle.idleTimeoutSeconds`. If an agent holds an active lease (`spec.lifecycle.leaseExpiresAt` in the future), idle auto-pause is suppressed until the lease expires.
+- **Idle Reaping (`ReapIdle`) & Async K8s Reaper Events** *(Added in v0.6.0)*: `cubepod-controller` monitors `status.lastActivityAt` against `spec.lifecycle.idleTimeoutSeconds`. If an agent holds an active lease (`spec.lifecycle.leaseExpiresAt` in the future), idle auto-pause is suppressed until the lease expires. When the controller transitions a `PodBox` asynchronously to `Paused`, `Terminated`, or deletes an expired `PodBox`, `cubepod-gateway`'s `SyncPodBoxesOnce` loop observes the change and emits deduplicated `sandbox.lifecycle.paused` (`pause_mode: "filesystem"`) and `sandbox.lifecycle.killed` events to `/events` and subscribed webhooks.
 - **Compute Pause-to-Zero**: Transitioning `desiredState` to `Paused` deletes the Kubernetes Pod (`status.podName` and `status.podIP` clear) while keeping `<box>-rootfs-pvc` and `<box>-workspace-pvc` bound and untouched.
 - **Paused TTL Reclamation**: Once `status.pausedAt` exceeds `spec.lifecycle.pausedTTLSeconds`, expired PVCs are reclaimed cleanly.
-- **Transparent Auto-Resume**: Any request hitting `cubepod-gateway` for a `Paused` sandbox — explicit `POST /sandboxes/{id}/connect`, data-plane `/commands` or `/files`, wildcard subdomain routing, desktop start, or `/panel/{token}/` proxy — automatically patches `desiredState: Running` and polls `podd` `/health` via `waitForPoddReady` before serving the request.
+- **Transparent Auto-Resume & Per-Sandbox Lock Granularity** *(Changed in v0.6.0)*: Any request hitting `cubepod-gateway` for a `Paused` sandbox — explicit `POST /sandboxes/{id}/connect`, data-plane `/commands` or `/files`, wildcard subdomain routing, desktop start, or `/panel/{token}/` proxy — automatically patches `desiredState: Running` and polls `podd` `/health` via `waitForPoddReady` before serving the request. Lifecycle handlers serialize per sandbox via reference-counted per-sandbox locks (`acquireSandboxLock` / `tryAcquireSandboxLock`), releasing the global `Server.mu` across blocking Kubernetes `Reconcile` and `waitForPoddReady` calls so `/health` probes and unrelated sandboxes never stall.
 
 ## Sub-50ms Startup via `PodWarmPool`
 
@@ -76,7 +76,7 @@ sequenceDiagram
 
 - **Bounded Freeze Safety**: `ParentPodd` flushes kernel dirty pages (`sync` + `syncfs`) and calls `FIFREEZE` (`0xC0045877`) backed by a monotonic watchdog timer (`maxFreezeMs` clamped to `[100, 5000]`, default `1500` ms). Even if `cubepod-controller` restarts mid-fork, the parent MicroVM automatically unfreezes rather than deadlocking.
 - **Dual-Backend Cloning**:
-  - **Kubernetes CSI Mode**: `cubepod-controller` creates child PVCs with `dataSource` (`DataSourcePVC` / snapshot clone) targeting the parent's RootFS and Workspace PVCs.
+  - **Kubernetes CSI Mode (`pvc-clone` and `snapshot`, *Added in v0.6.0*)**: By default (`--fork-mode=pvc-clone`), `cubepod-controller` creates child PVCs with `dataSource` (`DataSourcePVC`) targeting the parent's RootFS and Workspace PVCs. Passing `--fork-mode=snapshot` (optionally with `--volume-snapshot-class=<VolumeSnapshotClassName>`) creates temporary `snapshot.storage.k8s.io/v1` `VolumeSnapshot` objects from the parent PVCs, waits for `ReadyToUse` (`WaitVolumeSnapshotReady`), binds child PVCs to `dataSource.kind: VolumeSnapshot`, and deletes the temporary snapshots after provisioning (or on failure rollback).
   - **Local Docker Loopback Mode**: `pkg/runtime/docker.go` calls `quiesceSandbox`, clones both `.ext4` loopback files via `cp --reflink=auto --sparse=always -a`, calls `thaw`, and boots the child with `CUBEPOD_FORKED=1`.
 - **Multi-Generation PVC Resolution (`resolveParentPVCNames`)**: If the parent sandbox previously ran `reset-rootfs` (`rootfsGeneration > 1`), its live RootFS PVC is `<parent>-rootfs-gen<N>-pvc` rather than `<parent>-rootfs-pvc`. `resolveParentPVCNames` inspects the parent's `status.RootfsPVCName` and `status.WorkspacePVCName` so forks always capture the parent's true active generation.
 

@@ -206,7 +206,7 @@ flowchart LR
 - **Monitoring Requirements**: `cubepod_e2b_requests_total`, `cubepod_e2b_request_duration_seconds`, `cubepod_panel_active_sessions`, `cubepod_podd_active_processes`, `cubepod_podd_init_duration_milliseconds`, `cubepod_podd_init_e2b_bind_duration_ms`.
 - **Dependencies**: Linux `/proc` (`stat`, `meminfo`), `statvfs(2)`, optional cgroup v2/v1 files; zero new third-party dependencies in Rust or Go.
 - **Scalability**: Bounded `120`-entry ring buffer per sandbox keeps memory overhead negligible (`< 15 KiB` per sandbox); `endpoint` label normalization prevents Prometheus cardinality explosion.
-- **Troubleshooting**: Scrape `GET /v1/prometheus` on `podd` (`:49983`) or `GET /metrics` on `cubepod-gateway` (`:9090`); inspect `/run/cubepod/init-state.json` inside the guest for `duration_ms` and `e2b_bind_duration_ms`.
+- **Troubleshooting**: Scrape `GET /v1/prometheus` on `podd` (`:49983`) or `GET /metrics` on `cubepod-gateway` (`:8080`); inspect `/run/cubepod/init-state.json` inside the guest for `duration_ms` and `e2b_bind_duration_ms`.
 
 ---
 

@@ -30,7 +30,9 @@ CubePod Gateway（`cmd/cubepod-gateway`）对外提供一套**兼容 E2B 的超�
 | `POST /sandboxes/{id}/refreshes` | 刷新租约与延长 TTL（E2B 兼容别名） | 请求体：`{ "duration": <int> }` |
 | `POST /sandboxes/{id}/lease` | 续期沙箱独占租约 | 请求体：租约时长 / TTL |
 | `POST /sandboxes/{id}/reset-rootfs` | 递增 `rootfsGeneration` 清空 OS RootFS 层，同时完好保留 `/workspace` | 可选重置/模板参数 |
-| `POST /sandboxes/{id}/fork` | 通过 CSI 块快照（`cow_fork`）克隆出独立的子沙箱 | 可选分支参数 |
+| `POST /sandboxes/{id}/fork` *(v0.6.0 变更)* | 通过 CSI（`pvc-clone` 或 `snapshot` 模式）/ reflink 克隆出独立的子沙箱 | 可选分支参数 |
+| `GET /sandboxes/{sandboxID}/metrics` *(v0.6.0 新增)* | 查询单个沙箱的时间序列 `SandboxMetric` 快照 | 查询参数：`start`、`end`（Unix 秒或 RFC3339）、`autoResume`（默认 `true`；`false` 仅读取缓存环形缓冲） |
+| `GET /sandboxes/metrics` *(v0.6.0 新增)* | 批量查询多个沙箱的最新 `SandboxMetric` 快照 | 查询参数：`sandboxIds`（逗号分隔或重复参数）；返回 `{"sandboxes": {...}}`，不会唤醒暂停沙箱 |
 
 ## 命令执行、游标日志与 SSE 流式输出
 
@@ -72,7 +74,7 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 
 | 方法与路径 | 用途 | 说明 |
 | :--- | :--- | :--- |
-| `POST /sandboxes/{id}/desktop/start` | 启动显示服务与桌面会话 | 校验 `resolution` 格式（`^[0-9]{3,5}x[0-9]{3,5}x(16\|24\|32)$`），支持可选 `initialUrl` 与 `expiresInSeconds`；若镜像未包含桌面组件则返回 `422 desktop_not_installed`。同时提供 `/v1/sandboxes/{id}/desktop/start` 别名 |
+| `POST /sandboxes/{id}/desktop/start` | 启动显示服务与桌面会话 | 校验 `resolution` 格式（`^[0-9]{3,5}x[0-9]{3,5}x(16\|24\|32)$`），支持可选 `initialUrl`、`expiresInSeconds` 与 `transport`（`"webrtc" \| "novnc"`，*v0.6.0 新增*）；若镜像未包含桌面组件则返回 `422 desktop_not_installed`。同时提供 `/v1/sandboxes/{id}/desktop/start` 别名 |
 | `GET /sandboxes/{id}/desktop/status` | 查询桌面运行状态与各服务 URL | 同理提供 `/v1/sandboxes/{id}/desktop/status` 别名 |
 | `POST /sandboxes/{id}/desktop/stop` | 停止桌面相关服务 | 同理提供 `/v1/sandboxes/{id}/desktop/stop` 别名 |
 | `GET /sandboxes/{id}/endpoints/{port}` 与 `POST /sandboxes/{id}/endpoints/{port}` | 为沙箱内任意 TCP/WebSocket 端口生成签名访问令牌 | 令牌格式：`base64url(sandboxID:port:expUnix).hmacSha256Sig` |
@@ -124,11 +126,72 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 | `GET /templates/{id}/builds/{buildID}/logs` | 获取结构化构建日志流 | — |
 | `POST /templates/tags`、`DELETE /templates/tags`、`GET /templates/{id}/tags` | 为模板分配、移除或查询标签 | — |
 
+## 密钥、持久化卷、事件与 Webhook
+
+- **E2B 密钥（`E2BSecretsAPI`，*v0.6.0 变更*）**：`POST /secrets`、`GET /secrets`、`GET /secrets/{secretID}`、`POST /secrets/{secretID}`、`DELETE /secrets/{secretID}` — 租户隔离的 Write-Only 密钥存储（`KubeSecretBackend` 多副本 HA 或 AES-256-GCM 文件存储），配合 `${e2b.secrets.<name>}`（`Secret.fill()`）解析。
+- **E2B 卷（Volumes）**：`POST /volumes`、`GET /volumes`、`GET /volumes/{volumeID}`、`DELETE /volumes/{volumeID}`，内容传输 `/volumecontent/{volumeID}/{file,dir,path}`，以及 `POST /sandboxes` 的 `volumeMounts`（K8s Kata RWX 挂载由 `K8sE2BVolumeMounts` / Helm `e2bVolumes.rwxStorageClassName` 控制）。
+- **生命周期事件与 Webhook（`SandboxEventsAndWebhooks`，*v0.6.0 新增*）**：`GET /events`、`GET /sandboxes/{sandboxID}/events`、`POST /webhooks`、`GET /webhooks`、`GET /webhooks/{webhookID}`、`PATCH /webhooks/{webhookID}`、`DELETE /webhooks/{webhookID}`。
+
+## 特性开关（`--feature-gate`） *(v0.6.0 新增)*
+
+`cubepod-gateway` 与 `cubepod-controller` 均支持 `--feature-gate=GateA=true,GateB=false`：
+
+| 特性开关名称 | 默认值 | 生效组件 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `E2BTemplateAPI` | `false` | `gateway`、`controller` | 启用 E2B JSON 数组格式 `GET /templates` 与 `/v2`–`/v3` 模板接口（也可通过 `--e2b-template-api` 开启）。 |
+| `K8sE2BVolumeMounts` | `false` | `gateway` | 启用 Kubernetes RWX E2B `volumeMounts`（在 Helm 中设置 `e2bVolumes.rwxStorageClassName` 时会自动开启）。 |
+| `TransparentEgress` | `true` | `gateway`、`controller` | 控制 `CUBEPOD_TRANSPARENT=1` + `NET_ADMIN` `nftables` 透明劫持及 `/internal/v1/egress/exchange`。 |
+| `DesktopStack` | `true` | `gateway` | 控制 `/sandboxes/{id}/desktop/{start,status,stop}` 接口。 |
+| `StatelessGatewayHA` | `true` | `gateway` | 控制多副本网关跨副本基于 `PodBox` CRD 的缓存未命中重建。 |
+| `E2BFilesystemWatch` | `true` | `gateway` | 控制 Connect-RPC `WatchDir` 目录变更监听接口。 |
+| `E2BSecretsAPI` | `true` | `gateway` | 控制 `/secrets` 增删改查与 `${e2b.secrets.<name>}` 解析。 |
+| `SandboxEventsAndWebhooks` | `true` | `gateway` | 控制 `/events` 与 `/webhooks` 接口及异步 HMAC Webhook 投递。 |
+
+## Prometheus 可观测性与 `podd` 指标 *(v0.6.0 新增)*
+
+### Guest 内置 `podd` 指标接口（`:49983`）
+
+- **`GET /metrics`**：采样 `/proc/stat`、`/proc/meminfo`、cgroup v2/v1 限制与 `statvfs("/workspace")`，返回 JSON 格式 `SandboxMetric`（`timestamp`、`timestampUnix`、`cpuCount`、`cpuUsedPct`、`memUsed`、`memTotal`、`memCache`、`diskUsed`、`diskTotal`）；传入 `?format=prometheus` 或 `Accept: text/plain` 时返回 Prometheus 文本格式。
+- **`GET /v1/prometheus`**：导出 Prometheus `0.0.4` 指标：
+  - `cubepod_podd_active_processes`
+  - `cubepod_podd_init_duration_milliseconds`（读取 `/run/cubepod/init-state.json` 的 `duration_ms`）
+  - `cubepod_podd_init_e2b_bind_duration_ms`（读取 `/run/cubepod/init-state.json` 的 `e2b_bind_duration_ms`）
+  - `cubepod_podd_cpu_used_percent`、`cubepod_podd_memory_used_bytes`、`cubepod_podd_memory_total_bytes`、`cubepod_podd_disk_used_bytes`、`cubepod_podd_disk_total_bytes`
+
+### Gateway（`:8080/metrics`）、Controller（`:8081/metrics`）与 Egress（`:19090/metrics`）指标清单
+
+| 组件 | 指标名称 | 类型 | 说明与标签 |
+| :--- | :--- | :--- | :--- |
+| **Gateway** | `cubepod_gateway_http_requests_total` / `cubepod_gateway_requests_total` | Counter | `cubepod-gateway` 处理的 HTTP 请求总数 |
+| **Gateway** | `cubepod_e2b_requests_total` | Counter | 归一化路径后的 E2B API 请求数（`endpoint`、`status`） |
+| **Gateway** | `cubepod_e2b_request_duration_seconds` | Histogram | E2B API 请求耗时直方图 |
+| **Gateway** | `cubepod_gateway_sandboxes_created_total` | Counter | 累计创建的沙箱数 |
+| **Gateway** | `cubepod_gateway_autoresume_total` / `cubepod_gateway_auto_resumes_total` | Counter | 累计透明自动唤醒次数 |
+| **Gateway** | `cubepod_gateway_commands_executed_total` | Counter | 沙箱内累计执行命令数 |
+| **Gateway** | `cubepod_gateway_sandboxes_active` | Gauge | 当前活跃沙箱数（`state`：`Running`、`Paused`） |
+| **Gateway** | `cubepod_gateway_warmpools_total` | Gauge | 已配置的 WarmPool 数量 |
+| **Gateway** | `cubepod_gateway_crd_resyncs_total` | Counter | 网关执行 `PodBox`/`PodWarmPool` CRD 重同步次数 |
+| **Gateway** | `cubepod_panel_active_sessions` | Gauge | 当前活跃 `/panel/{token}/` HTTP/WebSocket 反代会话数 |
+| **Gateway** | `cubepod_desktop_activations_total` | Counter | 桌面启动次数（`result`：`ok`、`unsupported`、`error`） |
+| **Gateway** | `cubepod_secrets_operations_total` | Counter | 密钥存储操作数（`op`、`status`） |
+| **Gateway** | `cubepod_secrets_store_count` | Gauge | 全租户已存储的 E2B 密钥总数 |
+| **Gateway** | `cubepod_e2b_volume_mounts_total` / `cubepod_e2b_volume_mount_errors_total` | Counter | E2B 卷挂载次数与挂载规划/执行错误数 |
+| **Gateway** | `cubepod_events_recorded_total` | Counter | 已记录的沙箱生命周期事件总数（启用事件管理器时导出） |
+| **Gateway** | `cubepod_webhook_deliveries_total` / `cubepod_webhook_queue_depth` | Counter / Gauge | Webhook 投递结果（`result`：`ok`、`failed`、`dropped`）与队列深度 |
+| **Gateway & Controller** | `cubepod_sandbox_forks_total` / `cubepod_sandbox_fork_duration_seconds` | Counter / Histogram | CoW Fork 次数（`mode`、`result`）与耗时分布 |
+| **Gateway & Controller** | `cubepod_templates` / `cubepod_gateway_templates_total` | Gauge | 按 `status` 统计的模板数（开启 `E2BTemplateAPI` 时）或模板总数 |
+| **Controller** | `cubepod_active_sandboxes` / `cubepod_paused_sandboxes` | Gauge | 控制器调谐的 `Running` 与 `Paused` `PodBox` 数量 |
+| **Controller** | `cubepod_warmpool_ready` / `cubepod_warmpool_available_replicas` | Gauge | WarmPool 就绪及未被认领的待命副本数 |
+| **Controller** | `cubepod_template_builds_total` / `cubepod_template_build_duration_seconds` | Counter / Histogram | 模板构建完成数（`result`）与构建耗时 |
+| **Egress** | `cubepod_egress_requests_total` | Counter | 出站请求计数（`mode`、`decision`） |
+| **Egress** | `cubepod_egress_secret_exchanges_total` | Counter | 单沙箱 mTLS `cpodref_` 交换次数（`result`） |
+| **Egress** | `cubepod_egress_blocked_hosts_total` | Counter | 被策略拒绝的出站目标域名计数（`host`） |
+
 ## 内部零信任出站凭证交换
 
 | 方法与路径 | 用途 |
 | :--- | :--- |
-| `POST /internal/v1/egress/exchange` | 由 `cubepod-egress` 边车代理通过单沙箱 mTLS 发起调用，在放行出站请求前将 `cpodref_` 占位符实时置换为真实上游密钥 |
+| `POST /internal/v1/egress/exchange` | 由 `cubepod-egress` 边车代理通过严格单沙箱 mTLS（独立 `--egress-mtls-addr` 或主监听器）发起调用，在放行出站请求前将 `cpodref_` 占位符实时置换为真实上游密钥 |
 
 ## 下一步
 

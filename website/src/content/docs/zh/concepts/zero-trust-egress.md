@@ -45,7 +45,7 @@ flowchart LR
 `cubepod-egress`（`cmd/cubepod-egress/`、`pkg/egress/`）同时覆盖标准代理感知客户端与忽略代理环境变量的静态二进制或原生 Socket：
 
 - **显式代理监听 (`:18080`)**：为遵守 `HTTP_PROXY` / `HTTPS_PROXY` 的程序提供 HTTP 代理与 `HTTPS CONNECT` 隧道。
-- **透明劫持模式 (`CUBEPOD_TRANSPARENT=1`)**：由 `images/egress/egress-init.sh` 在 Pod 网络命名空间预先写入 `nftables` 表 `cubepod_egress`：
+- **透明劫持模式 (`CUBEPOD_TRANSPARENT=1`，*v0.6.0 变更*)**：当启用 `TransparentEgress`（`cubepod-controller` `--transparent-egress=true` / `--feature-gate=TransparentEgress=true`，或 Helm `egress.transparent: true` 与 `featureGates.transparentEgress: true`）时，`cubepod-controller` 会为 `egress` 边车容器注入 `CUBEPOD_TRANSPARENT=1` 与 `securityContext.capabilities.add: ["NET_ADMIN"]`（`pkg/controller/manifests.go`），同时由 `images/egress/egress-init.sh` 在 Pod 网络命名空间预先写入 `nftables` 表 `cubepod_egress`：
   - 将出站 **TCP `80`** 重定向至 **`:18081`**（透明 HTTP）
   - 将出站 **TCP `443`** 重定向至 **`:18443`**（透明 TLS SNI 路由器）
   - 将出站 **UDP/TCP `53`** 重定向至 **`:18053`**（策略强管控 DNS 代理）
@@ -74,6 +74,14 @@ flowchart LR
   2. 扫描请求头中的 `cpodref_` 令牌（若配置了 `AllowedHeaders`，仅检查白名单 Header）。
   3. 通过 **每沙箱 mTLS** 向 `cubepod-gateway` 发起 `POST /internal/v1/egress/exchange`，网关严格校验边车客户端证书 **`CN == sandboxID`**、目标 `sniHost` 与 `headerName`。
   4. 仅在内存传输缓冲区中将 `cpodref_...` 替换为真实凭证发出请求，绝不写入磁盘日志或回流进 Guest 容器。
+
+## 6. 多副本网关 HA 密钥同步与严格 mTLS 交换 *(v0.6.0 新增 / 变更)*
+
+为支持多副本水平扩展的 `cubepod-gateway`（`gateway.replicaCount > 1`）并消除副本间密钥状态漂移：
+
+- **`KubeSecretBackend` 跨副本 HA 同步（`pkg/secret/kube_backend.go`）**：当 `CUBEPOD_SECRETS_BACKEND=k8s`（Kubernetes 环境下未指定 `CUBEPOD_SECRETS_DIR` 时的默认后端）时，`/secrets` 条目会持久化为名为 `cubepod-e2b-sec-<id>` 的 `core/v1` `Secret`（带标签 `cubepod.io/resource=e2b-secret` 与 `cubepod.io/tenant=<prefix>`）。各网关副本通过 `StartSecretsSync`（每 `5s`）同步密钥并将轮换/吊销事件（`OnUpdate` / `OnRevoke`）实时传播到本地 `Vault`。
+- **按需 Vault 重水合（`rehydrateVaultBinding`）**：若 `cubepod-egress` 边车请求落在本地 `Vault` 尚未缓存该 `cpodref_` 绑定的网关副本（例如滚动升级或轮询负载均衡后），网关会读取 `PodBox` 的 `spec.networkPolicy.secretRefBindings`，同步密钥存储并即时恢复 `Vault` 绑定，避免出站请求中断。
+- **严格 mTLS 交换监听（`--egress-mtls-addr`）**：在 Kubernetes 模式或配置 `--egress-ca-cert` / `--egress-mtls-addr` 时，`cubepod-gateway` 强制开启 `SetStrictEgressMTLS(true)`，拒绝一切非 mTLS 请求头/请求体回退身份。指定 `--egress-mtls-addr`（可配 `--egress-tls-cert` / `--egress-tls-key`，否则由 `EgressCA` 自动签发服务端证书）即可启动强制 `tls.RequireAndVerifyClientCert` 的独立 `POST /internal/v1/egress/exchange` HTTPS 监听器。
 
 边车还在 **`:19090`** 暴露 `/metrics`（Prometheus）与 `/healthz` 探针端口。
 

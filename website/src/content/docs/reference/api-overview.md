@@ -30,7 +30,9 @@ For interactive schema exploration and copy-paste request testing, open the [Int
 | `POST /sandboxes/{id}/refreshes` | Refresh lease / extend TTL (E2B alias) | Body: `{ "duration": <int> }` |
 | `POST /sandboxes/{id}/lease` | Renew sandbox TTL lease | Body: lease duration / TTL |
 | `POST /sandboxes/{id}/reset-rootfs` | Increment `rootfsGeneration` to clear OS rootfs while keeping `/workspace` intact | Body: optional `template` / reset options |
-| `POST /sandboxes/{id}/fork` | Clone sandbox via CSI snapshot (`cow_fork`) into an independent child sandbox | Optional fork parameters |
+| `POST /sandboxes/{id}/fork` *(Changed in v0.6.0)* | Clone sandbox via CSI (`pvc-clone` or `snapshot` mode) / reflink into an independent child sandbox | Optional fork parameters |
+| `GET /sandboxes/{sandboxID}/metrics` *(Added in v0.6.0)* | Fetch time-series `SandboxMetric` snapshots for one sandbox | Query: `start`, `end` (Unix seconds or RFC3339), `autoResume` (`true` default; `false` reads cached ring buffer) |
+| `GET /sandboxes/metrics` *(Added in v0.6.0)* | Fetch latest `SandboxMetric` snapshot per sandbox | Query: `sandboxIds` (comma-separated or repeated); returns `{"sandboxes": {...}}` without waking paused sandboxes |
 
 ## Command Execution, Cursor Logs & SSE Streaming
 
@@ -72,7 +74,7 @@ For desktop-enabled images (such as `cubeplex-ubuntu24-desktop`), the Gateway co
 
 | Method & Path | Purpose | Notes |
 | :--- | :--- | :--- |
-| `POST /sandboxes/{id}/desktop/start` | Start display server & desktop session | Validates `resolution` (`^[0-9]{3,5}x[0-9]{3,5}x(16\|24\|32)$`), optional `initialUrl`, `expiresInSeconds`; returns `422 desktop_not_installed` if the image lacks desktop binaries. Aliased under `/v1/sandboxes/{id}/desktop/start` |
+| `POST /sandboxes/{id}/desktop/start` | Start display server & desktop session | Validates `resolution` (`^[0-9]{3,5}x[0-9]{3,5}x(16\|24\|32)$`), optional `initialUrl`, `expiresInSeconds`, and `transport` (`"webrtc" \| "novnc"`, *Added in v0.6.0*); returns `422 desktop_not_installed` if the image lacks desktop binaries. Aliased under `/v1/sandboxes/{id}/desktop/start` |
 | `GET /sandboxes/{id}/desktop/status` | Inspect desktop status (`desktopStatus`, panel URLs) | Also aliased under `/v1/sandboxes/{id}/desktop/status` |
 | `POST /sandboxes/{id}/desktop/stop` | Stop desktop services | Also aliased under `/v1/sandboxes/{id}/desktop/stop` |
 | `GET /sandboxes/{id}/endpoints/{port}` & `POST /sandboxes/{id}/endpoints/{port}` | Mint or query a signed proxy token for any sandbox TCP/WebSocket port | Token format: `base64url(sandboxID:port:expUnix).hmacSha256Sig` |
@@ -124,11 +126,72 @@ When `--e2b-template-api=true` is enabled on the Gateway and Controller, the ful
 | `GET /templates/{id}/builds/{buildID}/logs` | Fetch structured build log stream | — |
 | `POST /templates/tags`, `DELETE /templates/tags`, `GET /templates/{id}/tags` | Assign, remove, or inspect template tags | — |
 
+## Secrets, Volumes, Events & Webhooks
+
+- **E2B Secrets (`E2BSecretsAPI`, *Changed in v0.6.0*)**: `POST /secrets`, `GET /secrets`, `GET /secrets/{secretID}`, `POST /secrets/{secretID}`, `DELETE /secrets/{secretID}` — tenant-isolated write-only secret store (`KubeSecretBackend` HA or AES-256-GCM file store) resolved via `${e2b.secrets.<name>}` (`Secret.fill()`).
+- **E2B Volumes**: `POST /volumes`, `GET /volumes`, `GET /volumes/{volumeID}`, `DELETE /volumes/{volumeID}`, plus content endpoints `/volumecontent/{volumeID}/{file,dir,path}` and `volumeMounts` on `POST /sandboxes` (K8s Kata RWX mounts gated by `K8sE2BVolumeMounts` / Helm `e2bVolumes.rwxStorageClassName`).
+- **Lifecycle Events & Webhooks (`SandboxEventsAndWebhooks`, *Added in v0.6.0*)**: `GET /events`, `GET /sandboxes/{sandboxID}/events`, `POST /webhooks`, `GET /webhooks`, `GET /webhooks/{webhookID}`, `PATCH /webhooks/{webhookID}`, `DELETE /webhooks/{webhookID}`.
+
+## Feature Gates (`--feature-gate`) *(Added in v0.6.0)*
+
+Both `cubepod-gateway` and `cubepod-controller` accept `--feature-gate=GateA=true,GateB=false`:
+
+| Feature Gate | Default | Components | Purpose |
+| :--- | :--- | :--- | :--- |
+| `E2BTemplateAPI` | `false` | `gateway`, `controller` | Enables E2B JSON-array `GET /templates` and `/v2`–`/v3` template APIs (`--e2b-template-api` also toggles it). |
+| `K8sE2BVolumeMounts` | `false` | `gateway` | Enables Kubernetes RWX E2B `volumeMounts` (auto-enabled in Helm when `e2bVolumes.rwxStorageClassName` is set). |
+| `TransparentEgress` | `true` | `gateway`, `controller` | Controls `CUBEPOD_TRANSPARENT=1` + `NET_ADMIN` `nftables` interception and `/internal/v1/egress/exchange`. |
+| `DesktopStack` | `true` | `gateway` | Enables `/sandboxes/{id}/desktop/{start,status,stop}` routes. |
+| `StatelessGatewayHA` | `true` | `gateway` | Enables Kubernetes `PodBox` cache-miss reconstruction across gateway replicas. |
+| `E2BFilesystemWatch` | `true` | `gateway` | Enables Connect-RPC `WatchDir` / watcher endpoints. |
+| `E2BSecretsAPI` | `true` | `gateway` | Enables `/secrets` CRUD and `${e2b.secrets.<name>}` resolution. |
+| `SandboxEventsAndWebhooks` | `true` | `gateway` | Enables `/events` and `/webhooks` APIs and async HMAC webhook dispatch. |
+
+## Prometheus Observability & `podd` Metrics *(Added in v0.6.0)*
+
+### In-Guest `podd` Endpoints (`:49983`)
+
+- **`GET /metrics`**: Returns a JSON `SandboxMetric` snapshot (`timestamp`, `timestampUnix`, `cpuCount`, `cpuUsedPct`, `memUsed`, `memTotal`, `memCache`, `diskUsed`, `diskTotal`) sampled from `/proc/stat`, `/proc/meminfo`, cgroup v2/v1 limits, and `statvfs("/workspace")`. Passing `?format=prometheus` or `Accept: text/plain` returns Prometheus text exposition.
+- **`GET /v1/prometheus`**: Exposes Prometheus `0.0.4` gauges:
+  - `cubepod_podd_active_processes`
+  - `cubepod_podd_init_duration_milliseconds` (from `/run/cubepod/init-state.json` `duration_ms`)
+  - `cubepod_podd_init_e2b_bind_duration_ms` (from `/run/cubepod/init-state.json` `e2b_bind_duration_ms`)
+  - `cubepod_podd_cpu_used_percent`, `cubepod_podd_memory_used_bytes`, `cubepod_podd_memory_total_bytes`, `cubepod_podd_disk_used_bytes`, `cubepod_podd_disk_total_bytes`
+
+### Gateway (`:8080/metrics`), Controller (`:8081/metrics`) & Egress (`:19090/metrics`)
+
+| Component | Metric Name | Type | Description / Labels |
+| :--- | :--- | :--- | :--- |
+| **Gateway** | `cubepod_gateway_http_requests_total` / `cubepod_gateway_requests_total` | Counter | Total HTTP requests handled by `cubepod-gateway` |
+| **Gateway** | `cubepod_e2b_requests_total` | Counter | Normalized E2B API requests (`endpoint`, `status`) |
+| **Gateway** | `cubepod_e2b_request_duration_seconds` | Histogram | Latency histogram of E2B API requests |
+| **Gateway** | `cubepod_gateway_sandboxes_created_total` | Counter | Total sandboxes created |
+| **Gateway** | `cubepod_gateway_autoresume_total` / `cubepod_gateway_auto_resumes_total` | Counter | Total transparent sandbox auto-resume events |
+| **Gateway** | `cubepod_gateway_commands_executed_total` | Counter | Total commands executed in sandboxes |
+| **Gateway** | `cubepod_gateway_sandboxes_active` | Gauge | Active sandboxes by `state` (`Running`, `Paused`) |
+| **Gateway** | `cubepod_gateway_warmpools_total` | Gauge | Total configured WarmPools |
+| **Gateway** | `cubepod_gateway_crd_resyncs_total` | Counter | Total `PodBox`/`PodWarmPool` CRD resyncs |
+| **Gateway** | `cubepod_panel_active_sessions` | Gauge | Active `/panel/{token}/` HTTP/WebSocket proxy sessions |
+| **Gateway** | `cubepod_desktop_activations_total` | Counter | Desktop activations by `result` (`ok`, `unsupported`, `error`) |
+| **Gateway** | `cubepod_secrets_operations_total` | Counter | Secret store operations by `op` and `status` |
+| **Gateway** | `cubepod_secrets_store_count` | Gauge | Total stored E2B secrets across tenants |
+| **Gateway** | `cubepod_e2b_volume_mounts_total` / `cubepod_e2b_volume_mount_errors_total` | Counter | E2B volume mounts attached and mount planning/attach errors |
+| **Gateway** | `cubepod_events_recorded_total` | Counter | Sandbox lifecycle events recorded (when events manager is enabled) |
+| **Gateway** | `cubepod_webhook_deliveries_total` / `cubepod_webhook_queue_depth` | Counter / Gauge | Webhook delivery outcomes (`result`: `ok`, `failed`, `dropped`) and queue depth |
+| **Gateway & Controller** | `cubepod_sandbox_forks_total` / `cubepod_sandbox_fork_duration_seconds` | Counter / Histogram | CoW fork attempts (`mode`, `result`) and provisioning duration |
+| **Gateway & Controller** | `cubepod_templates` / `cubepod_gateway_templates_total` | Gauge | Templates by `status` (when `E2BTemplateAPI=true`) or total templates |
+| **Controller** | `cubepod_active_sandboxes` / `cubepod_paused_sandboxes` | Gauge | Reconciled `Running` and `Paused` `PodBox` counts |
+| **Controller** | `cubepod_warmpool_ready` / `cubepod_warmpool_available_replicas` | Gauge | Ready and unclaimed standby WarmPool replicas |
+| **Controller** | `cubepod_template_builds_total` / `cubepod_template_build_duration_seconds` | Counter / Histogram | Template build completions (`result`) and duration |
+| **Egress** | `cubepod_egress_requests_total` | Counter | Outbound requests (`mode`, `decision`) |
+| **Egress** | `cubepod_egress_secret_exchanges_total` | Counter | Per-pod mTLS `cpodref_` exchanges (`result`) |
+| **Egress** | `cubepod_egress_blocked_hosts_total` | Counter | Blocked outbound hosts (`host`) |
+
 ## Internal Zero-Trust Egress Exchange
 
 | Method & Path | Purpose |
 | :--- | :--- |
-| `POST /internal/v1/egress/exchange` | Called over mTLS by the `cubepod-egress` sidecar to resolve `cpodref_` credential placeholders into real upstream secrets just before outbound transmission |
+| `POST /internal/v1/egress/exchange` | Called over strict per-pod mTLS (dedicated `--egress-mtls-addr` or main listener) by the `cubepod-egress` sidecar to resolve `cpodref_` credential placeholders into real upstream secrets just before outbound transmission |
 
 ## Next Steps
 
