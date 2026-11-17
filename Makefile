@@ -1,4 +1,4 @@
-.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress build-cli test test-rust test-go test-e2e test-e2b-compat test-k8s-e2e test-k8s-block test-k8s-longhorn-v2 fmt vet clean docs-dev docs-build
+.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress build-cli test test-rust test-go test-e2e test-e2b-compat test-e2b-compat-ts test-k8s-e2e test-k8s-block test-k8s-longhorn-v2 fmt vet clean docs-dev docs-build
 
 GO ?= go
 CARGO ?= $(shell which cargo 2>/dev/null || echo "$(HOME)/.cargo/bin/cargo")
@@ -66,6 +66,9 @@ test-e2e: build
 
 test-e2b-compat: build-gateway
 	@bash test/e2b-compat/run_tests.sh
+
+test-e2b-compat-ts: build-gateway
+	cd test/e2b-compat-ts && npm ci && npm test
 
 # Optional deploy/k8s/env.local overrides discovery. See deploy/k8s/env.example.
 K8S_ENV := set -a; if [ -f deploy/k8s/env.local ]; then . deploy/k8s/env.local; fi; set +a
