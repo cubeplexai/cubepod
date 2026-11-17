@@ -142,6 +142,80 @@ paths:
                 items:
                   $ref: "#/components/schemas/SandboxInfo"
 
+  /sandboxes/metrics:
+    get:
+      tags:
+        - Sandboxes
+      summary: Get batch sandbox metrics
+      description: Retrieve latest CPU, memory, and disk utilization metrics for multiple or all active sandboxes (E2B compatible)
+      operationId: getBatchSandboxMetrics
+      parameters:
+        - name: sandboxIds
+          in: query
+          required: false
+          description: Comma-separated list of sandbox IDs (or repeated parameter). If omitted, returns metrics for all active sandboxes.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Map of sandbox ID to latest SandboxMetric snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sandboxes]
+                properties:
+                  sandboxes:
+                    type: object
+                    additionalProperties:
+                      $ref: "#/components/schemas/SandboxMetric"
+
+  /sandboxes/{sandboxID}/metrics:
+    get:
+      tags:
+        - Sandboxes
+      summary: Get sandbox metrics
+      description: Retrieve CPU, memory, and disk utilization metrics for a sandbox with optional start/end filtering (E2B compatible)
+      operationId: getSandboxMetrics
+      parameters:
+        - name: sandboxID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: start
+          in: query
+          required: false
+          description: Inclusive start timestamp (Unix seconds or RFC3339)
+          schema:
+            type: string
+        - name: end
+          in: query
+          required: false
+          description: Inclusive end timestamp (Unix seconds or RFC3339)
+          schema:
+            type: string
+        - name: autoResume
+          in: query
+          required: false
+          description: Set to false to read cached metrics from a Paused sandbox without resuming it
+          schema:
+            type: boolean
+            default: true
+      responses:
+        "200":
+          description: Time-ordered array of SandboxMetric samples
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SandboxMetric"
+        "400":
+          description: Invalid start or end timestamp
+        "404":
+          description: Sandbox not found
+
   /sandboxes/{sandboxID}:
     get:
       tags:
@@ -2075,6 +2149,55 @@ components:
                         type: array
                         items:
                           type: string
+
+    SandboxMetric:
+      type: object
+      required:
+        - timestamp
+        - timestampUnix
+        - cpuCount
+        - cpuUsedPct
+        - memUsed
+        - memTotal
+        - memCache
+        - diskUsed
+        - diskTotal
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-11-16T12:00:00Z"
+        timestampUnix:
+          type: integer
+          format: int64
+          example: 1794830400
+        cpuCount:
+          type: integer
+          example: 2
+        cpuUsedPct:
+          type: number
+          format: double
+          example: 14.25
+        memUsed:
+          type: integer
+          format: int64
+          example: 536870912
+        memTotal:
+          type: integer
+          format: int64
+          example: 2147483648
+        memCache:
+          type: integer
+          format: int64
+          example: 134217728
+        diskUsed:
+          type: integer
+          format: int64
+          example: 1073741824
+        diskTotal:
+          type: integer
+          format: int64
+          example: 10737418240
 
     SandboxInfo:
       type: object

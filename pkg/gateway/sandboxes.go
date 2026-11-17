@@ -405,6 +405,7 @@ func (s *Server) reconcileCachedSandboxWithPodBox(sandboxID string, box v1alpha1
 		if ok {
 			s.releaseSandboxVolumeMounts(sandboxID)
 			s.releaseLocalSandbox(sandboxID)
+			s.Metrics().sandboxMetricsStore().delete(sandboxID)
 			if s.vault != nil {
 				s.vault.RevokeSandbox(sandboxID)
 			}
@@ -1469,6 +1470,7 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 
 	s.releaseSandboxVolumeMounts(id)
 	s.releaseLocalSandbox(id)
+	s.Metrics().sandboxMetricsStore().delete(id)
 
 	// Revoke secrets associated with this sandbox
 	s.vault.RevokeSandbox(id)

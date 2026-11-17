@@ -123,18 +123,20 @@ pub struct InitState {
     pub workspace_device: String,
     pub workspace_action: VolumeAction,
     pub duration_ms: u64,
+    pub e2b_bind_duration_ms: u64,
 }
 
 impl InitState {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"pivoted\": {},\n  \"rootfs_device\": \"{}\",\n  \"rootfs_action\": \"{}\",\n  \"workspace_device\": \"{}\",\n  \"workspace_action\": \"{}\",\n  \"duration_ms\": {}\n}}\n",
+            "{{\n  \"pivoted\": {},\n  \"rootfs_device\": \"{}\",\n  \"rootfs_action\": \"{}\",\n  \"workspace_device\": \"{}\",\n  \"workspace_action\": \"{}\",\n  \"duration_ms\": {},\n  \"e2b_bind_duration_ms\": {}\n}}\n",
             self.pivoted,
             self.rootfs_device,
             self.rootfs_action.as_str(),
             self.workspace_device,
             self.workspace_action.as_str(),
-            self.duration_ms
+            self.duration_ms,
+            self.e2b_bind_duration_ms
         )
     }
 
@@ -256,13 +258,16 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         let _ = fs::create_dir_all(&cfg.workspace_dir);
         let _ = chown_path(&cfg.workspace_dir, cfg.default_uid, cfg.default_gid);
         let _ = fs::set_permissions(&cfg.workspace_dir, fs::Permissions::from_mode(0o777));
+        let mut e2b_bind_duration_ms = 0u64;
         if !e2b_mounts.is_empty() {
+            let bind_start = Instant::now();
             mount_e2b_volumes(
                 &e2b_mounts,
                 Path::new("/"),
                 cfg.default_uid,
                 cfg.default_gid,
             )?;
+            e2b_bind_duration_ms = bind_start.elapsed().as_millis() as u64;
         }
         let state = InitState {
             pivoted: false,
@@ -271,6 +276,7 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
             workspace_device: cfg.workspace_device.to_string_lossy().to_string(),
             workspace_action: VolumeAction::Skipped,
             duration_ms: start.elapsed().as_millis() as u64,
+            e2b_bind_duration_ms,
         };
         if let Err(e) = state.write_to_file(&cfg.init_state_path) {
             eprintln!(
@@ -402,7 +408,9 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         }
     }
 
+    let mut e2b_bind_duration_ms = 0u64;
     if !e2b_mounts.is_empty() {
+        let bind_start = Instant::now();
         mount_e2b_volumes(
             &e2b_mounts,
             &cfg.merged_root_path,
@@ -416,6 +424,7 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
                     .join(&m.volume_id),
             );
         }
+        e2b_bind_duration_ms = bind_start.elapsed().as_millis() as u64;
     }
 
     // 6. Perform pivot_root(2) into the merged root.
@@ -444,6 +453,7 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         workspace_device: cfg.workspace_device.to_string_lossy().to_string(),
         workspace_action,
         duration_ms: start.elapsed().as_millis() as u64,
+        e2b_bind_duration_ms,
     };
     if let Err(e) = state.write_to_file(&cfg.init_state_path) {
         eprintln!(
@@ -1213,6 +1223,7 @@ mod tests {
         assert!(content.contains("\"rootfs_action\": \"skipped\""));
         assert!(content.contains("\"workspace_action\": \"skipped\""));
         assert!(content.contains("\"duration_ms\":"));
+        assert!(content.contains("\"e2b_bind_duration_ms\":"));
     }
 
     #[test]
@@ -1270,6 +1281,7 @@ mod tests {
             workspace_device: "/dev/cubepod-workspace".to_string(),
             workspace_action: VolumeAction::Skipped,
             duration_ms: 128,
+            e2b_bind_duration_ms: 5,
         };
 
         state.write_to_file(&state_path).expect("write init state");
@@ -1282,6 +1294,7 @@ mod tests {
         assert!(content.contains("\"workspace_device\": \"/dev/cubepod-workspace\""));
         assert!(content.contains("\"workspace_action\": \"skipped\""));
         assert!(content.contains("\"duration_ms\": 128"));
+        assert!(content.contains("\"e2b_bind_duration_ms\": 5"));
     }
 
     #[test]
@@ -1306,10 +1319,11 @@ mod tests {
             workspace_device: "/dev/cubepod-workspace".to_string(),
             workspace_action: VolumeAction::Mounted,
             duration_ms: 42,
+            e2b_bind_duration_ms: 7,
         };
 
         let json = state.to_json();
-        let expected = "{\n  \"pivoted\": true,\n  \"rootfs_device\": \"/dev/cubepod-rootfs\",\n  \"rootfs_action\": \"mounted\",\n  \"workspace_device\": \"/dev/cubepod-workspace\",\n  \"workspace_action\": \"mounted\",\n  \"duration_ms\": 42\n}\n";
+        let expected = "{\n  \"pivoted\": true,\n  \"rootfs_device\": \"/dev/cubepod-rootfs\",\n  \"rootfs_action\": \"mounted\",\n  \"workspace_device\": \"/dev/cubepod-workspace\",\n  \"workspace_action\": \"mounted\",\n  \"duration_ms\": 42,\n  \"e2b_bind_duration_ms\": 7\n}\n";
         assert_eq!(json, expected);
     }
 
