@@ -77,6 +77,12 @@ func (s *Server) ConfigureE2BVolumes(cfg E2BVolumeConfig) error {
 	s.e2bCfg = vcfg
 	s.e2bMaxFileBytes = cfg.MaxFileSizeBytes
 	s.e2bK8sMounts = cfg.K8sE2BVolumeMounts
+	if cfg.K8sE2BVolumeMounts {
+		if s.featureGates == nil {
+			s.featureGates = DefaultFeatureGates()
+		}
+		s.featureGates[FeatureGateK8sE2BVolumeMounts] = true
+	}
 	s.e2bSharedPVC = strings.TrimSpace(cfg.SharedPVCName)
 	active := make(map[string]struct{}, len(s.sandboxes))
 	for id := range s.sandboxes {
@@ -127,9 +133,13 @@ func (s *Server) sharedE2BPVC() string {
 func (s *Server) isKubeVolumeMountsUnsupported() bool {
 	s.mu.RLock()
 	k8sMounts := s.e2bK8sMounts
+	if s.featureGates != nil {
+		k8sMounts = s.featureGates[FeatureGateK8sE2BVolumeMounts]
+	}
 	sharedPVC := s.e2bSharedPVC
+	live := s.livePodRouting
 	s.mu.RUnlock()
-	return s.livePodRouting && s.runtime == nil && (!k8sMounts || sharedPVC == "")
+	return live && s.runtime == nil && (!k8sMounts || sharedPVC == "")
 }
 
 // E2BVolumeMounts returns the volumes attached to a sandbox. The compose
@@ -678,14 +688,17 @@ func (s *Server) planSandboxVolumeMounts(r *http.Request, mounts []sandboxVolume
 		return nil, 0, ""
 	}
 	if s.isKubeVolumeMountsUnsupported() {
+		s.E2BVolumeMountErrorsTotal.Add(1)
 		return nil, http.StatusNotImplemented, "official E2B volumeMounts are not supported on the Kubernetes runtime"
 	}
 	key := managementAPIKey(r)
 	if key == "" {
+		s.E2BVolumeMountErrorsTotal.Add(1)
 		return nil, http.StatusUnauthorized, "API key is required"
 	}
 	st, err := s.e2bStore()
 	if err != nil {
+		s.E2BVolumeMountErrorsTotal.Add(1)
 		return nil, http.StatusInternalServerError, "volume store unavailable"
 	}
 	reqs := make([]volume.MountRequest, len(mounts))
@@ -694,6 +707,7 @@ func (s *Server) planSandboxVolumeMounts(r *http.Request, mounts []sandboxVolume
 	}
 	planned, err := st.LookupMounts(key, reqs)
 	if err != nil {
+		s.E2BVolumeMountErrorsTotal.Add(1)
 		switch {
 		case errors.Is(err, volume.ErrInvalidName):
 			return nil, http.StatusBadRequest, "invalid volume name"
@@ -716,9 +730,15 @@ func (s *Server) commitSandboxVolumeMounts(sandboxID, apiKey string, planned []v
 	}
 	st := s.e2b.Load()
 	if st == nil {
+		s.E2BVolumeMountErrorsTotal.Add(1)
 		return errors.New("volume store unavailable")
 	}
-	return st.CommitMounts(sandboxID, apiKey, planned)
+	if err := st.CommitMounts(sandboxID, apiKey, planned); err != nil {
+		s.E2BVolumeMountErrorsTotal.Add(1)
+		return err
+	}
+	s.E2BVolumeMountsTotal.Add(uint64(len(planned)))
+	return nil
 }
 
 func (s *Server) releaseSandboxVolumeMounts(sandboxID string) {
@@ -735,6 +755,7 @@ func (s *Server) copySandboxVolumeMounts(fromID, toID string) {
 		return
 	}
 	if err := st.CopyMounts(fromID, toID); err != nil {
+		s.E2BVolumeMountErrorsTotal.Add(1)
 		slog.Warn("copy e2b volume mounts failed", "from", fromID, "to", toID, "err", err)
 	}
 }

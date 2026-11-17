@@ -1075,3 +1075,81 @@ func TestE2BVolume_RestartPreservesPodBoxMountsAndBlocksDelete(t *testing.T) {
 		t.Fatalf("expected PodBox %s to exist: %v", sbxID, err)
 	}
 }
+
+func TestE2BVolumeMountCounters(t *testing.T) {
+	srv, ts, _ := newVolumeHarness(t, "")
+	key := "cpod_test_counters"
+	v1 := createVol(t, ts, key, "vol-one")
+	v2 := createVol(t, ts, key, "vol-two")
+
+	// 1. Successful sandbox create with 2 mounts increments E2BVolumeMountsTotal by 2.
+	body, _ := json.Marshal(map[string]any{
+		"templateID": "base",
+		"volumeMounts": []map[string]string{
+			{"name": v1.Name, "path": "/mnt/one"},
+			{"name": v2.Name, "path": "/mnt/two"},
+		},
+	})
+	resp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", key, body, "application/json")
+	var sb struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	readJSON(t, resp, &sb)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", resp.StatusCode)
+	}
+	if got := srv.E2BVolumeMountsTotal.Load(); got != 2 {
+		t.Fatalf("E2BVolumeMountsTotal = %d; want 2", got)
+	}
+	if got := srv.E2BVolumeMountErrorsTotal.Load(); got != 0 {
+		t.Fatalf("E2BVolumeMountErrorsTotal = %d; want 0", got)
+	}
+
+	// 2. Planning failures increment E2BVolumeMountErrorsTotal.
+	missingBody, _ := json.Marshal(map[string]any{
+		"templateID":   "base",
+		"volumeMounts": []map[string]string{{"name": "does-not-exist", "path": "/mnt/missing"}},
+	})
+	rMissing := volReq(t, http.MethodPost, ts.URL+"/sandboxes", key, missingBody, "application/json")
+	rMissing.Body.Close()
+	if rMissing.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing volume, got %d", rMissing.StatusCode)
+	}
+
+	reservedBody, _ := json.Marshal(map[string]any{
+		"templateID":   "base",
+		"volumeMounts": []map[string]string{{"name": v1.Name, "path": "/workspace"}},
+	})
+	rReserved := volReq(t, http.MethodPost, ts.URL+"/sandboxes", key, reservedBody, "application/json")
+	rReserved.Body.Close()
+	if rReserved.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for reserved mount path, got %d", rReserved.StatusCode)
+	}
+
+	if got := srv.E2BVolumeMountErrorsTotal.Load(); got != 2 {
+		t.Fatalf("E2BVolumeMountErrorsTotal = %d; want 2", got)
+	}
+	if got := srv.E2BVolumeMountsTotal.Load(); got != 2 {
+		t.Fatalf("E2BVolumeMountsTotal = %d; want 2", got)
+	}
+
+	// 3. Clean up sandbox and test K8s gated 501 increments error counter.
+	delReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+sb.SandboxID, nil)
+	delReq.Header.Set("X-API-KEY", key)
+	delResp, err := http.DefaultClient.Do(delReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delResp.Body.Close()
+
+	srv.SetLivePodRouting(true)
+	t.Cleanup(srv.Close)
+	rGated := volReq(t, http.MethodPost, ts.URL+"/sandboxes", key, body, "application/json")
+	rGated.Body.Close()
+	if rGated.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("expected 501 when K8sE2BVolumeMounts is disabled, got %d", rGated.StatusCode)
+	}
+	if got := srv.E2BVolumeMountErrorsTotal.Load(); got != 3 {
+		t.Fatalf("E2BVolumeMountErrorsTotal = %d; want 3", got)
+	}
+}
