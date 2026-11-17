@@ -39,7 +39,11 @@ spec:
             - "--runtime-class={{ .Values.runtime.runtimeClassName }}"
             - "--podd-image={{ .Values.runtime.poddInjectorImage }}"
             - "--sandbox-image={{ .Values.runtime.defaultSandboxImage }}"
+            - "--default-egress-enabled={{ .Values.egress.enabled }}"
             - "--egress-image={{ include "cubepod.egressImage" . }}"
+            {{- if .Values.egress.exchangeUrl }}
+            - "--egress-exchange-url={{ .Values.egress.exchangeUrl }}"
+            {{- end }}
             {{- if $pullSecretsCSV }}
             - "--image-pull-secrets={{ $pullSecretsCSV }}"
             {{- end }}
@@ -55,6 +59,7 @@ spec:
             {{- if .Values.featureGates.e2bTemplateAPI }}
             - "--e2b-template-api=true"
             {{- end }}
+            - "--feature-gate={{ include "cubepod.featureGatesCSV" . }}"
             {{- if .Values.templateBuild.enabled }}
             - "--template-build=true"
             - "--buildkit-addr={{ .Values.templateBuild.buildkit.address }}"

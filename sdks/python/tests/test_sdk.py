@@ -14,11 +14,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import httpx
 
+from datetime import datetime, timezone
+
 from cubepod import (
     AsyncCubePod,
     CubePod,
     CubePodFileTooLargeError,
     DesktopSession,
+    EventPage,
+    LifecycleEvent,
+    SandboxMetric,
+    Secret,
+    SecretInfo,
+    SecretPage,
     SyncCubePod,
     CommandInfo,
     CommandLogs,
@@ -26,7 +34,11 @@ from cubepod import (
     FileEntry,
     PanelEndpoint,
     SandboxInfo,
+    VolumeEntry,
+    VolumeInfo,
+    WebhookInfo,
     _build_tar_gz_bytes,
+    fill_secret,
 )
 
 
@@ -1561,3 +1573,402 @@ class TestProviderPrerequisites(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSecretsVolumesEventsWebhooksMetrics(unittest.IsolatedAsyncioTestCase):
+    def _make_handler(self, captured: list[dict[str, Any]]):
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(
+                {
+                    "method": request.method,
+                    "path": request.url.path,
+                    "raw_path": request.url.raw_path,
+                    "query": dict(request.url.params),
+                    "headers": dict(request.headers),
+                    "content": request.content,
+                }
+            )
+            method = request.method
+            path = request.url.path
+
+            # Secrets
+            if method == "POST" and path == "/secrets":
+                self.assertEqual(request.headers.get("x-api-key"), "cpod-key-1")
+                body = json.loads(request.content)
+                return httpx.Response(
+                    201,
+                    json={
+                        "secretID": "sec_123",
+                        "name": body["name"],
+                        "currentVersion": 1,
+                        "metadata": {},
+                        "createdAt": "2026-11-16T00:00:00Z",
+                        "updatedAt": "2026-11-16T00:00:00Z",
+                    },
+                )
+            if method == "GET" and path == "/secrets":
+                self.assertEqual(request.headers.get("x-api-key"), "cpod-key-1")
+                headers = {"X-Next-Token": "sec-next-2"} if request.url.params.get("limit") else {}
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    json=[
+                        {
+                            "secretID": "sec_123",
+                            "name": "openai_api_key",
+                            "currentVersion": 1,
+                            "metadata": {},
+                            "createdAt": "2026-11-16T00:00:00Z",
+                            "updatedAt": "2026-11-16T00:00:00Z",
+                        }
+                    ],
+                )
+            if method == "GET" and path == "/secrets/sec_123":
+                return httpx.Response(
+                    200,
+                    json={
+                        "secretID": "sec_123",
+                        "name": "openai_api_key",
+                        "currentVersion": 1,
+                    },
+                )
+            if method == "POST" and path == "/secrets/sec_123":
+                return httpx.Response(
+                    200,
+                    json={
+                        "secretID": "sec_123",
+                        "name": "openai_api_key",
+                        "currentVersion": 2,
+                    },
+                )
+            if method == "DELETE" and path == "/secrets/sec_123":
+                return httpx.Response(204)
+
+            # Volumes
+            if method == "POST" and path == "/volumes":
+                self.assertEqual(request.headers.get("x-api-key"), "cpod-key-1")
+                body = json.loads(request.content)
+                return httpx.Response(
+                    201,
+                    json={"volumeID": "vol_abc", "name": body["name"], "token": "vol_tok_1"},
+                )
+            if method == "GET" and path == "/volumes":
+                return httpx.Response(
+                    200,
+                    json=[{"volumeID": "vol_abc", "name": "datasets"}],
+                )
+            if method == "GET" and path == "/volumes/vol_abc":
+                return httpx.Response(
+                    200,
+                    json={"volumeID": "vol_abc", "name": "datasets", "token": "vol_tok_1"},
+                )
+            if method == "DELETE" and path == "/volumes/vol_abc":
+                return httpx.Response(204)
+            if method == "PUT" and path == "/volumecontent/vol_abc/file":
+                self.assertEqual(request.headers.get("authorization"), "Bearer vol_tok_1")
+                return httpx.Response(
+                    201,
+                    json={
+                        "name": "data.txt",
+                        "type": "file",
+                        "path": request.url.params.get("path", "/data.txt"),
+                        "size": len(request.content),
+                        "mode": 420,
+                        "uid": 1000,
+                        "gid": 1000,
+                    },
+                )
+            if method == "GET" and path == "/volumecontent/vol_abc/file":
+                self.assertEqual(request.headers.get("authorization"), "Bearer vol_tok_1")
+                return httpx.Response(200, content=b"hello volume bytes")
+
+            # Events & Webhooks
+            if method == "GET" and path == "/events":
+                headers = {"X-Next-Token": "evt-next-2"} if request.url.params.get("limit") else {}
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    json=[
+                        {
+                            "version": "v1",
+                            "id": "evt_1",
+                            "type": "sandbox.lifecycle.created",
+                            "timestamp": "2026-11-16T01:00:00Z",
+                            "eventCategory": "lifecycle",
+                            "eventLabel": "create",
+                            "sandboxId": "cpod-1",
+                            "sandboxTemplateId": "base",
+                            "eventData": None,
+                        }
+                    ],
+                )
+            if method == "GET" and path == "/sandboxes/cpod-1/events":
+                headers = {"X-Next-Token": "sbx-evt-next-2"} if request.url.params.get("limit") else {}
+                return httpx.Response(
+                    200,
+                    headers=headers,
+                    json=[
+                        {
+                            "version": "v1",
+                            "id": "evt_2",
+                            "type": "sandbox.lifecycle.paused",
+                            "timestamp": "2026-11-16T01:05:00Z",
+                            "eventCategory": "lifecycle",
+                            "eventLabel": "pause",
+                            "sandboxId": "cpod-1",
+                            "eventData": {"pause_mode": "filesystem"},
+                        }
+                    ],
+                )
+            if method == "POST" and path == "/webhooks":
+                body = json.loads(request.content)
+                return httpx.Response(
+                    201,
+                    json={
+                        "id": "whk_1",
+                        "name": body["name"],
+                        "url": body["url"],
+                        "events": body["events"],
+                        "enabled": body["enabled"],
+                        "signatureKey": "whsec_secret_key",
+                        "createdAt": "2026-11-16T01:00:00Z",
+                        "updatedAt": "2026-11-16T01:00:00Z",
+                    },
+                )
+            if method == "GET" and path == "/webhooks":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "id": "whk_1",
+                            "name": "lifecycle-hook",
+                            "url": "https://example.com/hook",
+                            "events": ["sandbox.lifecycle.created"],
+                            "enabled": True,
+                        }
+                    ],
+                )
+            if method == "GET" and path == "/webhooks/whk_1":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "whk_1",
+                        "name": "lifecycle-hook",
+                        "url": "https://example.com/hook",
+                        "events": ["sandbox.lifecycle.created"],
+                        "enabled": True,
+                    },
+                )
+            if method == "PATCH" and path == "/webhooks/whk_1":
+                body = json.loads(request.content)
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "whk_1",
+                        "name": "lifecycle-hook",
+                        "url": body.get("url", "https://example.com/hook"),
+                        "events": body.get("events", ["sandbox.lifecycle.created"]),
+                        "enabled": body.get("enabled", True),
+                        "signatureKey": "whsec_rotated" if body.get("rotateSecret") else None,
+                    },
+                )
+            if method == "DELETE" and path == "/webhooks/whk_1":
+                return httpx.Response(204)
+
+            # Metrics
+            if method == "GET" and path == "/sandboxes/cpod-1/metrics":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "timestamp": "2026-11-16T02:00:00Z",
+                            "timestampUnix": 1794794400,
+                            "cpuCount": 4,
+                            "cpuUsedPct": 12.5,
+                            "memUsed": 268435456,
+                            "memTotal": 1073741824,
+                            "memCache": 33554432,
+                            "diskUsed": 536870912,
+                            "diskTotal": 10737418240,
+                        }
+                    ],
+                )
+
+            # Desktop with WebRTC & sandbox create with network/volumeMounts
+            if method == "POST" and path == "/sandboxes":
+                return httpx.Response(
+                    201,
+                    json={
+                        "sandboxID": "cpod-1",
+                        "templateID": "base",
+                        "state": "Running",
+                    },
+                )
+            if method == "POST" and path in ("/sandboxes/cpod-1/desktop/start", "/sandboxes/cpod/special/desktop/start"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "running",
+                        "desktopUrl": "/panel/tok1/vnc.html?autoconnect=true&resize=scale",
+                        "terminalUrl": "/panel/tok2/",
+                        "cdpUrl": "/panel/tok3/",
+                        "webrtcUrl": "/panel/tok4/",
+                        "transportUsed": "webrtc",
+                        "expiresAt": "2026-11-16T03:00:00Z",
+                    },
+                )
+
+            return httpx.Response(404, json={"error": "not found"})
+
+        return handler
+
+    def test_sync_secrets_volumes_events_webhooks_metrics(self) -> None:
+        captured: list[dict[str, Any]] = []
+        self.assertEqual(Secret.fill("openai_api_key"), "${e2b.secrets.openai_api_key}")
+        self.assertEqual(fill_secret("openai_api_key"), "${e2b.secrets.openai_api_key}")
+
+        with CubePod(api_key="cpod-key-1", transport=httpx.MockTransport(self._make_handler(captured))) as client:
+            self.assertEqual(client.fill_secret("stripe_key"), "${e2b.secrets.stripe_key}")
+
+            sec = client.create_secret("openai_api_key", "sk-123")
+            self.assertIsInstance(sec, SecretInfo)
+            self.assertEqual(sec.secret_id, "sec_123")
+            self.assertEqual(sec.id, "sec_123")
+            self.assertEqual(sec.version, 1)
+
+            secs_page = client.list_secrets_page(limit=10, next_token="cur-1")
+            self.assertIsInstance(secs_page, SecretPage)
+            self.assertEqual(secs_page.next_token, "sec-next-2")
+            self.assertEqual(len(secs_page.items), 1)
+            secs = client.list_secrets(limit=10, next_token="cur-1")
+            self.assertEqual(len(secs), 1)
+            self.assertEqual(captured[-1]["query"], {"limit": "10", "nextToken": "cur-1"})
+
+            self.assertEqual(client.get_secret("sec_123").name, "openai_api_key")
+            updated_sec = client.update_secret("sec_123", "sk-456")
+            self.assertEqual(updated_sec.current_version, 2)
+            client.delete_secret("sec_123")
+
+            vol = client.create_volume("datasets")
+            self.assertIsInstance(vol, VolumeInfo)
+            self.assertEqual(vol.volume_id, "vol_abc")
+            self.assertEqual(vol.token, "vol_tok_1")
+
+            self.assertEqual(len(client.list_volumes()), 1)
+            self.assertEqual(client.get_volume("vol_abc").token, "vol_tok_1")
+
+            entry = client.write_volume_file("vol_abc", "/data.txt", "hello", force=True)
+            self.assertIsInstance(entry, VolumeEntry)
+            self.assertEqual(entry.path, "/data.txt")
+            self.assertEqual(entry.size, 5)
+
+            data = client.read_volume_file("vol_abc", "/data.txt")
+            self.assertEqual(data, b"hello volume bytes")
+            client.delete_volume("vol_abc")
+
+            evts_page = client.list_events_page(sandbox_id="cpod-1", event_type="sandbox.lifecycle.created", limit=50)
+            self.assertIsInstance(evts_page, EventPage)
+            self.assertEqual(evts_page.next_token, "evt-next-2")
+            self.assertEqual(len(evts_page.items), 1)
+            evts = client.list_events(sandbox_id="cpod-1", event_type="sandbox.lifecycle.created", limit=50)
+            self.assertEqual(len(evts), 1)
+            self.assertIsInstance(evts[0], LifecycleEvent)
+            self.assertEqual(evts[0].type, "sandbox.lifecycle.created")
+
+            sbx_evts_page = client.list_sandbox_events_page("cpod-1", limit=10)
+            self.assertEqual(sbx_evts_page.next_token, "sbx-evt-next-2")
+            sbx_evts = client.list_sandbox_events("cpod-1")
+            self.assertEqual(len(sbx_evts), 1)
+            self.assertEqual(sbx_evts[0].event_data, {"pause_mode": "filesystem"})
+
+            wh = client.create_webhook(
+                "lifecycle-hook",
+                "https://example.com/hook",
+                ["sandbox.lifecycle.created"],
+            )
+            self.assertIsInstance(wh, WebhookInfo)
+            self.assertEqual(wh.signature_key, "whsec_secret_key")
+            self.assertEqual(len(client.list_webhooks()), 1)
+            self.assertEqual(client.get_webhook("whk_1").id, "whk_1")
+
+            wh_rot = client.update_webhook("whk_1", enabled=False, rotate_secret=True)
+            self.assertFalse(wh_rot.enabled)
+            self.assertEqual(wh_rot.signature_key, "whsec_rotated")
+            client.delete_webhook("whk_1")
+
+            start_dt = datetime(2026, 11, 16, 1, 0, tzinfo=timezone.utc)
+            metrics = client.get_metrics("cpod-1", start=start_dt, end=1794798000)
+            self.assertEqual(len(metrics), 1)
+            self.assertIsInstance(metrics[0], SandboxMetric)
+            self.assertEqual(metrics[0].cpu_count, 4)
+            self.assertAlmostEqual(metrics[0].cpu_used_pct, 12.5)
+            self.assertEqual(
+                captured[-1]["query"],
+                {"start": "2026-11-16T01:00:00+00:00", "end": "1794798000"},
+            )
+
+            naive_dt = datetime(2026, 11, 16, 1, 30)
+            client.get_metrics("cpod-1", start=naive_dt)
+            self.assertEqual(captured[-1]["query"], {"start": "2026-11-16T01:30:00+00:00"})
+
+            with self.assertRaises(TypeError):
+                client.get_metrics("cpod-1", start=True)
+            with self.assertRaises(httpx.HTTPStatusError):
+                client.get_secret("missing_sec")
+
+            sbx = client.create(
+                "base",
+                network={"allowOut": ["api.openai.com"], "denyOut": ["0.0.0.0/0"]},
+                volume_mounts=[{"name": "datasets", "path": "/mnt/datasets"}],
+            )
+            self.assertEqual(sbx.sandbox_id, "cpod-1")
+            create_body = json.loads(captured[-1]["content"])
+            self.assertEqual(create_body["volumeMounts"], [{"name": "datasets", "path": "/mnt/datasets"}])
+            self.assertEqual(create_body["network"]["allowOut"], ["api.openai.com"])
+
+            desk = client.start_desktop("cpod/special", transport="webrtc")
+            self.assertIsInstance(desk, DesktopSession)
+            self.assertEqual(desk.transport_used, "webrtc")
+            self.assertEqual(desk.webrtc_url, "/panel/tok4/")
+            self.assertEqual(captured[-1]["raw_path"], b"/sandboxes/cpod%2Fspecial/desktop/start")
+
+    async def test_async_secrets_volumes_events_webhooks_metrics(self) -> None:
+        captured: list[dict[str, Any]] = []
+        async with AsyncCubePod(api_key="cpod-key-1", transport=httpx.MockTransport(self._make_handler(captured))) as client:
+            sec = await client.create_secret("openai_api_key", "sk-123")
+            self.assertEqual(sec.secret_id, "sec_123")
+            sec_page = await client.list_secrets_page(limit=5)
+            self.assertEqual(sec_page.next_token, "sec-next-2")
+            self.assertEqual(len(await client.list_secrets()), 1)
+            self.assertEqual((await client.get_secret("sec_123")).name, "openai_api_key")
+            self.assertEqual((await client.update_secret("sec_123", "sk-new")).version, 2)
+            await client.delete_secret("sec_123")
+
+            vol = await client.create_volume("datasets")
+            self.assertEqual(vol.volume_id, "vol_abc")
+            self.assertEqual(len(await client.list_volumes()), 1)
+            self.assertEqual((await client.get_volume("vol_abc")).name, "datasets")
+            ent = await client.write_volume_file("vol_abc", "/data.txt", b"bytes", token=vol.token)
+            self.assertEqual(ent.size, 5)
+            self.assertEqual(await client.read_volume_file("vol_abc", "/data.txt"), b"hello volume bytes")
+            await client.delete_volume("vol_abc")
+
+            ev_page = await client.list_events_page(limit=5)
+            self.assertEqual(ev_page.next_token, "evt-next-2")
+            sbx_ev_page = await client.list_sandbox_events_page("cpod-1", limit=5)
+            self.assertEqual(sbx_ev_page.next_token, "sbx-evt-next-2")
+            self.assertEqual(len(await client.list_events()), 1)
+            self.assertEqual(len(await client.list_sandbox_events("cpod-1")), 1)
+
+            wh = await client.create_webhook("lifecycle-hook", "https://example.com/hook", ["sandbox.lifecycle.created"])
+            self.assertEqual(wh.id, "whk_1")
+            self.assertEqual(len(await client.list_webhooks()), 1)
+            self.assertEqual((await client.get_webhook("whk_1")).name, "lifecycle-hook")
+            self.assertEqual((await client.update_webhook("whk_1", rotate_secret=True)).signature_key, "whsec_rotated")
+            await client.delete_webhook("whk_1")
+
+            metrics = await client.get_metrics("cpod-1")
+            self.assertEqual(len(metrics), 1)
+            self.assertEqual(metrics[0].mem_total, 1073741824)
+            with self.assertRaises(TypeError):
+                await client.get_metrics("cpod-1", end=False)

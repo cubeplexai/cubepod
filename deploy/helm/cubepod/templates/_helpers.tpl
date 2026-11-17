@@ -50,7 +50,9 @@ ServiceAccount name
 Default cubepod-egress sidecar image
 */}}
 {{- define "cubepod.egressImage" -}}
-{{- printf "%s/%s:%s" .Values.egress.image.registry .Values.egress.image.repository .Values.egress.image.tag -}}
+{{- $egress := .Values.egress | default dict -}}
+{{- $img := $egress.image | default dict -}}
+{{- printf "%s/%s:%s" ($img.registry | default "ghcr.io") ($img.repository | default "cubeplexai/cubepod-egress") ($img.tag | default "v0.5.4") -}}
 {{- end }}
 
 {{/*
@@ -109,15 +111,23 @@ Effective gateway stateDir
 {{- end }}
 
 {{/*
+Normalize a boolean value with a fallback of true (unlike Sprig default, preserves explicit false).
+*/}}
+{{- define "cubepod.boolDefaultTrue" -}}
+{{- if kindIs "bool" . -}}{{ . }}{{- else -}}true{{- end -}}
+{{- end }}
+
+{{/*
 Egress CA environment variables when egress.caSecretName is configured
 */}}
 {{- define "cubepod.egressCAEnv" -}}
-{{- if .Values.egress.caSecretName }}
+{{- $egress := .Values.egress | default dict -}}
+{{- if $egress.caSecretName }}
 - name: CUBEPOD_EGRESS_CA_CERT
   value: "/etc/cubepod-egress-ca/ca.crt"
 - name: CUBEPOD_EGRESS_CA_KEY
   value: "/etc/cubepod-egress-ca/ca.key"
-{{- if .Values.egress.upstreamCAEnabled }}
+{{- if $egress.upstreamCAEnabled }}
 - name: CUBEPOD_EGRESS_UPSTREAM_CA_FILE
   value: "/etc/cubepod-egress-ca/ca.crt"
 {{- end }}
@@ -128,7 +138,8 @@ Egress CA environment variables when egress.caSecretName is configured
 Egress CA volumeMount when egress.caSecretName is configured
 */}}
 {{- define "cubepod.egressCAVolumeMount" -}}
-{{- if .Values.egress.caSecretName }}
+{{- $egress := .Values.egress | default dict -}}
+{{- if $egress.caSecretName }}
 - name: cubepod-egress-ca
   mountPath: /etc/cubepod-egress-ca
   readOnly: true
@@ -139,9 +150,71 @@ Egress CA volumeMount when egress.caSecretName is configured
 Egress CA volume when egress.caSecretName is configured
 */}}
 {{- define "cubepod.egressCAVolume" -}}
-{{- if .Values.egress.caSecretName }}
+{{- $egress := .Values.egress | default dict -}}
+{{- if $egress.caSecretName }}
 - name: cubepod-egress-ca
   secret:
-    secretName: {{ .Values.egress.caSecretName | quote }}
+    secretName: {{ $egress.caSecretName | quote }}
 {{- end }}
+{{- end }}
+
+
+{{/*
+True ("true") when E2B Volumes should be active (explicitly enabled OR rwxStorageClassName is set)
+*/}}
+{{- define "cubepod.e2bVolumesActive" -}}
+{{- $ev := .Values.e2bVolumes | default dict -}}
+{{- if or $ev.enabled (ne (default "" $ev.rwxStorageClassName) "") -}}
+true
+{{- end -}}
+{{- end }}
+
+{{/*
+Effective K8sE2BVolumeMounts gate ("true" or "false")
+*/}}
+{{- define "cubepod.k8sE2BVolumeMountsEnabled" -}}
+{{- $fg := .Values.featureGates | default dict -}}
+{{- if or $fg.k8sE2BVolumeMounts (eq (include "cubepod.e2bVolumesActive" .) "true") -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end }}
+
+{{/*
+Effective TransparentEgress gate ("true" or "false")
+*/}}
+{{- define "cubepod.transparentEgressEnabled" -}}
+{{- $eg := .Values.egress | default dict -}}
+{{- $fg := .Values.featureGates | default dict -}}
+{{- if and (eq (include "cubepod.boolDefaultTrue" $eg.transparent) "true") (eq (include "cubepod.boolDefaultTrue" $fg.transparentEgress) "true") -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end }}
+
+{{/*
+Comma-separated feature gates string for controller and gateway
+*/}}
+{{- define "cubepod.featureGatesCSV" -}}
+{{- $fg := .Values.featureGates | default dict -}}
+{{- printf "E2BTemplateAPI=%t,TransparentEgress=%s,DesktopStack=%s,StatelessGatewayHA=%s,E2BFilesystemWatch=%s,E2BSecretsAPI=%s,SandboxEventsAndWebhooks=%s,K8sE2BVolumeMounts=%s" (default false $fg.e2bTemplateAPI) (include "cubepod.transparentEgressEnabled" .) (include "cubepod.boolDefaultTrue" $fg.desktopStack) (include "cubepod.boolDefaultTrue" $fg.statelessGatewayHA) (include "cubepod.boolDefaultTrue" $fg.e2bFilesystemWatch) (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) (include "cubepod.boolDefaultTrue" $fg.sandboxEventsAndWebhooks) (include "cubepod.k8sE2BVolumeMountsEnabled" .) -}}
+{{- end }}
+
+{{/*
+Effective Kubernetes Secret name for CUBEPOD_SECRETS_KEY
+*/}}
+{{- define "cubepod.secretsKeySecretName" -}}
+{{- $secrets := .Values.secrets | default dict -}}
+{{- $fg := .Values.featureGates | default dict -}}
+{{- $secretsEnabled := and (eq (include "cubepod.boolDefaultTrue" $secrets.enabled) "true") (eq (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) "true") -}}
+{{- if not $secretsEnabled -}}
+{{- else if $secrets.existingSecret -}}
+{{- $secrets.existingSecret -}}
+{{- else if .Values.gateway.secretsKeySecret -}}
+{{- .Values.gateway.secretsKeySecret -}}
+{{- else if and (eq (default "k8s" $secrets.backend) "file") $secrets.encryptionKey -}}
+{{- printf "%s-secrets-key" (include "cubepod.fullname" .) -}}
+{{- end -}}
 {{- end }}

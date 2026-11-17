@@ -54,6 +54,12 @@ export interface CreateSandboxOptions extends RequestOptions {
   rootfsSize?: string;
   workspaceSize?: string;
   networkPolicy?: NetworkPolicySpec;
+  network?: {
+    allowOut?: string[];
+    denyOut?: string[];
+    rules?: Record<string, Array<{ transform?: { headers?: Record<string, string> } }>>;
+  };
+  volumeMounts?: Array<{ name: string; path: string }>;
   secretBindings?: SecretBinding[];
 }
 
@@ -400,6 +406,154 @@ export interface WarmPoolInfo {
   availableReplicas?: number;
 }
 
+
+export interface StartDesktopOptions extends RequestOptions {
+  resolution?: string;
+  initialUrl?: string;
+  expiresInSeconds?: number;
+  transport?: 'novnc' | 'webrtc';
+}
+
+export interface DesktopSession {
+  status: string;
+  desktopUrl: string;
+  terminalUrl: string;
+  cdpUrl: string;
+  webrtcUrl?: string;
+  transportUsed?: 'novnc' | 'webrtc' | (string & {});
+  fallbackReason?: string;
+  expiresAt?: string;
+}
+
+export interface SandboxMetric {
+  timestamp: string;
+  timestampUnix: number;
+  cpuCount: number;
+  cpuUsedPct: number;
+  memUsed: number;
+  memTotal: number;
+  memCache: number;
+  diskUsed: number;
+  diskTotal: number;
+}
+
+export interface GetMetricsOptions extends RequestOptions {
+  start?: number | string | Date;
+  end?: number | string | Date;
+}
+
+export interface SecretInfo {
+  secretId: string;
+  id: string;
+  name: string;
+  currentVersion: number;
+  version: number;
+  metadata: Record<string, string>;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface ListSecretsOptions extends RequestOptions {
+  limit?: number;
+  nextToken?: string;
+}
+
+export interface SecretPage {
+  items: SecretInfo[];
+  nextToken?: string;
+}
+
+export interface VolumeInfo {
+  volumeId: string;
+  name: string;
+  token?: string;
+}
+
+export interface VolumeEntry {
+  name: string;
+  type: string;
+  path: string;
+  size: number;
+  mode: number;
+  uid: number;
+  gid: number;
+  atime?: string;
+  mtime?: string;
+  ctime?: string;
+}
+
+export interface WriteVolumeFileOptions extends RequestOptions {
+  token?: string;
+  uid?: number;
+  gid?: number;
+  mode?: number;
+  force?: boolean;
+}
+
+export interface ReadVolumeFileOptions extends RequestOptions {
+  token?: string;
+}
+
+export interface LifecycleEvent {
+  version: string;
+  id: string;
+  type: string;
+  timestamp: string;
+  eventCategory: string;
+  eventLabel: string;
+  sandboxId: string;
+  sandboxTeamId?: string;
+  sandboxTemplateId?: string;
+  sandboxBuildId?: string;
+  sandboxExecutionId?: string;
+  eventData?: Record<string, unknown> | null;
+}
+
+export interface ListSandboxEventsOptions extends RequestOptions {
+  eventType?: string;
+  limit?: number;
+  nextToken?: string;
+}
+
+export interface ListEventsOptions extends ListSandboxEventsOptions {
+  sandboxId?: string;
+}
+
+export interface EventPage {
+  items: LifecycleEvent[];
+  nextToken?: string;
+}
+
+export interface WebhookInfo {
+  id: string;
+  name: string;
+  url: string;
+  events: string[];
+  enabled: boolean;
+  signatureKey?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface CreateWebhookRequest {
+  name: string;
+  url: string;
+  events: string[];
+  enabled?: boolean;
+}
+
+export interface UpdateWebhookRequest {
+  url?: string;
+  events?: string[];
+  enabled?: boolean;
+  rotateSecret?: boolean;
+}
+
+export function fillSecret(name: string): string;
+export const Secret: {
+  fill(name: string): string;
+};
+
 export function normalizeSandboxInfo(raw: Record<string, unknown>): SandboxInfo;
 
 export class CubePodClient {
@@ -519,4 +673,66 @@ export class CubePodClient {
 
   createWarmPool(request: CreateWarmPoolRequest, options?: RequestOptions): Promise<WarmPoolInfo>;
   listWarmPools(options?: RequestOptions): Promise<WarmPoolInfo[]>;
+
+  startDesktop(
+    sandboxId: string,
+    desktopOptions?: StartDesktopOptions,
+    options?: RequestOptions,
+  ): Promise<DesktopSession>;
+  getDesktopStatus(sandboxId: string, options?: RequestOptions): Promise<Record<string, unknown>>;
+  stopDesktop(sandboxId: string, options?: RequestOptions): Promise<Record<string, unknown>>;
+
+  getMetrics(
+    sandboxId: string,
+    metricsOptions?: GetMetricsOptions,
+    options?: RequestOptions,
+  ): Promise<SandboxMetric[]>;
+
+  fillSecret(name: string): string;
+  createSecret(name: string, value: string, options?: RequestOptions): Promise<SecretInfo>;
+  listSecretsPage(listOptions?: ListSecretsOptions, options?: RequestOptions): Promise<SecretPage>;
+  listSecrets(listOptions?: ListSecretsOptions, options?: RequestOptions): Promise<SecretInfo[]>;
+  getSecret(secretId: string, options?: RequestOptions): Promise<SecretInfo>;
+  updateSecret(secretId: string, value: string, options?: RequestOptions): Promise<SecretInfo>;
+  deleteSecret(secretId: string, options?: RequestOptions): Promise<void>;
+
+  createVolume(name: string, options?: RequestOptions): Promise<VolumeInfo>;
+  listVolumes(options?: RequestOptions): Promise<VolumeInfo[]>;
+  getVolume(volumeId: string, options?: RequestOptions): Promise<VolumeInfo>;
+  deleteVolume(volumeId: string, options?: RequestOptions): Promise<void>;
+  writeVolumeFile(
+    volumeId: string,
+    path: string,
+    content: string | Uint8Array | ArrayBuffer,
+    options?: WriteVolumeFileOptions,
+  ): Promise<VolumeEntry>;
+  readVolumeFile(
+    volumeId: string,
+    path: string,
+    options?: ReadVolumeFileOptions,
+  ): Promise<Uint8Array>;
+
+  listEventsPage(filterOptions?: ListEventsOptions, options?: RequestOptions): Promise<EventPage>;
+  listEvents(filterOptions?: ListEventsOptions, options?: RequestOptions): Promise<LifecycleEvent[]>;
+  listSandboxEventsPage(
+    sandboxId: string,
+    filterOptions?: ListSandboxEventsOptions,
+    options?: RequestOptions,
+  ): Promise<EventPage>;
+  listSandboxEvents(
+    sandboxId: string,
+    filterOptions?: ListSandboxEventsOptions,
+    options?: RequestOptions,
+  ): Promise<LifecycleEvent[]>;
+  createWebhook(request: CreateWebhookRequest, options?: RequestOptions): Promise<WebhookInfo>;
+  listWebhooks(options?: RequestOptions): Promise<WebhookInfo[]>;
+  getWebhook(webhookId: string, options?: RequestOptions): Promise<WebhookInfo>;
+  updateWebhook(
+    webhookId: string,
+    request: UpdateWebhookRequest,
+    options?: RequestOptions,
+  ): Promise<WebhookInfo>;
+  deleteWebhook(webhookId: string, options?: RequestOptions): Promise<void>;
 }
+
+export const CubepodClient: typeof CubePodClient;

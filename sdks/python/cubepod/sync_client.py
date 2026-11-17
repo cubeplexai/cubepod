@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import builtins
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from datetime import datetime
 import time
 from typing import Any
 from urllib.parse import quote
@@ -19,27 +20,44 @@ from ._helpers import (
     _build_template_register_payload,
     _build_template_result,
     _format_build_error,
+    _format_metric_time_param,
     _json_dict,
     _json_list,
     _normalize_base_url,
     _parse_command_info,
     _parse_command_logs,
     _parse_desktop_session,
+    _parse_event_page,
     _parse_execution_result,
     _parse_file_entries,
     _parse_info,
     _parse_panel_endpoint,
+    _parse_sandbox_metric,
+    _parse_secret_info,
+    _parse_secret_page,
+    _parse_volume_entry,
+    _parse_volume_info,
+    _parse_webhook_info,
 )
 from .exceptions import CubePodFileTooLargeError
 from .models import (
     CommandInfo,
     CommandLogs,
     DesktopSession,
+    EventPage,
     ExecutionResult,
     FileEntry,
+    LifecycleEvent,
     NetworkPolicySpec,
     PanelEndpoint,
     SandboxInfo,
+    SandboxMetric,
+    Secret,
+    SecretInfo,
+    SecretPage,
+    VolumeEntry,
+    VolumeInfo,
+    WebhookInfo,
 )
 
 
@@ -55,7 +73,7 @@ class CubePod:
         timeout: float = 60.0,
         trust_env: bool = False,
     ) -> None:
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        headers = {"Authorization": f"Bearer {api_key}", "X-API-KEY": api_key} if api_key else {}
         self._max_retries = max_retries
         self._client = httpx.Client(
             base_url=_normalize_base_url(base_url),
@@ -106,6 +124,8 @@ class CubePod:
         volume_key: str | None = None,
         metadata: dict[str, str] | None = None,
         network_policy: NetworkPolicySpec | dict[str, Any] | None = None,
+        network: Mapping[str, Any] | None = None,
+        volume_mounts: Sequence[Mapping[str, str]] | None = None,
         secret_bindings: builtins.list[dict[str, Any]] | None = None,
         timeout_seconds: int | None = None,
         warm_pool_ref: str | None = None,
@@ -117,6 +137,8 @@ class CubePod:
             volume_key=volume_key,
             metadata=metadata,
             network_policy=network_policy,
+            network=network,
+            volume_mounts=volume_mounts,
             secret_bindings=secret_bindings,
             timeout_seconds=timeout_seconds,
             warm_pool_ref=warm_pool_ref,
@@ -231,16 +253,18 @@ class CubePod:
         resolution: str | None = None,
         initial_url: str | None = None,
         expires_in_seconds: int = 3600,
+        transport: str | None = None,
     ) -> DesktopSession:
         """Start or attach to the interactive desktop stack inside the sandbox."""
         payload = _build_desktop_start_payload(
             resolution=resolution,
             initial_url=initial_url,
             expires_in_seconds=expires_in_seconds,
+            transport=transport,
         )
         resp = self._request(
             "POST",
-            f"/sandboxes/{sandbox_id}/desktop/start",
+            f"/sandboxes/{quote(sandbox_id, safe='')}/desktop/start",
             json=payload,
         )
         resp.raise_for_status()
@@ -248,13 +272,13 @@ class CubePod:
 
     def get_desktop_status(self, sandbox_id: str) -> dict[str, Any]:
         """Fetch interactive desktop daemon status for a sandbox."""
-        resp = self._request("GET", f"/sandboxes/{sandbox_id}/desktop/status")
+        resp = self._request("GET", f"/sandboxes/{quote(sandbox_id, safe='')}/desktop/status")
         resp.raise_for_status()
         return _json_dict(resp)
 
     def stop_desktop(self, sandbox_id: str) -> dict[str, Any]:
         """Stop the interactive desktop stack inside a sandbox."""
-        resp = self._request("POST", f"/sandboxes/{sandbox_id}/desktop/stop")
+        resp = self._request("POST", f"/sandboxes/{quote(sandbox_id, safe='')}/desktop/stop")
         resp.raise_for_status()
         if resp.content:
             return _json_dict(resp)
@@ -759,6 +783,331 @@ class CubePod:
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"Timed out waiting for template build {build_id}")
             time.sleep(poll_interval)
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
+    def get_metrics(
+        self,
+        sandbox_id: str,
+        *,
+        start: int | float | str | datetime | None = None,
+        end: int | float | str | datetime | None = None,
+    ) -> builtins.list[SandboxMetric]:
+        """Fetch resource usage metrics for a sandbox."""
+        params: dict[str, str] = {}
+        start_val = _format_metric_time_param(start)
+        end_val = _format_metric_time_param(end)
+        if start_val is not None:
+            params["start"] = start_val
+        if end_val is not None:
+            params["end"] = end_val
+        resp = self._request(
+            "GET",
+            f"/sandboxes/{quote(sandbox_id, safe='')}/metrics",
+            params=params or None,
+        )
+        resp.raise_for_status()
+        return [_parse_sandbox_metric(item) for item in _json_list(resp, "metrics")]
+
+    # ------------------------------------------------------------------
+    # Secrets (CEP-0027)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def fill_secret(name: str) -> str:
+        """Return the placeholder template ``${e2b.secrets.<name>}``."""
+        return Secret.fill(name)
+
+    def create_secret(self, name: str, value: str) -> SecretInfo:
+        """Create a new write-only secret for the current API key tenant."""
+        resp = self._request("POST", "/secrets", json={"name": name, "value": value})
+        resp.raise_for_status()
+        return _parse_secret_info(_json_dict(resp))
+
+    def list_secrets_page(
+        self,
+        *,
+        limit: int | None = None,
+        next_token: str | None = None,
+    ) -> SecretPage:
+        """List secrets (metadata only) and return the next pagination token."""
+        params: dict[str, Any] = {}
+        if limit is not None:
+            params["limit"] = limit
+        if next_token is not None:
+            params["nextToken"] = next_token
+        resp = self._request("GET", "/secrets", params=params or None)
+        resp.raise_for_status()
+        return _parse_secret_page(resp)
+
+    def list_secrets(
+        self,
+        *,
+        limit: int | None = None,
+        next_token: str | None = None,
+    ) -> builtins.list[SecretInfo]:
+        """List secrets (metadata only) for the current API key tenant."""
+        return self.list_secrets_page(limit=limit, next_token=next_token).items
+
+    def get_secret(self, secret_id: str) -> SecretInfo:
+        """Fetch metadata for a single secret by ID."""
+        resp = self._request("GET", f"/secrets/{quote(secret_id, safe='')}")
+        resp.raise_for_status()
+        return _parse_secret_info(_json_dict(resp))
+
+    def update_secret(self, secret_id: str, value: str) -> SecretInfo:
+        """Rotate/update a secret's value and increment its version."""
+        resp = self._request(
+            "POST",
+            f"/secrets/{quote(secret_id, safe='')}",
+            json={"value": value},
+        )
+        resp.raise_for_status()
+        return _parse_secret_info(_json_dict(resp))
+
+    def delete_secret(self, secret_id: str) -> None:
+        """Delete a secret and revoke its active vault bindings."""
+        resp = self._request("DELETE", f"/secrets/{quote(secret_id, safe='')}")
+        resp.raise_for_status()
+
+    # ------------------------------------------------------------------
+    # Volumes (CEP-0025 / CEP-0026)
+    # ------------------------------------------------------------------
+
+    def create_volume(self, name: str) -> VolumeInfo:
+        """Create a durable E2B volume."""
+        resp = self._request("POST", "/volumes", json={"name": name})
+        resp.raise_for_status()
+        return _parse_volume_info(_json_dict(resp))
+
+    def list_volumes(self) -> builtins.list[VolumeInfo]:
+        """List durable E2B volumes owned by the current API key tenant."""
+        resp = self._request("GET", "/volumes")
+        resp.raise_for_status()
+        return [_parse_volume_info(item) for item in _json_list(resp, "volumes")]
+
+    def get_volume(self, volume_id: str) -> VolumeInfo:
+        """Fetch volume metadata and content token by volume ID."""
+        resp = self._request("GET", f"/volumes/{quote(volume_id, safe='')}")
+        resp.raise_for_status()
+        return _parse_volume_info(_json_dict(resp))
+
+    def delete_volume(self, volume_id: str) -> None:
+        """Delete an E2B volume that is not mounted by any active sandbox."""
+        resp = self._request("DELETE", f"/volumes/{quote(volume_id, safe='')}")
+        resp.raise_for_status()
+
+    def write_volume_file(
+        self,
+        volume_id: str,
+        path: str,
+        content: str | bytes,
+        *,
+        token: str | None = None,
+        uid: int | None = None,
+        gid: int | None = None,
+        mode: int | None = None,
+        force: bool = False,
+    ) -> VolumeEntry:
+        """Write a file directly into an E2B volume via the volume content API."""
+        vol_token = token
+        if not vol_token:
+            vol = self.get_volume(volume_id)
+            if not vol.token:
+                raise RuntimeError(f"Volume {volume_id} did not return a content token")
+            vol_token = vol.token
+        data = content.encode("utf-8") if isinstance(content, str) else content
+        params: dict[str, Any] = {"path": path}
+        if uid is not None:
+            params["uid"] = uid
+        if gid is not None:
+            params["gid"] = gid
+        if mode is not None:
+            params["mode"] = mode
+        if force:
+            params["force"] = "true"
+        resp = self._request(
+            "PUT",
+            f"/volumecontent/{quote(volume_id, safe='')}/file",
+            params=params,
+            content=data,
+            headers={
+                "Authorization": f"Bearer {vol_token}",
+                "Content-Type": "application/octet-stream",
+            },
+        )
+        resp.raise_for_status()
+        return _parse_volume_entry(_json_dict(resp))
+
+    def read_volume_file(
+        self,
+        volume_id: str,
+        path: str,
+        *,
+        token: str | None = None,
+    ) -> bytes:
+        """Read raw file bytes from an E2B volume via the volume content API."""
+        vol_token = token
+        if not vol_token:
+            vol = self.get_volume(volume_id)
+            if not vol.token:
+                raise RuntimeError(f"Volume {volume_id} did not return a content token")
+            vol_token = vol.token
+        resp = self._request(
+            "GET",
+            f"/volumecontent/{quote(volume_id, safe='')}/file",
+            params={"path": path},
+            headers={"Authorization": f"Bearer {vol_token}"},
+        )
+        resp.raise_for_status()
+        return resp.content
+
+    # ------------------------------------------------------------------
+    # Events & Webhooks (CEP-0028)
+    # ------------------------------------------------------------------
+
+    def list_events_page(
+        self,
+        *,
+        sandbox_id: str | None = None,
+        event_type: str | None = None,
+        limit: int | None = None,
+        next_token: str | None = None,
+    ) -> EventPage:
+        """List sandbox lifecycle events and return the next pagination token."""
+        params: dict[str, Any] = {}
+        if sandbox_id is not None:
+            params["sandboxID"] = sandbox_id
+        if event_type is not None:
+            params["eventType"] = event_type
+        if limit is not None:
+            params["limit"] = limit
+        if next_token is not None:
+            params["nextToken"] = next_token
+        resp = self._request("GET", "/events", params=params or None)
+        resp.raise_for_status()
+        return _parse_event_page(resp)
+
+    def list_events(
+        self,
+        *,
+        sandbox_id: str | None = None,
+        event_type: str | None = None,
+        limit: int | None = None,
+        next_token: str | None = None,
+    ) -> builtins.list[LifecycleEvent]:
+        """List sandbox lifecycle events for the current tenant."""
+        return self.list_events_page(
+            sandbox_id=sandbox_id,
+            event_type=event_type,
+            limit=limit,
+            next_token=next_token,
+        ).items
+
+    def list_sandbox_events_page(
+        self,
+        sandbox_id: str,
+        *,
+        event_type: str | None = None,
+        limit: int | None = None,
+        next_token: str | None = None,
+    ) -> EventPage:
+        """List lifecycle events scoped to a single sandbox and return the next token."""
+        params: dict[str, Any] = {}
+        if event_type is not None:
+            params["eventType"] = event_type
+        if limit is not None:
+            params["limit"] = limit
+        if next_token is not None:
+            params["nextToken"] = next_token
+        resp = self._request(
+            "GET",
+            f"/sandboxes/{quote(sandbox_id, safe='')}/events",
+            params=params or None,
+        )
+        resp.raise_for_status()
+        return _parse_event_page(resp)
+
+    def list_sandbox_events(
+        self,
+        sandbox_id: str,
+        *,
+        event_type: str | None = None,
+        limit: int | None = None,
+        next_token: str | None = None,
+    ) -> builtins.list[LifecycleEvent]:
+        """List lifecycle events scoped to a single sandbox."""
+        return self.list_sandbox_events_page(
+            sandbox_id,
+            event_type=event_type,
+            limit=limit,
+            next_token=next_token,
+        ).items
+
+    def create_webhook(
+        self,
+        name: str,
+        url: str,
+        events: Sequence[str],
+        *,
+        enabled: bool = True,
+    ) -> WebhookInfo:
+        """Register a new webhook subscription for sandbox lifecycle events."""
+        payload = {
+            "name": name,
+            "url": url,
+            "events": list(events),
+            "enabled": enabled,
+        }
+        resp = self._request("POST", "/webhooks", json=payload)
+        resp.raise_for_status()
+        return _parse_webhook_info(_json_dict(resp))
+
+    def list_webhooks(self) -> builtins.list[WebhookInfo]:
+        """List registered webhooks for the current tenant."""
+        resp = self._request("GET", "/webhooks")
+        resp.raise_for_status()
+        return [_parse_webhook_info(item) for item in _json_list(resp, "webhooks")]
+
+    def get_webhook(self, webhook_id: str) -> WebhookInfo:
+        """Fetch metadata for a single webhook subscription."""
+        resp = self._request("GET", f"/webhooks/{quote(webhook_id, safe='')}")
+        resp.raise_for_status()
+        return _parse_webhook_info(_json_dict(resp))
+
+    def update_webhook(
+        self,
+        webhook_id: str,
+        *,
+        url: str | None = None,
+        events: Sequence[str] | None = None,
+        enabled: bool | None = None,
+        rotate_secret: bool = False,
+    ) -> WebhookInfo:
+        """Update a webhook URL, subscribed events, enabled state, or rotate its signing key."""
+        payload: dict[str, Any] = {}
+        if url is not None:
+            payload["url"] = url
+        if events is not None:
+            payload["events"] = list(events)
+        if enabled is not None:
+            payload["enabled"] = enabled
+        if rotate_secret:
+            payload["rotateSecret"] = True
+        resp = self._request(
+            "PATCH",
+            f"/webhooks/{quote(webhook_id, safe='')}",
+            json=payload,
+        )
+        resp.raise_for_status()
+        return _parse_webhook_info(_json_dict(resp))
+
+    def delete_webhook(self, webhook_id: str) -> None:
+        """Delete a webhook subscription."""
+        resp = self._request("DELETE", f"/webhooks/{quote(webhook_id, safe='')}")
+        resp.raise_for_status()
 
     def close(self) -> None:
         """Close the underlying HTTP client session."""

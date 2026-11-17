@@ -28,12 +28,12 @@ export CUBEPOD_WORKDIR="${TMP_ROOT}/workspace"
 export CUBEPOD_DISPLAY=":99"
 mkdir -p "$CUBEPOD_BROWSER_PROFILE_DIR" "$CUBEPOD_WORKDIR"
 
-# Allocate 4 free ephemeral TCP ports on 127.0.0.1.
-read -r DESKTOP_PORT TERMINAL_PORT CDP_PORT VNC_PORT < <(python3 -c '
+# Allocate 5 free ephemeral TCP ports on 127.0.0.1.
+read -r DESKTOP_PORT TERMINAL_PORT CDP_PORT VNC_PORT WEBRTC_PORT < <(python3 -c '
 import socket
 socks = []
 ports = []
-for _ in range(4):
+for _ in range(5):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind(("127.0.0.1", 0))
     ports.append(str(s.getsockname()[1]))
@@ -47,6 +47,7 @@ export CUBEPOD_DESKTOP_PORT="$DESKTOP_PORT"
 export CUBEPOD_TERMINAL_PORT="$TERMINAL_PORT"
 export CUBEPOD_CDP_PORT="$CDP_PORT"
 export CUBEPOD_VNC_PORT="$VNC_PORT"
+export CUBEPOD_WEBRTC_PORT="$WEBRTC_PORT"
 
 MOCK_BIN_DIR="${TMP_ROOT}/mocks"
 mkdir -p "$MOCK_BIN_DIR"
@@ -127,6 +128,11 @@ cat >"${MOCK_BIN_DIR}/mock-ttyd" <<EOF
 #!/usr/bin/env bash
 export MOCK_CWD_MARKER="${TTYD_CWD_MARKER}"
 exec python3 "${MOCK_BIN_DIR}/mock_daemon.py" ttyd "${TERMINAL_PORT}"
+EOF
+
+cat >"${MOCK_BIN_DIR}/mock-neko" <<EOF
+#!/usr/bin/env bash
+exec python3 "${MOCK_BIN_DIR}/mock_daemon.py" neko "${WEBRTC_PORT}"
 EOF
 
 chmod +x "${MOCK_BIN_DIR}"/mock-*
@@ -318,5 +324,101 @@ PY
 OUT_FINAL_STATUS="$("$CTL" status)"
 assert_single_line_json "$OUT_FINAL_STATUS"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["status"]=="stopped" and d["pids"]=={}, d' "$OUT_FINAL_STATUS"
+
+echo "=== (h) WebRTC requested without neko installed gracefully falls back to noVNC ==="
+export CUBEPOD_NEKO_BIN="${TMP_ROOT}/missing-neko"
+OUT_H="$("$CTL" start --transport webrtc)"
+assert_single_line_json "$OUT_H"
+python3 - "$OUT_H" "$DESKTOP_PORT" "$TERMINAL_PORT" "$CDP_PORT" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["status"] == "running", d
+assert d["transportUsed"] == "novnc", d
+assert d.get("fallbackReason") == "neko_not_installed", d
+assert d["ports"] == {"desktop": int(sys.argv[2]), "terminal": int(sys.argv[3]), "cdp": int(sys.argv[4])}, d
+assert "neko" not in d["pids"], d
+PY
+"$CTL" stop >/dev/null
+
+echo "=== (i) WebRTC requested with neko installed launches neko alongside stack ==="
+export CUBEPOD_NEKO_BIN="${MOCK_BIN_DIR}/mock-neko"
+OUT_I="$("$CTL" start --transport webrtc)"
+assert_single_line_json "$OUT_I"
+python3 - "$OUT_I" "$DESKTOP_PORT" "$TERMINAL_PORT" "$CDP_PORT" "$WEBRTC_PORT" <<'PY'
+import json, os, sys
+d = json.loads(sys.argv[1])
+assert d["status"] == "running", d
+assert d["transportUsed"] == "webrtc", d
+assert "fallbackReason" not in d, d
+assert d["ports"] == {
+    "desktop": int(sys.argv[2]),
+    "terminal": int(sys.argv[3]),
+    "cdp": int(sys.argv[4]),
+    "webrtc": int(sys.argv[5]),
+}, d
+assert set(d["pids"].keys()) == {"xvfb", "wm", "chromium", "vnc", "websockify", "ttyd", "neko"}, d["pids"]
+os.kill(d["pids"]["neko"], 0)
+PY
+wait_tcp_port "$WEBRTC_PORT"
+
+OUT_I_STATUS="$("$CTL" status)"
+assert_single_line_json "$OUT_I_STATUS"
+python3 - "$OUT_I_STATUS" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["status"] == "running", d
+assert d["transportUsed"] == "webrtc", d
+assert "neko" in d["pids"], d
+PY
+
+# Switching back from webrtc to novnc must stop neko cleanly
+NEKO_PID="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["pids"]["neko"])' "$OUT_I")"
+OUT_SWITCH_NOVNC="$("$CTL" start --transport novnc)"
+assert_single_line_json "$OUT_SWITCH_NOVNC"
+python3 - "$OUT_SWITCH_NOVNC" "$NEKO_PID" <<'PY'
+import json, os, sys
+d = json.loads(sys.argv[1])
+old_neko = int(sys.argv[2])
+assert d["status"] == "running", d
+assert d["transportUsed"] == "novnc", d
+assert "neko" not in d["pids"], d
+assert "webrtc" not in d["ports"], d
+try:
+    os.kill(old_neko, 0)
+    raise AssertionError("neko still alive after switching back to novnc")
+except ProcessLookupError:
+    pass
+PY
+
+# Start webrtc again, then stop and verify status resets transportUsed/fallbackReason
+OUT_I2="$("$CTL" start --transport webrtc)"
+assert_single_line_json "$OUT_I2"
+OUT_I_STOP="$("$CTL" stop)"
+assert_single_line_json "$OUT_I_STOP"
+python3 - "$OUT_I_STOP" "$OUT_I2" <<'PY'
+import json, os, sys
+stopped = json.loads(sys.argv[1])
+prev = json.loads(sys.argv[2])
+assert stopped["status"] == "stopped", stopped
+assert stopped["pids"] == {}, stopped
+assert stopped["transportUsed"] == "novnc", stopped
+assert "fallbackReason" not in stopped, stopped
+try:
+    os.kill(prev["pids"]["neko"], 0)
+    raise AssertionError("neko still alive after stop")
+except ProcessLookupError:
+    pass
+PY
+
+OUT_I_POST_STOP_STATUS="$("$CTL" status)"
+assert_single_line_json "$OUT_I_POST_STOP_STATUS"
+python3 - "$OUT_I_POST_STOP_STATUS" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["status"] == "stopped", d
+assert d["transportUsed"] == "novnc", d
+assert "fallbackReason" not in d, d
+assert "webrtc" not in d["ports"], d
+PY
 
 echo "ALL TESTS PASSED"

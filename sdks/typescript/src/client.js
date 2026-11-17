@@ -165,6 +165,77 @@ async function readJsonOrUndefined(response) {
 /**
  * Statically & dynamically typed HTTP client for CubePod Control & Data Plane.
  */
+
+/**
+ * Return the official E2B secret placeholder ``${e2b.secrets.<name>}``.
+ *
+ * @param {string} name
+ * @returns {string}
+ */
+export function fillSecret(name) {
+  return `\${e2b.secrets.${name}}`;
+}
+
+export const Secret = {
+  fill: fillSecret,
+};
+
+/**
+ * Normalize SecretInfo JSON from the Gateway.
+ *
+ * @param {Record<string, any>} raw
+ * @returns {import('./client.d.ts').SecretInfo}
+ */
+function normalizeSecretInfo(raw) {
+  const secretId = raw.secretID ?? raw.id ?? '';
+  const currentVersion = raw.currentVersion ?? raw.version ?? 1;
+  return {
+    secretId,
+    id: secretId,
+    name: raw.name ?? '',
+    currentVersion,
+    version: currentVersion,
+    metadata: raw.metadata ?? {},
+    createdAt: raw.createdAt,
+    updatedAt: raw.updatedAt,
+  };
+}
+
+/**
+ * Normalize VolumeInfo JSON from the Gateway.
+ *
+ * @param {Record<string, any>} raw
+ * @returns {import('./client.d.ts').VolumeInfo}
+ */
+function normalizeVolumeInfo(raw) {
+  return {
+    volumeId: raw.volumeID ?? raw.volumeId ?? '',
+    name: raw.name ?? '',
+    token: raw.token,
+  };
+}
+
+/**
+ * Format a metric start/end timestamp for query parameters.
+ *
+ * @param {number | string | Date | undefined} value
+ * @returns {string | undefined}
+ */
+function formatMetricTime(value) {
+  if (value === undefined) return undefined;
+  if (typeof value === 'boolean') {
+    throw new TypeError('metric time must be a number, string, or Date, not boolean');
+  }
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new TypeError('metric time number must be finite');
+    }
+    return String(Math.trunc(value));
+  }
+  return String(value);
+}
+
 export class CubePodClient {
   /** @type {string} */
   baseUrl;
@@ -248,6 +319,7 @@ export class CubePodClient {
     const headers = new Headers(this.defaultHeaders);
     if (options.includeAuth !== false && this.apiKey) {
       headers.set('Authorization', `Bearer ${this.apiKey}`);
+      headers.set('X-API-KEY', this.apiKey);
     }
     if (options.headers) {
       for (const [k, v] of Object.entries(options.headers)) {
@@ -354,6 +426,12 @@ export class CubePodClient {
     }
     if (options.warmPoolRef !== undefined) {
       payload.warmPoolRef = options.warmPoolRef;
+    }
+    if (options.network !== undefined) {
+      payload.network = options.network;
+    }
+    if (options.volumeMounts !== undefined) {
+      payload.volumeMounts = options.volumeMounts;
     }
 
     /** @type {Record<string, unknown>} */
@@ -1498,4 +1576,515 @@ export class CubePodClient {
     const data = await readJsonOrUndefined(resp);
     return Array.isArray(data) ? data : (data?.warmPools ?? data?.warmpools ?? []);
   }
+
+  // ---------------------------------------------------------------------------
+  // Desktop Stack (CEP-0021)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start or attach to the interactive desktop stack inside a sandbox.
+   *
+   * @param {string} sandboxId
+   * @param {import('./client.d.ts').StartDesktopOptions} [desktopOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').DesktopSession>}
+   */
+  async startDesktop(sandboxId, desktopOptions = {}, options = {}) {
+    /** @type {Record<string, unknown>} */
+    const payload = {
+      expiresInSeconds: desktopOptions.expiresInSeconds ?? 3600,
+    };
+    if (desktopOptions.resolution !== undefined) payload.resolution = desktopOptions.resolution;
+    if (desktopOptions.initialUrl !== undefined) payload.initialUrl = desktopOptions.initialUrl;
+    if (desktopOptions.transport !== undefined) payload.transport = desktopOptions.transport;
+
+    const resp = await this._request(
+      'POST',
+      `/sandboxes/${encodeURIComponent(sandboxId)}/desktop/start`,
+      {
+        json: payload,
+        signal: options.signal ?? desktopOptions.signal,
+        sandboxId,
+      },
+    );
+    return (await readJsonOrUndefined(resp)) ?? {};
+  }
+
+  /**
+   * Fetch interactive desktop daemon status for a sandbox.
+   *
+   * @param {string} sandboxId
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<Record<string, unknown>>}
+   */
+  async getDesktopStatus(sandboxId, options = {}) {
+    const resp = await this._request(
+      'GET',
+      `/sandboxes/${encodeURIComponent(sandboxId)}/desktop/status`,
+      { signal: options.signal, sandboxId },
+    );
+    return (await readJsonOrUndefined(resp)) ?? {};
+  }
+
+  /**
+   * Stop the interactive desktop stack inside a sandbox.
+   *
+   * @param {string} sandboxId
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<Record<string, unknown>>}
+   */
+  async stopDesktop(sandboxId, options = {}) {
+    const resp = await this._request(
+      'POST',
+      `/sandboxes/${encodeURIComponent(sandboxId)}/desktop/stop`,
+      { signal: options.signal, sandboxId },
+    );
+    return (await readJsonOrUndefined(resp)) ?? { status: 'stopped' };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Sandbox Metrics
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Fetch resource usage metrics for a sandbox (`GET /sandboxes/{sandboxID}/metrics`).
+   *
+   * @param {string} sandboxId
+   * @param {import('./client.d.ts').GetMetricsOptions} [metricsOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').SandboxMetric[]>}
+   */
+  async getMetrics(sandboxId, metricsOptions = {}, options = {}) {
+    const resp = await this._request(
+      'GET',
+      `/sandboxes/${encodeURIComponent(sandboxId)}/metrics`,
+      {
+        query: {
+          start: formatMetricTime(metricsOptions.start),
+          end: formatMetricTime(metricsOptions.end),
+        },
+        signal: options.signal ?? metricsOptions.signal,
+        sandboxId,
+      },
+    );
+    const data = await readJsonOrUndefined(resp);
+    return Array.isArray(data) ? data : (data?.metrics ?? []);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Secrets (CEP-0027)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Return the official E2B secret placeholder ``${e2b.secrets.<name>}``.
+   *
+   * @param {string} name
+   * @returns {string}
+   */
+  fillSecret(name) {
+    return fillSecret(name);
+  }
+
+  /**
+   * Create a new write-only secret (`POST /secrets`).
+   *
+   * @param {string} name
+   * @param {string} value
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').SecretInfo>}
+   */
+  async createSecret(name, value, options = {}) {
+    const resp = await this._request('POST', '/secrets', {
+      json: { name, value },
+      signal: options.signal,
+    });
+    return normalizeSecretInfo((await readJsonOrUndefined(resp)) ?? {});
+  }
+
+  /**
+   * List tenant secrets with pagination metadata (`GET /secrets` and `X-Next-Token`).
+   *
+   * @param {import('./client.d.ts').ListSecretsOptions} [listOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').SecretPage>}
+   */
+  async listSecretsPage(listOptions = {}, options = {}) {
+    const resp = await this._request('GET', '/secrets', {
+      query: {
+        limit: listOptions.limit,
+        nextToken: listOptions.nextToken,
+      },
+      signal: options.signal ?? listOptions.signal,
+    });
+    const data = await readJsonOrUndefined(resp);
+    const rawItems = Array.isArray(data) ? data : (data?.secrets ?? []);
+    const rawNext = resp.headers.get('X-Next-Token') ?? data?.nextToken;
+    return {
+      items: rawItems.map(normalizeSecretInfo),
+      nextToken: rawNext ? String(rawNext) : undefined,
+    };
+  }
+
+  /**
+   * List tenant secrets (`GET /secrets`, metadata only).
+   *
+   * @param {import('./client.d.ts').ListSecretsOptions} [listOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').SecretInfo[]>}
+   */
+  async listSecrets(listOptions = {}, options = {}) {
+    const page = await this.listSecretsPage(listOptions, options);
+    return page.items;
+  }
+
+  /**
+   * Get secret metadata (`GET /secrets/{secretID}`).
+   *
+   * @param {string} secretId
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').SecretInfo>}
+   */
+  async getSecret(secretId, options = {}) {
+    const resp = await this._request('GET', `/secrets/${encodeURIComponent(secretId)}`, {
+      signal: options.signal,
+    });
+    return normalizeSecretInfo((await readJsonOrUndefined(resp)) ?? {});
+  }
+
+  /**
+   * Rotate/update a secret value (`POST /secrets/{secretID}`).
+   *
+   * @param {string} secretId
+   * @param {string} value
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').SecretInfo>}
+   */
+  async updateSecret(secretId, value, options = {}) {
+    const resp = await this._request('POST', `/secrets/${encodeURIComponent(secretId)}`, {
+      json: { value },
+      signal: options.signal,
+    });
+    return normalizeSecretInfo((await readJsonOrUndefined(resp)) ?? {});
+  }
+
+  /**
+   * Delete a secret (`DELETE /secrets/{secretID}`).
+   *
+   * @param {string} secretId
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<void>}
+   */
+  async deleteSecret(secretId, options = {}) {
+    await this._request('DELETE', `/secrets/${encodeURIComponent(secretId)}`, {
+      signal: options.signal,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Volumes (CEP-0025 / CEP-0026)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Create a durable E2B volume (`POST /volumes`).
+   *
+   * @param {string} name
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').VolumeInfo>}
+   */
+  async createVolume(name, options = {}) {
+    const resp = await this._request('POST', '/volumes', {
+      json: { name },
+      signal: options.signal,
+    });
+    return normalizeVolumeInfo((await readJsonOrUndefined(resp)) ?? {});
+  }
+
+  /**
+   * List durable E2B volumes (`GET /volumes`).
+   *
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').VolumeInfo[]>}
+   */
+  async listVolumes(options = {}) {
+    const resp = await this._request('GET', '/volumes', { signal: options.signal });
+    const data = await readJsonOrUndefined(resp);
+    const items = Array.isArray(data) ? data : (data?.volumes ?? []);
+    return items.map(normalizeVolumeInfo);
+  }
+
+  /**
+   * Get volume metadata and content token (`GET /volumes/{volumeID}`).
+   *
+   * @param {string} volumeId
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').VolumeInfo>}
+   */
+  async getVolume(volumeId, options = {}) {
+    const resp = await this._request('GET', `/volumes/${encodeURIComponent(volumeId)}`, {
+      signal: options.signal,
+    });
+    return normalizeVolumeInfo((await readJsonOrUndefined(resp)) ?? {});
+  }
+
+  /**
+   * Delete an E2B volume (`DELETE /volumes/{volumeID}`).
+   *
+   * @param {string} volumeId
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<void>}
+   */
+  async deleteVolume(volumeId, options = {}) {
+    await this._request('DELETE', `/volumes/${encodeURIComponent(volumeId)}`, {
+      signal: options.signal,
+    });
+  }
+
+  /**
+   * Write a file inside an E2B volume (`PUT /volumecontent/{volumeID}/file`).
+   *
+   * @param {string} volumeId
+   * @param {string} path
+   * @param {string | Uint8Array | ArrayBuffer} content
+   * @param {import('./client.d.ts').WriteVolumeFileOptions} [options]
+   * @returns {Promise<import('./client.d.ts').VolumeEntry>}
+   */
+  async writeVolumeFile(volumeId, path, content, options = {}) {
+    let volToken = options.token;
+    if (!volToken) {
+      const vol = await this.getVolume(volumeId, { signal: options.signal });
+      if (!vol.token) {
+        throw new CubePodError(`Volume ${volumeId} did not return a content token`);
+      }
+      volToken = vol.token;
+    }
+    const body =
+      typeof content === 'string'
+        ? textEncoder.encode(content)
+        : content instanceof ArrayBuffer
+          ? new Uint8Array(content)
+          : content;
+
+    const resp = await this._request(
+      'PUT',
+      `/volumecontent/${encodeURIComponent(volumeId)}/file`,
+      {
+        query: {
+          path,
+          uid: options.uid,
+          gid: options.gid,
+          mode: options.mode,
+          force: options.force ? 'true' : undefined,
+        },
+        body,
+        headers: {
+          Authorization: `Bearer ${volToken}`,
+          'Content-Type': 'application/octet-stream',
+        },
+        includeAuth: false,
+        signal: options.signal,
+      },
+    );
+    return (await readJsonOrUndefined(resp)) ?? {};
+  }
+
+  /**
+   * Read raw bytes from a file inside an E2B volume (`GET /volumecontent/{volumeID}/file`).
+   *
+   * @param {string} volumeId
+   * @param {string} path
+   * @param {import('./client.d.ts').ReadVolumeFileOptions} [options]
+   * @returns {Promise<Uint8Array>}
+   */
+  async readVolumeFile(volumeId, path, options = {}) {
+    let volToken = options.token;
+    if (!volToken) {
+      const vol = await this.getVolume(volumeId, { signal: options.signal });
+      if (!vol.token) {
+        throw new CubePodError(`Volume ${volumeId} did not return a content token`);
+      }
+      volToken = vol.token;
+    }
+    const resp = await this._request(
+      'GET',
+      `/volumecontent/${encodeURIComponent(volumeId)}/file`,
+      {
+        query: { path },
+        headers: {
+          Authorization: `Bearer ${volToken}`,
+        },
+        includeAuth: false,
+        signal: options.signal,
+      },
+    );
+    const buf = await resp.arrayBuffer();
+    return new Uint8Array(buf);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Events & Webhooks (CEP-0028)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * List tenant sandbox lifecycle events with pagination metadata (`GET /events`).
+   *
+   * @param {import('./client.d.ts').ListEventsOptions} [filterOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').EventPage>}
+   */
+  async listEventsPage(filterOptions = {}, options = {}) {
+    const resp = await this._request('GET', '/events', {
+      query: {
+        sandboxID: filterOptions.sandboxId,
+        eventType: filterOptions.eventType,
+        limit: filterOptions.limit,
+        nextToken: filterOptions.nextToken,
+      },
+      signal: options.signal ?? filterOptions.signal,
+    });
+    const data = await readJsonOrUndefined(resp);
+    const rawNext = resp.headers.get('X-Next-Token') ?? data?.nextToken;
+    return {
+      items: Array.isArray(data) ? data : (data?.events ?? []),
+      nextToken: rawNext ? String(rawNext) : undefined,
+    };
+  }
+
+  /**
+   * List tenant sandbox lifecycle events (`GET /events`).
+   *
+   * @param {import('./client.d.ts').ListEventsOptions} [filterOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').LifecycleEvent[]>}
+   */
+  async listEvents(filterOptions = {}, options = {}) {
+    const page = await this.listEventsPage(filterOptions, options);
+    return page.items;
+  }
+
+  /**
+   * List lifecycle events for a single sandbox with pagination metadata (`GET /sandboxes/{sandboxID}/events`).
+   *
+   * @param {string} sandboxId
+   * @param {import('./client.d.ts').ListSandboxEventsOptions} [filterOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').EventPage>}
+   */
+  async listSandboxEventsPage(sandboxId, filterOptions = {}, options = {}) {
+    const resp = await this._request(
+      'GET',
+      `/sandboxes/${encodeURIComponent(sandboxId)}/events`,
+      {
+        query: {
+          eventType: filterOptions.eventType,
+          limit: filterOptions.limit,
+          nextToken: filterOptions.nextToken,
+        },
+        signal: options.signal ?? filterOptions.signal,
+        sandboxId,
+      },
+    );
+    const data = await readJsonOrUndefined(resp);
+    const rawNext = resp.headers.get('X-Next-Token') ?? data?.nextToken;
+    return {
+      items: Array.isArray(data) ? data : (data?.events ?? []),
+      nextToken: rawNext ? String(rawNext) : undefined,
+    };
+  }
+
+  /**
+   * List lifecycle events for a single sandbox (`GET /sandboxes/{sandboxID}/events`).
+   *
+   * @param {string} sandboxId
+   * @param {import('./client.d.ts').ListSandboxEventsOptions} [filterOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').LifecycleEvent[]>}
+   */
+  async listSandboxEvents(sandboxId, filterOptions = {}, options = {}) {
+    const page = await this.listSandboxEventsPage(sandboxId, filterOptions, options);
+    return page.items;
+  }
+
+  /**
+   * Register a webhook subscription (`POST /webhooks`).
+   *
+   * @param {import('./client.d.ts').CreateWebhookRequest} request
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').WebhookInfo>}
+   */
+  async createWebhook(request, options = {}) {
+    const resp = await this._request('POST', '/webhooks', {
+      json: {
+        name: request.name,
+        url: request.url,
+        events: request.events,
+        enabled: request.enabled ?? true,
+      },
+      signal: options.signal,
+    });
+    return (await readJsonOrUndefined(resp)) ?? {};
+  }
+
+  /**
+   * List webhook subscriptions (`GET /webhooks`).
+   *
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').WebhookInfo[]>}
+   */
+  async listWebhooks(options = {}) {
+    const resp = await this._request('GET', '/webhooks', { signal: options.signal });
+    const data = await readJsonOrUndefined(resp);
+    return Array.isArray(data) ? data : (data?.webhooks ?? []);
+  }
+
+  /**
+   * Get a single webhook subscription (`GET /webhooks/{webhookID}`).
+   *
+   * @param {string} webhookId
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').WebhookInfo>}
+   */
+  async getWebhook(webhookId, options = {}) {
+    const resp = await this._request('GET', `/webhooks/${encodeURIComponent(webhookId)}`, {
+      signal: options.signal,
+    });
+    return (await readJsonOrUndefined(resp)) ?? {};
+  }
+
+  /**
+   * Update a webhook subscription or rotate its signing key (`PATCH /webhooks/{webhookID}`).
+   *
+   * @param {string} webhookId
+   * @param {import('./client.d.ts').UpdateWebhookRequest} request
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').WebhookInfo>}
+   */
+  async updateWebhook(webhookId, request, options = {}) {
+    /** @type {Record<string, unknown>} */
+    const payload = {};
+    if (request.url !== undefined) payload.url = request.url;
+    if (request.events !== undefined) payload.events = request.events;
+    if (request.enabled !== undefined) payload.enabled = request.enabled;
+    if (request.rotateSecret !== undefined) payload.rotateSecret = request.rotateSecret;
+
+    const resp = await this._request('PATCH', `/webhooks/${encodeURIComponent(webhookId)}`, {
+      json: payload,
+      signal: options.signal,
+    });
+    return (await readJsonOrUndefined(resp)) ?? {};
+  }
+
+  /**
+   * Delete a webhook subscription (`DELETE /webhooks/{webhookID}`).
+   *
+   * @param {string} webhookId
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<void>}
+   */
+  async deleteWebhook(webhookId, options = {}) {
+    await this._request('DELETE', `/webhooks/${encodeURIComponent(webhookId)}`, {
+      signal: options.signal,
+    });
+  }
 }
+
+export const CubepodClient = CubePodClient;

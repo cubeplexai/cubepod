@@ -17,6 +17,8 @@ DESKTOP_PORT="${CUBEPOD_DESKTOP_PORT:-8080}"
 TERMINAL_PORT="${CUBEPOD_TERMINAL_PORT:-7681}"
 CDP_PORT="${CUBEPOD_CDP_PORT:-9222}"
 VNC_PORT="${CUBEPOD_VNC_PORT:-5900}"
+WEBRTC_PORT="${CUBEPOD_WEBRTC_PORT:-8081}"
+DEFAULT_TRANSPORT="${CUBEPOD_DESKTOP_TRANSPORT:-novnc}"
 
 DISPLAY_NUM="${CUBEPOD_DISPLAY:-:99}"
 DEFAULT_RESOLUTION="${CUBEPOD_RESOLUTION:-1280x800x24}"
@@ -83,6 +85,9 @@ json_escape() {
   local s="$1"
   s="${s//\\/\\\\}"
   s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
   printf '%s' "$s"
 }
 
@@ -118,12 +123,43 @@ get_daemon_pid() {
   return 1
 }
 
+resolve_neko_bin() {
+  if [ -n "${CUBEPOD_NEKO_BIN:-}" ]; then
+    if [ -f "$CUBEPOD_NEKO_BIN" ] && [ -x "$CUBEPOD_NEKO_BIN" ]; then
+      printf '%s' "$CUBEPOD_NEKO_BIN"
+      return 0
+    fi
+    local resolved=""
+    resolved="$(command -v "$CUBEPOD_NEKO_BIN" 2>/dev/null || true)"
+    if [ -n "$resolved" ] && [ -f "$resolved" ] && [ -x "$resolved" ]; then
+      printf '%s' "$resolved"
+      return 0
+    fi
+    return 1
+  fi
+  if [ -f /usr/local/bin/neko ] && [ -x /usr/local/bin/neko ]; then
+    printf '%s' "/usr/local/bin/neko"
+    return 0
+  fi
+  local resolved=""
+  resolved="$(command -v neko 2>/dev/null || true)"
+  if [ -n "$resolved" ] && [ -f "$resolved" ] && [ -x "$resolved" ]; then
+    printf '%s' "$resolved"
+    return 0
+  fi
+  return 1
+}
+
 save_state() {
   local resolution="$1"
   local display="$2"
+  local transport_used="${3:-novnc}"
+  local fallback_reason="${4:-}"
   {
     printf 'SAVED_RESOLUTION=%q\n' "$resolution"
     printf 'SAVED_DISPLAY=%q\n' "$display"
+    printf 'SAVED_TRANSPORT_USED=%q\n' "$transport_used"
+    printf 'SAVED_FALLBACK_REASON=%q\n' "$fallback_reason"
   } >"$STATE_FILE"
   if [ "$DROP_PRIV" = "1" ]; then
     chown "${TARGET_UID}:${TARGET_GID}" "$STATE_FILE" 2>/dev/null || true
@@ -133,6 +169,8 @@ save_state() {
 load_state() {
   SAVED_RESOLUTION="$DEFAULT_RESOLUTION"
   SAVED_DISPLAY="$DISPLAY_NUM"
+  SAVED_TRANSPORT_USED="$DEFAULT_TRANSPORT"
+  SAVED_FALLBACK_REASON=""
   if [ -f "$STATE_FILE" ]; then
     # shellcheck disable=SC1090
     source "$STATE_FILE"
@@ -240,11 +278,18 @@ parse_resolution_dims() {
 emit_status_json() {
   local resolution="$1"
   local display="$2"
+  local transport_used="${3:-novnc}"
+  local fallback_reason="${4:-}"
+
+  local check_daemons=("${DAEMONS[@]}")
+  if [ "$transport_used" = "webrtc" ]; then
+    check_daemons+=(neko)
+  fi
 
   local alive_count=0
   local pids_json=""
   local name pid
-  for name in "${DAEMONS[@]}"; do
+  for name in "${check_daemons[@]}"; do
     if pid="$(get_daemon_pid "$name")"; then
       alive_count=$((alive_count + 1))
       if [ -n "$pids_json" ]; then
@@ -255,115 +300,39 @@ emit_status_json() {
   done
 
   local state_str="stopped"
-  if [ "$alive_count" -eq "${#DAEMONS[@]}" ]; then
+  if [ "$alive_count" -eq "${#check_daemons[@]}" ]; then
     state_str="running"
   elif [ "$alive_count" -gt 0 ]; then
     state_str="degraded"
   fi
 
-  printf '{"status":"%s","display":"%s","resolution":"%s","ports":{"desktop":%d,"terminal":%d,"cdp":%d},"pids":{%s}}\n' \
+  local ports_json
+  if [ "$transport_used" = "webrtc" ]; then
+    ports_json=$(printf '{"desktop":%d,"terminal":%d,"cdp":%d,"webrtc":%d}' "$DESKTOP_PORT" "$TERMINAL_PORT" "$CDP_PORT" "$WEBRTC_PORT")
+  else
+    ports_json=$(printf '{"desktop":%d,"terminal":%d,"cdp":%d}' "$DESKTOP_PORT" "$TERMINAL_PORT" "$CDP_PORT")
+  fi
+
+  local fallback_json=""
+  if [ -n "$fallback_reason" ]; then
+    fallback_json=$(printf ',"fallbackReason":"%s"' "$(json_escape "$fallback_reason")")
+  fi
+
+  printf '{"status":"%s","display":"%s","resolution":"%s","transportUsed":"%s"%s,"ports":%s,"pids":{%s}}\n' \
     "$state_str" \
     "$(json_escape "$display")" \
     "$(json_escape "$resolution")" \
-    "$DESKTOP_PORT" \
-    "$TERMINAL_PORT" \
-    "$CDP_PORT" \
+    "$(json_escape "$transport_used")" \
+    "$fallback_json" \
+    "$ports_json" \
     "$pids_json"
 }
 
-cmd_start() {
-  local resolution="$DEFAULT_RESOLUTION"
-  local initial_url="$DEFAULT_URL"
-
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --resolution)
-        shift
-        [ "$#" -gt 0 ] || { echo "cubepod-desktop-ctl: --resolution requires a value" >&2; exit 2; }
-        resolution="$1"
-        ;;
-      --resolution=*)
-        resolution="${1#--resolution=}"
-        ;;
-      --url)
-        shift
-        [ "$#" -gt 0 ] || { echo "cubepod-desktop-ctl: --url requires a value" >&2; exit 2; }
-        initial_url="$1"
-        ;;
-      --url=*)
-        initial_url="${1#--url=}"
-        ;;
-      *)
-        echo "cubepod-desktop-ctl: unknown start option '$1'" >&2
-        exit 2
-        ;;
-    esac
-    shift
-  done
-
-  parse_resolution_dims "$resolution"
-  resolution="$NORMALIZED_RES"
-
-  prepare_dirs
-  save_state "$resolution" "$DISPLAY_NUM"
-
-  if ! get_daemon_pid xvfb >/dev/null; then
-    spawn_daemon xvfb "$WORKDIR" \
-      "$XVFB_BIN" "$DISPLAY_NUM" -screen 0 "$resolution" -ac +extension GLX +render -noreset
-    wait_xvfb_ready
-  fi
-
-  if ! get_daemon_pid wm >/dev/null; then
-    spawn_daemon wm "$WORKDIR" "$WM_BIN"
-  fi
-
-  if ! get_daemon_pid chromium >/dev/null; then
-    cleanup_stale_chromium_locks
-    spawn_daemon chromium "$WORKDIR" \
-      "$BROWSER_BIN" \
-      --no-sandbox \
-      --disable-dev-shm-usage \
-      --disable-gpu \
-      --remote-debugging-address=127.0.0.1 \
-      --remote-debugging-port="$CDP_PORT" \
-      --user-data-dir="$PROFILE_DIR" \
-      --no-first-run \
-      --no-default-browser-check \
-      --window-size="${RES_WIDTH},${RES_HEIGHT}" \
-      "$initial_url"
-  fi
-
-  if ! get_daemon_pid vnc >/dev/null; then
-    spawn_daemon vnc "$WORKDIR" \
-      "$X11VNC_BIN" -display "$DISPLAY_NUM" -rfbport "$VNC_PORT" -listen 127.0.0.1 -forever -shared -nopw -xkb
-  fi
-
-  if ! get_daemon_pid websockify >/dev/null; then
-    spawn_daemon websockify "$WORKDIR" \
-      "$WEBSOCKIFY_BIN" --web "$NOVNC_DIR" "0.0.0.0:${DESKTOP_PORT}" "127.0.0.1:${VNC_PORT}"
-  fi
-
-  if ! get_daemon_pid ttyd >/dev/null; then
-    spawn_daemon ttyd "$WORKDIR" \
-      "$TTYD_BIN" -W -p "$TERMINAL_PORT" /bin/bash
-  fi
-
-  emit_status_json "$resolution" "$DISPLAY_NUM"
-}
-
-cmd_status() {
-  load_state
-  emit_status_json "$SAVED_RESOLUTION" "$SAVED_DISPLAY"
-}
-
-cmd_stop() {
-  load_state
-
-  local stop_order=(ttyd websockify vnc chromium wm xvfb)
+stop_daemons() {
   local pids_to_wait=()
   local name pid
 
-  for name in "${stop_order[@]}"; do
+  for name in "$@"; do
     if pid="$(get_daemon_pid "$name")"; then
       kill -TERM "$pid" 2>/dev/null || true
       pids_to_wait+=("$pid")
@@ -391,11 +360,151 @@ cmd_stop() {
     sleep 0.05
   fi
 
-  for name in "${stop_order[@]}"; do
+  for name in "$@"; do
     rm -f "${RUN_DIR}/${name}.pid"
   done
+}
 
-  emit_status_json "$SAVED_RESOLUTION" "$SAVED_DISPLAY"
+cmd_start() {
+  local resolution="$DEFAULT_RESOLUTION"
+  local initial_url="$DEFAULT_URL"
+  local transport="$DEFAULT_TRANSPORT"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --resolution)
+        shift
+        [ "$#" -gt 0 ] || { echo "cubepod-desktop-ctl: --resolution requires a value" >&2; exit 2; }
+        resolution="$1"
+        ;;
+      --resolution=*)
+        resolution="${1#--resolution=}"
+        ;;
+      --url)
+        shift
+        [ "$#" -gt 0 ] || { echo "cubepod-desktop-ctl: --url requires a value" >&2; exit 2; }
+        initial_url="$1"
+        ;;
+      --url=*)
+        initial_url="${1#--url=}"
+        ;;
+      --transport)
+        shift
+        [ "$#" -gt 0 ] || { echo "cubepod-desktop-ctl: --transport requires a value" >&2; exit 2; }
+        transport="$1"
+        ;;
+      --transport=*)
+        transport="${1#--transport=}"
+        ;;
+      *)
+        echo "cubepod-desktop-ctl: unknown start option '$1'" >&2
+        exit 2
+        ;;
+    esac
+    shift
+  done
+
+  case "$transport" in
+    novnc|webrtc) ;;
+    *)
+      echo "cubepod-desktop-ctl: invalid --transport '$transport' (expected novnc or webrtc)" >&2
+      exit 2
+      ;;
+  esac
+
+  parse_resolution_dims "$resolution"
+  resolution="$NORMALIZED_RES"
+
+  local transport_used="novnc"
+  local fallback_reason=""
+  local neko_bin=""
+  if [ "$transport" = "webrtc" ]; then
+    if neko_bin="$(resolve_neko_bin 2>/dev/null)"; then
+      transport_used="webrtc"
+    else
+      transport_used="novnc"
+      fallback_reason="neko_not_installed"
+    fi
+  fi
+
+  prepare_dirs
+  save_state "$resolution" "$DISPLAY_NUM" "$transport_used" "$fallback_reason"
+
+  if ! get_daemon_pid xvfb >/dev/null; then
+    spawn_daemon xvfb "$WORKDIR" \
+      "$XVFB_BIN" "$DISPLAY_NUM" -screen 0 "$resolution" -ac +extension GLX +render -noreset
+    wait_xvfb_ready
+  fi
+
+  if ! get_daemon_pid wm >/dev/null; then
+    spawn_daemon wm "$WORKDIR" "$WM_BIN"
+  fi
+
+  if ! get_daemon_pid chromium >/dev/null; then
+    cleanup_stale_chromium_locks
+    spawn_daemon chromium "$WORKDIR" \
+      "$BROWSER_BIN" \
+      --no-sandbox \
+      --disable-dev-shm-usage \
+      --disable-gpu \
+      --remote-debugging-address=127.0.0.1 \
+      --remote-debugging-port="$CDP_PORT" \
+      --user-data-dir="$PROFILE_DIR" \
+      --no-first-run \
+      --no-default-browser-check \
+      --window-size="${RES_WIDTH},${RES_HEIGHT}" \
+      -- "$initial_url"
+  fi
+
+  if ! get_daemon_pid vnc >/dev/null; then
+    spawn_daemon vnc "$WORKDIR" \
+      "$X11VNC_BIN" -display "$DISPLAY_NUM" -rfbport "$VNC_PORT" -listen 127.0.0.1 -forever -shared -nopw -xkb
+  fi
+
+  if ! get_daemon_pid websockify >/dev/null; then
+    spawn_daemon websockify "$WORKDIR" \
+      "$WEBSOCKIFY_BIN" --web "$NOVNC_DIR" "0.0.0.0:${DESKTOP_PORT}" "127.0.0.1:${VNC_PORT}"
+  fi
+
+  if ! get_daemon_pid ttyd >/dev/null; then
+    spawn_daemon ttyd "$WORKDIR" \
+      "$TTYD_BIN" -W -p "$TERMINAL_PORT" /bin/bash
+  fi
+
+  if [ "$transport_used" = "webrtc" ]; then
+    if ! get_daemon_pid neko >/dev/null; then
+      spawn_daemon neko "$WORKDIR" \
+        env NEKO_DISPLAY="$DISPLAY_NUM" \
+        NEKO_BIND="0.0.0.0:${WEBRTC_PORT}" \
+        NEKO_SCREEN="${RES_WIDTH}x${RES_HEIGHT}@30" \
+        NEKO_EPR="${CUBEPOD_NEKO_EPR:-52000-52100}" \
+        NEKO_PASSWORD="${CUBEPOD_NEKO_PASSWORD:-neko}" \
+        NEKO_PASSWORD_ADMIN="${CUBEPOD_NEKO_PASSWORD_ADMIN:-admin}" \
+        "$neko_bin" serve
+    fi
+  else
+    stop_daemons neko
+  fi
+
+  emit_status_json "$resolution" "$DISPLAY_NUM" "$transport_used" "$fallback_reason"
+}
+
+cmd_status() {
+  load_state
+  emit_status_json "$SAVED_RESOLUTION" "$SAVED_DISPLAY" "$SAVED_TRANSPORT_USED" "$SAVED_FALLBACK_REASON"
+}
+
+cmd_stop() {
+  load_state
+
+  local stop_order=(neko ttyd websockify vnc chromium wm xvfb)
+  stop_daemons "${stop_order[@]}"
+
+  SAVED_TRANSPORT_USED="novnc"
+  SAVED_FALLBACK_REASON=""
+  save_state "$SAVED_RESOLUTION" "$SAVED_DISPLAY" "novnc" ""
+
+  emit_status_json "$SAVED_RESOLUTION" "$SAVED_DISPLAY" "novnc" ""
 }
 
 usage() {
@@ -403,7 +512,7 @@ usage() {
 Usage: cubepod-desktop-ctl <start|status|stop> [options]
 
 Subcommands:
-  start [--resolution 1280x800x24] [--url about:blank]
+  start [--resolution 1280x800x24] [--url about:blank] [--transport novnc|webrtc]
   status
   stop
 EOF

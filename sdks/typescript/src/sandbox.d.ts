@@ -9,17 +9,24 @@ import {
   CubePodClient,
   CubePodClientOptions,
   DeleteSandboxOptions,
+  DesktopSession,
   EndpointHost,
+  EventPage,
   ExecutionResult,
   FileEntry,
   ForkSandboxOptions,
   GetCommandLogsOptions,
+  GetMetricsOptions,
+  LifecycleEvent,
+  ListSandboxEventsOptions,
   PanelEndpoint,
   RequestOptions,
   RunCodeOptions,
   RunCommandOptions,
   SandboxInfo,
+  SandboxMetric,
   SandboxState,
+  StartDesktopOptions,
   WriteFileOptions,
 } from './client.js';
 
@@ -95,4 +102,19 @@ export class Sandbox {
     endpointOptions?: CreateEndpointOptions,
     options?: RequestOptions,
   ): Promise<PanelEndpoint>;
+  getMetrics(metricsOptions?: GetMetricsOptions, options?: RequestOptions): Promise<SandboxMetric[]>;
+  listEventsPage(
+    filterOptions?: ListSandboxEventsOptions,
+    options?: RequestOptions,
+  ): Promise<EventPage>;
+  listEvents(
+    filterOptions?: ListSandboxEventsOptions,
+    options?: RequestOptions,
+  ): Promise<LifecycleEvent[]>;
+  startDesktop(
+    desktopOptions?: StartDesktopOptions,
+    options?: RequestOptions,
+  ): Promise<DesktopSession>;
+  getDesktopStatus(options?: RequestOptions): Promise<Record<string, unknown>>;
+  stopDesktop(options?: RequestOptions): Promise<Record<string, unknown>>;
 }

@@ -243,4 +243,68 @@ export class Sandbox {
   async createEndpoint(port, endpointOptions = {}, options = {}) {
     return this.client.createEndpoint(this.sandboxId, port, endpointOptions, options);
   }
+
+  /**
+   * Fetch resource usage metrics for this sandbox (`GET /sandboxes/{sandboxID}/metrics`).
+   *
+   * @param {import('./client.d.ts').GetMetricsOptions} [metricsOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').SandboxMetric[]>}
+   */
+  async getMetrics(metricsOptions = {}, options = {}) {
+    return this.client.getMetrics(this.sandboxId, metricsOptions, options);
+  }
+
+  /**
+   * List lifecycle events for this sandbox with pagination metadata (`GET /sandboxes/{sandboxID}/events`).
+   *
+   * @param {import('./client.d.ts').ListSandboxEventsOptions} [filterOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').EventPage>}
+   */
+  async listEventsPage(filterOptions = {}, options = {}) {
+    return this.client.listSandboxEventsPage(this.sandboxId, filterOptions, options);
+  }
+
+  /**
+   * List lifecycle events for this sandbox (`GET /sandboxes/{sandboxID}/events`).
+   *
+   * @param {import('./client.d.ts').ListSandboxEventsOptions} [filterOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').LifecycleEvent[]>}
+   */
+  async listEvents(filterOptions = {}, options = {}) {
+    return this.client.listSandboxEvents(this.sandboxId, filterOptions, options);
+  }
+
+  /**
+   * Start or attach to the interactive desktop stack inside this sandbox.
+   *
+   * @param {import('./client.d.ts').StartDesktopOptions} [desktopOptions]
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<import('./client.d.ts').DesktopSession>}
+   */
+  async startDesktop(desktopOptions = {}, options = {}) {
+    return this.client.startDesktop(this.sandboxId, desktopOptions, options);
+  }
+
+  /**
+   * Fetch interactive desktop daemon status for this sandbox.
+   *
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<Record<string, unknown>>}
+   */
+  async getDesktopStatus(options = {}) {
+    return this.client.getDesktopStatus(this.sandboxId, options);
+  }
+
+  /**
+   * Stop the interactive desktop stack inside this sandbox.
+   *
+   * @param {import('./client.d.ts').RequestOptions} [options]
+   * @returns {Promise<Record<string, unknown>>}
+   */
+  async stopDesktop(options = {}) {
+    return this.client.stopDesktop(this.sandboxId, options);
+  }
 }
