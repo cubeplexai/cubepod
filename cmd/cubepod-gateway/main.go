@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -76,6 +78,9 @@ func main() {
 		egressCACert         = flag.String("egress-ca-cert", os.Getenv("CUBEPOD_EGRESS_CA_CERT"), "Path to egress mTLS root CA certificate PEM")
 		egressCAKey          = flag.String("egress-ca-key", os.Getenv("CUBEPOD_EGRESS_CA_KEY"), "Path to egress mTLS root CA private key PEM")
 		egressUpstreamCAFile = flag.String("egress-upstream-ca-file", os.Getenv("CUBEPOD_EGRESS_UPSTREAM_CA_FILE"), "Optional path to upstream CA PEM mounted into egress sidecars")
+		egressMTLSAddr       = flag.String("egress-mtls-addr", os.Getenv("CUBEPOD_EGRESS_MTLS_ADDR"), "Optional mTLS listen address for /internal/v1/egress/exchange")
+		egressTLSCert        = flag.String("egress-tls-cert", os.Getenv("CUBEPOD_EGRESS_TLS_CERT"), "Optional TLS server certificate PEM path for --egress-mtls-addr")
+		egressTLSKey         = flag.String("egress-tls-key", os.Getenv("CUBEPOD_EGRESS_TLS_KEY"), "Optional TLS server private key PEM path for --egress-mtls-addr")
 	)
 	flag.Parse()
 
@@ -183,6 +188,9 @@ func main() {
 	}
 
 	gw := gateway.NewServer(reconciler)
+	if *egressCACert != "" || hasKube || strings.TrimSpace(*egressMTLSAddr) != "" {
+		gw.SetStrictEgressMTLS(true)
+	}
 	gateway.ApplyTemplateConfig(gw, e2bAPIEnabled, *templateBuild, *controllerURL, *templateProbeTimeout)
 	if *livePodRouting {
 		gw.SetLivePodRouting(true)
@@ -228,32 +236,26 @@ func main() {
 		slog.Info("E2B volume store enabled", "dir", volDir, "dockerVolumes", vcfg.DockerVolumes)
 	}
 
-	secretsDir := strings.TrimSpace(os.Getenv("CUBEPOD_SECRETS_DIR"))
-	if secretsDir == "" && volDir != "" {
-		secretsDir = filepath.Join(filepath.Dir(volDir), "secrets")
+	secretsEnabled, secretsK8s, scfg, err := resolveSecretsConfig(
+		os.Getenv("CUBEPOD_SECRETS_BACKEND"),
+		os.Getenv("CUBEPOD_SECRETS_DIR"),
+		volDir,
+		os.Getenv("CUBEPOD_SECRETS_KEY"),
+		os.Getenv("CUBEPOD_MAX_SECRETS_PER_TENANT"),
+		hasKube,
+		reconciler.KubeClient(),
+		*namespace,
+	)
+	if err != nil {
+		slog.Error("invalid E2B secret store configuration", "err", err)
+		os.Exit(1)
 	}
-	if secretsDir != "" && !strings.EqualFold(secretsDir, "disabled") {
-		scfg := gateway.E2BSecretConfig{Dir: secretsDir}
-		if rawKey := strings.TrimSpace(os.Getenv("CUBEPOD_SECRETS_KEY")); rawKey != "" {
-			if decoded, err := base64.StdEncoding.DecodeString(rawKey); err == nil && len(decoded) == 32 {
-				scfg.EncryptionKey = decoded
-			} else if decoded, err := hex.DecodeString(rawKey); err == nil && len(decoded) == 32 {
-				scfg.EncryptionKey = decoded
-			} else {
-				slog.Error("CUBEPOD_SECRETS_KEY must be a 32-byte base64 or 64-char hex key")
-				os.Exit(1)
-			}
-		}
-		if rawMax := strings.TrimSpace(os.Getenv("CUBEPOD_MAX_SECRETS_PER_TENANT")); rawMax != "" {
-			if n, err := strconv.Atoi(rawMax); err == nil && n > 0 {
-				scfg.MaxSecretsPerTenant = n
-			}
-		}
+	if secretsEnabled {
 		if err := gw.ConfigureE2BSecrets(scfg); err != nil {
-			slog.Error("failed to configure E2B secret store", "dir", secretsDir, "err", err)
+			slog.Error("failed to configure E2B secret store", "backend", scfg.Backend, "dir", scfg.Dir, "err", err)
 			os.Exit(1)
 		}
-		slog.Info("E2B secret store enabled", "dir", secretsDir)
+		slog.Info("E2B secret store enabled", "backend", scfg.Backend, "dir", scfg.Dir, "namespace", scfg.Namespace)
 	}
 
 	eventsDir := strings.TrimSpace(os.Getenv("CUBEPOD_EVENTS_DIR"))
@@ -309,6 +311,16 @@ func main() {
 		slog.Info("docker runtime enabled", "network", cfg.Network, "image", cfg.DefaultImage)
 	}
 
+	var mtlsSrv *http.Server
+	if strings.TrimSpace(*egressMTLSAddr) != "" {
+		var buildErr error
+		mtlsSrv, buildErr = buildEgressMTLSServer(*egressMTLSAddr, *egressTLSCert, *egressTLSKey, *namespace, reconciler.EgressCA(), gw.EgressExchangeHandler())
+		if buildErr != nil {
+			slog.Error("failed to configure egress mTLS listener", "addr", *egressMTLSAddr, "err", buildErr)
+			os.Exit(1)
+		}
+	}
+
 	httpSrv := &http.Server{
 		Addr:    *addr,
 		Handler: gw.Handler(),
@@ -317,6 +329,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if secretsK8s {
+		gw.StartSecretsSync(ctx, 5*time.Second)
+		slog.Info("started background E2B Kubernetes secret sync loop", "interval", "5s")
+	}
+
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("gateway HTTP server failed", "err", err)
@@ -324,9 +341,115 @@ func main() {
 		}
 	}()
 
+	if mtlsSrv != nil {
+		go func() {
+			slog.Info("starting egress mTLS exchange listener", "addr", mtlsSrv.Addr)
+			if err := mtlsSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+				slog.Error("egress mTLS server failed", "err", err)
+				os.Exit(1)
+			}
+		}()
+	}
+
 	<-ctx.Done()
 	slog.Info("shutting down cubepod-gateway")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+	if mtlsSrv != nil {
+		_ = mtlsSrv.Shutdown(shutdownCtx)
+	}
+}
+
+func resolveSecretsConfig(backendEnv, secretsDirEnv, volDir, keyEnv, maxPerTenantEnv string, hasKube bool, kc controller.KubeClient, namespace string) (enabled bool, isK8s bool, cfg gateway.E2BSecretConfig, err error) {
+	backend := strings.ToLower(strings.TrimSpace(backendEnv))
+	explicitDir := strings.TrimSpace(secretsDirEnv)
+	if backend == "disabled" || strings.EqualFold(explicitDir, "disabled") {
+		return false, false, gateway.E2BSecretConfig{}, nil
+	}
+	if rawMax := strings.TrimSpace(maxPerTenantEnv); rawMax != "" {
+		if n, convErr := strconv.Atoi(rawMax); convErr == nil && n > 0 {
+			cfg.MaxSecretsPerTenant = n
+		}
+	}
+
+	if backend == "k8s" || (backend == "" && hasKube && explicitDir == "") {
+		if kc == nil {
+			return false, false, gateway.E2BSecretConfig{}, fmt.Errorf("k8s secrets backend requires KubeClient")
+		}
+		cfg.Backend = "k8s"
+		cfg.KubeClient = kc
+		cfg.Namespace = namespace
+		return true, true, cfg, nil
+	}
+
+	if backend != "" && backend != "file" {
+		return false, false, gateway.E2BSecretConfig{}, fmt.Errorf("unsupported CUBEPOD_SECRETS_BACKEND %q (expected file, k8s, or disabled)", backendEnv)
+	}
+
+	secretsDir := explicitDir
+	if secretsDir == "" && volDir != "" {
+		secretsDir = filepath.Join(filepath.Dir(volDir), "secrets")
+	}
+	if secretsDir == "" {
+		return false, false, gateway.E2BSecretConfig{}, nil
+	}
+
+	cfg.Backend = "file"
+	cfg.Dir = secretsDir
+	if rawKey := strings.TrimSpace(keyEnv); rawKey != "" {
+		if decoded, decErr := base64.StdEncoding.DecodeString(rawKey); decErr == nil && len(decoded) == 32 {
+			cfg.EncryptionKey = decoded
+		} else if decoded, decErr := hex.DecodeString(rawKey); decErr == nil && len(decoded) == 32 {
+			cfg.EncryptionKey = decoded
+		} else {
+			return false, false, gateway.E2BSecretConfig{}, fmt.Errorf("CUBEPOD_SECRETS_KEY must be a 32-byte base64 or 64-char hex key")
+		}
+	}
+	return true, false, cfg, nil
+}
+
+func buildEgressMTLSServer(addr, certPath, keyPath, namespace string, clientCA *egress.CA, exchangeHandler http.HandlerFunc) (*http.Server, error) {
+	if clientCA == nil {
+		return nil, fmt.Errorf("--egress-mtls-addr requires --egress-ca-cert and --egress-ca-key (reconciler EgressCA)")
+	}
+	certPath = strings.TrimSpace(certPath)
+	keyPath = strings.TrimSpace(keyPath)
+	if (certPath != "") != (keyPath != "") {
+		return nil, fmt.Errorf("both --egress-tls-cert and --egress-tls-key must be set together")
+	}
+	var srvCert tls.Certificate
+	var err error
+	if certPath != "" {
+		srvCert, err = tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load egress TLS keypair: %w", err)
+		}
+	} else {
+		hosts := []string{"localhost", "127.0.0.1", "cubepod-gateway"}
+		if namespace != "" {
+			hosts = append(hosts, "cubepod-gateway."+namespace+".svc", "cubepod-gateway."+namespace+".svc.cluster.local")
+		}
+		certPEM, keyPEM, mintErr := clientCA.MintServerCert(hosts, 365*24*time.Hour)
+		if mintErr != nil {
+			return nil, fmt.Errorf("mint egress TLS server cert: %w", mintErr)
+		}
+		srvCert, err = tls.X509KeyPair(certPEM, keyPEM)
+		if err != nil {
+			return nil, fmt.Errorf("parse minted egress TLS server cert: %w", err)
+		}
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /internal/v1/egress/exchange", exchangeHandler)
+	return &http.Server{
+		Addr:    addr,
+		Handler: mux,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{srvCert},
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			ClientCAs:    clientCA.CertPool(),
+			MinVersion:   tls.VersionTLS12,
+		},
+	}, nil
 }

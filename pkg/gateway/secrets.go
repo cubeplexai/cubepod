@@ -1,23 +1,33 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
+	"github.com/cubeplexai/cubepod/pkg/controller"
+	"github.com/cubeplexai/cubepod/pkg/egress"
 	"github.com/cubeplexai/cubepod/pkg/secret"
 )
 
 // E2BSecretConfig configures the tenant-isolated E2B Secrets store.
 type E2BSecretConfig struct {
-	// Dir is the durable secret store root. Required.
+	// Backend selects "file" or "k8s". Defaults to "k8s" when Dir is empty and KubeClient is set.
+	Backend string
+	// Dir is the durable secret store root (for "file" backend).
 	Dir string
-	// EncryptionKey is an optional 32-byte AES-256 key.
+	// EncryptionKey is an optional 32-byte AES-256 key (for "file" backend).
 	EncryptionKey []byte
+	// KubeClient is the Kubernetes client (for "k8s" backend).
+	KubeClient controller.KubeClient
+	// Namespace is the Kubernetes namespace for "k8s" backend Secrets.
+	Namespace string
 	// MaxSecretsPerTenant caps secrets per API key tenant (default 100).
 	MaxSecretsPerTenant int
 }
@@ -38,17 +48,104 @@ var (
 	}
 )
 
-// ConfigureE2BSecrets opens (or reopens) the durable encrypted E2B secret store.
+// ConfigureE2BSecrets opens (or reopens) the durable E2B secret store.
 func (s *Server) ConfigureE2BSecrets(cfg E2BSecretConfig) error {
-	st, err := secret.Open(cfg.Dir, secret.Config{
+	secretCfg := secret.Config{
 		EncryptionKey:       cfg.EncryptionKey,
 		MaxSecretsPerTenant: cfg.MaxSecretsPerTenant,
-	})
+		OnUpdate: func(tenantHash, secretID string, value secret.SecretValue) {
+			if s.vault != nil {
+				s.vault.UpdateSecretByRef(tenantHash, secretID, value.Raw())
+			}
+		},
+		OnRevoke: func(tenantHash, secretID string) {
+			if s.vault != nil {
+				s.vault.RevokeSecretByRef(tenantHash, secretID)
+			}
+		},
+	}
+
+	backendMode := strings.ToLower(strings.TrimSpace(cfg.Backend))
+	var (
+		st  *secret.Store
+		err error
+	)
+	if backendMode == "k8s" || (backendMode == "" && strings.TrimSpace(cfg.Dir) == "" && cfg.KubeClient != nil) {
+		kb, kbErr := secret.NewKubeSecretBackend(cfg.KubeClient, cfg.Namespace)
+		if kbErr != nil {
+			return kbErr
+		}
+		st, err = secret.OpenWithBackend(kb, secretCfg)
+	} else {
+		st, err = secret.Open(cfg.Dir, secretCfg)
+	}
 	if err != nil {
 		return err
 	}
 	s.secrets.Store(st)
 	return nil
+}
+
+// SecretStore returns the configured E2B secret store, or nil if disabled.
+func (s *Server) SecretStore() *secret.Store {
+	return s.secrets.Load()
+}
+
+// StartSecretsSync runs periodic secret store synchronization in the background until ctx is cancelled.
+func (s *Server) StartSecretsSync(ctx context.Context, interval time.Duration) {
+	if st := s.secrets.Load(); st != nil {
+		st.StartSync(ctx, interval)
+	}
+}
+
+func (s *Server) rehydrateVaultBinding(ctx context.Context, sandboxID, placeholder string) error {
+	if s.vault == nil || s.reconciler == nil || s.reconciler.KubeClient() == nil {
+		return egress.ErrUnknownPlaceholder
+	}
+	st := s.secrets.Load()
+	if st == nil {
+		return egress.ErrUnknownPlaceholder
+	}
+	box, err := s.reconciler.KubeClient().GetPodBox(ctx, s.reconciler.Namespace(), sandboxID)
+	if err != nil || box == nil || box.Spec.NetworkPolicy == nil {
+		return egress.ErrUnknownPlaceholder
+	}
+
+	var matched *v1alpha1.SecretRefBinding
+	for i := range box.Spec.NetworkPolicy.SecretRefBindings {
+		if box.Spec.NetworkPolicy.SecretRefBindings[i].Placeholder == placeholder {
+			matched = &box.Spec.NetworkPolicy.SecretRefBindings[i]
+			break
+		}
+	}
+	if matched == nil {
+		return egress.ErrUnknownPlaceholder
+	}
+
+	_, val, err := st.ResolveByTenantID(matched.TenantHash, matched.SecretID)
+	if errors.Is(err, secret.ErrNotFound) {
+		if syncErr := st.Sync(ctx); syncErr != nil {
+			return syncErr
+		}
+		_, val, err = st.ResolveByTenantID(matched.TenantHash, matched.SecretID)
+	}
+	if err != nil {
+		return err
+	}
+	raw := val.Raw()
+	if !isValidHeaderValue(raw) {
+		return errors.New("secret value contains invalid control characters")
+	}
+	return s.vault.RestoreManagedSecret(
+		matched.Placeholder,
+		sandboxID,
+		matched.TenantHash,
+		matched.SecretID,
+		"",
+		raw,
+		matched.AllowedHosts,
+		matched.AllowedHeaders,
+	)
 }
 
 func (s *Server) requireSecretStore(w http.ResponseWriter) (*secret.Store, bool) {

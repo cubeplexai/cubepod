@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
@@ -666,6 +667,96 @@ func (c *RESTKubeClient) GetSecret(ctx context.Context, namespace, name string) 
 		return nil, fmt.Errorf("failed to decode Secret: %w", err)
 	}
 	return &sec, nil
+}
+
+// EnsureSecret creates or updates a Kubernetes core/v1 Secret in the given namespace.
+func (c *RESTKubeClient) EnsureSecret(ctx context.Context, secret KubeSecret) error {
+	ns := c.resolveNamespace(secret.Metadata.Namespace)
+	secret.Metadata.Namespace = ns
+	name := secret.Metadata.Name
+	if name == "" {
+		return fmt.Errorf("Secret metadata.name is required")
+	}
+	if secret.APIVersion == "" {
+		secret.APIVersion = "v1"
+	}
+	if secret.Kind == "" {
+		secret.Kind = "Secret"
+	}
+
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets", c.baseURL, ns)
+	payload, err := json.Marshal(secret)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Secret JSON: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPost, reqURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("EnsureSecret POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		return nil
+	}
+	if resp.StatusCode == http.StatusConflict {
+		existing, getErr := c.GetSecret(ctx, ns, name)
+		if getErr == nil && existing != nil && existing.Metadata.ResourceVersion != "" {
+			secret.Metadata.ResourceVersion = existing.Metadata.ResourceVersion
+		}
+		putURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets/%s", c.baseURL, ns, name)
+		putPayload, err := json.Marshal(secret)
+		if err != nil {
+			return fmt.Errorf("failed to marshal Secret JSON for update: %w", err)
+		}
+		putResp, err := c.doRequest(ctx, http.MethodPut, putURL, bytes.NewReader(putPayload))
+		if err != nil {
+			return fmt.Errorf("EnsureSecret PUT failed: %w", err)
+		}
+		defer putResp.Body.Close()
+		if putResp.StatusCode == http.StatusOK || putResp.StatusCode == http.StatusCreated {
+			return nil
+		}
+		putBody, _ := io.ReadAll(putResp.Body)
+		return fmt.Errorf("EnsureSecret PUT failed: status %d (%s)", putResp.StatusCode, string(putBody))
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("EnsureSecret failed: status %d (%s)", resp.StatusCode, string(body))
+}
+
+// ListSecrets queries Kubernetes core/v1 Secrets in the specified namespace matching optional labelSelector.
+func (c *RESTKubeClient) ListSecrets(ctx context.Context, namespace string, labelSelector string) ([]KubeSecret, error) {
+	ns := c.resolveNamespace(namespace)
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/secrets", c.baseURL, ns)
+	if labelSelector != "" {
+		reqURL += "?labelSelector=" + url.QueryEscape(labelSelector)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ListSecrets GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return []KubeSecret{}, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("ListSecrets failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+
+	var list struct {
+		Items []KubeSecret `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("failed to decode SecretList: %w", err)
+	}
+	if list.Items == nil {
+		return []KubeSecret{}, nil
+	}
+	return list.Items, nil
 }
 
 // DeleteSecret removes a Kubernetes core/v1 Secret by namespace and name, ignoring 404 NotFound.

@@ -56,7 +56,9 @@ type KubeClient interface {
 
 	GetPodPhase(ctx context.Context, namespace, name string) (string, error)
 	CreateSecret(ctx context.Context, secret KubeSecret) error
+	EnsureSecret(ctx context.Context, secret KubeSecret) error
 	GetSecret(ctx context.Context, namespace, name string) (*KubeSecret, error)
+	ListSecrets(ctx context.Context, namespace string, labelSelector string) ([]KubeSecret, error)
 	DeleteSecret(ctx context.Context, namespace, name string) error
 
 	EnsureVolumeSnapshot(ctx context.Context, snap VolumeSnapshot) error
@@ -496,6 +498,53 @@ func (m *MemoryKubeClient) GetPodPhase(_ context.Context, namespace, name string
 	return "Running", nil
 }
 
+func copyKubeSecret(secret KubeSecret) KubeSecret {
+	cp := secret
+	if secret.Metadata.Labels != nil {
+		cp.Metadata.Labels = make(map[string]string, len(secret.Metadata.Labels))
+		for k, v := range secret.Metadata.Labels {
+			cp.Metadata.Labels[k] = v
+		}
+	}
+	if secret.Metadata.Annotations != nil {
+		cp.Metadata.Annotations = make(map[string]string, len(secret.Metadata.Annotations))
+		for k, v := range secret.Metadata.Annotations {
+			cp.Metadata.Annotations[k] = v
+		}
+	}
+	cp.Data = make(map[string][]byte, len(secret.Data)+len(secret.StringData))
+	for k, v := range secret.Data {
+		b := make([]byte, len(v))
+		copy(b, v)
+		cp.Data[k] = b
+	}
+	for k, v := range secret.StringData {
+		cp.Data[k] = []byte(v)
+	}
+	cp.StringData = nil
+	return cp
+}
+
+func parseLabelSelector(labelSelector string) map[string]string {
+	if labelSelector == "" {
+		return nil
+	}
+	selectors := make(map[string]string)
+	for _, part := range strings.Split(labelSelector, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) == 2 {
+			selectors[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+		} else {
+			selectors[part] = ""
+		}
+	}
+	return selectors
+}
+
 // CreateSecret stores a KubeSecret in memory.
 func (m *MemoryKubeClient) CreateSecret(_ context.Context, secret KubeSecret) error {
 	m.mu.Lock()
@@ -518,18 +567,32 @@ func (m *MemoryKubeClient) CreateSecret(_ context.Context, secret KubeSecret) er
 	if _, exists := m.Secrets[key]; exists {
 		return fmt.Errorf("secret %s/%s already exists: status 409", ns, secret.Metadata.Name)
 	}
-	cp := secret
-	cp.Data = make(map[string][]byte, len(secret.Data)+len(secret.StringData))
-	for k, v := range secret.Data {
-		b := make([]byte, len(v))
-		copy(b, v)
-		cp.Data[k] = b
+	m.Secrets[key] = copyKubeSecret(secret)
+	return nil
+}
+
+// EnsureSecret creates or updates a KubeSecret in memory.
+func (m *MemoryKubeClient) EnsureSecret(_ context.Context, secret KubeSecret) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Secrets == nil {
+		m.Secrets = make(map[string]KubeSecret)
 	}
-	for k, v := range secret.StringData {
-		cp.Data[k] = []byte(v)
+	if secret.Metadata.Name == "" {
+		return fmt.Errorf("Secret metadata.name is required")
 	}
-	cp.StringData = nil
-	m.Secrets[key] = cp
+	ns := secret.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	secret.Metadata.Namespace = ns
+	if secret.APIVersion == "" {
+		secret.APIVersion = "v1"
+	}
+	if secret.Kind == "" {
+		secret.Kind = "Secret"
+	}
+	m.Secrets[podKey(ns, secret.Metadata.Name)] = copyKubeSecret(secret)
 	return nil
 }
 
@@ -544,8 +607,39 @@ func (m *MemoryKubeClient) GetSecret(_ context.Context, namespace, name string) 
 	if !ok {
 		return nil, fmt.Errorf("secret %s/%s not found", namespace, name)
 	}
-	cp := sec
+	cp := copyKubeSecret(sec)
 	return &cp, nil
+}
+
+// ListSecrets retrieves KubeSecrets matching optional namespace and labelSelector from memory.
+func (m *MemoryKubeClient) ListSecrets(_ context.Context, namespace string, labelSelector string) ([]KubeSecret, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	selectors := parseLabelSelector(labelSelector)
+	res := make([]KubeSecret, 0, len(m.Secrets))
+	for _, sec := range m.Secrets {
+		secNs := sec.Metadata.Namespace
+		if secNs == "" {
+			secNs = "default"
+		}
+		if namespace != "" && secNs != namespace {
+			continue
+		}
+		if len(selectors) > 0 {
+			match := true
+			for k, v := range selectors {
+				if sec.Metadata.Labels == nil || sec.Metadata.Labels[k] != v {
+					match = false
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+		}
+		res = append(res, copyKubeSecret(sec))
+	}
+	return res, nil
 }
 
 // DeleteSecret removes a KubeSecret from memory.

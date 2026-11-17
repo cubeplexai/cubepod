@@ -31,16 +31,21 @@ type SecretBinding struct {
 	AllowedHeaders []string
 }
 
+type vaultKey struct {
+	sandboxID   string
+	placeholder string
+}
+
 // Vault manages in-memory secret bindings and zero-trust placeholder exchanges.
 type Vault struct {
 	mu       sync.RWMutex
-	bindings map[string]*SecretBinding
+	bindings map[vaultKey]*SecretBinding
 }
 
 // NewVault constructs a new Secret Vault.
 func NewVault() *Vault {
 	return &Vault{
-		bindings: make(map[string]*SecretBinding),
+		bindings: make(map[vaultKey]*SecretBinding),
 	}
 }
 
@@ -78,7 +83,10 @@ func (v *Vault) BindManagedSecret(sandboxID, tenantHash, secretID, envName, rawS
 	copy(headersCopy, allowedHeaders)
 
 	v.mu.Lock()
-	v.bindings[placeholder] = &SecretBinding{
+	if v.bindings == nil {
+		v.bindings = make(map[vaultKey]*SecretBinding)
+	}
+	v.bindings[vaultKey{sandboxID: sandboxID, placeholder: placeholder}] = &SecretBinding{
 		SandboxID:      sandboxID,
 		TenantHash:     tenantHash,
 		SecretID:       secretID,
@@ -96,12 +104,19 @@ func (v *Vault) BindManagedSecret(sandboxID, tenantHash, secretID, envName, rawS
 // with fail-closed semantics, returning the real secret value upon verification.
 func (v *Vault) Exchange(sandboxID, placeholder, sniHost, headerName string) (string, error) {
 	v.mu.RLock()
-	binding, ok := v.bindings[placeholder]
-	v.mu.RUnlock()
-
+	ptr, ok := v.bindings[vaultKey{sandboxID: sandboxID, placeholder: placeholder}]
 	if !ok {
+		for k := range v.bindings {
+			if k.placeholder == placeholder {
+				v.mu.RUnlock()
+				return "", ErrSandboxMismatch
+			}
+		}
+		v.mu.RUnlock()
 		return "", ErrUnknownPlaceholder
 	}
+	binding := *ptr
+	v.mu.RUnlock()
 
 	// 1. Sandbox identity verification
 	if binding.SandboxID != sandboxID {
@@ -146,9 +161,9 @@ func (v *Vault) RevokeSandbox(sandboxID string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	for placeholder, binding := range v.bindings {
-		if binding.SandboxID == sandboxID {
-			delete(v.bindings, placeholder)
+	for k := range v.bindings {
+		if k.sandboxID == sandboxID {
+			delete(v.bindings, k)
 		}
 	}
 }
@@ -157,7 +172,11 @@ func (v *Vault) RevokeSandbox(sandboxID string) {
 func (v *Vault) RevokeSecret(placeholder string) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	delete(v.bindings, placeholder)
+	for k := range v.bindings {
+		if k.placeholder == placeholder {
+			delete(v.bindings, k)
+		}
+	}
 }
 
 // UpdateSecretByRef rotates RawSecret for all active bindings referencing (tenantHash, secretID).
@@ -168,9 +187,11 @@ func (v *Vault) UpdateSecretByRef(tenantHash, secretID, newRawSecret string) int
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	updated := 0
-	for _, binding := range v.bindings {
+	for k, binding := range v.bindings {
 		if binding.TenantHash == tenantHash && binding.SecretID == secretID {
-			binding.RawSecret = newRawSecret
+			cp := *binding
+			cp.RawSecret = newRawSecret
+			v.bindings[k] = &cp
 			updated++
 		}
 	}
@@ -185,9 +206,9 @@ func (v *Vault) RevokeSecretByRef(tenantHash, secretID string) int {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	revoked := 0
-	for placeholder, binding := range v.bindings {
+	for k, binding := range v.bindings {
 		if binding.TenantHash == tenantHash && binding.SecretID == secretID {
-			delete(v.bindings, placeholder)
+			delete(v.bindings, k)
 			revoked++
 		}
 	}
