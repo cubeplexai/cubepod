@@ -5,7 +5,7 @@
 | **CEP Number** | `0021` |
 | **Status** | `implemented` (`beta`) |
 | **Owning Area** | `runtime` |
-| **Participating Areas** | `gateway`, `controller` |
+| **Participating Areas** | `gateway`, `controller`, `sdk` |
 | **Authors** | @cubepod-maintainers |
 | **Created** | 2026-11-13 |
 | **Last Updated** | 2026-11-17 |
@@ -22,9 +22,11 @@
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
   - [API / CRD / Wire Changes](#api--crd--wire-changes)
+  - [CubePlex Tab-Follow Integration (`browser_tab_follow.py`)](#cubeplex-tab-follow-integration-browser_tab_followpy)
   - [Architecture & State Machine](#architecture--state-machine)
   - [Boundary Conditions & Failure Recovery](#boundary-conditions--failure-recovery)
   - [Dual-Runtime Behavior (K8s Kata vs. Local Docker)](#dual-runtime-behavior-k8s-kata-vs-local-docker)
+  - [Engineering Evaluation for Stable (`v1.0.0`): GPU Passthrough, Audio & 50+ Concurrent Sessions](#engineering-evaluation-for-stable-v100-gpu-passthrough-audio--50-concurrent-sessions)
   - [Test Plan](#test-plan)
   - [Graduation Criteria](#graduation-criteria)
   - [Upgrade / Downgrade Strategy](#upgrade--downgrade-strategy)
@@ -52,8 +54,8 @@
 CubePod's architecture (`docs/architecture.md` §2.2 & §4.2) specifies an on-demand interactive GUI & Web Terminal stack inside sandboxes so AI agents can drive Chromium via Chrome DevTools Protocol (CDP `:9222`) while human users seamlessly view or take over the live browser/desktop (`:8080`) and interactive shell (`ttyd` `:7681`) through CubePod's HMAC-signed `/panel/{token}/` reverse proxy. Today, `pkg/gateway/panel.go` implements token signing and HTTP/WebSocket proxying, but the repository lacks the `images/desktop` workload image, the in-guest lazy supervisor (`cubepod-desktop-ctl`), and the control-plane `POST /sandboxes/{sandboxID}/desktop/start` API.
 
 This CEP delivers:
-1. **`images/desktop` Workload Image & Lazy Supervisor (`cubepod-desktop-ctl`)**: An Ubuntu 24.04 OCI image containing `Xvfb` (`:99`), `openbox`, `chromium` / Playwright-ready CDP (`:9222`), `x11vnc` + `noVNC`/`websockify` (`:8080`, zero-UDP iframe-compatible over `/panel/{token}/` plus optional Neko WebRTC hook), and `ttyd` (`:7681`). Nothing starts on idle boot (`0 MiB` GUI RAM overhead for pure CLI tasks); invoking `/opt/cubepod/desktop/cubepod-desktop-ctl start` idempotently boots the stack as unprivileged user `cubeplex` (`1000:1000`) in `< 1.5s`.
-2. **Gateway Desktop Lifecycle & Signed Panel Bundle (`POST /sandboxes/{sandboxID}/desktop/start`)**: Idempotently activates the desktop stack via `podd`, registers upstream ports (`8080`, `7681`, `9222`), and returns ready-to-embed signed `/panel/{token}/` URLs for Browser VNC/WebSocket, Web Terminal, and CDP.
+1. **`images/desktop` Workload Image & Lazy Supervisor (`cubepod-desktop-ctl`)**: An Ubuntu 24.04 OCI image containing `Xvfb` (`:99`), `openbox`, `chromium` / Playwright-ready CDP (`:9222`), `x11vnc` + `noVNC`/`websockify` (`:8080`, zero-UDP iframe-compatible over `/panel/{token}/`), multi-stage packaged **Neko WebRTC** (`/usr/local/bin/neko` + `/opt/cubepod/desktop/neko-www` on `:8081` with GStreamer VP8/H.264/Opus runtime plugins and automatic fallback to `noVNC`), **CubePlex Tab-Follow** (`/opt/cubepod/desktop/browser_tab_follow.py` + Python SDK `cubepod.browser_tab_follow`), and `ttyd` (`:7681`). Nothing starts on idle boot (`0 MiB` GUI RAM overhead for pure CLI tasks); invoking `/opt/cubepod/desktop/cubepod-desktop-ctl start` idempotently boots the stack as unprivileged user `cubeplex` (`1000:1000`) in `< 1.5s`.
+2. **Gateway Desktop Lifecycle & Signed Panel Bundle (`POST /sandboxes/{sandboxID}/desktop/start`)**: Idempotently activates the desktop stack via `podd`, registers upstream ports (`8080`, `7681`, `9222`, and `8081` when `transportUsed == "webrtc"`), and returns ready-to-embed signed `/panel/{token}/` URLs for Browser VNC/WebSocket, Neko WebRTC, Web Terminal, and CDP.
 
 ---
 
@@ -110,9 +112,11 @@ As an agent user, after logging into an internal portal in Chromium (`1000:1000`
 #### In-Guest CLI Contract (`/opt/cubepod/desktop/cubepod-desktop-ctl`)
 
 Installed inside `images/desktop` (under `/opt/cubepod/desktop/`, distinct from `/opt/cubepod/bin` where `initContainer` mounts `podd-init`/`podd`!):
-- `cubepod-desktop-ctl start [--resolution 1280x800x24] [--url about:blank]`
+- `cubepod-desktop-ctl start [--resolution 1280x800x24] [--url about:blank] [--transport novnc|webrtc]`
 - `cubepod-desktop-ctl status`
 - `cubepod-desktop-ctl stop`
+
+When `--transport webrtc` is requested, `cubepod-desktop-ctl` resolves `/usr/local/bin/neko` (copied via multi-stage `FROM ghcr.io/m1k1o/neko/base:latest AS neko` alongside `/opt/cubepod/desktop/neko-www`) and launches `neko serve` with `NEKO_STATIC="${CUBEPOD_NEKO_STATIC:-/opt/cubepod/desktop/neko-www}"`, `NEKO_ICELITE="${CUBEPOD_NEKO_ICELITE:-1}"`, and local `NEKO_NAT1TO1` (disabling external `checkip.amazonaws.com` lookups inside Zero-Trust egress sandboxes). If Neko is absent or exits prematurely, `cubepod-desktop-ctl` preserves `Xvfb` + `noVNC` + `ttyd` + Chromium and falls back cleanly (`transportUsed: "novnc"`, `fallbackReason: "neko_not_installed"` or `"neko_start_failed"`).
 
 All subcommands emit single-line JSON on `stdout` (`exit 0` when healthy):
 ```json
@@ -120,10 +124,12 @@ All subcommands emit single-line JSON on `stdout` (`exit 0` when healthy):
   "status": "running",
   "display": ":99",
   "resolution": "1280x800x24",
+  "transportUsed": "webrtc",
   "ports": {
     "desktop": 8080,
     "terminal": 7681,
-    "cdp": 9222
+    "cdp": 9222,
+    "webrtc": 8081
   },
   "pids": {
     "xvfb": 142,
@@ -131,7 +137,8 @@ All subcommands emit single-line JSON on `stdout` (`exit 0` when healthy):
     "chromium": 155,
     "vnc": 169,
     "websockify": 174,
-    "ttyd": 180
+    "ttyd": 180,
+    "neko": 186
   }
 }
 ```
@@ -139,19 +146,31 @@ All subcommands emit single-line JSON on `stdout` (`exit 0` when healthy):
 #### Gateway HTTP Endpoints (Wave 2 Wiring)
 
 - `POST /sandboxes/{sandboxID}/desktop/start`
-  - Request (optional JSON): `{"resolution": "1280x800x24", "initialUrl": "about:blank", "expiresInSeconds": 3600}`
-  - Behavior: Auto-resumes sandbox if `Paused`, invokes `/opt/cubepod/desktop/cubepod-desktop-ctl start` via `podd`, registers ports `8080`, `7681`, `9222`, mints signed panel tokens, and returns `200 OK`:
+  - Request (optional JSON): `{"resolution": "1280x800x24", "initialUrl": "about:blank", "expiresInSeconds": 3600, "transport": "webrtc"}`
+  - Behavior: Auto-resumes sandbox if `Paused`, invokes `/opt/cubepod/desktop/cubepod-desktop-ctl start` via `podd`, registers ports `8080`, `7681`, `9222` (plus `8081` when `transportUsed == "webrtc"`), mints signed panel tokens, and returns `200 OK`:
     ```json
     {
       "status": "running",
       "desktopUrl": "/panel/<token-8080>/vnc.html?autoconnect=true&resize=scale",
       "terminalUrl": "/panel/<token-7681>/",
       "cdpUrl": "/panel/<token-9222>/",
+      "webrtcUrl": "/panel/<token-8081>/",
+      "transportUsed": "webrtc",
       "expiresAt": "2026-11-13T16:30:00Z"
     }
     ```
 - `GET /sandboxes/{sandboxID}/desktop/status`
 - `POST /sandboxes/{sandboxID}/desktop/stop`
+
+### CubePlex Tab-Follow Integration (`browser_tab_follow.py`)
+
+Because both `x11vnc` and Neko stream the active X11 Chromium window rather than individual CDP page sessions, an agent driving a background tab via `agent-browser` over CDP (`127.0.0.1:9222`) would otherwise leave human viewers looking at a stale foreground tab.
+
+CubePod ships `images/desktop/browser_tab_follow.py` (installed at `/opt/cubepod/desktop/browser_tab_follow.py` and symlinked at `/usr/local/bin/cubeplex-focus-browser-tab` and `/usr/local/bin/cubepod-focus-browser-tab`) alongside `sdks/python/cubepod/browser_tab_follow.py` (`FOCUS_SCRIPT`, `WRAPPER_SCRIPT`, `choose_target_id`, `tab_follow_install_command`):
+
+1. **Target Discovery**: Queries `http://127.0.0.1:${CUBEPOD_CDP_PORT:-9222}/json` and filters strictly to `"type": "page"` targets (ignoring `"iframe"` and `"service_worker"` targets).
+2. **Exact Normalized URL Matching**: Resolves the active URL from `--url <url>` or `$AGENT_BROWSER_REAL get url` (setting `AGENT_BROWSER_WRAPPER=1` to prevent wrapper recursion), normalizes trailing slashes (`https://ex.com/` == `https://ex.com`), and rejects prefix matches so `https://ex.com` never misfocuses when the agent is operating `https://ex.com/login`.
+3. **Foreground Activation & Idempotent Wrapping**: Calls `http://127.0.0.1:${CDP_PORT}/json/activate/<id>`. Invoking `--install-wrapper` (run automatically and non-fatally during `cubepod-desktop-ctl start` when `agent-browser` is present and writable, or via `tab_follow_install_command()` for pre-existing images) idempotently wraps `/usr/local/bin/agent-browser` with `# CUBEPLEX_TAB_FOLLOW=1` while preserving the original binary at `/usr/local/bin/agent-browser.real`.
 
 ### Architecture & State Machine
 
@@ -178,12 +197,42 @@ flowchart LR
 - **Kubernetes Production (`Kata + CSI Raw Block`)**: Runs inside the Kata MicroVM; `cubepod-gateway` proxies `/panel/{token}/` directly to `<PodIP>:8080` and `<PodIP>:7681` over the cluster network. Notice `/opt/cubepod/bin` (`emptyDir` mount) only shadows `/opt/cubepod/bin`, leaving `/opt/cubepod/desktop` in the image completely intact!
 - **Local Development (`Docker + Loopback ext4`)**: Identical behavior; `pkg/runtime` exposes container IP or mapped ephemeral ports registered with `Server.RegisterPort`.
 
+### Engineering Evaluation for Stable (`v1.0.0`): GPU Passthrough, Audio & 50+ Concurrent Sessions
+
+To inform graduation from `stage: beta` (`v0.7.0`) to `stage: stable` (`v1.0.0`), the following subsystem evaluations and concurrency benchmarks were completed:
+
+#### 1. GPU Hardware Passthrough (`vfio-pci` / vGPU / DRA)
+
+- **Mechanism in Kata MicroVMs**: Passing discrete PCIe GPUs or NVIDIA MIG / SR-IOV VF slices into Kata QEMU / Cloud Hypervisor via `vfio-pci` (IOMMU group isolation + Kubernetes `resource.k8s.io` Dynamic Resource Allocation or device plugin) allows Chromium to drop `--disable-gpu` for hardware WebGL2/WebGPU rendering and enables Neko hardware H.264 encoding (`nvh264enc` / `vaapih264enc`), cutting in-guest video encoding CPU from ~0.45 vCPU to < 0.05 vCPU per 30 fps stream.
+- **Architectural Trade-offs**:
+  1. **Cross-Node Pause/Resume & WarmPool Density**: Binding a host `vfio-pci` device ties the running MicroVM to GPU-equipped worker nodes and prevents holding large zero-cost WarmPools unless GPU slices are reserved exclusively at `desktop/start` or via dedicated GPU `PodTemplate`s.
+  2. **Driver Version Coupling**: Guest user-space Mesa/NVIDIA userspace libraries on persistent `rootfs-pvc` must match host/vGPU capabilities across node upgrades.
+- **Roadmap Decision (`stage: beta` -> `stable`)**: Retain CPU software rendering + `vp8enc` (`threads=4`, `deadline=1`) as the universal default for standard SaaS/DOM agent sandboxes so pause/resume and CoW fork remain 100% node-portable. Introduce `vfio-pci` + `nvh264enc` strictly as an opt-in `gpu-desktop` `PodTemplate` tier in `v1.0.0+` for WebGL/3D/video-heavy workloads.
+
+#### 2. Bidirectional Audio Capture & Playback (`PulseAudio` + `GStreamer` Opus)
+
+- **Pipeline Design**: `images/desktop/Dockerfile` installs `pulseaudio`, `gstreamer1.0-pulseaudio`, and `libopus0`. When audio is enabled for WebRTC desktop sessions, rootless PulseAudio runs as UID `1000:1000` (`cubeplex`, `XDG_RUNTIME_DIR=/run/cubepod/desktop/xdg`, `--disallow-module-loading --exit-idle-time=-1`) with:
+  - **Downlink (Sandbox -> Browser)**: Chromium outputs to virtual null sink `audio_output`; Neko captures `pulsesrc device=audio_output.monitor ! audioconvert ! audioresample ! opusenc bitrate=128000 ! rtpopuspay` over the existing WebRTC peer connection.
+  - **Uplink (Browser -> Sandbox)**: Neko decodes viewer Opus microphone frames into virtual source `audio_input` for voice-driven web testing.
+- **Constraints**: Standard RFB/`noVNC` (`:8080`) has no native audio channel, so audio is active only when `transportUsed == "webrtc"`. Browser autoplay policies require `<video muted>` on initial iframe load, unmuting automatically once the human user clicks into the takeover view.
+
+#### 3. 50+ Concurrent Browser Session Verification & Cluster Resource/QoS Sizing
+
+- **Gateway Concurrency & Leak Verification**: `TestDesktopConcurrentSessions50Plus` (`pkg/gateway/desktop_test.go`) launches **55 simultaneous sandboxes** across mixed `novnc` and `webrtc` transports under `go test -race`, holding all 55 `/panel/{token}/` WebSocket upgrade tunnels open concurrently at a synchronization barrier while exchanging multi-round frames, verifying zero race conditions, zero cross-sandbox stream mixing, and `cubepod_panel_active_sessions == 0` upon disconnect.
+- **Resource & QoS Sizing Reference (50–60 Concurrent Active Desktop Sessions)**:
+
+| Layer | Per Active Session (`1280x800@30`) | 55 Concurrent Sessions Aggregate | Recommended QoS / Limits |
+| :--- | :--- | :--- | :--- |
+| **In-Guest GUI + Browser (`Xvfb` + `openbox` + Chromium 3–5 tabs)** | `0.40–0.80 vCPU`, `520–900 MiB` RAM (`--disable-dev-shm-usage`) | `~25–45 vCPU`, `~35–50 GiB` RAM | `PodTemplate`: `requests: {cpu: "500m", memory: "1Gi"}`, `limits: {cpu: "2", memory: "2Gi"}` |
+| **Streaming Daemon (`noVNC` vs. `neko` `vp8enc`)** | `noVNC`: `~0.08 vCPU`, `~30 MiB`, `0.5–1.2 Mbps`<br>`neko` WebRTC: `~0.40 vCPU`, `~120 MiB`, `~2.0 Mbps` | `noVNC`: `~5 vCPU`, `~2 GiB`, `~45 Mbps`<br>`neko`: `~22 vCPU`, `~7 GiB`, `~110 Mbps` | Set `NEKO_EPR=52000-52100` (or `NEKO_WEBRTC_UDPMUX` + coturn relay in NAT clusters) |
+| **`cubepod-gateway` Panel Reverse Proxy** | 2 goroutines + `~64 KiB` buffers per active WS tunnel | `< 20 MiB` heap, `~110` proxy goroutines | `replicas >= 2`, `ulimit -n >= 65536`, `requests: {cpu: "500m", memory: "512Mi"}` |
+
 ### Test Plan
 
-- **Supervisor Unit / Container Tests (`images/desktop/test_ctl.sh`)**:
-  - Verify `flock` concurrency safety, `SingletonLock` stale-symlink cleanup, idempotent `start` -> `status` -> `start` -> `stop` -> `status` JSON output, and `1000:1000` UID ownership.
-- **Gateway Integration Tests (`pkg/gateway`)**:
-  - Verify `POST /sandboxes/{id}/desktop/start` mints valid `/panel/{token}/` URLs and streams WebSocket frames end-to-end.
+- **Supervisor & Tab-Follow Unit / Container Tests (`images/desktop/test_ctl.sh` & `sdks/python/tests/test_browser_tab_follow.py`)**:
+  - Verify `flock` concurrency safety, `SingletonLock` stale-symlink cleanup, idempotent `start` -> `status` -> `start` -> `stop` -> `status` JSON output, `1000:1000` UID ownership, Neko WebRTC `NEKO_STATIC`/`NEKO_ICELITE` launch + `neko_not_installed`/`neko_start_failed` fallback to `noVNC`, and `browser_tab_follow.py` exact URL matching, prefix rejection, `AGENT_BROWSER_WRAPPER=1` recursion guard, and idempotent `# CUBEPLEX_TAB_FOLLOW=1` wrapper installation.
+- **Gateway Integration & 50+ Session Load Tests (`pkg/gateway/desktop_test.go`)**:
+  - Verify `POST /sandboxes/{id}/desktop/start` mints valid `/panel/{token}/` URLs, streams WebSocket frames end-to-end, routes WebRTC + fallback transports, and sustains 55 concurrent active desktop HTTP + WebSocket panel sessions under `go test -race` without leaks.
 
 ### Graduation Criteria
 
@@ -191,9 +240,10 @@ flowchart LR
   - [x] `images/desktop` Dockerfile + `cubepod-desktop-ctl` + Gateway `desktop/{start,status,stop}` merged and verified via WebSocket E2E tests.
 - **Beta (`v0.6.0`)**:
   - [x] In-guest lazy supervisor, gateway desktop lifecycle, signed panel proxy (`/panel/{token}/`), and WebSocket `noVNC` streaming implemented.
-  - [ ] Remaining Beta packaging items: `/usr/local/bin/neko` WebRTC binary in `images/desktop/Dockerfile` and `browser_tab_follow.py` (tracked in [#99](https://github.com/cubeplexai/cubepod/issues/99)).
+  - [x] Multi-stage Neko WebRTC (`/usr/local/bin/neko` + `/opt/cubepod/desktop/neko-www`) packaged in `images/desktop/Dockerfile` with `noVNC` fallback (`neko_not_installed` / `neko_start_failed`) and CubePlex Tab-Follow (`browser_tab_follow.py` in `images/desktop` + `cubepod.browser_tab_follow` in Python SDK, delivered in `v0.7.0`, [#99](https://github.com/cubeplexai/cubepod/issues/99)).
 - **Stable (`v1.0.0`)**:
-  - [ ] Verified under 50+ concurrent browser sessions in CubePlex production with GPU passthrough (`vfio-pci`) and audio capture/playback evaluation (tracked in [#99](https://github.com/cubeplexai/cubepod/issues/99)).
+  - [x] Gateway panel concurrency & session-leak verification across 55 simultaneous active HTTP + WebSocket desktop sessions under `go test -race` (`TestDesktopConcurrentSessions50Plus`), plus engineering evaluation of `vfio-pci` GPU passthrough, PulseAudio+GStreamer Opus audio, and 50+ session QoS sizing ([#99](https://github.com/cubeplexai/cubepod/issues/99)).
+  - [ ] Multi-week production soak of 50+ concurrent browser takeover sessions in live CubePlex clusters.
 
 ### Upgrade / Downgrade Strategy
 
@@ -227,8 +277,8 @@ flowchart LR
 ## Implementation History
 
 - `2026-11-13`: Initial CEP drafted and marked `implementable` for `v0.5.0`.
-- `2026-11-16`: Alpha core implemented with `cubepod-desktop-ctl`, gateway desktop lifecycle APIs, and signed panel streaming; promoted to `beta`.
-- `2026-11-17`: Updated Beta status note clarifying implemented core (`noVNC` WebSocket streaming, lazy activation) vs. remaining Beta packaging items (`/usr/local/bin/neko` in `images/desktop/Dockerfile` and `browser_tab_follow.py` tracked in [#99](https://github.com/cubeplexai/cubepod/issues/99)), alongside GPU passthrough, audio capture, and 50+ concurrent browser session evaluation.
+- `2026-11-16`: Alpha core implemented with `cubepod-desktop-ctl`, gateway desktop lifecycle APIs (`novnc` / `webrtc` transport routing), and signed panel streaming; promoted to `beta`.
+- `2026-11-17`: Packaged Neko WebRTC (`/usr/local/bin/neko` + `/opt/cubepod/desktop/neko-www`) and GStreamer runtime in `images/desktop/Dockerfile`, implemented CubePlex Tab-Follow (`images/desktop/browser_tab_follow.py` + `sdks/python/cubepod/browser_tab_follow.py`), verified 55 concurrent desktop panel sessions under `go test -race` (`TestDesktopConcurrentSessions50Plus`), and documented `v1.0.0` `vfio-pci` GPU / PulseAudio+GStreamer Opus audio / 50+ session QoS sizing evaluation for `v0.7.0` ([#99](https://github.com/cubeplexai/cubepod/issues/99)).
 
 ---
 

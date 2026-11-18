@@ -1,6 +1,13 @@
 """CubePod Python SDK — Sync & Async client for persistent MicroVM agent sandboxes."""
 
+from . import browser_tab_follow
 from .async_client import AsyncCubePod
+from .browser_tab_follow import (
+    FOCUS_SCRIPT,
+    WRAPPER_SCRIPT,
+    choose_target_id,
+    tab_follow_install_command,
+)
 from .exceptions import CubePodFileTooLargeError
 from .models import (
     CommandInfo,
@@ -54,4 +61,9 @@ __all__ = [
     "AsyncCubePod",
     "CubePod",
     "SyncCubePod",
+    "browser_tab_follow",
+    "FOCUS_SCRIPT",
+    "WRAPPER_SCRIPT",
+    "choose_target_id",
+    "tab_follow_install_command",
 ]

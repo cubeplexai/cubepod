@@ -14,7 +14,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/gateway"
@@ -474,5 +476,313 @@ func TestDesktopTransportWebRTCAndFallback(t *testing.T) {
 	_ = statusResp.Body.Close()
 	if statusBody.Status != "running" || statusBody.TransportUsed != "webrtc" || statusBody.Ports.WebRTC <= 0 {
 		t.Fatalf("expected GET /desktop/status to report running webrtc with port, got %+v", statusBody)
+	}
+}
+
+func TestDesktopConcurrentSessions50Plus(t *testing.T) {
+	const totalSessions = 55
+
+	var activeUpstreamWS atomic.Int64
+	var peakUpstreamWS atomic.Int64
+
+	desktopUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				http.Error(w, "hijack unsupported", http.StatusInternalServerError)
+				return
+			}
+			conn, rw, err := hj.Hijack()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			cur := activeUpstreamWS.Add(1)
+			defer activeUpstreamWS.Add(-1)
+			for {
+				prev := peakUpstreamWS.Load()
+				if cur <= prev || peakUpstreamWS.CompareAndSwap(prev, cur) {
+					break
+				}
+			}
+
+			accept := computeWebSocketAccept(r.Header.Get("Sec-WebSocket-Key"))
+			_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\n" +
+				"Upgrade: websocket\r\n" +
+				"Connection: Upgrade\r\n" +
+				"Sec-WebSocket-Accept: " + accept + "\r\n\r\n")
+			_ = rw.Flush()
+
+			for {
+				line, err := rw.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if strings.TrimSpace(line) == "bye" {
+					return
+				}
+				_, _ = rw.WriteString("echo:" + line)
+				_ = rw.Flush()
+			}
+		}
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = fmt.Fprintf(w, "panel-ok path=%s", r.URL.Path)
+	}))
+	defer desktopUpstream.Close()
+
+	upURL, _ := url.Parse(desktopUpstream.URL)
+	_, upPortStr, _ := net.SplitHostPort(upURL.Host)
+	upPort, _ := strconv.Atoi(upPortStr)
+
+	mockPodd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/health":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/commands/run":
+			var req struct {
+				Command string `json:"command"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			w.Header().Set("Content-Type", "application/json")
+			var statusJSON string
+			if strings.Contains(req.Command, "'webrtc'") {
+				statusJSON = fmt.Sprintf(
+					`{"status":"running","display":":99","resolution":"1280x800x24","transportUsed":"webrtc","ports":{"desktop":%d,"terminal":%d,"cdp":%d,"webrtc":%d},"pids":{"xvfb":10,"wm":11,"chromium":12,"vnc":13,"websockify":14,"ttyd":15,"neko":16}}`,
+					upPort, upPort, upPort, upPort,
+				)
+			} else {
+				statusJSON = fmt.Sprintf(
+					`{"status":"running","display":":99","resolution":"1280x800x24","transportUsed":"novnc","ports":{"desktop":%d,"terminal":%d,"cdp":%d},"pids":{"xvfb":10,"wm":11,"chromium":12,"vnc":13,"websockify":14,"ttyd":15}}`,
+					upPort, upPort, upPort,
+				)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id":        "cmd-conc",
+				"exit_code": 0,
+				"output":    statusJSON,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer mockPodd.Close()
+
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	tsParsed, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatalf("parse gateway URL: %v", err)
+	}
+
+	httpClient := &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        128,
+			MaxIdleConnsPerHost: 128,
+		},
+	}
+	defer httpClient.CloseIdleConnections()
+
+	startGate := make(chan struct{})
+	var readyWG sync.WaitGroup
+	var holdWG sync.WaitGroup
+	holdGate := make(chan struct{})
+	var doneWG sync.WaitGroup
+	errCh := make(chan error, totalSessions)
+
+	readyWG.Add(totalSessions)
+	holdWG.Add(totalSessions)
+	doneWG.Add(totalSessions)
+
+	for idx := 0; idx < totalSessions; idx++ {
+		idx := idx
+		go func() {
+			defer doneWG.Done()
+			holdDone := false
+			releaseHold := func() {
+				if !holdDone {
+					holdDone = true
+					holdWG.Done()
+				}
+			}
+			defer releaseHold()
+
+			createResp, err := httpClient.Post(
+				ts.URL+"/sandboxes",
+				"application/json",
+				strings.NewReader(`{"templateID":"cubeplex-ubuntu24-desktop"}`),
+			)
+			if err != nil {
+				readyWG.Done()
+				errCh <- fmt.Errorf("session %d create sandbox: %w", idx, err)
+				return
+			}
+			var rec gateway.SandboxRecord
+			decodeErr := json.NewDecoder(createResp.Body).Decode(&rec)
+			_ = createResp.Body.Close()
+			if decodeErr != nil {
+				readyWG.Done()
+				errCh <- fmt.Errorf("session %d decode sandbox: %w", idx, decodeErr)
+				return
+			}
+			srv.SetPoddURL(rec.SandboxID, mockPodd.URL)
+
+			readyWG.Done()
+			<-startGate
+
+			transport := "novnc"
+			if idx%2 == 0 {
+				transport = "webrtc"
+			}
+			startReqBody := fmt.Sprintf(`{"resolution":"1280x800x24","transport":%q,"expiresInSeconds":600}`, transport)
+			startResp, err := httpClient.Post(
+				ts.URL+"/sandboxes/"+rec.SandboxID+"/desktop/start",
+				"application/json",
+				strings.NewReader(startReqBody),
+			)
+			if err != nil {
+				errCh <- fmt.Errorf("session %d desktop/start: %w", idx, err)
+				return
+			}
+			var startData struct {
+				Status        string `json:"status"`
+				DesktopURL    string `json:"desktopUrl"`
+				WebRTCURL     string `json:"webrtcUrl"`
+				TransportUsed string `json:"transportUsed"`
+			}
+			err = json.NewDecoder(startResp.Body).Decode(&startData)
+			_ = startResp.Body.Close()
+			if err != nil {
+				errCh <- fmt.Errorf("session %d decode desktop/start: %w", idx, err)
+				return
+			}
+			if startResp.StatusCode != http.StatusOK || startData.TransportUsed != transport {
+				errCh <- fmt.Errorf("session %d unexpected start response (%d): %+v", idx, startResp.StatusCode, startData)
+				return
+			}
+
+			// 1. Concurrent HTTP panel request
+			httpTarget := startData.DesktopURL
+			wsPath := strings.Split(startData.DesktopURL, "/vnc.html")[0] + "/websockify"
+			if transport == "webrtc" {
+				httpTarget = startData.WebRTCURL + "index.html"
+				wsPath = startData.WebRTCURL + "ws"
+			}
+
+			panelResp, err := httpClient.Get(ts.URL + httpTarget)
+			if err != nil {
+				errCh <- fmt.Errorf("session %d HTTP panel GET: %w", idx, err)
+				return
+			}
+			panelBytes, _ := io.ReadAll(panelResp.Body)
+			_ = panelResp.Body.Close()
+			if panelResp.StatusCode != http.StatusOK || !strings.Contains(string(panelBytes), "panel-ok") {
+				errCh <- fmt.Errorf("session %d unexpected HTTP panel response (%d): %q", idx, panelResp.StatusCode, string(panelBytes))
+				return
+			}
+
+			// 2. Concurrent WebSocket panel tunnel held open simultaneously across all 55 sessions
+			conn, err := net.DialTimeout("tcp", tsParsed.Host, 10*time.Second)
+			if err != nil {
+				errCh <- fmt.Errorf("session %d dial WS: %w", idx, err)
+				return
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+
+			wsKey := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("cubepod-ws-key-%02d", idx)))
+			_, err = fmt.Fprintf(
+				conn,
+				"GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
+				wsPath,
+				tsParsed.Host,
+				wsKey,
+			)
+			if err != nil {
+				errCh <- fmt.Errorf("session %d write WS upgrade: %w", idx, err)
+				return
+			}
+
+			br := bufio.NewReader(conn)
+			statusLine, err := br.ReadString('\n')
+			if err != nil || !strings.Contains(statusLine, "101") {
+				errCh <- fmt.Errorf("session %d expected 101 upgrade, got %q (err=%v)", idx, statusLine, err)
+				return
+			}
+			for {
+				hdr, err := br.ReadString('\n')
+				if err != nil {
+					errCh <- fmt.Errorf("session %d read upgrade header: %w", idx, err)
+					return
+				}
+				if hdr == "\r\n" {
+					break
+				}
+			}
+
+			// Signal that this session's WebSocket tunnel is live, then wait until all 55 are open simultaneously.
+			releaseHold()
+			<-holdGate
+
+			for round := 1; round <= 2; round++ {
+				msg := fmt.Sprintf("session-%02d-sbx-%s-round-%d\n", idx, rec.SandboxID, round)
+				if _, err := conn.Write([]byte(msg)); err != nil {
+					errCh <- fmt.Errorf("session %d write WS payload: %w", idx, err)
+					return
+				}
+				reply, err := br.ReadString('\n')
+				if err != nil {
+					errCh <- fmt.Errorf("session %d read WS reply: %w", idx, err)
+					return
+				}
+				if reply != "echo:"+msg {
+					errCh <- fmt.Errorf("session %d stream mismatch: want %q, got %q", idx, "echo:"+msg, reply)
+					return
+				}
+			}
+
+			_, _ = conn.Write([]byte("bye\n"))
+		}()
+	}
+
+	readyWG.Wait()
+	close(startGate)
+
+	holdWG.Wait()
+	activeAtBarrier := srv.Metrics().PanelActiveSessions.Load()
+	close(holdGate)
+
+	doneWG.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent desktop session error: %v", err)
+		}
+	}
+
+	if activeAtBarrier < totalSessions {
+		t.Fatalf("expected >= %d simultaneous active panel sessions at barrier, got %d (peak upstream=%d)",
+			totalSessions, activeAtBarrier, peakUpstreamWS.Load())
+	}
+	if gotOK := srv.Metrics().DesktopActivationsOK.Load(); gotOK != totalSessions {
+		t.Fatalf("expected %d successful desktop activations, got %d", totalSessions, gotOK)
+	}
+
+	// Verify all 55 reverse-proxy handlers unwind cleanly with zero leaked PanelActiveSessions.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.Metrics().PanelActiveSessions.Load() == 0 && activeUpstreamWS.Load() == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if leaked := srv.Metrics().PanelActiveSessions.Load(); leaked != 0 {
+		t.Fatalf("panel session leak detected: expected 0 active sessions after close, got %d", leaked)
 	}
 }

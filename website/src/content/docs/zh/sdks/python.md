@@ -229,6 +229,34 @@ panel = await client.get_panel_endpoint(box.sandbox_id, port=8080, expires_in_se
 print(panel.url, panel.token, panel.expires_at)
 ```
 
+### 浏览器标签页自动跟随辅助模块 (`cubepod.browser_tab_follow`)
+
+*v0.7.0 新增。*
+
+当 Agent 通过 `agent-browser` 经由 CDP（`127.0.0.1:9222`）驱动后台 Chromium 标签页时，`cubepod.browser_tab_follow` 可通过精确归一化 URL 匹配（忽略末尾 `/`，绝不进行前缀误匹配）定位对应的 `"type": "page"` 目标并调用 `/json/activate/<id>` 自动聚焦前台画面：
+
+```python
+from cubepod.browser_tab_follow import (
+    FOCUS_SCRIPT,
+    WRAPPER_SCRIPT,
+    choose_target_id,
+    tab_follow_install_command,
+)
+
+# 精确匹配目标 CDP 页面 ID（返回 "tab-login"，绝不会前缀误匹配到 "tab-home"）
+target_id = choose_target_id(
+    [
+        {"id": "tab-home", "type": "page", "url": "https://ex.com/"},
+        {"id": "tab-login", "type": "page", "url": "https://ex.com/login"},
+    ],
+    "https://ex.com/login/",
+)
+
+# 以 root 权限向已有沙箱幂等注入 # CUBEPLEX_TAB_FOLLOW=1 包装脚本（保留 agent-browser.real）
+# （v0.7.0+ 的 images/desktop 镜像已在 /opt/cubepod/desktop/browser_tab_follow.py 内置该脚本）
+await client.execute(box.sandbox_id, tab_follow_install_command(), uid=0, gid=0)
+```
+
 ## Zero-Trust `cpodref_` 出站密钥绑定
 
 切勿将真实的外部 API 密钥直接放入 `envs` 或沙箱文件中。请在创建沙箱时注册 `secret_bindings`，确保 MicroVM 内部仅存在不透明的 `cpodref_` 占位符，而由 `cubepod-egress` 在放行目标域名时再注入真实凭证：

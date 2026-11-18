@@ -24,8 +24,13 @@ DISPLAY_NUM="${CUBEPOD_DISPLAY:-:99}"
 DEFAULT_RESOLUTION="${CUBEPOD_RESOLUTION:-1280x800x24}"
 DEFAULT_URL="${CUBEPOD_INITIAL_URL:-about:blank}"
 NOVNC_DIR="${CUBEPOD_NOVNC_DIR:-/usr/share/novnc}"
+NEKO_STATIC="${CUBEPOD_NEKO_STATIC:-/opt/cubepod/desktop/neko-www}"
+NEKO_ICELITE="${CUBEPOD_NEKO_ICELITE:-1}"
 PROFILE_DIR="${CUBEPOD_BROWSER_PROFILE_DIR:-/home/cubeplex/.config/chromium}"
 WORKDIR="${CUBEPOD_WORKDIR:-/workspace}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TAB_FOLLOW_SCRIPT="${CUBEPOD_TAB_FOLLOW_SCRIPT:-${SCRIPT_DIR}/browser_tab_follow.py}"
 
 resolve_run_dir() {
   if [ -n "${CUBEPOD_DESKTOP_RUN_DIR:-}" ]; then
@@ -150,6 +155,35 @@ resolve_neko_bin() {
   return 1
 }
 
+resolve_neko_nat1to1() {
+  if [ -n "${CUBEPOD_NEKO_NAT1TO1:-}" ]; then
+    printf '%s' "$CUBEPOD_NEKO_NAT1TO1"
+    return 0
+  fi
+  local ip=""
+  if command -v hostname >/dev/null 2>&1; then
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  printf '%s' "${ip:-127.0.0.1}"
+}
+
+ensure_tab_follow_wrapper() {
+  [ -f "$TAB_FOLLOW_SCRIPT" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  local wrap_bin="${CUBEPOD_AGENT_BROWSER_BIN:-/usr/local/bin/agent-browser}"
+  local wrap_dir
+  wrap_dir="$(dirname "$wrap_bin")"
+
+  if [ -e "$wrap_bin" ] || [ -e "${wrap_bin}.real" ] || { [ "$wrap_bin" = "/usr/local/bin/agent-browser" ] && [ -e /usr/bin/agent-browser ]; }; then
+    if [ -d "$wrap_dir" ] && [ -w "$wrap_dir" ]; then
+      if [ ! -e "$wrap_bin" ] || [ -w "$wrap_bin" ]; then
+        python3 "$TAB_FOLLOW_SCRIPT" --install-wrapper >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+}
+
 save_state() {
   local resolution="$1"
   local display="$2"
@@ -260,6 +294,27 @@ wait_xvfb_ready() {
     i=$((i + 1))
   done
   return 0
+}
+
+is_tcp_listening() {
+  local port="$1"
+  ( : </dev/tcp/127.0.0.1/"$port" ) >/dev/null 2>&1
+}
+
+wait_neko_ready() {
+  local i=0
+  while [ "$i" -lt 60 ]; do
+    if ! get_daemon_pid neko >/dev/null; then
+      return 1
+    fi
+    if is_tcp_listening "$WEBRTC_PORT"; then
+      get_daemon_pid neko >/dev/null && return 0
+      return 1
+    fi
+    sleep 0.05
+    i=$((i + 1))
+  done
+  return 1
 }
 
 parse_resolution_dims() {
@@ -428,6 +483,7 @@ cmd_start() {
   fi
 
   prepare_dirs
+  ensure_tab_follow_wrapper
   save_state "$resolution" "$DISPLAY_NUM" "$transport_used" "$fallback_reason"
 
   if ! get_daemon_pid xvfb >/dev/null; then
@@ -472,15 +528,49 @@ cmd_start() {
   fi
 
   if [ "$transport_used" = "webrtc" ]; then
-    if ! get_daemon_pid neko >/dev/null; then
-      spawn_daemon neko "$WORKDIR" \
+    local neko_ok=1
+    if get_daemon_pid neko >/dev/null && is_tcp_listening "$WEBRTC_PORT"; then
+      neko_ok=0
+    else
+      stop_daemons neko
+      local neko_icelite_bool="false"
+      case "${NEKO_ICELITE,,}" in
+        1|true|yes|on) neko_icelite_bool="true" ;;
+      esac
+      local neko_nat1to1
+      neko_nat1to1="$(resolve_neko_nat1to1)"
+      if spawn_daemon neko "$WORKDIR" \
         env NEKO_DISPLAY="$DISPLAY_NUM" \
+        NEKO_DESKTOP_DISPLAY="$DISPLAY_NUM" \
+        NEKO_CAPTURE_VIDEO_DISPLAY="$DISPLAY_NUM" \
+        NEKO_DESKTOP_INPUT_ENABLED="${CUBEPOD_NEKO_INPUT_DRIVER:-false}" \
         NEKO_BIND="0.0.0.0:${WEBRTC_PORT}" \
+        NEKO_SERVER_BIND="0.0.0.0:${WEBRTC_PORT}" \
         NEKO_SCREEN="${RES_WIDTH}x${RES_HEIGHT}@30" \
+        NEKO_DESKTOP_SCREEN="${RES_WIDTH}x${RES_HEIGHT}@30" \
         NEKO_EPR="${CUBEPOD_NEKO_EPR:-52000-52100}" \
+        NEKO_WEBRTC_EPR="${CUBEPOD_NEKO_EPR:-52000-52100}" \
+        NEKO_STATIC="$NEKO_STATIC" \
+        NEKO_SERVER_STATIC="$NEKO_STATIC" \
+        NEKO_ICELITE="$NEKO_ICELITE" \
+        NEKO_WEBRTC_ICELITE="$neko_icelite_bool" \
+        NEKO_NAT1TO1="$neko_nat1to1" \
+        NEKO_WEBRTC_NAT1TO1="$neko_nat1to1" \
+        NEKO_IPFETCH="${CUBEPOD_NEKO_IPFETCH:-}" \
+        NEKO_WEBRTC_IP_RETRIEVAL_URL="${CUBEPOD_NEKO_IPFETCH:-}" \
         NEKO_PASSWORD="${CUBEPOD_NEKO_PASSWORD:-neko}" \
+        NEKO_MEMBER_MULTIUSER_USER_PASSWORD="${CUBEPOD_NEKO_PASSWORD:-neko}" \
         NEKO_PASSWORD_ADMIN="${CUBEPOD_NEKO_PASSWORD_ADMIN:-admin}" \
-        "$neko_bin" serve
+        NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD="${CUBEPOD_NEKO_PASSWORD_ADMIN:-admin}" \
+        "$neko_bin" serve && wait_neko_ready; then
+        neko_ok=0
+      fi
+    fi
+    if [ "$neko_ok" -ne 0 ]; then
+      stop_daemons neko
+      transport_used="novnc"
+      fallback_reason="neko_start_failed"
+      save_state "$resolution" "$DISPLAY_NUM" "$transport_used" "$fallback_reason"
     fi
   else
     stop_daemons neko
