@@ -7,8 +7,14 @@ import tempfile
 import unittest
 
 from cleanup_node import owned_files, validate_pool, validate_thin
+from verify_guest_log import guest_ready
 
 class RuntimeProofTest(unittest.TestCase):
+    def test_guest_proof_requires_both_exact_kernel_and_output(self):
+        for text in ('', '6.18.62\n', 'KATA_GUEST_READY\n', '6.12.113\nKATA_GUEST_READY\n'):
+            self.assertFalse(guest_ready(text))
+        self.assertTrue(guest_ready('6.18.62\r\nKATA_GUEST_READY\r\n'))
+
     def verify(self, runtime='kata-clh-e2e', count=12, expected='kata-clh-e2e'):
         events = [{'type':'ADDED', 'object':{'kind':'Pod','metadata':{'name':f'sandbox-{i}'},'spec':{'runtimeClassName':runtime}}} for i in range(count)]
         with tempfile.TemporaryDirectory() as directory:

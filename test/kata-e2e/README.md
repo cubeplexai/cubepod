@@ -99,3 +99,24 @@ required vhost-vsock transport, matching RuntimeClass and the same unskipped SDK
 suite. It is deliberately not labeled covered by this FC/CLH-focused change.
 Production RWX CSI, multi-node, zero-trust egress, desktop and performance SLAs
 are outside this single-node integration harness.
+
+
+## Current integration evidence and unresolved FC dependency
+
+On 2026-11-18, hosted `ubuntu-24.04` booted native FC and CLH Linux guests.
+CLH additionally passed all five official Python and all five official
+TypeScript scenarios, with zero skips, actual VMM process proof and twelve
+RuntimeClass-matching Pods (run `44248528618`). That run remained red due strict
+CSI cleanup; a successful test report is not a successful cleanup check.
+
+FC currently remains red before the SDK suite: containerd's devmapper plugin
+creates thin mappings, but their `/dev/mapper/OWNED-pool-snap-N` device entries
+are absent in kind's private `/dev` without udev (run `44249767997`). The owned
+pool itself, CRI and explicit transfer unpack configuration are working; the
+owned thin mappings/pool/loops were cleaned. Do not fix this by mounting the
+host's entire `/dev` read-write, running broad host udev rules, skipping volumes
+or accepting a native guest as full E2E. A node-scoped, ownership-checked device
+publication mechanism (including every child snapshot, not just the pool) is
+still required before claiming FC Kata/SDK coverage. The full lane deliberately
+fails visibly until resolved. Native Linux guest success is not the missing
+Kata/SDK proof.
