@@ -2,12 +2,15 @@ package gateway_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -386,4 +389,148 @@ func TestSandboxMetrics_TenantIsolationAndDeleteEviction(t *testing.T) {
 	delReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+sbB.SandboxID, nil)
 	delResp, _ := ts.Client().Do(delReq)
 	_ = delResp.Body.Close()
+}
+
+func historicalSamples(t *testing.T, ts *httptest.Server, id string) []gateway.SandboxMetric {
+	t.Helper()
+	// A past `end` makes the handler serve ring-buffer history only (no on-demand poll).
+	end := time.Now().Add(-time.Minute).Unix()
+	resp, err := ts.Client().Get(fmt.Sprintf("%s/sandboxes/%s/metrics?start=0&end=%d", ts.URL, id, end))
+	if err != nil {
+		t.Fatalf("GET historical metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+	var out []gateway.SandboxMetric
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return out
+}
+
+func TestMetricsSampler_BackgroundTicksPopulateHistory(t *testing.T) {
+	srv := gateway.NewServer(controller.NewReconciler())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	var hits atomic.Int64
+	mockPodd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := hits.Add(1)
+		// Distinct past timestamps so every sample is retained and queryable historically.
+		tsSample := time.Now().Add(-time.Hour).Add(time.Duration(n) * time.Second).UTC()
+		_ = json.NewEncoder(w).Encode(gateway.SandboxMetric{
+			Timestamp: tsSample.Format(time.RFC3339), TimestampUnix: tsSample.Unix(),
+			CPUCount: 2, CPUUsedPct: 10, MemUsed: 1, MemTotal: 100, DiskUsed: 1, DiskTotal: 100,
+		})
+	}))
+	defer mockPodd.Close()
+
+	rec := createTestSandbox(t, ts.Client(), ts.URL)
+	srv.SetPoddURL(rec.SandboxID, mockPodd.URL)
+
+	srv.StartMetricsSampler(context.Background(), 20*time.Millisecond)
+	defer srv.StopMetricsSampler()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for hits.Load() < 4 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	srv.StopMetricsSampler()
+	got := historicalSamples(t, ts, rec.SandboxID)
+	if len(got) < 3 {
+		t.Fatalf("expected >=3 background samples, got %d", len(got))
+	}
+
+	mresp, err := ts.Client().Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(mresp.Body)
+	mresp.Body.Close()
+	if !strings.Contains(string(body), `cubepod_sandbox_metrics_samples_total{result="ok"}`) ||
+		strings.Contains(string(body), `cubepod_sandbox_metrics_samples_total{result="ok"} 0`) {
+		t.Fatalf("sampler ok counter missing/zero:\n%s", body)
+	}
+}
+
+func TestMetricsSampler_SkipsPausedAndHandlesErrors(t *testing.T) {
+	srv := gateway.NewServer(controller.NewReconciler())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	var okHits, badHits atomic.Int64
+	okPodd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		okHits.Add(1)
+		_ = json.NewEncoder(w).Encode(gateway.SandboxMetric{CPUCount: 1, MemTotal: 1, DiskTotal: 1})
+	}))
+	defer okPodd.Close()
+	badPodd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		badHits.Add(1)
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer badPodd.Close()
+
+	paused := createTestSandbox(t, ts.Client(), ts.URL)
+	srv.SetPoddURL(paused.SandboxID, okPodd.URL)
+	pr, err := ts.Client().Post(ts.URL+"/sandboxes/"+paused.SandboxID+"/pause", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr.Body.Close()
+	okHitsAfterPause := okHits.Load()
+
+	failing := createTestSandbox(t, ts.Client(), ts.URL)
+	srv.SetPoddURL(failing.SandboxID, badPodd.URL)
+
+	srv.StartMetricsSampler(context.Background(), 20*time.Millisecond)
+	deadline := time.Now().Add(5 * time.Second)
+	for badHits.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	srv.StopMetricsSampler()
+
+	if badHits.Load() < 2 {
+		t.Fatalf("failing sandbox was not polled")
+	}
+	if okHits.Load() != okHitsAfterPause {
+		t.Fatalf("paused sandbox was polled by sampler")
+	}
+	mresp, err := ts.Client().Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(mresp.Body)
+	mresp.Body.Close()
+	if strings.Contains(string(body), `cubepod_sandbox_metrics_samples_total{result="error"} 0`) {
+		t.Fatalf("expected error counter > 0:\n%s", body)
+	}
+}
+
+func TestMetricsSampler_StopIsCleanAndIdempotent(t *testing.T) {
+	srv := gateway.NewServer(controller.NewReconciler())
+	before := runtime.NumGoroutine()
+	srv.StopMetricsSampler() // no-op before start
+	for i := 0; i < 5; i++ {
+		srv.StartMetricsSampler(context.Background(), 5*time.Millisecond)
+	}
+	srv.StartMetricsSampler(context.Background(), 0) // disabled: no-op
+	time.Sleep(30 * time.Millisecond)
+	srv.StopMetricsSampler()
+	srv.StopMetricsSampler()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if after := runtime.NumGoroutine(); after > before {
+		t.Fatalf("goroutine leak: before=%d after=%d", before, after)
+	}
+
+	// Parent context cancellation also stops the loop.
+	ctx, cancel := context.WithCancel(context.Background())
+	srv.StartMetricsSampler(ctx, 5*time.Millisecond)
+	cancel()
+	srv.StopMetricsSampler()
 }

@@ -33,33 +33,34 @@ func defaultEgressImage() string {
 
 func main() {
 	var (
-		addr                 = flag.String("addr", ":8080", "HTTP listen address for CubePod Gateway")
-		namespace            = flag.String("namespace", "cubepod-workloads", "Kubernetes namespace for PodBox workloads")
-		kubeAPI              = flag.String("kube-api", "", "Kubernetes API Server URL (empty to auto-detect from in-cluster / env)")
-		kubeToken            = flag.String("kube-token", "", "Kubernetes API Bearer token")
-		storageClass         = flag.String("storage-class", "nfs-storage", "Default StorageClass name")
-		volumeMode           = flag.String("volume-mode", "Filesystem", "Storage volume mode (Block or Filesystem)")
-		runtimeClass         = flag.String("runtime-class", "", "Container runtime class name (empty for standard runc/containerd)")
-		poddImage            = flag.String("podd-image", "ghcr.io/cubeplexai/cubepod-podd:v0.6.0", "Image for podd-installer initContainer")
-		sandboxImage         = flag.String("sandbox-image", "ubuntu:24.04", "Default sandbox image")
-		egressImage          = flag.String("egress-image", defaultEgressImage(), "Default cubepod-egress sidecar image when template egress.image is empty")
-		livePodRouting       = flag.Bool("live-pod-routing", true, "Route commands and files to live in-cluster Pod IP")
-		e2bTemplateAPI       = flag.Bool("e2b-template-api", false, "Enable E2B template API feature gate")
-		featureGate          = flag.String("feature-gate", "", "Comma-separated feature gates (e.g. E2BTemplateAPI=true)")
-		templateBuild        = flag.Bool("template-build", false, "Enable template image build Beta pipeline")
-		controllerURL        = flag.String("controller-url", "", "Base URL of cubepod-controller for forwarding template build operations")
-		stateDir             = flag.String("state-dir", "", "State directory for local template catalog, contexts, and logs")
-		templateProbeTimeout = flag.Duration("template-probe-timeout", 120*time.Second, "Timeout for template readyCmd probe")
-		templateRegistry     = flag.String("template-registry", "", "Target OCI registry URL for template builds (local single-process mode)")
-		templateRepoPrefix   = flag.String("template-repo-prefix", "cubepod-templates", "Repository prefix under target template registry")
-		templatePullSecret   = flag.String("template-pull-secret", "", "Kubernetes imagePullSecret attached to sandbox pods")
-		imagePullSecrets     = flag.String("image-pull-secrets", os.Getenv("CUBEPOD_IMAGE_PULL_SECRETS"), "Comma-separated Kubernetes imagePullSecrets attached to sandbox Pods")
-		egressCACert         = flag.String("egress-ca-cert", os.Getenv("CUBEPOD_EGRESS_CA_CERT"), "Path to egress mTLS root CA certificate PEM")
-		egressCAKey          = flag.String("egress-ca-key", os.Getenv("CUBEPOD_EGRESS_CA_KEY"), "Path to egress mTLS root CA private key PEM")
-		egressUpstreamCAFile = flag.String("egress-upstream-ca-file", os.Getenv("CUBEPOD_EGRESS_UPSTREAM_CA_FILE"), "Optional path to upstream CA PEM mounted into egress sidecars")
-		egressMTLSAddr       = flag.String("egress-mtls-addr", os.Getenv("CUBEPOD_EGRESS_MTLS_ADDR"), "Optional mTLS listen address for /internal/v1/egress/exchange")
-		egressTLSCert        = flag.String("egress-tls-cert", os.Getenv("CUBEPOD_EGRESS_TLS_CERT"), "Optional TLS server certificate PEM path for --egress-mtls-addr")
-		egressTLSKey         = flag.String("egress-tls-key", os.Getenv("CUBEPOD_EGRESS_TLS_KEY"), "Optional TLS server private key PEM path for --egress-mtls-addr")
+		addr                  = flag.String("addr", ":8080", "HTTP listen address for CubePod Gateway")
+		namespace             = flag.String("namespace", "cubepod-workloads", "Kubernetes namespace for PodBox workloads")
+		kubeAPI               = flag.String("kube-api", "", "Kubernetes API Server URL (empty to auto-detect from in-cluster / env)")
+		kubeToken             = flag.String("kube-token", "", "Kubernetes API Bearer token")
+		storageClass          = flag.String("storage-class", "nfs-storage", "Default StorageClass name")
+		volumeMode            = flag.String("volume-mode", "Filesystem", "Storage volume mode (Block or Filesystem)")
+		runtimeClass          = flag.String("runtime-class", "", "Container runtime class name (empty for standard runc/containerd)")
+		poddImage             = flag.String("podd-image", "ghcr.io/cubeplexai/cubepod-podd:v0.6.0", "Image for podd-installer initContainer")
+		sandboxImage          = flag.String("sandbox-image", "ubuntu:24.04", "Default sandbox image")
+		egressImage           = flag.String("egress-image", defaultEgressImage(), "Default cubepod-egress sidecar image when template egress.image is empty")
+		livePodRouting        = flag.Bool("live-pod-routing", true, "Route commands and files to live in-cluster Pod IP")
+		e2bTemplateAPI        = flag.Bool("e2b-template-api", false, "Enable E2B template API feature gate")
+		featureGate           = flag.String("feature-gate", "", "Comma-separated feature gates (e.g. E2BTemplateAPI=true)")
+		templateBuild         = flag.Bool("template-build", false, "Enable template image build Beta pipeline")
+		controllerURL         = flag.String("controller-url", "", "Base URL of cubepod-controller for forwarding template build operations")
+		stateDir              = flag.String("state-dir", "", "State directory for local template catalog, contexts, and logs")
+		templateProbeTimeout  = flag.Duration("template-probe-timeout", 120*time.Second, "Timeout for template readyCmd probe")
+		templateRegistry      = flag.String("template-registry", "", "Target OCI registry URL for template builds (local single-process mode)")
+		templateRepoPrefix    = flag.String("template-repo-prefix", "cubepod-templates", "Repository prefix under target template registry")
+		templatePullSecret    = flag.String("template-pull-secret", "", "Kubernetes imagePullSecret attached to sandbox pods")
+		imagePullSecrets      = flag.String("image-pull-secrets", os.Getenv("CUBEPOD_IMAGE_PULL_SECRETS"), "Comma-separated Kubernetes imagePullSecrets attached to sandbox Pods")
+		egressCACert          = flag.String("egress-ca-cert", os.Getenv("CUBEPOD_EGRESS_CA_CERT"), "Path to egress mTLS root CA certificate PEM")
+		egressCAKey           = flag.String("egress-ca-key", os.Getenv("CUBEPOD_EGRESS_CA_KEY"), "Path to egress mTLS root CA private key PEM")
+		egressUpstreamCAFile  = flag.String("egress-upstream-ca-file", os.Getenv("CUBEPOD_EGRESS_UPSTREAM_CA_FILE"), "Optional path to upstream CA PEM mounted into egress sidecars")
+		egressMTLSAddr        = flag.String("egress-mtls-addr", os.Getenv("CUBEPOD_EGRESS_MTLS_ADDR"), "Optional mTLS listen address for /internal/v1/egress/exchange")
+		egressTLSCert         = flag.String("egress-tls-cert", os.Getenv("CUBEPOD_EGRESS_TLS_CERT"), "Optional TLS server certificate PEM path for --egress-mtls-addr")
+		egressTLSKey          = flag.String("egress-tls-key", os.Getenv("CUBEPOD_EGRESS_TLS_KEY"), "Optional TLS server private key PEM path for --egress-mtls-addr")
+		metricsSampleInterval = flag.Duration("metrics-sample-interval", envDuration("CUBEPOD_METRICS_SAMPLE_INTERVAL", 10*time.Second), "Background sandbox metrics sampling interval (0 disables)")
 	)
 	flag.Parse()
 
@@ -312,6 +313,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if *metricsSampleInterval > 0 {
+		gw.StartMetricsSampler(ctx, *metricsSampleInterval)
+		defer gw.StopMetricsSampler()
+		slog.Info("started background sandbox metrics sampler", "interval", metricsSampleInterval.String())
+	}
+
 	if secretsK8s {
 		gw.StartSecretsSync(ctx, 5*time.Second)
 		slog.Info("started background E2B Kubernetes secret sync loop", "interval", "5s")
@@ -435,4 +442,17 @@ func buildEgressMTLSServer(addr, certPath, keyPath, namespace string, clientCA *
 			MinVersion:   tls.VersionTLS12,
 		},
 	}, nil
+}
+
+func envDuration(key string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		slog.Warn("invalid duration env, using default", "key", key, "value", raw)
+		return def
+	}
+	return d
 }
