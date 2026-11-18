@@ -145,3 +145,13 @@ is not covered by this profile**; the initial failure is documented rather than
 claimed fixed in the external driver. See the driver's state/unpublish behavior
 in https://github.com/kubernetes-csi/csi-driver-host-path/issues/217 and
 https://github.com/kubernetes-csi/csi-driver-host-path/issues/457.
+
+
+The retained-volume fixture needs more than the eight loop aliases initially
+visible in a privileged kind node. The harness creates up to 128 **private node
+`/dev/loopN` entries**, validating any existing entries and never changing a host
+`/dev` path or reserving/attaching a kernel loop at that stage. CSI later selects
+free loops for this cluster's own backing files; cleanup verifies their inodes
+and actual detach. Without these aliases, captured run44253236266 passed CLH's
+first three Python tests then failed real PVC provisioning with `losetup -f`;
+those failures remain archived rather than hidden as SDK skips.
