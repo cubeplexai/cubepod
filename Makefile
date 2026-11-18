@@ -112,3 +112,9 @@ test-kind-e2e:
 .PHONY: test-compose-e2e
 test-compose-e2e:
 	bash test/compose-e2e/run.sh
+
+.PHONY: test-kind-fc-e2e test-kind-clh-e2e
+test-kind-fc-e2e:
+	KATA_VMM=fc bash test/kind-e2e/run.sh
+test-kind-clh-e2e:
+	KATA_VMM=clh bash test/kind-e2e/run.sh

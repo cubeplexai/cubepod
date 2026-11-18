@@ -41,10 +41,18 @@ finish() {
   trap - EXIT
   set +e
   if [[ $ACTIVE_OWNER != 1 ]]; then
+    if [[ -n ${KATA_VMM:-} ]]; then kata_cleanup || rc=1; fi
     echo "No cluster acquired by this invocation; artifacts: $ARTIFACTS"
     exit "$rc"
   fi
   collect
+  if [[ -n ${KATA_VMM:-} ]]; then
+    kata_collect
+    if ! kata_teardown_node; then
+      echo "Kata device cleanup failed; retaining owned node and state for safe recovery" >&2
+      KEEP_CLUSTER=1; rc=1
+    fi
+  fi
   # Keep the development control plane, not leaked sandboxes from failed creates.
   if owned && [[ ${KEEP_CLUSTER:-0} == 1 ]]; then
     k delete podboxes.cubepod.io --all -n "$NS" --ignore-not-found --timeout=30s || { [[ $rc != 0 ]] || rc=1; }
@@ -59,6 +67,7 @@ finish() {
       [[ $rc != 0 ]] || rc=1
     fi
   fi
+  if [[ -n ${KATA_VMM:-} ]]; then kata_cleanup || rc=1; fi
   echo "Exit: $rc; artifacts: $ARTIFACTS"
   if owned; then echo "Retained cluster: $CLUSTER_NAME; KUBECONFIG=$KUBECONFIG"; fi
   exit "$rc"
@@ -88,7 +97,9 @@ build_images() {
   for component in gateway controller injector sandbox; do
     local image=$component
     [[ "$component" != injector ]] || image=podd
-    timeout 600s docker build -f "$HERE/Dockerfile" --target "$component" -t "docker.io/cubepod-kind/$image:$CLUSTER_NAME" "$BUILD"
+    local target=$component
+    if [[ "$component" == sandbox && -n ${KATA_VMM:-} ]]; then target=sandbox-block; fi
+    timeout 600s docker build -f "$HERE/Dockerfile" --target "$target" -t "docker.io/cubepod-kind/$image:$CLUSTER_NAME" "$BUILD"
   done
 }
 ensure_new_cluster() {
@@ -98,6 +109,7 @@ ensure_new_cluster() {
 }
 create() {
   ensure_new_cluster
+  if [[ -n ${KATA_VMM:-} ]]; then kata_prepare; fi
   # Mark ownership before create so even partial failures are collected/cleaned.
   ACTIVE_OWNER=1
   printf '%s\n' "$CLUSTER_NAME" >"$STATE/owned"
@@ -110,18 +122,24 @@ networking:
 nodes:
 - role: control-plane
 EOF
+  if [[ -n ${KATA_VMM:-} ]]; then kata_kind_config; fi
   timeout 300s kind create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$STATE/kind.yaml" --kubeconfig "$KUBECONFIG" --wait 180s --retain
   chmod 600 "$KUBECONFIG"
   timeout 300s kind load docker-image --name "$CLUSTER_NAME" docker.io/cubepod-kind/{gateway,controller,podd,sandbox}:"$CLUSTER_NAME"
+  if [[ -n ${KATA_VMM:-} ]]; then kata_configure; fi
   k create namespace "$NS"
   k label namespace "$NS" app.kubernetes.io/managed-by=Helm
   k annotate namespace "$NS" meta.helm.sh/release-name=cubepod meta.helm.sh/release-namespace="$NS"
   k apply -f "$HERE/storage.yaml"
+  local runtime_args=()
+  if [[ -n ${KATA_VMM:-} ]]; then runtime_args=(--set "runtime.runtimeClassName=kata-$KATA_VMM-e2e" --set storage.volumeMode=Block --set storage.storageClassName=cubepod-block); fi
   timeout 240s helm upgrade --install cubepod "$ROOT/deploy/helm/cubepod" --namespace "$NS" --kube-context "kind-$CLUSTER_NAME" -f "$HERE/values.yaml" \
     --set gateway.image.tag="$CLUSTER_NAME" --set controller.image.tag="$CLUSTER_NAME" \
     --set runtime.poddInjectorImage="docker.io/cubepod-kind/podd:$CLUSTER_NAME" \
-    --set runtime.defaultSandboxImage="docker.io/cubepod-kind/sandbox:$CLUSTER_NAME" --wait --timeout 180s
-  sed "s/:e2e/:$CLUSTER_NAME/g" "$HERE/template.yaml" | k apply -f -
+    --set runtime.defaultSandboxImage="docker.io/cubepod-kind/sandbox:$CLUSTER_NAME" "${runtime_args[@]}" --wait --timeout 180s
+  local runtime=none storage=standard
+  if [[ -n ${KATA_VMM:-} ]]; then runtime="kata-$KATA_VMM-e2e"; storage=cubepod-block; fi
+  sed -e "s/:e2e/:$CLUSTER_NAME/g" -e "s/runtimeClassName: none/runtimeClassName: $runtime/" -e "s/storageClassName: standard/storageClassName: $storage/" "$HERE/template.yaml" | k apply -f -
   sed "s/:e2e/:$CLUSTER_NAME/g" "$HERE/network.yaml" | k apply -f -
   # Prebuilt local test image: declare it ready, without invoking template builds.
   k patch podtemplates.cubepod.io kind-e2e -n "$NS" --subresource=status --type=merge -p "{\"status\":{\"buildStatus\":\"ready\",\"readyImage\":\"docker.io/cubepod-kind/sandbox:$CLUSTER_NAME\",\"readyBuildID\":\"kind-local\",\"templateID\":\"kind-e2e\"}}"
@@ -142,7 +160,9 @@ test_sdks() {
   [[ -n "$port" ]] || { echo 'Port forward timed out'; return 1; }
   export E2B_API_URL="http://127.0.0.1:$port" E2B_SANDBOX_URL="http://127.0.0.1:$port" E2B_VOLUME_API_URL="http://127.0.0.1:$port" E2B_API_KEY=cpod_kind_test_only
   local sdk=0
+  if [[ -n ${KATA_VMM:-} ]]; then kata_watch_sdks; fi
   STATE="$STATE" ARTIFACTS="$ARTIFACTS" bash "$HERE/run-sdks.sh" || sdk=$?
+  if [[ -n ${KATA_VMM:-} ]]; then kata_verify_sdks || sdk=1; fi
   # Never turn a missing report, skip, or unexpectedly empty suite into green.
   local deleted=0
   k wait --for=delete pods -n "$NS" -l pod.cubeplex.ai/box --timeout=60s >"$ARTIFACTS/sandbox-cleanup.txt" 2>&1 || deleted=$?
@@ -150,9 +170,20 @@ test_sdks() {
   python3 "$HERE/check_reports.py" "$ARTIFACTS/python.xml" "$ARTIFACTS/typescript.xml" || return 1
   (( sdk == 0 && deleted == 0 ))
 }
+if [[ -f "$STATE/kata-owned" ]]; then
+  stored_vmm=$(<"$STATE/kata-profile")
+  [[ "$stored_vmm" == fc || "$stored_vmm" == clh ]] || { echo 'Invalid owned Kata profile'; exit 2; }
+  [[ -z ${KATA_VMM:-} || "$KATA_VMM" == "$stored_vmm" ]] || { echo 'Owned runtime/profile mismatch'; exit 2; }
+  KATA_VMM=$stored_vmm
+fi
+if [[ -n ${KATA_VMM:-} ]]; then
+  source "$ROOT/test/kata-e2e/hooks.sh"
+fi
 case "${1:-run}" in
   run) preflight; ensure_new_cluster; trap finish EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; build_images; create; test_sdks ;;
-  test) preflight; owned || { echo 'No owned cluster; use run first.'; exit 1; }; ACTIVE_OWNER=1; trap finish EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; test_sdks ;;
-  down) owned || { echo 'No owned cluster at this state path'; exit 1; }; ACTIVE_OWNER=1; trap finish EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; KEEP_CLUSTER=0 ;;
+  test) preflight; owned || { echo 'No owned cluster; use run first.'; exit 1; }; ACTIVE_OWNER=1; if [[ -n ${KATA_VMM:-} ]]; then KATA_ACTIVE=1; fi; trap finish EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; test_sdks ;;
+  down) if owned; then ACTIVE_OWNER=1
+    elif [[ -n ${KATA_VMM:-} && -f "$STATE/kata-owned" && $(<"$STATE/kata-owned") == "$CLUSTER_NAME" ]]; then ACTIVE_OWNER=0
+    else echo 'No owned cluster or Kata setup at this state path'; exit 1; fi; if [[ -n ${KATA_VMM:-} ]]; then KATA_ACTIVE=1; fi; trap finish EXIT; trap 'exit 130' INT; trap 'exit 143' TERM; KEEP_CLUSTER=0 ;;
   *) echo 'Usage: run.sh [run|test|down]'; exit 2 ;;
 esac

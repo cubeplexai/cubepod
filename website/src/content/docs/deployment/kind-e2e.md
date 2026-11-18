@@ -33,3 +33,35 @@ and failure-artifact troubleshooting, see the
 [runner documentation](https://github.com/cubeplexai/cubepod/blob/main/test/kind-e2e/README.md).
 The `Kind E2E` GitHub Actions workflow runs the same command on PRs and supports
 manual dispatch, with bounded execution and downloadable reports and diagnostics.
+
+## Independent Kata Firecracker and Cloud Hypervisor lanes
+
+Added after v0.6.0. The runc baseline stays non-KVM. Two additional independently
+reported checks run the same complete official dual-SDK scenarios with real Kata:
+
+```sh
+make test-kind-fc-e2e
+make test-kind-clh-e2e
+```
+
+Allow at least 6 GiB **available** RAM and 20 GiB free disk on an x86_64 Linux KVM
+host. The lanes pin Kata 4.4.0, bundled FC 1.17.0 / CLH 54.1 and Linux 6.18.62.
+They first execute KVM VM/vCPU checks and boot an actual Linux guest with each
+VMM, then boot a real Kata Pod before deploying CubePod with block rootfs and
+workspace CSI volumes. Both SDKs assert the guest kernel, and Kubernetes evidence
+must show the requested runtime for all created sandboxes; no runc fallback or
+skipped tests count as success. Matrix `fail-fast` is disabled.
+
+FC also needs a devmapper snapshotter/thin-pool. The harness uses only its newly
+owned loop files and checked pool UUID; it never formats an existing host disk.
+The local scripts do not load host modules or tune shared sysctls. Configuration
+and containerd restarts occur only inside the new kind node. Before deletion,
+backing-file inode checks protect unrelated loops; unsafe cleanup failure retains
+the owned node for recovery rather than discarding device ownership state.
+
+A native guest or smoke-Pod pass is **not** full SDK E2E. In particular FC has no
+virtiofs, while CubePod's current E2B shared content store uses filesystem staging.
+If unsupported, its real volume test must fail visibly pending a genuine block
+solution; it is never skipped or replaced with a mock. `kata-qemu` is another
+formal runtime, planned for its own VMM/transport/full-SDK lane and not implicitly
+covered here. Runtime and guest diagnostics join the ordinary kind test artifacts.
