@@ -20,6 +20,8 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/http2"
+
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
 
@@ -753,6 +755,99 @@ func (p *EgressProxy) spliceUpstream(clientConn net.Conn, host, port string) {
 	wg.Wait()
 }
 
+// mitmReject describes a MITM request refused before reaching the upstream.
+type mitmReject struct {
+	status int
+	body   string
+}
+
+// hopByHopHeaders are connection-scoped headers that must not be forwarded by a proxy (RFC 9110 §7.6.1).
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Connection",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+// stripHopByHopHeaders removes hop-by-hop headers (and any header named by the
+// Connection header) in place. TE is retained only when its value is "trailers".
+func stripHopByHopHeaders(h http.Header) {
+	for _, v := range h.Values("Connection") {
+		for _, tok := range strings.Split(v, ",") {
+			if t := strings.TrimSpace(tok); t != "" {
+				h.Del(t)
+			}
+		}
+	}
+	for _, k := range hopByHopHeaders {
+		h.Del(k)
+	}
+	if te := h.Values("Te"); len(te) > 0 {
+		if len(te) == 1 && strings.EqualFold(strings.TrimSpace(te[0]), "trailers") {
+			h.Set("Te", "trailers")
+		} else {
+			h.Del("Te")
+		}
+	}
+}
+
+// prepareMITMRequest is shared by the HTTP/1.1 and HTTP/2 MITM paths. It enforces
+// Host/:authority == TLS SNI (domain-fronting defence), applies header transforms,
+// exchanges cpodref_/cbxref_ placeholders, strips hop-by-hop headers, and builds
+// the upstream request. It never closes req.Body; callers own the body lifecycle.
+func (p *EgressProxy) prepareMITMRequest(req *http.Request, sniHost, port string) (*http.Request, *mitmReject) {
+	if req.Host == "" || normalizeHost(req.Host) != sniHost ||
+		(req.URL.Scheme != "" && !strings.EqualFold(req.URL.Scheme, "https")) ||
+		(req.URL.Host != "" && !sameHostPort(req.URL.Host, req.Host, port)) {
+		p.metrics.IncBlockedHost(req.Host)
+		return nil, &mitmReject{http.StatusMisdirectedRequest, "421 Misdirected Request: Host header does not match TLS SNI\n"}
+	}
+
+	hdr := req.Header.Clone()
+	if hdr == nil {
+		hdr = make(http.Header)
+	}
+	applyHeaderTransforms(hdr, p.GetPolicy(), sniHost)
+
+	newHeaders, err := p.replaceHeaderPlaceholders(req.Context(), hdr, sniHost)
+	if err != nil {
+		return nil, &mitmReject{http.StatusForbidden, fmt.Sprintf("403 Forbidden: %v\n", err)}
+	}
+	stripHopByHopHeaders(newHeaders)
+
+	outURL := *req.URL
+	outURL.Scheme = "https"
+	outURL.Host = req.Host
+
+	outReq, err := http.NewRequestWithContext(req.Context(), req.Method, outURL.String(), req.Body)
+	if err != nil {
+		return nil, &mitmReject{http.StatusInternalServerError, "500 Internal Server Error\n"}
+	}
+	outReq.Header = newHeaders
+	outReq.Host = req.Host
+	outReq.ContentLength = req.ContentLength
+	return outReq, nil
+}
+
+func (p *EgressProxy) newMITMUpstreamTransport(sniHost, port string) *http.Transport {
+	return &http.Transport{
+		TLSClientConfig: &tls.Config{
+			ServerName: sniHost,
+			RootCAs:    p.upstreamRootCAs,
+			MinVersion: tls.VersionTLS12,
+			NextProtos: []string{http2.NextProtoTLS, "http/1.1"},
+		},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return p.dialUpstream(ctx, sniHost, port)
+		},
+		// A custom DialContext/TLSClientConfig disables automatic HTTP/2 unless forced.
+		ForceAttemptHTTP2: true,
+	}
+}
+
 func (p *EgressProxy) serveMITMTLS(clientConn net.Conn, sniHost, port string) {
 	leafCert, err := p.getMITMCert(sniHost)
 	if err != nil {
@@ -762,7 +857,7 @@ func (p *EgressProxy) serveMITMTLS(clientConn net.Conn, sniHost, port string) {
 
 	tlsConn := tls.Server(clientConn, &tls.Config{
 		Certificates: []tls.Certificate{leafCert},
-		NextProtos:   []string{"http/1.1"},
+		NextProtos:   []string{http2.NextProtoTLS, "http/1.1"},
 		MinVersion:   tls.VersionTLS12,
 	})
 	defer tlsConn.Close()
@@ -773,18 +868,20 @@ func (p *EgressProxy) serveMITMTLS(clientConn net.Conn, sniHost, port string) {
 	}
 	_ = tlsConn.SetDeadline(time.Time{})
 
-	upstreamTransport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			ServerName: sniHost,
-			RootCAs:    p.upstreamRootCAs,
-			MinVersion: tls.VersionTLS12,
-		},
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return p.dialUpstream(ctx, sniHost, port)
-		},
-	}
+	upstreamTransport := p.newMITMUpstreamTransport(sniHost, port)
 	defer upstreamTransport.CloseIdleConnections()
 
+	proto := tlsConn.ConnectionState().NegotiatedProtocol
+	if proto == http2.NextProtoTLS {
+		p.metrics.IncMITMALPN("h2")
+		p.serveMITMH2(tlsConn, upstreamTransport, sniHost, port)
+		return
+	}
+	p.metrics.IncMITMALPN("http/1.1")
+	p.serveMITMHTTP1(tlsConn, upstreamTransport, sniHost, port)
+}
+
+func (p *EgressProxy) serveMITMHTTP1(tlsConn *tls.Conn, upstreamTransport *http.Transport, sniHost, port string) {
 	br := bufio.NewReader(tlsConn)
 	for {
 		req, err := http.ReadRequest(br)
@@ -792,38 +889,12 @@ func (p *EgressProxy) serveMITMTLS(clientConn net.Conn, sniHost, port string) {
 			return
 		}
 
-		// Enforce HTTP Host == TLS SNI to prevent domain fronting.
-		if req.Host == "" || normalizeHost(req.Host) != sniHost ||
-			(req.URL.Scheme != "" && !strings.EqualFold(req.URL.Scheme, "https")) ||
-			(req.URL.Host != "" && !sameHostPort(req.URL.Host, req.Host, "443")) {
-			p.metrics.IncBlockedHost(req.Host)
+		outReq, rej := p.prepareMITMRequest(req, sniHost, port)
+		if rej != nil {
 			_ = req.Body.Close()
-			_ = writeMITMErrorResponse(tlsConn, http.StatusMisdirectedRequest, "421 Misdirected Request: Host header does not match TLS SNI\n")
+			_ = writeMITMErrorResponse(tlsConn, rej.status, rej.body)
 			return
 		}
-
-		applyHeaderTransforms(req.Header, p.GetPolicy(), sniHost)
-
-		newHeaders, err := p.replaceHeaderPlaceholders(req.Context(), req.Header, sniHost)
-		if err != nil {
-			_ = req.Body.Close()
-			_ = writeMITMErrorResponse(tlsConn, http.StatusForbidden, fmt.Sprintf("403 Forbidden: %v\n", err))
-			return
-		}
-
-		outURL := *req.URL
-		outURL.Scheme = "https"
-		outURL.Host = req.Host
-
-		outReq, err := http.NewRequestWithContext(req.Context(), req.Method, outURL.String(), req.Body)
-		if err != nil {
-			_ = req.Body.Close()
-			_ = writeMITMErrorResponse(tlsConn, http.StatusInternalServerError, "500 Internal Server Error\n")
-			return
-		}
-		outReq.Header = newHeaders
-		outReq.Host = req.Host
-		outReq.ContentLength = req.ContentLength
 
 		resp, err := upstreamTransport.RoundTrip(outReq)
 		_ = req.Body.Close()
@@ -832,12 +903,68 @@ func (p *EgressProxy) serveMITMTLS(clientConn net.Conn, sniHost, port string) {
 			return
 		}
 
+		// The upstream leg may have negotiated HTTP/2; always frame the reply as HTTP/1.1.
+		resp.Proto, resp.ProtoMajor, resp.ProtoMinor = "HTTP/1.1", 1, 1
 		writeErr := resp.Write(tlsConn)
 		_ = resp.Body.Close()
 		if writeErr != nil || req.Close || resp.Close || !req.ProtoAtLeast(1, 1) {
 			return
 		}
 	}
+}
+
+// serveMITMH2 serves an already-handshaken client TLS connection that negotiated
+// ALPN "h2". Each stream passes through the same SNI/:authority, header-transform
+// and placeholder-exchange checks as HTTP/1.1 before being relayed upstream.
+func (p *EgressProxy) serveMITMH2(tlsConn *tls.Conn, upstreamTransport *http.Transport, sniHost, port string) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		outReq, rej := p.prepareMITMRequest(r, sniHost, port)
+		if rej != nil {
+			http.Error(w, strings.TrimSuffix(rej.body, "\n"), rej.status)
+			return
+		}
+
+		resp, err := upstreamTransport.RoundTrip(outReq)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("502 Bad Gateway: %v", err), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		stripHopByHopHeaders(resp.Header)
+		dst := w.Header()
+		for k, vs := range resp.Header {
+			dst[k] = append([]string(nil), vs...)
+		}
+		w.WriteHeader(resp.StatusCode)
+
+		rc := http.NewResponseController(w)
+		_ = rc.Flush()
+
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				if _, werr := w.Write(buf[:n]); werr != nil {
+					return
+				}
+				_ = rc.Flush()
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				// Reset the stream instead of signalling a clean end of a truncated body.
+				panic(http.ErrAbortHandler)
+			}
+		}
+
+		for k, vs := range resp.Trailer {
+			dst[http.TrailerPrefix+k] = append([]string(nil), vs...)
+		}
+	})
+
+	(&http2.Server{}).ServeConn(tlsConn, &http2.ServeConnOpts{Handler: handler})
 }
 
 func writeMITMErrorResponse(w io.Writer, statusCode int, body string) error {
