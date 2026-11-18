@@ -534,3 +534,90 @@ func TestMetricsSampler_StopIsCleanAndIdempotent(t *testing.T) {
 	cancel()
 	srv.StopMetricsSampler()
 }
+
+func scrapeMetricsText(t *testing.T, ts *httptest.Server) string {
+	t.Helper()
+	resp, err := ts.Client().Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return string(b)
+}
+
+func TestMetricsSampler_DeleteDuringSampleDoesNotResurrectSeries(t *testing.T) {
+	srv := gateway.NewServer(controller.NewReconciler())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	entered := make(chan struct{}, 8)
+	release := make(chan struct{})
+	mockPodd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		_ = json.NewEncoder(w).Encode(gateway.SandboxMetric{CPUCount: 1, MemTotal: 1, DiskTotal: 1})
+	}))
+	defer mockPodd.Close()
+
+	rec := createTestSandbox(t, ts.Client(), ts.URL)
+	srv.SetPoddURL(rec.SandboxID, mockPodd.URL)
+	srv.StartMetricsSampler(context.Background(), 10*time.Millisecond)
+	defer srv.StopMetricsSampler()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sampler never polled podd")
+	}
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+rec.SandboxID, nil)
+	dr, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dr.Body.Close()
+	close(release)
+	time.Sleep(150 * time.Millisecond)
+	srv.StopMetricsSampler()
+
+	if body := scrapeMetricsText(t, ts); strings.Contains(body, rec.SandboxID) {
+		t.Fatalf("deleted sandbox series resurrected:\n%s", body)
+	}
+}
+
+func TestMetricsSampler_GaugesOnlyForRunningSandboxes(t *testing.T) {
+	srv := gateway.NewServer(controller.NewReconciler())
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	mockPodd := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(gateway.SandboxMetric{CPUCount: 1, MemUsed: 5, MemTotal: 10, DiskTotal: 1})
+	}))
+	defer mockPodd.Close()
+
+	rec := createTestSandbox(t, ts.Client(), ts.URL)
+	srv.SetPoddURL(rec.SandboxID, mockPodd.URL)
+	srv.StartMetricsSampler(context.Background(), 10*time.Millisecond)
+	defer srv.StopMetricsSampler()
+
+	want := fmt.Sprintf(`cubepod_sandbox_memory_used_bytes{sandbox_id=%q} 5`, rec.SandboxID)
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(scrapeMetricsText(t, ts), want) {
+		if time.Now().After(deadline) {
+			t.Fatal("running sandbox gauge never appeared")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	pr, err := ts.Client().Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/pause", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr.Body.Close()
+	if body := scrapeMetricsText(t, ts); strings.Contains(body, rec.SandboxID) {
+		t.Fatalf("paused sandbox gauges still exported:\n%s", body)
+	}
+}

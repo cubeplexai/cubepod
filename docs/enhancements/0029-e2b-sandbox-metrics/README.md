@@ -225,7 +225,7 @@ flowchart LR
 
 - **2026-11-16**: CEP-0029 drafted and marked `implementable` for `v0.6`.
 - **2026-11-16**: Alpha implementation completed across `podd-init`, `podd`, `cubepod-gateway`, and `api/openapi/cubepod-v1.yaml`; marked `implemented`.
-- **2026-11-18**: Beta: background sampler, live K8s E2E assertions (`TestK8sLiveE2ESandboxMetrics`), and Prometheus rules/Grafana dashboard added (#98).
+- **2026-11-17**: Beta: background sampler, live K8s E2E assertions (`TestK8sLiveE2ESandboxMetrics`), and Prometheus rules/Grafana dashboard added (#98).
 
 ---
 
