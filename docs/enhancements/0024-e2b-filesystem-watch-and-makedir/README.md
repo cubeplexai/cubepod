@@ -194,7 +194,8 @@ flowchart LR
 - **Beta (`v0.6.0`)**:
   - [x] Verified against official Python and TypeScript E2B SDKs in CI and live Kubernetes Kata cluster (`TestK8sLiveE2EWatchAndMakeDir`).
 - **Stable (`v1.0.0`)**:
-  - [ ] Baked in CubePlex production with Prometheus watcher/stream metrics (active watchers, emitted events, `IN_Q_OVERFLOW` / queue overflows; tracked in [#103](https://github.com/cubeplexai/cubepod/issues/103)).
+  - [x] Watcher/stream metrics exported (*Added in v0.7.0*, [#103](https://github.com/cubeplexai/cubepod/issues/103)): `podd` exposes `cubepod_podd_watchers_active`, `cubepod_podd_watch_events_emitted_total`, and `cubepod_podd_watch_overflows_total{kind="inotify_queue|ring_buffer|subscriber_queue"}`; the gateway exposes `cubepod_watch_streams_active`, `cubepod_watchers_active`, `cubepod_watch_events_total`, and `cubepod_watch_overflows_total`. The `CubePodWatchOverflowDetected` alert lives in `deploy/monitoring/watcher-secret-alerts.yaml`.
+  - [ ] Baked in CubePlex production.
 
 ### Upgrade / Downgrade Strategy
 

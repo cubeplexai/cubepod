@@ -16,6 +16,7 @@ import (
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
+	"github.com/cubeplexai/cubepod/pkg/secret"
 )
 
 var defaultDurationBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
@@ -138,6 +139,9 @@ type Metrics struct {
 	E2BVolumeMountsTotal          atomic.Uint64
 	E2BVolumeMountErrorsTotal     atomic.Uint64
 	CRDResyncsTotal               atomic.Uint64
+	WatchStreamsActive            atomic.Int64
+	WatchEventsTotal              atomic.Uint64
+	WatchOverflowsTotal           atomic.Uint64
 
 	e2bRequests        labeledCounterMap
 	e2bRequestDuration promHistogram
@@ -496,11 +500,18 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		warmpoolsTotal = len(s.reconciler.GetWarmPoolSpecs())
 	}
 
+	watchStreamsActive := m.WatchStreamsActive.Load()
+	if watchStreamsActive < 0 {
+		watchStreamsActive = 0
+	}
+	watchersActive := s.activePollWatchers()
 	secretsStoreCount := 0
 	var secretOpsSnapshot map[string]map[string]uint64
+	var secretLatencySnapshot map[string]secret.LatencySnapshot
 	if secStore := s.secrets.Load(); secStore != nil {
 		secretsStoreCount = secStore.Count()
 		secretOpsSnapshot = secStore.OperationsSnapshot()
+		secretLatencySnapshot = secStore.OperationsLatencySnapshot()
 	}
 	volumeMountsTotal := s.E2BVolumeMountsTotal.Load() + m.E2BVolumeMountsTotal.Load()
 	volumeMountErrorsTotal := s.E2BVolumeMountErrorsTotal.Load() + m.E2BVolumeMountErrorsTotal.Load()
@@ -551,6 +562,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 			"cubepod_gateway_warmpools_total":          warmpoolsTotal,
 			"cubepod_panel_active_sessions":            m.PanelActiveSessions.Load(),
 			"cubepod_secrets_store_count":              secretsStoreCount,
+			"cubepod_watch_streams_active":             watchStreamsActive,
+			"cubepod_watchers_active":                  watchersActive,
+			"cubepod_watch_events_total":               m.WatchEventsTotal.Load(),
+			"cubepod_watch_overflows_total":            m.WatchOverflowsTotal.Load(),
 			"cubepod_e2b_volume_mounts_total":          volumeMountsTotal,
 			"cubepod_e2b_volume_mount_errors_total":    volumeMountErrorsTotal,
 			"cubepod_gateway_crd_resyncs_total":        crdResyncsTotal,
@@ -695,6 +710,38 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&buf, "# HELP cubepod_panel_active_sessions Current number of active panel proxy HTTP/WebSocket sessions\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_panel_active_sessions gauge\n")
 	fmt.Fprintf(&buf, "cubepod_panel_active_sessions %d\n", m.PanelActiveSessions.Load())
+
+	if len(secretLatencySnapshot) > 0 {
+		fmt.Fprintf(&buf, "# HELP cubepod_secrets_operation_duration_seconds Latency of E2B secret store operations by operation\n")
+		fmt.Fprintf(&buf, "# TYPE cubepod_secrets_operation_duration_seconds histogram\n")
+		ops := make([]string, 0, len(secretLatencySnapshot))
+		for op := range secretLatencySnapshot {
+			ops = append(ops, op)
+		}
+		sort.Strings(ops)
+		for _, op := range ops {
+			snap := secretLatencySnapshot[op]
+			for i, upper := range snap.Buckets {
+				fmt.Fprintf(&buf, "cubepod_secrets_operation_duration_seconds_bucket{operation=%q,le=\"%g\"} %d\n", op, upper, snap.Counts[i])
+			}
+			fmt.Fprintf(&buf, "cubepod_secrets_operation_duration_seconds_bucket{operation=%q,le=\"+Inf\"} %d\n", op, snap.Count)
+			fmt.Fprintf(&buf, "cubepod_secrets_operation_duration_seconds_sum{operation=%q} %g\n", op, snap.Sum)
+			fmt.Fprintf(&buf, "cubepod_secrets_operation_duration_seconds_count{operation=%q} %d\n", op, snap.Count)
+		}
+	}
+
+	fmt.Fprintf(&buf, "# HELP cubepod_watch_streams_active Current number of live WatchDir streams\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_watch_streams_active gauge\n")
+	fmt.Fprintf(&buf, "cubepod_watch_streams_active %d\n", watchStreamsActive)
+	fmt.Fprintf(&buf, "# HELP cubepod_watchers_active Current number of active poll watchers\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_watchers_active gauge\n")
+	fmt.Fprintf(&buf, "cubepod_watchers_active %d\n", watchersActive)
+	fmt.Fprintf(&buf, "# HELP cubepod_watch_events_total Total filesystem watch events emitted by the gateway\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_watch_events_total counter\n")
+	fmt.Fprintf(&buf, "cubepod_watch_events_total %d\n", m.WatchEventsTotal.Load())
+	fmt.Fprintf(&buf, "# HELP cubepod_watch_overflows_total Total filesystem watch resource_exhausted overflows\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_watch_overflows_total counter\n")
+	fmt.Fprintf(&buf, "cubepod_watch_overflows_total %d\n", m.WatchOverflowsTotal.Load())
 
 	fmt.Fprintf(&buf, "# HELP cubepod_secrets_store_count Current number of stored E2B secrets across tenants\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_secrets_store_count gauge\n")

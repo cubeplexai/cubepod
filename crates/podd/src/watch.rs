@@ -108,7 +108,17 @@ struct WatchSub {
     message: Arc<Mutex<String>>,
 }
 
+/// Lock-free watcher telemetry exported by `/metrics?format=prometheus`.
+#[derive(Debug, Default)]
+pub struct WatchStats {
+    pub events_emitted: AtomicU64,
+    pub overflow_inotify_queue: AtomicU64,
+    pub overflow_ring_buffer: AtomicU64,
+    pub overflow_subscriber_queue: AtomicU64,
+}
+
 pub(crate) struct DirWatcher {
+    stats: Arc<WatchStats>,
     id: String,
     root: PathBuf,
     recursive: bool,
@@ -154,6 +164,7 @@ pub struct WatchRegistry {
     inner: Arc<Mutex<HashMap<String, Arc<DirWatcher>>>>,
     counter: Arc<AtomicU64>,
     max_watchers: usize,
+    stats: Arc<WatchStats>,
 }
 
 #[derive(Debug)]
@@ -181,6 +192,7 @@ impl WatchRegistry {
             inner: Arc::new(Mutex::new(HashMap::new())),
             counter: Arc::new(AtomicU64::new(1)),
             max_watchers: MAX_WATCHERS_PER_SANDBOX,
+            stats: Arc::new(WatchStats::default()),
         }
     }
 
@@ -190,7 +202,12 @@ impl WatchRegistry {
             inner: Arc::new(Mutex::new(HashMap::new())),
             counter: Arc::new(AtomicU64::new(1)),
             max_watchers,
+            stats: Arc::new(WatchStats::default()),
         }
+    }
+
+    pub fn stats(&self) -> Arc<WatchStats> {
+        Arc::clone(&self.stats)
     }
 
     pub fn active_count(&self) -> usize {
@@ -284,6 +301,7 @@ impl WatchRegistry {
         }
         let id = format!("w{}", self.counter.fetch_add(1, Ordering::SeqCst));
         let watcher = Arc::new(DirWatcher {
+            stats: Arc::clone(&self.stats),
             id: id.clone(),
             root: root.clone(),
             recursive,
@@ -414,6 +432,9 @@ impl DirWatcher {
     /// Holds the ring lock while the flag is set so GetWatcherEvents cannot
     /// observe a successful truncated drain.
     fn mark_overflow(&self, message: &str) {
+        self.stats
+            .overflow_inotify_queue
+            .fetch_add(1, Ordering::Relaxed);
         {
             let _pending = self.pending.lock().unwrap();
             self.overflowed.store(true, Ordering::SeqCst);
@@ -434,6 +455,9 @@ impl DirWatcher {
                 if pending.len() >= WATCH_RING_CAP {
                     // Bound memory. The dropped event is not returned as success.
                     pending.pop_front();
+                    self.stats
+                        .overflow_ring_buffer
+                        .fetch_add(1, Ordering::Relaxed);
                     self.overflowed.store(true, Ordering::SeqCst);
                     true
                 } else {
@@ -448,10 +472,14 @@ impl DirWatcher {
         } else if self.overflowed.load(Ordering::SeqCst) {
             return;
         }
+        self.stats.events_emitted.fetch_add(1, Ordering::Relaxed);
         let mut subs = self.subscribers.lock().unwrap();
         subs.retain(|sub| match sub.tx.try_send(WatchMsg::Event(ev.clone())) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
+                self.stats
+                    .overflow_subscriber_queue
+                    .fetch_add(1, Ordering::Relaxed);
                 sub.overflow.store(true, Ordering::SeqCst);
                 *sub.message.lock().unwrap() = WATCH_QUEUE_OVERFLOW_MSG.to_string();
                 false
@@ -1874,6 +1902,7 @@ mod tests {
         let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
         assert!(fd >= 0);
         let w = DirWatcher {
+            stats: Arc::new(WatchStats::default()),
             id: "wrace".into(),
             root: dir.clone(),
             recursive: true,
@@ -2184,5 +2213,69 @@ mod tests {
         assert_eq!(map_mask(libc::IN_MODIFY), Some("EVENT_TYPE_WRITE"));
         assert_eq!(map_mask(libc::IN_CLOSE_WRITE), None);
         assert_eq!(WATCH_MASK & libc::IN_CLOSE_WRITE, 0);
+    }
+
+    fn synthetic_watcher(reg: &WatchRegistry, id: &str, poll: bool) -> Arc<DirWatcher> {
+        // No inotify fd: exercises the counters independent of host inotify limits.
+        let w = Arc::new(DirWatcher {
+            stats: reg.stats(),
+            id: id.into(),
+            root: PathBuf::from("/"),
+            recursive: false,
+            include_entry: false,
+            poll,
+            fd: AtomicI32::new(-1),
+            stop_fd: AtomicI32::new(-1),
+            watches: Mutex::new(HashMap::new()),
+            pending: Mutex::new(VecDeque::new()),
+            subscribers: Mutex::new(Vec::new()),
+            stopped: AtomicBool::new(false),
+            overflowed: AtomicBool::new(false),
+            last_poll: Mutex::new(std::time::Instant::now()),
+        });
+        reg.inner
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), Arc::clone(&w));
+        w
+    }
+
+    #[test]
+    fn watch_stats_count_events_and_each_overflow_kind() {
+        let ev = |n: &str| FsEvent {
+            name: n.into(),
+            kind: "EVENT_TYPE_CREATE".into(),
+            entry: None,
+        };
+        let reg = WatchRegistry::new();
+        let stats = reg.stats();
+        assert_eq!(reg.active_count(), 0);
+
+        // Subscriber queue overflow (non-poll).
+        let w = synthetic_watcher(&reg, "w-sub", false);
+        assert_eq!(reg.active_count(), 1);
+        let _sub = w.subscribe();
+        for i in 0..(WATCH_SUB_QUEUE + 3) {
+            w.publish(ev(&format!("n{i}")));
+        }
+        assert_eq!(stats.overflow_subscriber_queue.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stats.events_emitted.load(Ordering::Relaxed),
+            (WATCH_SUB_QUEUE + 3) as u64
+        );
+
+        // Kernel IN_Q_OVERFLOW.
+        w.on_raw(0, libc::IN_Q_OVERFLOW, "");
+        assert_eq!(stats.overflow_inotify_queue.load(Ordering::Relaxed), 1);
+        reg.remove("w-sub");
+        assert_eq!(reg.active_count(), 0);
+
+        // Poll ring overflow.
+        let p = synthetic_watcher(&reg, "w-ring", true);
+        for i in 0..=WATCH_RING_CAP {
+            p.publish(ev(&format!("r{i}")));
+        }
+        assert_eq!(stats.overflow_ring_buffer.load(Ordering::Relaxed), 1);
+        reg.remove("w-ring");
     }
 }
