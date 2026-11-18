@@ -6,6 +6,7 @@ import re
 import stat
 import subprocess
 import sys
+import tomllib
 
 vmm, cluster = sys.argv[1:]
 assert vmm in ('fc', 'clh') and re.fullmatch(r'cubepod-[a-z0-9-]+', cluster)
@@ -69,6 +70,17 @@ root_path = "/var/lib/containerd/io.containerd.snapshotter.v1.devmapper"
 pool_name = "{pool}"
 base_image_size = "1GB"
 discard_blocks = true
+'''
+    # Preserve overlayfs while enabling devmapper in the containerd 2.x transfer
+    # unpacker: https://github.com/containerd/containerd/issues/11606
+    assert not tomllib.loads(original)['plugins']['io.containerd.transfer.v1.local'].get('unpack_config'), 'Unexpected pre-existing transfer unpack configuration'
+    extra += '''
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+platform = "linux/amd64"
+snapshotter = "overlayfs"
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+platform = "linux/amd64"
+snapshotter = "devmapper"
 '''
 original += f'''
 [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.kata-{vmm}-e2e]

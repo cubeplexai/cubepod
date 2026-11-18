@@ -54,7 +54,7 @@ finish() {
     fi
   fi
   # Keep the development control plane, not leaked sandboxes from failed creates.
-  if owned && [[ ${KEEP_CLUSTER:-0} == 1 ]]; then
+  if owned && [[ ${KEEP_CLUSTER:-0} == 1 && -z ${KATA_VMM:-} ]]; then
     k delete podboxes.cubepod.io --all -n "$NS" --ignore-not-found --timeout=30s || { [[ $rc != 0 ]] || rc=1; }
     k delete pods,pvc -n "$NS" -l pod.cubeplex.ai/box --ignore-not-found --timeout=45s || { [[ $rc != 0 ]] || rc=1; }
   fi

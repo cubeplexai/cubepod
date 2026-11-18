@@ -133,6 +133,7 @@ kata_collect() {
   k logs -n cubepod-csi statefulset/hostpath --all-containers=true --tail=1000 >"$ARTIFACTS/csi.log" 2>&1 || true
   kata_node journalctl -u containerd --no-pager -n 3000 >"$ARTIFACTS/containerd-kata.log" 2>&1 || true
   kata_node bash -ec 'cat /etc/containerd/config.toml; cat /etc/kata-containers/configuration-e2e.toml; ls -l /dev/kvm; cat /proc/cpuinfo' >"$ARTIFACTS/runtime-config-cpu.txt" 2>&1 || true
+  kata_node bash -ec 'ctr -n k8s.io tasks list; findmnt -rn -o TARGET,SOURCE,FSTYPE; losetup --list' >"$ARTIFACTS/tasks-mounts-loops.txt" 2>&1 || true
   kata_node bash -ec 'ls -R /run/vc /var/log/kata-containers 2>/dev/null || true' >"$ARTIFACTS/guest-log-paths.txt" 2>&1 || true
 }
 kata_teardown_node() {
