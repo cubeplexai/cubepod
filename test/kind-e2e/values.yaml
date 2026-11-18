@@ -1,0 +1,49 @@
+# Single-node container baseline. Not a Kata, block-CSI, or security test.
+runtime:
+  runtimeClassName: "none"
+  defaultTemplate: kind-e2e
+  poddInjectorImage: docker.io/cubepod-kind/podd:e2e
+  defaultSandboxImage: docker.io/cubepod-kind/sandbox:e2e
+storage:
+  storageClassName: standard
+  volumeMode: Filesystem
+  rootfsSize: 128Mi
+  workspaceSize: 128Mi
+warmPool:
+  enabled: false
+gateway:
+  replicaCount: 1
+  image:
+    registry: docker.io
+    repository: cubepod-kind/gateway
+    tag: e2e
+    pullPolicy: Never
+  livePodRouting: true
+  resources:
+    requests: {cpu: 100m, memory: 64Mi}
+    limits: {cpu: "1", memory: 256Mi}
+controller:
+  workloadNamespace: cubepod-kind
+  syncInterval: 1s
+  image:
+    registry: docker.io
+    repository: cubepod-kind/controller
+    tag: e2e
+    pullPolicy: Never
+  resources:
+    requests: {cpu: 100m, memory: 64Mi}
+    limits: {cpu: "1", memory: 256Mi}
+egress:
+  enabled: false
+  transparent: false
+featureGates:
+  e2bTemplateAPI: true
+  transparentEgress: false
+  desktopStack: false
+  k8sE2BVolumeMounts: true
+secrets:
+  enabled: false
+e2bVolumes:
+  enabled: true
+  pvcName: cubepod-e2b-volumes
+  rwxStorageClassName: ""

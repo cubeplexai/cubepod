@@ -1,0 +1,25 @@
+# A node-local shared filesystem, ONLY for this single-node kind baseline.
+# This is not a production RWX CSI driver. Both gateway and sandboxes share it.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: cubepod-kind-volumes
+spec:
+  capacity: {storage: 1Gi}
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: ""
+  hostPath: {path: /var/local/cubepod-kind-volumes, type: DirectoryOrCreate}
+  claimRef: {namespace: cubepod-kind, name: cubepod-e2b-volumes}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cubepod-e2b-volumes
+  namespace: cubepod-kind
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests: {storage: 1Gi}
+  storageClassName: ""
+  volumeName: cubepod-kind-volumes

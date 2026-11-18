@@ -61,3 +61,6 @@ deploy/k8s/local/
 *.swp
 *.swo
 .DS_Store
+
+# Isolated kind E2E build, credentials, and evidence
+.kind-e2e/
