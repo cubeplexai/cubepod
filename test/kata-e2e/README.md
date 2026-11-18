@@ -125,3 +125,23 @@ not start udev, mount host /dev or change a host service. Ten safety/contract un
 tests pass; **actual FC revalidation is still required**. The full lane deliberately
 fails visibly until real integration succeeds. Native Linux guest success is not the missing
 Kata/SDK proof.
+
+
+### Test CSI reclaim policy (not production reclaim coverage)
+
+The block fixture uses `Retain`: captured runs with the pinned example
+hostpath driver show `DeleteVolume` losing its volume record before kubelet's
+asynchronous `NodeUnpublishVolume`; that RPC then returns `NotFound` for every
+published block bind. Waiting longer or stopping containers does not repair
+that lost metadata. Evidence is retained in runs 44250515533 and 44251855668.
+
+Retain is a real supported StorageClass profile, not a mocked volume or skipped
+SDK assertion. All official mounted-volume persistence tests remain identical.
+The harness must prove every CSI block bind is unpublished, then stop only owned
+node processes, verify owned backing-inode associations and actual loop detach,
+and delete only the owned node/artifact volume, removing backing files and PV
+records. Uncertain cleanup remains red. **Automatic CSI `DeleteVolume` reclaim
+is not covered by this profile**; the initial failure is documented rather than
+claimed fixed in the external driver. See the driver's state/unpublish behavior
+in https://github.com/kubernetes-csi/csi-driver-host-path/issues/217 and
+https://github.com/kubernetes-csi/csi-driver-host-path/issues/457.
