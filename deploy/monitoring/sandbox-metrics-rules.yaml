@@ -1,11 +1,11 @@
 # Prometheus Operator rules for CubePod sandbox metrics (CEP-0029, GA).
 # Requires the gateway background sampler (--metrics-sample-interval, v0.7.0+)
 # and a scrape job/ServiceMonitor for the cubepod-gateway /metrics endpoint.
+# Apply with `kubectl apply -n <namespace>` where your Prometheus Operator selects rules.
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
   name: cubepod-sandbox-metrics
-  namespace: cubepod-system
   labels:
     app.kubernetes.io/name: cubepod
     app.kubernetes.io/component: monitoring

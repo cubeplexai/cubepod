@@ -172,6 +172,8 @@ Both `cubepod-gateway` and `cubepod-controller` accept `--feature-gate=GateA=tru
 | **Gateway** | `cubepod_gateway_sandboxes_active` | Gauge | Active sandboxes by `state` (`Running`, `Paused`) |
 | **Gateway** | `cubepod_gateway_warmpools_total` | Gauge | Total configured WarmPools |
 | **Gateway** | `cubepod_gateway_crd_resyncs_total` | Counter | Total `PodBox`/`PodWarmPool` CRD resyncs |
+| **Gateway** | `cubepod_sandbox_metrics_samples_total` | Counter | Background sandbox metrics sampler results (`result="ok|error"`). *Added in v0.7.0.* |
+| **Gateway** | `cubepod_sandbox_cpu_count` / `cubepod_sandbox_cpu_used_pct` / `cubepod_sandbox_memory_used_bytes` / `cubepod_sandbox_memory_total_bytes` / `cubepod_sandbox_disk_used_bytes` / `cubepod_sandbox_disk_total_bytes` | Gauge | Latest sampled per-sandbox resource usage for Running sandboxes (`sandbox_id` label). *Added in v0.7.0.* |
 | **Gateway** | `cubepod_panel_active_sessions` | Gauge | Active `/panel/{token}/` HTTP/WebSocket proxy sessions |
 | **Gateway** | `cubepod_desktop_activations_total` | Counter | Desktop activations by `result` (`ok`, `unsupported`, `error`) |
 | **Gateway** | `cubepod_secrets_operations_total` | Counter | Secret store operations by `op` and `status` |

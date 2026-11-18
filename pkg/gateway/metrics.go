@@ -708,7 +708,7 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&buf, "cubepod_webhook_queue_depth %d\n", evMgr.QueueDepth())
 	}
 
-	writeSandboxMetricsSamplerProm(&buf, m)
+	s.writeSandboxMetricsSamplerProm(&buf)
 
 	// Gauges
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_sandboxes_active Current number of active sandboxes by state\n")

@@ -510,17 +510,34 @@ func (st *sandboxMetricsStore) latestAll() map[string]SandboxMetric {
 	return out
 }
 
-func writeSandboxMetricsSamplerProm(buf *bytes.Buffer, m *Metrics) {
+func (st *sandboxMetricsStore) prune(keep func(id string) bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for id := range st.rings {
+		if !keep(id) {
+			delete(st.rings, id)
+		}
+	}
+}
+
+func (s *Server) writeSandboxMetricsSamplerProm(buf *bytes.Buffer) {
+	m := s.Metrics()
 	fmt.Fprintf(buf, "# HELP cubepod_sandbox_metrics_samples_total Background sandbox metrics sampler results\n")
 	fmt.Fprintf(buf, "# TYPE cubepod_sandbox_metrics_samples_total counter\n")
 	fmt.Fprintf(buf, "cubepod_sandbox_metrics_samples_total{result=\"ok\"} %d\n", m.SandboxMetricsSamplesOK.Load())
 	fmt.Fprintf(buf, "cubepod_sandbox_metrics_samples_total{result=\"error\"} %d\n", m.SandboxMetricsSamplesError.Load())
 
+	// Only emit gauges for currently Running sandboxes so frozen samples of
+	// paused sandboxes cannot keep alerts firing.
 	latest := m.sandboxMetricsStore().latestAll()
 	ids := make([]string, 0, len(latest))
+	s.mu.RLock()
 	for id := range latest {
-		ids = append(ids, id)
+		if rec, ok := s.sandboxes[id]; ok && rec != nil && strings.EqualFold(rec.State, "Running") {
+			ids = append(ids, id)
+		}
 	}
+	s.mu.RUnlock()
 	sort.Strings(ids)
 	gauges := []struct {
 		name, help string
@@ -598,12 +615,19 @@ func (s *Server) sampleMetricsOnce(ctx context.Context) {
 		}
 	}
 	s.mu.RUnlock()
-	if len(targets) == 0 {
-		return
-	}
 
 	m := s.Metrics()
 	store := m.sandboxMetricsStore()
+	// Drop rings of sandboxes that no longer exist.
+	store.prune(func(id string) bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		_, ok := s.sandboxes[id]
+		return ok
+	})
+	if len(targets) == 0 {
+		return
+	}
 	sem := make(chan struct{}, maxMetricsSamplerWorkers)
 	var wg sync.WaitGroup
 	for _, t := range targets {
@@ -635,6 +659,15 @@ func (s *Server) sampleMetricsOnce(ctx context.Context) {
 				}
 			} else {
 				sample = s.sampleLocalSandboxMetric(t.rec)
+			}
+			// The sandbox may have been deleted/paused while polling; do not
+			// resurrect its ring (and gauge series) in that case.
+			s.mu.RLock()
+			cur, exists := s.sandboxes[t.id]
+			stillRunning := exists && cur == t.rec && strings.EqualFold(cur.State, "Running")
+			s.mu.RUnlock()
+			if !stillRunning {
+				return
 			}
 			store.record(t.id, sample)
 			m.SandboxMetricsSamplesOK.Add(1)

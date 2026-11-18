@@ -172,6 +172,8 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 | **Gateway** | `cubepod_gateway_sandboxes_active` | Gauge | 当前活跃沙箱数（`state`：`Running`、`Paused`） |
 | **Gateway** | `cubepod_gateway_warmpools_total` | Gauge | 已配置的 WarmPool 数量 |
 | **Gateway** | `cubepod_gateway_crd_resyncs_total` | Counter | 网关执行 `PodBox`/`PodWarmPool` CRD 重同步次数 |
+| **Gateway** | `cubepod_sandbox_metrics_samples_total` | Counter | 后台沙箱指标采样器结果（`result="ok|error"`）。*v0.7.0 新增。* |
+| **Gateway** | `cubepod_sandbox_cpu_count` / `cubepod_sandbox_cpu_used_pct` / `cubepod_sandbox_memory_used_bytes` / `cubepod_sandbox_memory_total_bytes` / `cubepod_sandbox_disk_used_bytes` / `cubepod_sandbox_disk_total_bytes` | Gauge | 运行中沙箱最近一次采样的资源使用情况（带 `sandbox_id` 标签）。*v0.7.0 新增。* |
 | **Gateway** | `cubepod_panel_active_sessions` | Gauge | 当前活跃 `/panel/{token}/` HTTP/WebSocket 反代会话数 |
 | **Gateway** | `cubepod_desktop_activations_total` | Counter | 桌面启动次数（`result`：`ok`、`unsupported`、`error`） |
 | **Gateway** | `cubepod_secrets_operations_total` | Counter | 密钥存储操作数（`op`、`status`） |
