@@ -12,6 +12,19 @@ vmm, cluster = sys.argv[1:]
 assert vmm in ('fc', 'clh') and re.fullmatch(r'cubepod-[a-z0-9-]+', cluster)
 base = Path('/var/lib/cubepod-kata-e2e') / cluster
 base.mkdir(parents=True, exist_ok=True)
+# Retained CSI volumes need >8 loop aliases. This creates ONLY missing device
+# entries in this new node's private /dev, not kernel loop reservations or host
+# nodes. CSI later selects free devices and attaches only owned backing files.
+loop_entries = 0
+for index in range(128):
+    path = Path('/dev') / ('loop' + str(index))
+    expected = os.makedev(7, index)
+    if not path.exists():
+        os.mknod(path, stat.S_IFBLK | 0o600, expected)
+        loop_entries += 1
+    actual = path.stat()
+    assert stat.S_ISBLK(actual.st_mode) and actual.st_rdev == expected, 'Unexpected private loop alias'
+print(f'Published {loop_entries} private loop aliases; no loop associated by publication', flush=True)
 config = Path(f'/opt/kata/share/defaults/kata-containers/configuration-{vmm}.toml').read_text()
 config = re.sub(r'^default_memory\s*=.*$', 'default_memory = 512', config, flags=re.M)
 config = re.sub(r'^default_maxvcpus\s*=.*$', 'default_maxvcpus = 1', config, flags=re.M)
