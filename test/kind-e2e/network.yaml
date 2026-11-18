@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: network-target, namespace: cubepod-kind}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: network-target}
+  template:
+    metadata:
+      labels: {app: network-target}
+    spec:
+      containers:
+      - name: http
+        image: docker.io/cubepod-kind/sandbox:e2e
+        imagePullPolicy: Never
+        command: [python3, -u, -m, http.server, "8080", --directory, /etc]
+        resources:
+          requests: {cpu: 10m, memory: 16Mi}
+          limits: {cpu: 100m, memory: 64Mi}
+        readinessProbe:
+          httpGet: {path: /hostname, port: 8080}
+          periodSeconds: 1
+---
+apiVersion: v1
+kind: Service
+metadata: {name: network-target, namespace: cubepod-kind}
+spec:
+  selector: {app: network-target}
+  ports: [{port: 8080, targetPort: 8080}]

@@ -103,3 +103,8 @@ docs-dev:
 
 docs-build:
 	cd website && npm run build && npm run verify
+
+# Reproducible, isolated real Kubernetes + official dual-SDK baseline.
+.PHONY: test-kind-e2e
+test-kind-e2e:
+	bash test/kind-e2e/run.sh

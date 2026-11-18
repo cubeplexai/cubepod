@@ -287,3 +287,10 @@ Built on a **Brain-Hands Decoupling** architecture, CubePod provides the persist
 ## License
 
 CubePod is open-source software licensed under the [Apache License, Version 2.0](LICENSE).
+
+### Reproducible kind E2E
+
+Run `make test-kind-e2e` on a Linux Docker host to build and deploy this checkout
+into an isolated kind cluster and exercise real sandboxes with both official E2B
+SDKs. See [requirements, coverage, diagnostics and local reuse](test/kind-e2e/README.md).
+No KVM or existing Kubernetes environment is needed.

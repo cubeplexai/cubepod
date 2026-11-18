@@ -1,0 +1,23 @@
+apiVersion: cubepod.io/v1alpha1
+kind: PodTemplate
+metadata:
+  name: kind-e2e
+  namespace: cubepod-kind
+spec:
+  names: [kind-e2e]
+  runtimeClassName: none
+  image: docker.io/cubepod-kind/sandbox:e2e
+  poddImage: docker.io/cubepod-kind/podd:e2e
+  cpuCount: 1
+  memoryMB: 256
+  diskSizeMB: 128
+  resources:
+    cpuRequest: 100m
+    cpuLimit: "1"
+    memoryRequest: 64Mi
+    memoryLimit: 256Mi
+  storage:
+    storageClassName: standard
+    rootfsSize: 128Mi
+    workspaceSize: 128Mi
+  egress: {enabled: false}
