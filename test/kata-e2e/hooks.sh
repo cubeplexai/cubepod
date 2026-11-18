@@ -63,8 +63,10 @@ kata_configure() {
   if [[ "$KATA_VMM" == fc ]]; then
     # kind intentionally compiles its containerd without devmapper. Replace ONLY
     # this owned node's daemon with the same-version official full build.
+    kata_node mkdir -p /usr/local/libexec/cubepod-kata-e2e
+    timeout 30s docker cp "$KATA_HERE/dmsetup_node.py" "$CLUSTER_NAME-control-plane:/usr/local/libexec/cubepod-kata-e2e/dmsetup_node.py"
     timeout 30s docker cp "$STATE/containerd/bin/containerd" "$CLUSTER_NAME-control-plane:/usr/local/bin/containerd-e2e"
-    kata_node bash -ec 'mkdir -p /etc/systemd/system/containerd.service.d; printf "[Service]\nExecStart=\nExecStart=/usr/local/bin/containerd-e2e\n" >/etc/systemd/system/containerd.service.d/e2e.conf; systemctl daemon-reload'
+    kata_node bash -ec 'mkdir -p /etc/systemd/system/containerd.service.d; printf "[Service]\nExecStart=\nExecStart=/usr/local/bin/containerd-e2e\nEnvironment=PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin\n" >/etc/systemd/system/containerd.service.d/e2e.conf; systemctl daemon-reload'
   fi
   timeout 180s docker exec -i "$CLUSTER_NAME-control-plane" python3 - "$KATA_VMM" "$CLUSTER_NAME" <"$KATA_HERE/configure_node.py" >"$ARTIFACTS/configure-node.log" 2>&1
   kata_node systemctl restart containerd
@@ -140,6 +142,7 @@ kata_collect() {
   k logs -n cubepod-csi statefulset/hostpath --all-containers=true --tail=1000 >"$ARTIFACTS/csi.log" 2>&1 || true
   kata_node journalctl -u containerd --no-pager -n 3000 >"$ARTIFACTS/containerd-kata.log" 2>&1 || true
   kata_node bash -ec 'cat /etc/containerd/config.toml; cat /etc/kata-containers/configuration-e2e.toml; ls -l /dev/kvm; cat /proc/cpuinfo' >"$ARTIFACTS/runtime-config-cpu.txt" 2>&1 || true
+  if [[ "$KATA_VMM" == fc ]]; then kata_node cat "/var/lib/cubepod-kata-e2e/$CLUSTER_NAME/device-publication.log" >"$ARTIFACTS/device-publication.log" 2>&1 || true; fi
   kata_node bash -ec 'ctr -n k8s.io tasks list; findmnt -rn -o TARGET,SOURCE,FSTYPE; losetup --list' >"$ARTIFACTS/tasks-mounts-loops.txt" 2>&1 || true
   kata_node bash -ec 'ls -R /run/vc /var/log/kata-containers 2>/dev/null || true' >"$ARTIFACTS/guest-log-paths.txt" 2>&1 || true
 }
