@@ -75,6 +75,8 @@ flowchart LR
   3. 通过 **每沙箱 mTLS** 向 `cubepod-gateway` 发起 `POST /internal/v1/egress/exchange`，网关严格校验边车客户端证书 **`CN == sandboxID`**、目标 `sniHost` 与 `headerName`。
   4. 仅在内存传输缓冲区中将 `cpodref_...` 替换为真实凭证发出请求，绝不写入磁盘日志或回流进 Guest 容器。
 
+**HTTP/2 (`h2`) ALPN 支持** *(v0.7.0 新增。)*：面向客户端的 MITM 监听器通过 ALPN 同时声明 `h2` 与 `http/1.1`，因此现代 HTTP/2 客户端（`curl --http2`、Go `net/http`、`httpx`、`undici`、基于 HTTPS 的 gRPC）可被原生处理并在单连接上多路复用多个 Stream，仅支持 HTTP/1.1 的客户端依然可用。每个 `h2` Stream 与 HTTP/1.1 执行完全相同的校验：`:authority` 必须等于 TLS SNI（否则返回 `421 Misdirected Request`）、应用 `HeaderTransforms`，并且仅对允许的主机与 Header 交换 `cpodref_` / `cbxref_` 占位符（否则返回 `403 Forbidden`，且不会向上游转发任何内容）。SSE 等流式响应会被增量刷新。协商结果通过 `cubepod_egress_mitm_alpn_total{proto="h2|http/1.1"}` 指标导出。
+
 ## 6. 多副本网关 HA 密钥同步与严格 mTLS 交换 *(v0.6.0 新增 / 变更)*
 
 为支持多副本水平扩展的 `cubepod-gateway`（`gateway.replicaCount > 1`）并消除副本间密钥状态漂移：
