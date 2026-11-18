@@ -6,7 +6,7 @@
 | **Stage** | `beta` |
 | **Status** | `implemented` |
 | **Created** | `2026-11-15` |
-| **Updated** | `2026-11-17` |
+| **Updated** | `2026-11-18` |
 | **Owning Area** | `runtime` (`podd`), `gateway` (`cubepod-gateway`) |
 
 <!-- toc -->
@@ -169,6 +169,10 @@ sequenceDiagram
   - `TestConnectRPC_PTY_SandboxIsolation_And_EnvSanitization`
   - `TestConnectRPC_PTY_ConcurrentSendInputAndKill_NoRace`
   - `TestConnectRPC_Process_ConnectRunningNonPTY_WaitsForExit`
+- **Kubernetes E2E & Concurrent Soak Suite (`test/k8s-e2e/`)**:
+  - `TestK8sLiveE2EPTY` (`test/k8s-e2e/k8s_e2e_test.go`): Live Kubernetes Pod PTY `Start`, `SendInput`, `Update` (`80x24` -> `120x40`), and `SendSignal` verification.
+  - `TestSoakRunnerShortVerification` (`test/k8s-e2e/soak_test.go`): Concurrent real OS PTY `Start`, `SendInput`, `Update`, `List`, stream disconnect, `Connect` 64 KiB replay, and `SendSignal` cycles verified in `< 3s` under `go test -race` with zero leaked PTYs or goroutines.
+  - `TestK8sLiveSoakE2BAndPTY` (`test/k8s-e2e/soak_test.go`, `make test-soak`): Multi-day live cluster concurrent interactive PTY soak runner gated on `CUBEPOD_K8S_SOAK=1`.
 
 ### Graduation Criteria
 
@@ -178,7 +182,8 @@ sequenceDiagram
   - [x] Live Kubernetes (`Kata + CSI Block`) and Docker E2E suite exercises `sandbox.pty.create` / `connect` / `resize` / `kill` end-to-end (`TestK8sLiveE2EPTY`).
   - [x] Official E2B extended SDK suites verified (`test/e2b-compat/test_official_e2b_extended.py` and TypeScript suite).
 - **Stable (`v1.0.0`)**:
-  - [ ] Multi-day soak testing with concurrent interactive terminals and `prepare_stop` cleanup (tracked in [#104](https://github.com/cubeplexai/cubepod/issues/104)).
+  - [x] Automated concurrent E2B + interactive PTY soak harness (`test/k8s-e2e/soak_test.go`, `make test-soak`) verifying disconnect-safe `Connect` replay, `Update` resize, and zero goroutine/sandbox leaks under `-race`.
+  - [ ] Multi-day soak testing (`CUBEPOD_K8S_SOAK=1 make test-soak`) with concurrent interactive terminals and `prepare_stop` cleanup across > 10,000 sandbox hours (pending multi-day wall-clock execution; tracked in [#104](https://github.com/cubeplexai/cubepod/issues/104)).
 
 ### Upgrade / Downgrade Strategy
 
@@ -201,6 +206,7 @@ sequenceDiagram
 
 - `2026-11-15`: Initial implementation in `crates/podd` and `pkg/gateway`, followed by review hardening (`OwnedFd` lifetime, atomic `O_CLOEXEC`, waiter thread reaping, gateway sandbox isolation, `safeSandboxEnv`, and regression tests).
 - `2026-11-17`: Promoted to `beta`. Live Kubernetes E2E suite (`TestK8sLiveE2EPTY`) and official E2B extended SDK suites (`test/e2b-compat/test_official_e2b_extended.py` and TypeScript suite) verified; multi-day concurrent interactive PTY soak testing tracked in [#104](https://github.com/cubeplexai/cubepod/issues/104).
+- `2026-11-18`: Added concurrent E2B + interactive PTY soak harness (`test/k8s-e2e/soak_test.go`, `make test-soak`) with `< 3s` `-race` leak/accounting verification (`TestSoakRunnerShortVerification`) and live multi-day soak runner (`TestK8sLiveSoakE2BAndPTY`); multi-day production soak runtime remains pending ([#104](https://github.com/cubeplexai/cubepod/issues/104)).
 
 ---
 

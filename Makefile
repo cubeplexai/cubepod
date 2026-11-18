@@ -1,4 +1,4 @@
-.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress build-cli test test-rust test-go test-e2e test-e2b-compat test-e2b-compat-ts test-k8s-e2e test-k8s-block test-k8s-longhorn-v2 fmt vet clean docs-dev docs-build
+.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress build-cli test test-rust test-go test-e2e test-e2b-compat test-e2b-compat-ts test-k8s-e2e test-k8s-block test-k8s-longhorn-v2 test-soak fmt vet clean docs-dev docs-build
 
 GO ?= go
 CARGO ?= $(shell which cargo 2>/dev/null || echo "$(HOME)/.cargo/bin/cargo")
@@ -22,6 +22,7 @@ help:
 	@echo "  make test-k8s-e2e         Live CubePod lifecycle. Uses deploy/k8s/env.local or the current kubeconfig"
 	@echo "  make test-k8s-block       Live volumeMode Block attach check for the discovered StorageClass"
 	@echo "  make test-k8s-longhorn-v2 Same as test-k8s-block"
+	@echo "  make test-soak            Live concurrent E2B + interactive PTY soak suite (CUBEPOD_SOAK_DURATION, CUBEPOD_SOAK_CONCURRENCY)"
 	@echo "  make fmt                Format Rust and Go source code"
 	@echo "  make clean              Remove build artifacts"
 
@@ -76,8 +77,15 @@ K8S_ENV := set -a; if [ -f deploy/k8s/env.local ]; then . deploy/k8s/env.local; 
 test-k8s-e2e:
 	$(K8S_ENV); CUBEPOD_K8S_E2E=1 $(GO) test -v -timeout 15m ./test/k8s-e2e/ -run 'TestK8sLiveE2E|TestLoadClusterConfigLive|TestK8sWarmPoolClaimLive'
 
+CUBEPOD_SOAK_DURATION ?= 1h
+CUBEPOD_SOAK_CONCURRENCY ?= 4
+CUBEPOD_SOAK_TIMEOUT ?= 168h
+
 test-k8s-block test-k8s-longhorn-v2:
 	$(K8S_ENV); CUBEPOD_K8S_BLOCK=1 $(GO) test -v -timeout 10m ./test/k8s-e2e/ -run TestK8sBlockPublish
+
+test-soak:
+	$(K8S_ENV); CUBEPOD_K8S_SOAK=1 CUBEPOD_SOAK_DURATION="$(CUBEPOD_SOAK_DURATION)" CUBEPOD_SOAK_CONCURRENCY="$(CUBEPOD_SOAK_CONCURRENCY)" $(GO) test -v -timeout "$(CUBEPOD_SOAK_TIMEOUT)" ./test/k8s-e2e/ -run TestK8sLiveSoakE2BAndPTY
 
 fmt:
 	$(CARGO) fmt --all
