@@ -212,9 +212,9 @@ const copy = isZh
       compareTitle: 'CubePod vs. 上游 E2B vs. 传统容器',
       compareHeaders: ['对比维度', 'CubePod v0.6.0', '上游 E2B Cloud', '传统容器沙箱'],
       compareRows: [
-        ['系统盘持久化', 'RootFS + /workspace 双卷解耦持久', 'VM 快照保存（与工作区耦合）', '重启即丢失'],
+        ['系统盘持久化', 'RootFS + /workspace 双卷解耦持久', '随沙箱 Pause 快照保存', '重启即丢失'],
         ['存储性能模型', 'Dual CSI Raw Block (NVMe-oF)', '临时 overlay / 共享 FS', 'OverlayFS / NFS'],
-        ['OS 与数据耦合', '完全解耦（独立重置 OS）', '状态耦合', '全局重置丢失'],
+        ['OS 与数据耦合', '完全解耦（独立重置 OS）', '默认快照耦合（可挂 Volume）', '全局重置丢失'],
         ['休眠与唤醒', '0 CPU/RAM · ~1s 块卷恢复', '导出内存镜像 / 冷启', '持续占内存'],
         ['沙箱分支克隆', '< 1s CoW 双卷快照', '不支持 / 全量拷贝', '不支持'],
         ['凭据安全隔离', 'cpodref_ + mTLS 边界替换', '明文环境变量', '明文 ENV + 共享内核'],
@@ -461,9 +461,9 @@ const copy = isZh
       compareTitle: 'CubePod vs. Upstream E2B & Containers',
       compareHeaders: ['Dimension', 'CubePod v0.6.0', 'Upstream E2B', 'Containers'],
       compareRows: [
-        ['System Persistence', 'Decoupled RootFS + /workspace', 'Saved via VM snapshot (coupled)', 'Lost on restart'],
+        ['System Persistence', 'Decoupled RootFS + /workspace', 'Saved via pause snapshot', 'Lost on restart'],
         ['Storage Engine', 'Dual CSI Raw Block (NVMe-oF)', 'Ephemeral overlay', 'Overlay / NFS'],
-        ['OS / Data Coupling', 'Decoupled (rootfsGeneration)', 'Coupled state', 'Full wipe on reset'],
+        ['OS / Data Coupling', 'Decoupled (rootfsGeneration)', 'Snapshot coupled (or Volumes)', 'Full wipe on reset'],
         ['Suspend & Wake', '0 CPU/RAM · ~1s block attach', 'Memory dump / cold boot', 'Always billed RAM'],
         ['Sandbox Forking', '< 1s CoW dual-volume clone', 'Full copy / N/A', 'Not supported'],
         ['Secret Isolation', 'cpodref_ + mTLS proxy swap', 'Plaintext env vars', 'Plaintext ENV'],
