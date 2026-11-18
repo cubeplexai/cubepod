@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 
 def validate_pool(cluster, pool, uuid):
@@ -86,7 +87,12 @@ def main(cluster):
             for device in devices:
                 assert re.fullmatch(r'/dev/loop\d+', device)
                 run(['losetup', '--detach', device])
-                print(f'Detached owned loop {device}: {path}')
+                deadline = time.monotonic() + 5
+                while device in subprocess.check_output(['losetup', '--associated', str(path), '--output', 'NAME', '--noheadings'], text=True, timeout=10).split():
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f'Owned loop still attached: {device}: {path}; retain node')
+                    time.sleep(0.1)
+                print(f'Confirmed detached owned loop {device}: {path}')
 
 
 if __name__ == "__main__":

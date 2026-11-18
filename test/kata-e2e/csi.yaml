@@ -39,7 +39,11 @@ apiVersion: storage.k8s.io/v1
 kind: StorageClass
 metadata: {name: cubepod-block}
 provisioner: hostpath.csi.k8s.io
-reclaimPolicy: Delete
+# The example driver forgets DeleteVolume metadata before asynchronous
+# NodeUnpublishVolume, returning NotFound and leaking published block binds.
+# Retain the test backing files until proven unpublish + scoped loop cleanup;
+# deleting this owned kind node then removes files/PVs, not a production policy.
+reclaimPolicy: Retain
 volumeBindingMode: WaitForFirstConsumer
 ---
 apiVersion: apps/v1
