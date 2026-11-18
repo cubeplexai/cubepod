@@ -266,6 +266,7 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
                 Path::new("/"),
                 cfg.default_uid,
                 cfg.default_gid,
+                true,
             )?;
             e2b_bind_duration_ms = bind_start.elapsed().as_millis() as u64;
         }
@@ -416,6 +417,7 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
             &cfg.merged_root_path,
             cfg.default_uid,
             cfg.default_gid,
+            false,
         )?;
         for m in &e2b_mounts {
             unmount_lazy_ignore_missing(
@@ -772,6 +774,7 @@ pub fn mount_e2b_volumes(
     root: &Path,
     default_uid: u32,
     default_gid: u32,
+    no_pivot: bool,
 ) -> Result<(), String> {
     for mount in mounts {
         let src_path = Path::new(&mount.staging_path);
@@ -785,6 +788,17 @@ pub fn mount_e2b_volumes(
         let dst = root.join(mount.target_path.trim_start_matches('/'));
         fs::create_dir_all(&dst).map_err(|e| format!("mkdir e2b target {}: {e}", dst.display()))?;
         chown_path(&dst, default_uid, default_gid)?;
+
+        // With no pivot, Kubernetes can mount the same PVC/subPath at both
+        // locations. Do not issue mount(2) in that case: a standard container
+        // intentionally has no CAP_SYS_ADMIN. Pivoted roots still use the
+        // bind/remount path below, including its nosuid/nodev hardening.
+        use std::os::unix::fs::MetadataExt;
+        let src_meta = fs::metadata(src_path).map_err(|e| format!("stat e2b source: {e}"))?;
+        let dst_meta = fs::metadata(&dst).map_err(|e| format!("stat e2b target: {e}"))?;
+        if no_pivot && src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino() {
+            continue;
+        }
 
         let c_src = CString::new(mount.staging_path.as_bytes())
             .map_err(|e| format!("invalid staging_path {}: {e}", mount.staging_path))?;
@@ -1547,7 +1561,32 @@ mod tests {
             staging_path: format!("/run/cubepod/volumes/{vid}-nonexistent"),
             target_path: "/mnt/dataset".to_string(),
         };
-        let err = mount_e2b_volumes(&[spec], Path::new("/"), 1000, 1000).unwrap_err();
+        let err = mount_e2b_volumes(&[spec], Path::new("/"), 1000, 1000, false).unwrap_err();
         assert!(err.contains("does not exist"), "unexpected error: {err}");
+    }
+    #[test]
+    fn e2b_already_mounted_target_needs_no_mount_capability() {
+        let root = unique_temp_path("e2b-direct", "dir");
+        let target = root.join("data");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("persist.txt"), "real-volume").unwrap();
+        let mount = E2BMountSpec {
+            volume_id: "0123456789abcdef0123456789abcdef".into(),
+            staging_path: target.to_string_lossy().into_owned(),
+            target_path: "/data".into(),
+        };
+        mount_e2b_volumes(
+            &[mount],
+            &root,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+            true,
+        )
+        .expect("an identical source/target must not require mount(2)");
+        assert_eq!(
+            fs::read_to_string(target.join("persist.txt")).unwrap(),
+            "real-volume"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

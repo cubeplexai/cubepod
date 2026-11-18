@@ -485,3 +485,31 @@ func TestBuildBlockPVCsWithOptions_VolumeSnapshotDataSource(t *testing.T) {
 		t.Fatalf("unexpected wsPVC snapshot dataSource: %+v", wsPVC)
 	}
 }
+
+// The container baseline must not need CAP_SYS_ADMIN just to mount an E2B PVC.
+func TestBuildKataPod_OfficialMountsWithoutPivot(t *testing.T) {
+	id := "0123456789abcdef0123456789abcdef"
+	for _, runtimeClass := range []string{"", "none", "-"} {
+		t.Run("runtime="+runtimeClass, func(t *testing.T) {
+			shared := "cubepod-e2b-volumes"
+			subPath := id + "/data"
+			spec := v1alpha1.PodBoxSpec{E2BVolumeMounts: []v1alpha1.E2BVolumeMount{
+				{VolumeID: id, PVCName: shared, SubPath: subPath, Path: "/data"},
+			}}
+			pod := controller.BuildKataPod("box-container", v1alpha1.PodTemplateSpec{RuntimeClassName: runtimeClass}, spec, v1alpha1.PodBoxStatus{}, "Filesystem")
+			main := pod.Containers[0]
+			if main.Privileged || main.SecurityContext != nil {
+				t.Fatal("standard volume mounting must not grant additional privileges")
+			}
+			paths := map[string]bool{}
+			for _, mount := range main.VolumeMounts {
+				if mount.Name == shared && mount.SubPath == subPath {
+					paths[mount.MountPath] = true
+				}
+			}
+			if !paths["/data"] || !paths["/run/cubepod/volumes/"+id] {
+				t.Fatalf("expected both final and staging paths for identical volume, got %+v", main.VolumeMounts)
+			}
+		})
+	}
+}
