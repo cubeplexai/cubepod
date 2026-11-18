@@ -23,4 +23,11 @@ feature-gates:
       - "podd"
       - "cubepod-gateway"
 disable-supported: false
-metrics: []
+metrics:
+  - "cubepod_podd_watchers_active"
+  - "cubepod_podd_watch_events_emitted_total"
+  - "cubepod_podd_watch_overflows_total"
+  - "cubepod_watch_streams_active"
+  - "cubepod_watchers_active"
+  - "cubepod_watch_events_total"
+  - "cubepod_watch_overflows_total"

@@ -123,3 +123,63 @@ func TestStoreValidationAndAutoKEK(t *testing.T) {
 		t.Fatalf("expected ErrInvalidValue for oversized, got %v", err)
 	}
 }
+
+func TestStoreOperationsLatencyHistograms(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	st, err := Open(t.TempDir(), Config{EncryptionKey: key, MaxSecretsPerTenant: 5})
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+	info, err := st.Create("key-a", "n1", "v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.List("key-a", 10, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Get("key-a", info.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Update("key-a", info.ID, "v2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ResolveByID("key-a", info.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := st.ResolveByName("key-a", "missing"); err == nil {
+		t.Fatal("expected not found")
+	}
+	if _, err := st.Delete("key-a", info.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	snap := st.OperationsLatencySnapshot()
+	want := map[string]uint64{"create": 1, "list": 1, "get": 1, "update": 1, "delete": 1, "resolve": 2}
+	for op, n := range want {
+		s, ok := snap[op]
+		if !ok {
+			t.Fatalf("missing latency snapshot for %q", op)
+		}
+		if s.Count != n {
+			t.Fatalf("%s count = %d, want %d", op, s.Count, n)
+		}
+		if len(s.Buckets) != 11 || len(s.Counts) != 11 || s.Buckets[0] != 0.005 || s.Buckets[10] != 10 {
+			t.Fatalf("%s unexpected buckets %v", op, s.Buckets)
+		}
+		for i := 1; i < len(s.Counts); i++ {
+			if s.Counts[i] < s.Counts[i-1] {
+				t.Fatalf("%s bucket counts not cumulative: %v", op, s.Counts)
+			}
+		}
+		if s.Counts[10] > s.Count || s.Sum < 0 {
+			t.Fatalf("%s inconsistent snapshot %+v", op, s)
+		}
+	}
+	// Failed operations are timed too (resolve error above).
+	if ops := st.OperationsSnapshot(); ops["resolve"]["error"] != 1 || ops["resolve"]["ok"] != 1 {
+		t.Fatalf("resolve ops = %v", ops["resolve"])
+	}
+}

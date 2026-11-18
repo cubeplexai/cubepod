@@ -304,6 +304,7 @@ sequenceDiagram
   - Python & TypeScript SDK helpers (`Secret` / `AsyncSecret`, `Secret.fill`) verified against live gateway.
 - **Stable (`v1.0`)**:
   - Production bake time in CubePlex with Prometheus alerting on secret exchange errors and store latency.
+  - Per-operation latency histograms `cubepod_secrets_operation_duration_seconds{operation}` and `PrometheusRule` alerts (`CubePodSecretStoreHighErrorRate`, `CubePodSecretStoreHighLatency`, `CubePodSecretExchangeErrors`) in `deploy/monitoring/watcher-secret-alerts.yaml` (*Added in v0.7.0*).
 
 ### Upgrade / Downgrade Strategy
 

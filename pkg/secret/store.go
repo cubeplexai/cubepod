@@ -301,9 +301,61 @@ func (b *FileBackend) saveLocked() error {
 	return os.Rename(tmp, path)
 }
 
+// LatencyBuckets are the upper bounds (seconds) of the per-operation latency histograms.
+var LatencyBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
+
+// LatencySnapshot is a point-in-time copy of one operation's latency histogram.
+// Counts are cumulative per bucket (Prometheus "le" semantics); Count is the +Inf bucket.
+type LatencySnapshot struct {
+	Buckets []float64
+	Counts  []uint64
+	Sum     float64
+	Count   uint64
+}
+
 type opCounterPair struct {
 	ok  atomic.Uint64
 	err atomic.Uint64
+
+	latMu     sync.Mutex
+	latCounts [11]uint64
+	latSum    float64
+	latTotal  uint64
+}
+
+// track starts timing an operation; call the returned func (via defer) with the final error.
+func (p *opCounterPair) track(errp *error) func() {
+	start := time.Now()
+	return func() {
+		p.record(*errp)
+		p.observe(time.Since(start).Seconds())
+	}
+}
+
+func (p *opCounterPair) observe(seconds float64) {
+	if seconds < 0 {
+		seconds = 0
+	}
+	p.latMu.Lock()
+	for i, upper := range LatencyBuckets {
+		if seconds <= upper {
+			p.latCounts[i]++
+		}
+	}
+	p.latSum += seconds
+	p.latTotal++
+	p.latMu.Unlock()
+}
+
+func (p *opCounterPair) latency() LatencySnapshot {
+	p.latMu.Lock()
+	defer p.latMu.Unlock()
+	return LatencySnapshot{
+		Buckets: append([]float64(nil), LatencyBuckets...),
+		Counts:  append([]uint64(nil), p.latCounts[:]...),
+		Sum:     p.latSum,
+		Count:   p.latTotal,
+	}
 }
 
 func (p *opCounterPair) record(err error) {
@@ -331,6 +383,17 @@ func (m *storeMetrics) snapshot() map[string]map[string]uint64 {
 		"update":  {"ok": m.update.ok.Load(), "error": m.update.err.Load()},
 		"delete":  {"ok": m.delete.ok.Load(), "error": m.delete.err.Load()},
 		"resolve": {"ok": m.resolve.ok.Load(), "error": m.resolve.err.Load()},
+	}
+}
+
+func (m *storeMetrics) latencySnapshot() map[string]LatencySnapshot {
+	return map[string]LatencySnapshot{
+		"create":  m.create.latency(),
+		"list":    m.list.latency(),
+		"get":     m.get.latency(),
+		"update":  m.update.latency(),
+		"delete":  m.delete.latency(),
+		"resolve": m.resolve.latency(),
 	}
 }
 
@@ -598,7 +661,7 @@ func toInfo(rec *StoredSecret) SecretInfo {
 
 // Create stores a new secret for the tenant identified by apiKey.
 func (s *Store) Create(apiKey, name, value string) (info SecretInfo, err error) {
-	defer func() { s.metrics.create.record(err) }()
+	defer s.metrics.create.track(&err)()
 
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
@@ -652,7 +715,7 @@ func (s *Store) Create(apiKey, name, value string) (info SecretInfo, err error) 
 
 // List returns paginated secret metadata (never values) for the tenant.
 func (s *Store) List(apiKey string, limit int, nextToken string) (items []SecretInfo, next string, err error) {
-	defer func() { s.metrics.list.record(err) }()
+	defer s.metrics.list.track(&err)()
 
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
@@ -716,7 +779,7 @@ func (s *Store) findLocked(tenant, idOrName string) (*StoredSecret, bool) {
 
 // Get returns secret metadata (never value) for secretID or name owned by the tenant.
 func (s *Store) Get(apiKey, secretID string) (info SecretInfo, err error) {
-	defer func() { s.metrics.get.record(err) }()
+	defer s.metrics.get.track(&err)()
 
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
@@ -734,7 +797,7 @@ func (s *Store) Get(apiKey, secretID string) (info SecretInfo, err error) {
 
 // Update rotates an existing secret's value and increments its version.
 func (s *Store) Update(apiKey, secretID, value string) (info SecretInfo, err error) {
-	defer func() { s.metrics.update.record(err) }()
+	defer s.metrics.update.track(&err)()
 
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
@@ -773,7 +836,7 @@ func (s *Store) Update(apiKey, secretID, value string) (info SecretInfo, err err
 
 // Delete removes a secret owned by the tenant.
 func (s *Store) Delete(apiKey, secretID string) (info SecretInfo, err error) {
-	defer func() { s.metrics.delete.record(err) }()
+	defer s.metrics.delete.track(&err)()
 
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
@@ -802,7 +865,7 @@ func (s *Store) Delete(apiKey, secretID string) (info SecretInfo, err error) {
 
 // ResolveByName looks up a secret by name for the tenant and returns its metadata and redacted SecretValue.
 func (s *Store) ResolveByName(apiKey, name string) (info SecretInfo, val SecretValue, err error) {
-	defer func() { s.metrics.resolve.record(err) }()
+	defer s.metrics.resolve.track(&err)()
 
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
@@ -825,7 +888,7 @@ func (s *Store) ResolveByName(apiKey, name string) (info SecretInfo, val SecretV
 
 // ResolveByID looks up a secret by ID for the tenant and returns its metadata and redacted SecretValue.
 func (s *Store) ResolveByID(apiKey, secretID string) (info SecretInfo, val SecretValue, err error) {
-	defer func() { s.metrics.resolve.record(err) }()
+	defer s.metrics.resolve.track(&err)()
 
 	tenant, err := requireTenantHash(apiKey)
 	if err != nil {
@@ -845,7 +908,7 @@ func (s *Store) ResolveByID(apiKey, secretID string) (info SecretInfo, val Secre
 // ResolveByTenantID looks up a secret by pre-hashed tenantHash and secretID
 // (used for HA Vault re-hydration from PodBox SecretRefBindings).
 func (s *Store) ResolveByTenantID(tenantHash, secretID string) (info SecretInfo, val SecretValue, err error) {
-	defer func() { s.metrics.resolve.record(err) }()
+	defer s.metrics.resolve.track(&err)()
 
 	if strings.TrimSpace(tenantHash) == "" || strings.TrimSpace(secretID) == "" {
 		return SecretInfo{}, "", ErrNotFound
@@ -874,4 +937,10 @@ func (s *Store) Count() int {
 // OperationsSnapshot returns a thread-safe copy of secret operation counts by operation and status ("ok"/"error").
 func (s *Store) OperationsSnapshot() map[string]map[string]uint64 {
 	return s.metrics.snapshot()
+}
+
+// OperationsLatencySnapshot returns a thread-safe copy of per-operation latency histograms
+// (create, list, get, update, delete, resolve).
+func (s *Store) OperationsLatencySnapshot() map[string]LatencySnapshot {
+	return s.metrics.latencySnapshot()
 }

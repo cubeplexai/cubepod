@@ -192,6 +192,7 @@ flowchart LR
 - **Alpha (current)**: Implemented in `podd` and `cubepod-gateway` with unit/multi-process tests passing (`cargo test -p podd`, `go test -race ./pkg/gateway/...`).
 - **Beta**: Verified against official Python and TypeScript E2B SDKs in CI and live Kubernetes Kata cluster.
 - **Stable**: Baked in CubePlex production with Prometheus watcher/stream metrics.
+  - Watcher/stream metrics exported (*Added in v0.7.0*): `podd` exposes `cubepod_podd_watchers_active`, `cubepod_podd_watch_events_emitted_total`, and `cubepod_podd_watch_overflows_total{kind="inotify_queue|ring_buffer|subscriber_queue"}`; the gateway exposes `cubepod_watch_streams_active`, `cubepod_watchers_active`, `cubepod_watch_events_total`, and `cubepod_watch_overflows_total`. The `CubePodWatchOverflowDetected` alert lives in `deploy/monitoring/watcher-secret-alerts.yaml`.
 
 ### Upgrade / Downgrade Strategy
 

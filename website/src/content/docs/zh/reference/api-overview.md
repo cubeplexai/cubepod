@@ -157,6 +157,7 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
   - `cubepod_podd_init_duration_milliseconds`（读取 `/run/cubepod/init-state.json` 的 `duration_ms`）
   - `cubepod_podd_init_e2b_bind_duration_ms`（读取 `/run/cubepod/init-state.json` 的 `e2b_bind_duration_ms`）
   - `cubepod_podd_cpu_used_percent`、`cubepod_podd_memory_used_bytes`、`cubepod_podd_memory_total_bytes`、`cubepod_podd_disk_used_bytes`、`cubepod_podd_disk_total_bytes`
+  - *v0.7.0 新增。* 文件监听指标：`cubepod_podd_watchers_active`（gauge）、`cubepod_podd_watch_events_emitted_total`（counter）、`cubepod_podd_watch_overflows_total{kind="inotify_queue|ring_buffer|subscriber_queue"}`（counter）。`GET /metrics?format=prometheus` 返回相同指标。
 
 ### Gateway（`:8080/metrics`）、Controller（`:8081/metrics`）与 Egress（`:19090/metrics`）指标清单
 
@@ -175,6 +176,10 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 | **Gateway** | `cubepod_desktop_activations_total` | Counter | 桌面启动次数（`result`：`ok`、`unsupported`、`error`） |
 | **Gateway** | `cubepod_secrets_operations_total` | Counter | 密钥存储操作数（`op`、`status`） |
 | **Gateway** | `cubepod_secrets_store_count` | Gauge | 全租户已存储的 E2B 密钥总数 |
+| **Gateway** | `cubepod_secrets_operation_duration_seconds` *(v0.7.0 新增)* | Histogram | 按 `operation`（`create`、`list`、`get`、`update`、`delete`、`resolve`）统计的密钥存储耗时；桶 0.005s–10s |
+| **Gateway** | `cubepod_watch_streams_active` / `cubepod_watchers_active` *(v0.7.0 新增)* | Gauge | 活跃 `WatchDir` 流数与活跃轮询监听器（`CreateWatcher`）数 |
+| **Gateway** | `cubepod_watch_events_total` / `cubepod_watch_overflows_total` *(v0.7.0 新增)* | Counter | 已发出的监听事件数与 `resource_exhausted` 监听溢出次数 |
+| **Egress** | `cubepod_egress_secret_exchanges_total` | Counter | `cpodref_` 密钥交换次数（`result`：`ok`、`denied`、`error`） |
 | **Gateway** | `cubepod_e2b_volume_mounts_total` / `cubepod_e2b_volume_mount_errors_total` | Counter | E2B 卷挂载次数与挂载规划/执行错误数 |
 | **Gateway** | `cubepod_events_recorded_total` | Counter | 已记录的沙箱生命周期事件总数（启用事件管理器时导出） |
 | **Gateway** | `cubepod_webhook_deliveries_total` / `cubepod_webhook_queue_depth` | Counter / Gauge | Webhook 投递结果（`result`：`ok`、`failed`、`dropped`）与队列深度 |
@@ -186,6 +191,10 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 | **Egress** | `cubepod_egress_requests_total` | Counter | 出站请求计数（`mode`、`decision`） |
 | **Egress** | `cubepod_egress_secret_exchanges_total` | Counter | 单沙箱 mTLS `cpodref_` 交换次数（`result`） |
 | **Egress** | `cubepod_egress_blocked_hosts_total` | Counter | 被策略拒绝的出站目标域名计数（`host`） |
+
+### 告警规则 *(v0.7.0 新增)*
+
+[`deploy/monitoring/watcher-secret-alerts.yaml`](https://github.com/cubeplexai/cubepod/blob/main/deploy/monitoring/watcher-secret-alerts.yaml) 是 Prometheus Operator `PrometheusRule`，包含 `CubePodSecretStoreHighErrorRate`、`CubePodSecretStoreHighLatency`（p99 > 0.5s）、`CubePodSecretExchangeErrors` 与 `CubePodWatchOverflowDetected`。
 
 ## 内部零信任出站凭证交换
 
