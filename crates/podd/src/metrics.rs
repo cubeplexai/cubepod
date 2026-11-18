@@ -12,12 +12,14 @@ use std::ffi::CString;
 use std::fs;
 use std::net::TcpStream;
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::commands::ProcessRegistry;
 use crate::http::{write_json, write_response, HttpRequest};
 use crate::json::{escape_json, JsonValue};
+use crate::watch::WatchStats;
 use crate::DaemonConfig;
 
 const DEFAULT_INIT_STATE_PATH: &str = "/run/cubepod/init-state.json";
@@ -431,7 +433,17 @@ pub fn render_prometheus_metrics(
     init: InitMetrics,
     sample: &SandboxMetric,
 ) -> String {
-    format!(
+    render_prometheus_metrics_with_watch(active_processes, init, sample, 0, &WatchStats::default())
+}
+
+pub fn render_prometheus_metrics_with_watch(
+    active_processes: usize,
+    init: InitMetrics,
+    sample: &SandboxMetric,
+    watchers_active: usize,
+    stats: &WatchStats,
+) -> String {
+    let mut out = format!(
         concat!(
             "# HELP cubepod_podd_active_processes Current number of active processes managed by podd\n",
             "# TYPE cubepod_podd_active_processes gauge\n",
@@ -466,7 +478,28 @@ pub fn render_prometheus_metrics(
         sample.mem_total,
         sample.disk_used,
         sample.disk_total
-    )
+    );
+    out.push_str(&format!(
+        concat!(
+            "# HELP cubepod_podd_watchers_active Current number of active filesystem watchers\n",
+            "# TYPE cubepod_podd_watchers_active gauge\n",
+            "cubepod_podd_watchers_active {}\n",
+            "# HELP cubepod_podd_watch_events_emitted_total Filesystem watch events emitted\n",
+            "# TYPE cubepod_podd_watch_events_emitted_total counter\n",
+            "cubepod_podd_watch_events_emitted_total {}\n",
+            "# HELP cubepod_podd_watch_overflows_total Filesystem watch overflows by kind\n",
+            "# TYPE cubepod_podd_watch_overflows_total counter\n",
+            "cubepod_podd_watch_overflows_total{{kind=\"inotify_queue\"}} {}\n",
+            "cubepod_podd_watch_overflows_total{{kind=\"ring_buffer\"}} {}\n",
+            "cubepod_podd_watch_overflows_total{{kind=\"subscriber_queue\"}} {}\n"
+        ),
+        watchers_active,
+        stats.events_emitted.load(Ordering::Relaxed),
+        stats.overflow_inotify_queue.load(Ordering::Relaxed),
+        stats.overflow_ring_buffer.load(Ordering::Relaxed),
+        stats.overflow_subscriber_queue.load(Ordering::Relaxed),
+    ));
+    out
 }
 
 pub fn handle_metrics(
@@ -507,7 +540,13 @@ pub fn handle_prometheus(
     let init_path = init_state_path();
     let init = read_init_metrics(Path::new(&init_path));
     let sample = sample_sandbox_metric(&config.workdir);
-    let body = render_prometheus_metrics(active, init, &sample);
+    let body = render_prometheus_metrics_with_watch(
+        active,
+        init,
+        &sample,
+        registry.watchers.active_count(),
+        &registry.watchers.stats(),
+    );
     write_response(
         stream,
         "200 OK",
@@ -654,5 +693,23 @@ SReclaimable:     500000 kB
         assert!(prom.contains("cubepod_podd_active_processes 3\n"));
         assert!(prom.contains("cubepod_podd_init_duration_milliseconds 42\n"));
         assert!(prom.contains("cubepod_podd_init_e2b_bind_duration_ms 7\n"));
+        assert!(prom.contains("cubepod_podd_watchers_active 0\n"));
+    }
+
+    #[test]
+    fn prometheus_renders_watch_metrics() {
+        let stats = WatchStats::default();
+        stats.events_emitted.store(5, Ordering::Relaxed);
+        stats.overflow_inotify_queue.store(1, Ordering::Relaxed);
+        stats.overflow_ring_buffer.store(2, Ordering::Relaxed);
+        stats.overflow_subscriber_queue.store(3, Ordering::Relaxed);
+        let sample = sample_sandbox_metric("/tmp");
+        let prom =
+            render_prometheus_metrics_with_watch(0, InitMetrics::default(), &sample, 4, &stats);
+        assert!(prom.contains("cubepod_podd_watchers_active 4\n"));
+        assert!(prom.contains("cubepod_podd_watch_events_emitted_total 5\n"));
+        assert!(prom.contains("cubepod_podd_watch_overflows_total{kind=\"inotify_queue\"} 1\n"));
+        assert!(prom.contains("cubepod_podd_watch_overflows_total{kind=\"ring_buffer\"} 2\n"));
+        assert!(prom.contains("cubepod_podd_watch_overflows_total{kind=\"subscriber_queue\"} 3\n"));
     }
 }

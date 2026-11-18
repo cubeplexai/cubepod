@@ -1462,3 +1462,106 @@ func TestK8sLiveE2EVolumeSnapshotFork(t *testing.T) {
 	}
 	t.Logf("[K8s-E2E] VolumeSnapshot CoW fork verified (parent=%s child=%s dataSource=%+v)", parent.SandboxID, child.SandboxID, ds)
 }
+
+func TestK8sLiveE2ESandboxMetrics(t *testing.T) {
+	cfg := requireLiveE2EConfig(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	base := strings.TrimRight(cfg.GatewayURL, "/")
+	apiKey := getenv("CUBEPOD_API_KEY", "cpod_k8s_e2e_key")
+	otherKey := apiKey + "_other_tenant"
+	httpClient := &http.Client{Timeout: 3 * time.Minute}
+
+	c := client.New(cfg.GatewayURL, client.WithTimeout(3*time.Minute))
+	createStatus, createBody, err := doGatewayJSON(ctx, httpClient, http.MethodPost, base+"/sandboxes", apiKey, map[string]any{
+		"templateID": cfg.SandboxImage,
+		"metadata":   map[string]string{"env": "k8s-e2e", "feature": "sandbox-metrics"},
+	})
+	if err != nil || (createStatus != http.StatusCreated && createStatus != http.StatusOK) {
+		t.Fatalf("POST /sandboxes: status=%d err=%v body=%s", createStatus, err, createBody)
+	}
+	var sb client.SandboxRecord
+	if err := json.Unmarshal(createBody, &sb); err != nil || sb.SandboxID == "" {
+		t.Fatalf("decode sandbox: err=%v body=%s", err, createBody)
+	}
+	defer func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer ccancel()
+		_ = c.DeleteSandboxWithOptions(cctx, sb.SandboxID, true)
+	}()
+
+	checkMetric := func(label string, m map[string]any) {
+		t.Helper()
+		num := func(k string) float64 {
+			v, _ := m[k].(float64)
+			return v
+		}
+		if num("cpuCount") < 1 {
+			t.Fatalf("%s: cpuCount=%v, want >=1", label, m["cpuCount"])
+		}
+		if num("memTotal") <= 0 {
+			t.Fatalf("%s: memTotal=%v, want >0", label, m["memTotal"])
+		}
+		if num("diskTotal") <= 0 {
+			t.Fatalf("%s: diskTotal=%v, want >0", label, m["diskTotal"])
+		}
+		ts, _ := m["timestamp"].(string)
+		if _, err := time.Parse(time.RFC3339, ts); err != nil {
+			t.Fatalf("%s: invalid timestamp %q: %v", label, ts, err)
+		}
+		if num("timestampUnix") <= 0 {
+			t.Fatalf("%s: invalid timestampUnix=%v", label, m["timestampUnix"])
+		}
+	}
+
+	// Single-sandbox endpoint.
+	status, body, err := doGatewayJSON(ctx, httpClient, http.MethodGet, base+"/sandboxes/"+sb.SandboxID+"/metrics", apiKey, nil)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("GET /sandboxes/{id}/metrics: status=%d err=%v body=%s", status, err, body)
+	}
+	var series []map[string]any
+	if err := json.Unmarshal(body, &series); err != nil || len(series) == 0 {
+		t.Fatalf("decode metrics series: err=%v body=%s", err, body)
+	}
+	checkMetric("single", series[len(series)-1])
+
+	// Batch endpoint.
+	status, body, err = doGatewayJSON(ctx, httpClient, http.MethodGet, base+"/sandboxes/metrics?sandboxIds="+sb.SandboxID, apiKey, nil)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("GET /sandboxes/metrics: status=%d err=%v body=%s", status, err, body)
+	}
+	var batch struct {
+		Sandboxes map[string]map[string]any `json:"sandboxes"`
+	}
+	if err := json.Unmarshal(body, &batch); err != nil {
+		t.Fatalf("decode batch metrics: %v body=%s", err, body)
+	}
+	m, ok := batch.Sandboxes[sb.SandboxID]
+	if !ok {
+		t.Fatalf("batch metrics missing sandbox %s: %s", sb.SandboxID, body)
+	}
+	checkMetric("batch", m)
+
+	// Cross-tenant isolation: a different API key must not see the sandbox.
+	status, body, err = doGatewayJSON(ctx, httpClient, http.MethodGet, base+"/sandboxes/"+sb.SandboxID+"/metrics", otherKey, nil)
+	if err != nil {
+		t.Fatalf("cross-tenant single metrics: %v", err)
+	}
+	if status != http.StatusNotFound {
+		t.Fatalf("cross-tenant single metrics: status=%d, want 404 body=%s", status, body)
+	}
+	status, body, err = doGatewayJSON(ctx, httpClient, http.MethodGet, base+"/sandboxes/metrics?sandboxIds="+sb.SandboxID, otherKey, nil)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("cross-tenant batch metrics: status=%d err=%v body=%s", status, err, body)
+	}
+	var otherBatch struct {
+		Sandboxes map[string]map[string]any `json:"sandboxes"`
+	}
+	if err := json.Unmarshal(body, &otherBatch); err != nil {
+		t.Fatalf("decode cross-tenant batch: %v", err)
+	}
+	if _, leaked := otherBatch.Sandboxes[sb.SandboxID]; leaked {
+		t.Fatalf("cross-tenant batch leaked sandbox metrics: %s", body)
+	}
+}

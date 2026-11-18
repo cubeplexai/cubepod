@@ -14,6 +14,7 @@ type Metrics struct {
 	requests        map[requestMetricKey]uint64
 	secretExchanges map[string]uint64
 	blockedHosts    map[string]uint64
+	mitmALPN        map[string]uint64
 }
 
 type requestMetricKey struct {
@@ -27,6 +28,7 @@ func NewMetrics() *Metrics {
 		requests:        make(map[requestMetricKey]uint64),
 		secretExchanges: make(map[string]uint64),
 		blockedHosts:    make(map[string]uint64),
+		mitmALPN:        make(map[string]uint64),
 	}
 }
 
@@ -47,6 +49,21 @@ func (m *Metrics) IncSecretExchange(result string) {
 	}
 	m.mu.Lock()
 	m.secretExchanges[result]++
+	m.mu.Unlock()
+}
+
+// IncMITMALPN increments cubepod_egress_mitm_alpn_total{proto} for the ALPN
+// protocol negotiated on a client-facing MITM TLS connection. Unknown or empty
+// protocols are recorded as "http/1.1" because the proxy serves them as HTTP/1.1.
+func (m *Metrics) IncMITMALPN(proto string) {
+	if m == nil {
+		return
+	}
+	if proto != "h2" {
+		proto = "http/1.1"
+	}
+	m.mu.Lock()
+	m.mitmALPN[proto]++
 	m.mu.Unlock()
 }
 
@@ -117,6 +134,15 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for i, k := range blockedKeys {
 		blockedVals[i] = m.blockedHosts[k]
 	}
+	alpnKeys := make([]string, 0, len(m.mitmALPN))
+	for k := range m.mitmALPN {
+		alpnKeys = append(alpnKeys, k)
+	}
+	sort.Strings(alpnKeys)
+	alpnVals := make([]uint64, len(alpnKeys))
+	for i, k := range alpnKeys {
+		alpnVals[i] = m.mitmALPN[k]
+	}
 	m.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -138,6 +164,12 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	b.WriteString("# TYPE cubepod_egress_blocked_hosts_total counter\n")
 	for i, k := range blockedKeys {
 		fmt.Fprintf(&b, "cubepod_egress_blocked_hosts_total{host=%q} %d\n", k, blockedVals[i])
+	}
+
+	b.WriteString("# HELP cubepod_egress_mitm_alpn_total Total number of MITM client connections by negotiated ALPN protocol.\n")
+	b.WriteString("# TYPE cubepod_egress_mitm_alpn_total counter\n")
+	for i, k := range alpnKeys {
+		fmt.Fprintf(&b, "cubepod_egress_mitm_alpn_total{proto=%q} %d\n", k, alpnVals[i])
 	}
 
 	_, _ = w.Write([]byte(b.String()))

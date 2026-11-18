@@ -157,6 +157,7 @@ Both `cubepod-gateway` and `cubepod-controller` accept `--feature-gate=GateA=tru
   - `cubepod_podd_init_duration_milliseconds` (from `/run/cubepod/init-state.json` `duration_ms`)
   - `cubepod_podd_init_e2b_bind_duration_ms` (from `/run/cubepod/init-state.json` `e2b_bind_duration_ms`)
   - `cubepod_podd_cpu_used_percent`, `cubepod_podd_memory_used_bytes`, `cubepod_podd_memory_total_bytes`, `cubepod_podd_disk_used_bytes`, `cubepod_podd_disk_total_bytes`
+  - *Added in v0.7.0.* Watcher metrics: `cubepod_podd_watchers_active` (gauge), `cubepod_podd_watch_events_emitted_total` (counter), and `cubepod_podd_watch_overflows_total{kind="inotify_queue|ring_buffer|subscriber_queue"}` (counter). The same series are returned by `GET /metrics?format=prometheus`.
 
 ### Gateway (`:8080/metrics`), Controller (`:8081/metrics`) & Egress (`:19090/metrics`)
 
@@ -171,10 +172,15 @@ Both `cubepod-gateway` and `cubepod-controller` accept `--feature-gate=GateA=tru
 | **Gateway** | `cubepod_gateway_sandboxes_active` | Gauge | Active sandboxes by `state` (`Running`, `Paused`) |
 | **Gateway** | `cubepod_gateway_warmpools_total` | Gauge | Total configured WarmPools |
 | **Gateway** | `cubepod_gateway_crd_resyncs_total` | Counter | Total `PodBox`/`PodWarmPool` CRD resyncs |
+| **Gateway** | `cubepod_sandbox_metrics_samples_total` | Counter | Background sandbox metrics sampler results (`result="ok|error"`). *Added in v0.7.0.* |
+| **Gateway** | `cubepod_sandbox_cpu_count` / `cubepod_sandbox_cpu_used_pct` / `cubepod_sandbox_memory_used_bytes` / `cubepod_sandbox_memory_total_bytes` / `cubepod_sandbox_disk_used_bytes` / `cubepod_sandbox_disk_total_bytes` | Gauge | Latest sampled per-sandbox resource usage for Running sandboxes (`sandbox_id` label). *Added in v0.7.0.* |
 | **Gateway** | `cubepod_panel_active_sessions` | Gauge | Active `/panel/{token}/` HTTP/WebSocket proxy sessions |
 | **Gateway** | `cubepod_desktop_activations_total` | Counter | Desktop activations by `result` (`ok`, `unsupported`, `error`) |
 | **Gateway** | `cubepod_secrets_operations_total` | Counter | Secret store operations by `op` and `status` |
 | **Gateway** | `cubepod_secrets_store_count` | Gauge | Total stored E2B secrets across tenants |
+| **Gateway** | `cubepod_secrets_operation_duration_seconds` *(Added in v0.7.0)* | Histogram | Secret store latency by `operation` (`create`, `list`, `get`, `update`, `delete`, `resolve`); buckets 0.005s–10s |
+| **Gateway** | `cubepod_watch_streams_active` / `cubepod_watchers_active` *(Added in v0.7.0)* | Gauge | Live `WatchDir` streams and active poll watchers (`CreateWatcher`) |
+| **Gateway** | `cubepod_watch_events_total` / `cubepod_watch_overflows_total` *(Added in v0.7.0)* | Counter | Watch events emitted and `resource_exhausted` watch overflows |
 | **Gateway** | `cubepod_e2b_volume_mounts_total` / `cubepod_e2b_volume_mount_errors_total` | Counter | E2B volume mounts attached and mount planning/attach errors |
 | **Gateway** | `cubepod_e2b_volume_quota_rejections_total` *(Added in v0.7.0)* | Counter | E2B volume creation or upload requests rejected (`429`) due to tenant volume-count or byte quotas |
 | **Gateway** | `cubepod_e2b_volumes_storage_capacity_bytes` / `cubepod_e2b_volumes_storage_used_bytes` / `cubepod_e2b_volumes_storage_available_bytes` *(Added in v0.7.0)* | Gauge | Filesystem capacity, used bytes, and available bytes (`statfs`) of the E2B volumes store directory |
@@ -187,8 +193,12 @@ Both `cubepod-gateway` and `cubepod-controller` accept `--feature-gate=GateA=tru
 | **Controller** | `cubepod_warmpool_ready` / `cubepod_warmpool_available_replicas` | Gauge | Ready and unclaimed standby WarmPool replicas |
 | **Controller** | `cubepod_template_builds_total` / `cubepod_template_build_duration_seconds` | Counter / Histogram | Template build completions (`result`) and duration |
 | **Egress** | `cubepod_egress_requests_total` | Counter | Outbound requests (`mode`, `decision`) |
-| **Egress** | `cubepod_egress_secret_exchanges_total` | Counter | Per-pod mTLS `cpodref_` exchanges (`result`) |
+| **Egress** | `cubepod_egress_secret_exchanges_total` | Counter | Per-pod mTLS `cpodref_` exchanges (`result`: `ok`, `denied`, `error`) |
 | **Egress** | `cubepod_egress_blocked_hosts_total` | Counter | Blocked outbound hosts (`host`) |
+
+### Alerting Rules *(Added in v0.7.0)*
+
+[`deploy/monitoring/watcher-secret-alerts.yaml`](https://github.com/cubeplexai/cubepod/blob/main/deploy/monitoring/watcher-secret-alerts.yaml) is a Prometheus Operator `PrometheusRule` providing `CubePodSecretStoreHighErrorRate`, `CubePodSecretStoreHighLatency` (p99 > 0.5s), `CubePodSecretExchangeErrors`, and `CubePodWatchOverflowDetected`.
 
 ## Internal Zero-Trust Egress Exchange
 

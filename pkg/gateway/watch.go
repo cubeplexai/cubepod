@@ -109,6 +109,7 @@ func (s *watchSub) overflowed() bool {
 }
 
 type dirWatcher struct {
+	metrics      *Metrics
 	id           string
 	sandboxID    string
 	root         string
@@ -158,8 +159,16 @@ func (w *dirWatcher) stop() {
 	})
 }
 
+func (w *dirWatcher) recordOverflow() {
+	if w.metrics != nil {
+		w.metrics.WatchOverflowsTotal.Add(1)
+	}
+}
+
 func (w *dirWatcher) failOverflowLocked(msg string) {
-	w.overflowed.Store(true)
+	if !w.overflowed.Swap(true) {
+		w.recordOverflow()
+	}
 	for sub := range w.subs {
 		delete(w.subs, sub)
 		sub.failWith(msg)
@@ -190,6 +199,9 @@ func (w *dirWatcher) publish(ev fsEvent) {
 		}
 		w.pending = append(w.pending, ev)
 	}
+	if w.metrics != nil {
+		w.metrics.WatchEventsTotal.Add(1)
+	}
 	var drop []*watchSub
 	for sub := range w.subs {
 		select {
@@ -200,6 +212,7 @@ func (w *dirWatcher) publish(ev fsEvent) {
 	}
 	for _, sub := range drop {
 		delete(w.subs, sub)
+		w.recordOverflow()
 		sub.fail()
 	}
 }
@@ -668,6 +681,7 @@ func (s *Server) startDirWatcherWithCap(rec *SandboxRecord, req watchCreateReq, 
 		return nil, inotifyErr("eventfd", err)
 	}
 	w := &dirWatcher{
+		metrics:      s.Metrics(),
 		id:           fmt.Sprintf("w%d", watcherSeq.Add(1)),
 		sandboxID:    rec.SandboxID,
 		root:         full,
@@ -697,6 +711,22 @@ func (s *Server) startDirWatcherWithCap(rec *SandboxRecord, req watchCreateReq, 
 	s.mu.Unlock()
 	go w.loop()
 	return w, nil
+}
+
+// activePollWatchers counts live poll-mode watchers (CreateWatcher), clamped to >= 0.
+func (s *Server) activePollWatchers() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	n := 0
+	for _, w := range s.watchers {
+		if w.poll {
+			n++
+		}
+	}
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func (s *Server) watcherByID(sandboxID, id string) *dirWatcher {
@@ -898,6 +928,8 @@ func (s *Server) handleConnectRPCWatchDir(w http.ResponseWriter, r *http.Request
 		return
 	}
 	defer s.removeWatcher(watcher.id)
+	s.Metrics().WatchStreamsActive.Add(1)
+	defer s.Metrics().WatchStreamsActive.Add(-1)
 	sub := watcher.subscribe()
 	defer watcher.removeSub(sub)
 

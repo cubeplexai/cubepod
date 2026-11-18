@@ -75,6 +75,8 @@ For allowed TLS connections (`CONNECT :18080` or transparent `:18443`), `pkg/egr
   3. Calls `cubepod-gateway` (`POST /internal/v1/egress/exchange`) over **per-sandbox mTLS**, where the gateway verifies that the sidecar's client certificate **`CN` matches `sandboxID`**, along with `sniHost` and `headerName`.
   4. Replaces `cpodref_...` with the real secret solely in transit buffers and forwards upstream; real credentials are never logged or sent back to the guest.
 
+**HTTP/2 (`h2`) ALPN support** *(Added in v0.7.0.)*: The client-facing MITM listener advertises `h2` and `http/1.1` via ALPN, so modern HTTP/2 clients (`curl --http2`, Go `net/http`, `httpx`, `undici`, gRPC-over-HTTPS) are served natively and can multiplex many streams over one connection, while HTTP/1.1-only clients keep working. Each `h2` stream goes through the same checks as HTTP/1.1: `:authority` must equal the TLS SNI (`421 Misdirected Request` otherwise), `HeaderTransforms` are applied, and `cpodref_` / `cbxref_` placeholders are exchanged only for allowed hosts and headers (`403 Forbidden` otherwise, and nothing is forwarded upstream). Streaming responses such as SSE are flushed incrementally. The negotiated protocol is exported as `cubepod_egress_mitm_alpn_total{proto="h2|http/1.1"}`.
+
 ## 6. Multi-Replica Gateway HA Secrets & Strict mTLS Exchange *(Added / Changed in v0.6.0)*
 
 To support horizontally scaled `cubepod-gateway` deployments (`gateway.replicaCount > 1`) without local state drift:
