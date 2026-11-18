@@ -14,6 +14,7 @@ import dmsetup_node
 from cleanup_node import owned_files, validate_pool, validate_thin
 from verify_guest_log import guest_ready
 from dmsetup_node import validate as validate_publication
+from collect_block_state import owned_thin as validate_diagnostic
 
 class RuntimeProofTest(unittest.TestCase):
     def test_guest_proof_requires_both_exact_kernel_and_output(self):
@@ -109,6 +110,22 @@ class DevicePublicationTest(unittest.TestCase):
                 dmsetup_node.main(cluster, ['create', 'foreign-disk', '--table', '0 2048 thin /dev/mapper/' + cluster + '-pool 1'])
             create.assert_not_called()
             publish.assert_not_called()
+
+
+class DiagnosticOwnershipTest(unittest.TestCase):
+    def test_diagnostics_reject_foreign_or_stale_devices(self):
+        cluster = 'cubepod-fc-owned'
+        name = cluster + '-pool-snap-12'
+        uuid = 'CUBEPOD_E2E_' + cluster
+        validate_diagnostic(cluster, name, uuid, '0 2048 thin 253:1 12', '253:1')
+        for candidate, owner, table in [
+            ('sda', uuid, '0 2048 thin 253:1 12'),
+            (name, 'FOREIGN', '0 2048 thin 253:1 12'),
+            (name, uuid, '0 2048 thin 253:9 12'),
+            (name, uuid, '0 2048 linear 253:1 12'),
+        ]:
+            with self.assertRaises(AssertionError):
+                validate_diagnostic(cluster, candidate, owner, table, '253:1')
 
 
 if __name__ == '__main__':

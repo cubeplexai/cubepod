@@ -125,7 +125,16 @@ print(json.dumps(found,indent=2));assert found,"No actual selected VMM process"'
   sed "s/CLUSTER_PLACEHOLDER/$CLUSTER_NAME/g" "$KATA_HERE/csi.yaml" | k apply -f -
   k rollout status statefulset/hostpath -n cubepod-csi --timeout=240s
 }
+kata_block_diagnostics() {
+  [[ "$KATA_VMM" == fc ]] || return 0
+  owned || return 1
+  [[ $(docker inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "$CLUSTER_NAME-control-plane") == "$CLUSTER_NAME" ]] || return 1
+  timeout 60s docker exec -i "$CLUSTER_NAME-control-plane" python3 - "$CLUSTER_NAME" <"$KATA_HERE/collect_block_state.py" >"$ARTIFACTS/fc-block-$1.jsonl" 2>&1
+}
 kata_watch_sdks() {
+  # Capture actual thin-pool usage, sector geometry and filesystem headers before
+  # SDK mutation and again on failure, without mounting or repairing any disk.
+  kata_block_diagnostics before-sdks || echo "Read-only FC diagnostics incomplete; full SDK and cleanup assertions still required" >&2
   export E2E_GUEST_KERNEL=6.18.62
   timeout 1300s kubectl --context "kind-$CLUSTER_NAME" --request-timeout=0 get pods -n "$NS" -l pod.cubeplex.ai/box --watch --output-watch-events -o json >"$ARTIFACTS/sdk-pods-watch.json" 2>"$ARTIFACTS/sdk-pods-watch.stderr" &
   KATA_WATCH_PID=$!
@@ -139,9 +148,10 @@ kata_verify_sdks() {
 }
 kata_collect() {
   kata_stop_watch
+  kata_block_diagnostics final || true
   k get runtimeclass,pv,storageclass -o yaml >"$ARTIFACTS/kata-storage.yaml" 2>&1 || true
   k logs -n cubepod-csi statefulset/hostpath --all-containers=true --tail=1000 >"$ARTIFACTS/csi.log" 2>&1 || true
-  kata_node journalctl -u containerd --no-pager -n 3000 >"$ARTIFACTS/containerd-kata.log" 2>&1 || true
+  kata_node journalctl -u containerd --no-pager -n 30000 >"$ARTIFACTS/containerd-kata.log" 2>&1 || true
   kata_node bash -ec 'cat /etc/containerd/config.toml; cat /etc/kata-containers/configuration-e2e.toml; ls -l /dev/kvm; cat /proc/cpuinfo' >"$ARTIFACTS/runtime-config-cpu.txt" 2>&1 || true
   if [[ "$KATA_VMM" == fc ]]; then kata_node cat "/var/lib/cubepod-kata-e2e/$CLUSTER_NAME/device-publication.log" >"$ARTIFACTS/device-publication.log" 2>&1 || true; fi
   kata_node bash -ec 'ctr -n k8s.io tasks list; findmnt -rn -o TARGET,SOURCE,FSTYPE; losetup --list' >"$ARTIFACTS/tasks-mounts-loops.txt" 2>&1 || true
