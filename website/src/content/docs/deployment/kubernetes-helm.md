@@ -43,6 +43,7 @@ Helm skips upgrading files inside `crds/` on subsequent `helm upgrade` runs. Whe
 ```bash
 kubectl apply -f deploy/helm/cubepod/crds/
 ```
+When upgrading to v0.7.0, re-apply at least `kubectl apply -f deploy/helm/cubepod/crds/cubepod.io_sandboxwebhooks.yaml` so the `SandboxWebhook` CRD gains the `status.deadLetters` schema used by the `k8s` events backend.
 :::
 
 ## Deployed Resources Architecture
@@ -127,8 +128,25 @@ helm upgrade --install cubepod ./deploy/helm/cubepod \
 - **Gateway PodDisruptionBudget (`gateway.podDisruptionBudget.*`)** *(Added in v0.6.0)*: When `gateway.podDisruptionBudget.enabled` is `null` (default) and `gateway.replicaCount > 1`, `pdb.yaml` automatically provisions a `PodDisruptionBudget` with `minAvailable: 1` (or `maxUnavailable` if set).
 - **Zero-Trust Egress (`egress.*`)** *(Changed in v0.6.0)*: Enabled by default (`egress.enabled: true`, `egress.transparent: true`), injecting the `cubepod-egress` sidecar (`egress.image.*`) on port `18080` and swapping `cpodref_` placeholders against `egress.exchangeUrl`. Both `egress.transparent` and `featureGates.transparentEgress` must be `true` for `TransparentEgress` (`CUBEPOD_TRANSPARENT=1` + `NET_ADMIN`) to activate. See [Zero-Trust Egress](/concepts/zero-trust-egress/).
 - **E2B Secrets HA Store (`secrets.*`)** *(Added in v0.6.0)*: Configures `CUBEPOD_SECRETS_BACKEND` (`"k8s"` default for multi-replica HA via `KubeSecretBackend`, `"file"` using `secrets.dir`, or `"disabled"`) and encryption key wiring (`secrets.existingSecret`, inline `secrets.encryptionKey`, or legacy fallback `gateway.secretsKeySecret`).
+- **Sandbox Events & Webhooks HA Store (`events.*`)** *(Added in v0.7.0)*: `events.enabled` (default `true`), `events.backend` (default `"k8s"`, rendered as `CUBEPOD_EVENTS_BACKEND`), and `events.dir` (default `/var/lib/cubepod/events`, used only when `events.backend` is `"file"`). Events are disabled when `events.enabled` is `false` or `featureGates.sandboxEventsAndWebhooks` is `false`. With the `k8s` backend every gateway replica shares state through the Kubernetes API: each webhook is a `SandboxWebhook` CR (`cubepod-whk-<hex>`) whose HMAC `signatureKey` lives only in a companion `Secret` (`cubepod-whk-sec-<hex>`), lifecycle events are core/v1 `Event`s on the `PodBox` (label `cubepod.io/resource=sandbox-event`, subject to the apiserver event TTL, default `1h`), and failed/dropped deliveries are kept as dead letters in `status.deadLetters` (max 50 per webhook). Replicas resync webhooks every `5s`. See [Sandbox events and webhooks](/reference/api-overview/).
 - **Unified Feature Gates (`featureGates.*`)** *(Changed in v0.7.0)*: Chart values under `featureGates` (`e2bTemplateAPI`, `transparentEgress`, `desktopStack`, `statelessGatewayHA`, `e2bFilesystemWatch`, `e2bSecretsAPI`, `sandboxEventsAndWebhooks`, `k8sE2BVolumeMounts`) are rendered into `--feature-gate=...` on both `cubepod-gateway` and `cubepod-controller`. `e2bTemplateAPI` now defaults to `true` (GA in `v0.7.0`; set `false` for legacy rollback).
 - **Shared E2B RWX Volumes (`e2bVolumes.*`)** *(Changed in v0.6.0)*: Setting `e2bVolumes.rwxStorageClassName` (for example `"longhorn-rwx"` or `"nfs-storage"`) automatically creates the `ReadWriteMany` PVC (`e2bVolumes.pvcName`), mounts it into `cubepod-gateway`, and **automatically enables `K8sE2BVolumeMounts`** even if `e2bVolumes.enabled` and `featureGates.k8sE2BVolumeMounts` remain `false`.
+
+## Webhook Delivery Alerts (`PrometheusRule`)
+
+*Added in v0.7.0.* `deploy/monitoring/webhook-alerts.yaml` ships a reference `monitoring.coreos.com/v1` `PrometheusRule` for clusters running the Prometheus Operator. It alerts on the gateway `/metrics` series:
+
+| Alert | Expression | For | Severity |
+| :--- | :--- | :--- | :--- |
+| `CubePodWebhookDeliveriesFailed` | `increase(cubepod_webhook_deliveries_total{result="failed"}[10m]) > 0` | `5m` | `warning` |
+| `CubePodWebhookDeliveriesDropped` | `increase(cubepod_webhook_deliveries_total{result="dropped"}[10m]) > 0` | `5m` | `critical` |
+| `CubePodWebhookDeadLettersPending` | `cubepod_webhook_dead_letters_pending > 0` | `30m` | `info` |
+
+```bash
+kubectl -n cubepod-system apply -f deploy/monitoring/webhook-alerts.yaml
+```
+
+Adjust `metadata.labels` (for example `release: kube-prometheus-stack`) to match your Prometheus `ruleSelector`. Inspect and replay failed deliveries with `GET /webhooks/dead-letters` and `POST /webhooks/{webhookID}/dead-letters/{deadLetterID}/retry`.
 
 ## Enabling In-Cluster Template Builds (`BuildKit` & HA S3 Context Store)
 

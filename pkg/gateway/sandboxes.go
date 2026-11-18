@@ -382,6 +382,16 @@ func isBoxNotFoundErr(err error) bool {
 	return strings.Contains(msg, "not found") || strings.Contains(msg, "404")
 }
 
+// observedTransitionKey derives a replica-independent dedupe key for a PodBox phase
+// transition so every gateway replica computes the same deterministic event ID.
+func observedTransitionKey(box v1alpha1.PodBox) string {
+	key := string(box.Status.Phase) + "|" + box.Status.Reason
+	if box.Status.PausedAt != nil {
+		key += "|" + strconv.FormatInt(box.Status.PausedAt.UTC().UnixNano(), 10)
+	}
+	return key
+}
+
 func (s *Server) reconcileCachedSandboxWithPodBox(sandboxID string, box v1alpha1.PodBox, found bool) (*SandboxRecord, bool) {
 	if !found {
 		var wireRec *SandboxRecord
@@ -414,7 +424,7 @@ func (s *Server) reconcileCachedSandboxWithPodBox(sandboxID string, box v1alpha1
 			}
 		}
 		if emitKilled && wireRec != nil {
-			s.emitSandboxEvent(tenantHash, events.EventKilled, wireRec, &events.EventData{
+			s.emitObservedSandboxEvent(tenantHash, events.EventKilled, wireRec, "podbox-deleted", &events.EventData{
 				Execution: executionDataForRecord(wireRec),
 			})
 		}
@@ -475,13 +485,13 @@ func (s *Server) reconcileCachedSandboxWithPodBox(sandboxID string, box v1alpha1
 	s.mu.Unlock()
 
 	if emitPaused && wireRec != nil {
-		s.emitSandboxEvent(tenantHash, events.EventPaused, wireRec, &events.EventData{
+		s.emitObservedSandboxEvent(tenantHash, events.EventPaused, wireRec, observedTransitionKey(box), &events.EventData{
 			PauseMode: "filesystem",
 			Execution: executionDataForRecord(wireRec),
 		})
 	}
 	if emitKilled && wireRec != nil {
-		s.emitSandboxEvent(tenantHash, events.EventKilled, wireRec, &events.EventData{
+		s.emitObservedSandboxEvent(tenantHash, events.EventKilled, wireRec, "podbox-terminated", &events.EventData{
 			Execution: executionDataForRecord(wireRec),
 		})
 	}
@@ -537,7 +547,11 @@ func (s *Server) resolveSandbox(ctx context.Context, sandboxID string) (*Sandbox
 	timeoutSecs := 1800
 	volumeKey := box.Spec.VolumeKey
 	var metadata map[string]string
+	var ownerTenant string
 	if box.Metadata.Annotations != nil {
+		if ot := box.Metadata.Annotations["cubepod.io/owner-tenant"]; ot != "" {
+			ownerTenant = ot
+		}
 		if templateID == "" {
 			templateID = box.Metadata.Annotations["cubepod.io/template-id"]
 		}
@@ -605,6 +619,7 @@ func (s *Server) resolveSandbox(ctx context.Context, sandboxID string) (*Sandbox
 		LastActivityAt:            &now,
 		TimeoutSeconds:            timeoutSecs,
 		WorkspaceDir:              s.workspaceDirForSandbox(sandboxID, volumeKey),
+		OwnerTenantHash:           ownerTenant,
 		lastEmittedLifecycleState: initialLifecycle,
 	}
 
@@ -798,6 +813,14 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ownerTenant := ""
+	if key := managementAPIKey(r); key != "" {
+		ownerTenant = events.TenantHash(key)
+	}
+	if ownerTenant != "" && s.reconciler != nil {
+		s.reconciler.SetBoxAnnotations(id, map[string]string{"cubepod.io/owner-tenant": ownerTenant})
+	}
+
 	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
 	if err != nil && spec.WarmPoolRef != "" {
 		slog.Warn("warmpool claim failed, refreshing standbys from Kubernetes via SyncFromKube and retrying", "sandboxID", id, "pool", spec.WarmPoolRef, "err", err)
@@ -845,10 +868,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ownerTenant := ""
-	if key := managementAPIKey(r); key != "" {
-		ownerTenant = events.TenantHash(key)
-	}
+	// ownerTenant already computed above before Reconcile
 	now := time.Now().UTC()
 	endAt := now.Add(time.Duration(timeoutSecs) * time.Second)
 	rec := &SandboxRecord{
@@ -1359,6 +1379,9 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.copySandboxVolumeMounts(parentID, childID)
+	if parentCopy.OwnerTenantHash != "" && s.reconciler != nil {
+		s.reconciler.SetBoxAnnotations(childID, map[string]string{"cubepod.io/owner-tenant": parentCopy.OwnerTenantHash})
+	}
 	status, err := s.reconciler.Reconcile(r.Context(), childID, spec)
 	if err != nil {
 		s.releaseSandboxVolumeMounts(childID)

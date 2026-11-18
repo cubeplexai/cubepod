@@ -43,6 +43,7 @@ Helm 在后续执行 `helm upgrade` 时不会自动更新 `crds/` 目录中的�
 ```bash
 kubectl apply -f deploy/helm/cubepod/crds/
 ```
+升级到 v0.7.0 时，至少需要重新执行 `kubectl apply -f deploy/helm/cubepod/crds/cubepod.io_sandboxwebhooks.yaml`，使 `SandboxWebhook` CRD 获得 `k8s` 事件后端所需的 `status.deadLetters` 字段定义。
 :::
 
 ## 部署资源架构
@@ -127,8 +128,25 @@ helm upgrade --install cubepod ./deploy/helm/cubepod \
 - **Gateway PodDisruptionBudget（`gateway.podDisruptionBudget.*`）** *(v0.6.0 新增)*：当 `gateway.podDisruptionBudget.enabled` 为 `null`（默认值）且 `gateway.replicaCount > 1` 时，`pdb.yaml` 会自动创建 `PodDisruptionBudget`（默认 `minAvailable: 1`，也可显式配置 `maxUnavailable`）。
 - **Zero-Trust 出站代理（`egress.*`）** *(v0.6.0 变更)*：默认启用（`egress.enabled: true`、`egress.transparent: true`），为沙箱注入监听 `:18080` 的 `cubepod-egress` 边车容器（`egress.image.*`），并通过 `egress.exchangeUrl` 按单沙箱 mTLS 置换 `cpodref_` 占位符。仅当 `egress.transparent` 与 `featureGates.transparentEgress` 均为 `true` 时，才启用 `TransparentEgress`（`CUBEPOD_TRANSPARENT=1` + `NET_ADMIN`）。详情请参阅[零信任出站代理与密钥隔离](/zh/concepts/zero-trust-egress/)。
 - **E2B 密钥 HA 存储（`secrets.*`）** *(v0.6.0 新增)*：配置 `CUBEPOD_SECRETS_BACKEND`（默认 `"k8s"`，使用 `KubeSecretBackend` 实现多副本 HA；或 `"file"` 配合 `secrets.dir`；或 `"disabled"`）及加密密钥引用（`secrets.existingSecret`、内联 `secrets.encryptionKey` 或旧版回退 `gateway.secretsKeySecret`）。
+- **沙箱事件与 Webhook HA 存储（`events.*`）** *(v0.7.0 新增)*：`events.enabled`（默认 `true`）、`events.backend`（默认 `"k8s"`，渲染为 `CUBEPOD_EVENTS_BACKEND`）与 `events.dir`（默认 `/var/lib/cubepod/events`，仅在 `events.backend` 为 `"file"` 时使用）。当 `events.enabled` 或 `featureGates.sandboxEventsAndWebhooks` 为 `false` 时禁用事件功能。使用 `k8s` 后端时，所有 Gateway 副本通过 Kubernetes API 共享状态：每个 Webhook 存储为 `SandboxWebhook` CR（`cubepod-whk-<hex>`），HMAC `signatureKey` 仅保存在配套 `Secret`（`cubepod-whk-sec-<hex>`）中；生命周期事件写为挂载在 `PodBox` 上的 core/v1 `Event`（标签 `cubepod.io/resource=sandbox-event`，受 apiserver 事件 TTL 限制，默认 `1h`）；投递失败或被丢弃的事件以死信形式保存在 `status.deadLetters`（每个 Webhook 最多 50 条）。各副本每 `5s` 同步一次 Webhook。详见 [API 概览](/zh/reference/api-overview/)。
 - **统一特性开关（`featureGates.*`）** *(v0.7.0 变更)*：`featureGates` 下的所有开关（`e2bTemplateAPI`、`transparentEgress`、`desktopStack`、`statelessGatewayHA`、`e2bFilesystemWatch`、`e2bSecretsAPI`、`sandboxEventsAndWebhooks`、`k8sE2BVolumeMounts`）会统一渲染为 `--feature-gate=...` 传入 `cubepod-gateway` 与 `cubepod-controller`。其中 `e2bTemplateAPI` 自 `v0.7.0` 起默认开启（GA；设为 `false` 可回滚）。
 - **共享 E2B RWX 持久化卷（`e2bVolumes.*`）** *(v0.6.0 变更)*：只要将 `e2bVolumes.rwxStorageClassName` 设为非空值（如 `"longhorn-rwx"` 或 `"nfs-storage"`），Chart 就会自动创建 `ReadWriteMany` PVC（`e2bVolumes.pvcName`）、挂载到 `cubepod-gateway` 并**自动开启 `K8sE2BVolumeMounts`**，即使 `e2bVolumes.enabled` 与 `featureGates.k8sE2BVolumeMounts` 保持默认 `false` 也会生效。
+
+## Webhook 投递告警（`PrometheusRule`）
+
+*v0.7.0 新增。* `deploy/monitoring/webhook-alerts.yaml` 提供了一个参考用的 `monitoring.coreos.com/v1` `PrometheusRule`，适用于部署了 Prometheus Operator 的集群，基于 Gateway `/metrics` 指标告警：
+
+| 告警 | 表达式 | 持续时间 | 级别 |
+| :--- | :--- | :--- | :--- |
+| `CubePodWebhookDeliveriesFailed` | `increase(cubepod_webhook_deliveries_total{result="failed"}[10m]) > 0` | `5m` | `warning` |
+| `CubePodWebhookDeliveriesDropped` | `increase(cubepod_webhook_deliveries_total{result="dropped"}[10m]) > 0` | `5m` | `critical` |
+| `CubePodWebhookDeadLettersPending` | `cubepod_webhook_dead_letters_pending > 0` | `30m` | `info` |
+
+```bash
+kubectl -n cubepod-system apply -f deploy/monitoring/webhook-alerts.yaml
+```
+
+请按需调整 `metadata.labels`（例如 `release: kube-prometheus-stack`）以匹配 Prometheus 的 `ruleSelector`。可通过 `GET /webhooks/dead-letters` 查看失败投递，并通过 `POST /webhooks/{webhookID}/dead-letters/{deadLetterID}/retry` 重新投递。
 
 ## 开启集群内模板构建（`BuildKit` 与高可用 S3 上下文存储）
 

@@ -284,34 +284,28 @@ func main() {
 		slog.Info("E2B secret store enabled", "backend", scfg.Backend, "dir", scfg.Dir, "namespace", scfg.Namespace)
 	}
 
-	eventsDir := strings.TrimSpace(os.Getenv("CUBEPOD_EVENTS_DIR"))
-	if eventsDir == "" && effectiveStateDir != "" {
-		eventsDir = filepath.Join(effectiveStateDir, "events")
-	} else if eventsDir == "" && volDir != "" {
-		eventsDir = filepath.Join(filepath.Dir(volDir), "events")
+	eventsEnabled, eventsK8s, ecfg, err := resolveEventsConfig(
+		os.Getenv("CUBEPOD_EVENTS_BACKEND"),
+		os.Getenv("CUBEPOD_EVENTS_DIR"),
+		effectiveStateDir,
+		volDir,
+		os.Getenv("CUBEPOD_EVENTS_KEY"),
+		os.Getenv("CUBEPOD_WEBHOOK_ALLOW_PRIVATE"),
+		hasKube,
+		reconciler.KubeClient(),
+		*namespace,
+	)
+	if err != nil {
+		slog.Error("invalid E2B events and webhooks configuration", "err", err)
+		os.Exit(1)
 	}
-	if eventsDir != "" && !strings.EqualFold(eventsDir, "disabled") {
-		ecfg := gateway.E2BEventsConfig{Dir: eventsDir}
-		switch strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_WEBHOOK_ALLOW_PRIVATE"))) {
-		case "1", "true", "yes":
-			ecfg.AllowPrivateIPs = true
-		}
-		if rawKey := strings.TrimSpace(os.Getenv("CUBEPOD_EVENTS_KEY")); rawKey != "" {
-			if decoded, err := base64.StdEncoding.DecodeString(rawKey); err == nil && len(decoded) == 32 {
-				ecfg.EncryptionKey = decoded
-			} else if decoded, err := hex.DecodeString(rawKey); err == nil && len(decoded) == 32 {
-				ecfg.EncryptionKey = decoded
-			} else {
-				slog.Error("CUBEPOD_EVENTS_KEY must be a 32-byte base64 or 64-char hex key")
-				os.Exit(1)
-			}
-		}
+	if eventsEnabled {
 		if err := gw.ConfigureEvents(ecfg); err != nil {
-			slog.Error("failed to configure E2B events and webhooks", "dir", eventsDir, "err", err)
+			slog.Error("failed to configure E2B events and webhooks", "backend", ecfg.Backend, "dir", ecfg.Dir, "err", err)
 			os.Exit(1)
 		}
 		defer gw.CloseEvents()
-		slog.Info("E2B events and webhooks enabled", "dir", eventsDir, "allowPrivateIPs", ecfg.AllowPrivateIPs)
+		slog.Info("E2B events and webhooks enabled", "backend", ecfg.Backend, "dir", ecfg.Dir, "namespace", ecfg.Namespace, "allowPrivateIPs", ecfg.AllowPrivateIPs)
 	}
 
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("CUBEPOD_RUNTIME")), "docker") {
@@ -364,6 +358,10 @@ func main() {
 	if secretsK8s {
 		gw.StartSecretsSync(ctx, 5*time.Second)
 		slog.Info("started background E2B Kubernetes secret sync loop", "interval", "5s")
+	}
+	if eventsK8s {
+		gw.StartEventsSync(ctx, 5*time.Second)
+		slog.Info("started background SandboxWebhook Kubernetes sync loop", "interval", "5s")
 	}
 
 	go func() {
@@ -528,6 +526,59 @@ func resolveSecretsConfig(backendEnv, secretsDirEnv, volDir, keyEnv, maxPerTenan
 			cfg.EncryptionKey = decoded
 		} else {
 			return false, false, gateway.E2BSecretConfig{}, fmt.Errorf("CUBEPOD_SECRETS_KEY must be a 32-byte base64 or 64-char hex key")
+		}
+	}
+	return true, false, cfg, nil
+}
+
+// resolveEventsConfig mirrors resolveSecretsConfig for CUBEPOD_EVENTS_BACKEND
+// ("k8s" | "file" | "disabled"). When unset, the Kubernetes backend is used if the gateway
+// has a KubeClient and CUBEPOD_EVENTS_DIR is unset; otherwise the file backend under
+// <state-dir>/events (or next to the E2B volume dir) is used when a directory is known.
+func resolveEventsConfig(backendEnv, eventsDirEnv, stateDir, volDir, keyEnv, allowPrivateEnv string, hasKube bool, kc controller.KubeClient, namespace string) (enabled bool, isK8s bool, cfg gateway.E2BEventsConfig, err error) {
+	backend := strings.ToLower(strings.TrimSpace(backendEnv))
+	explicitDir := strings.TrimSpace(eventsDirEnv)
+	if backend == "disabled" || strings.EqualFold(explicitDir, "disabled") {
+		return false, false, gateway.E2BEventsConfig{}, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(allowPrivateEnv)) {
+	case "1", "true", "yes":
+		cfg.AllowPrivateIPs = true
+	}
+
+	if backend == "k8s" || (backend == "" && hasKube && explicitDir == "") {
+		if kc == nil {
+			return false, false, gateway.E2BEventsConfig{}, fmt.Errorf("k8s events backend requires KubeClient")
+		}
+		cfg.Backend = "k8s"
+		cfg.KubeClient = kc
+		cfg.Namespace = namespace
+		return true, true, cfg, nil
+	}
+
+	if backend != "" && backend != "file" {
+		return false, false, gateway.E2BEventsConfig{}, fmt.Errorf("unsupported CUBEPOD_EVENTS_BACKEND %q (expected file, k8s, or disabled)", backendEnv)
+	}
+
+	eventsDir := explicitDir
+	if eventsDir == "" && strings.TrimSpace(stateDir) != "" {
+		eventsDir = filepath.Join(stateDir, "events")
+	} else if eventsDir == "" && volDir != "" {
+		eventsDir = filepath.Join(filepath.Dir(volDir), "events")
+	}
+	if eventsDir == "" {
+		return false, false, gateway.E2BEventsConfig{}, nil
+	}
+
+	cfg.Backend = "file"
+	cfg.Dir = eventsDir
+	if rawKey := strings.TrimSpace(keyEnv); rawKey != "" {
+		if decoded, decErr := base64.StdEncoding.DecodeString(rawKey); decErr == nil && len(decoded) == 32 {
+			cfg.EncryptionKey = decoded
+		} else if decoded, decErr := hex.DecodeString(rawKey); decErr == nil && len(decoded) == 32 {
+			cfg.EncryptionKey = decoded
+		} else {
+			return false, false, gateway.E2BEventsConfig{}, fmt.Errorf("CUBEPOD_EVENTS_KEY must be a 32-byte base64 or 64-char hex key")
 		}
 	}
 	return true, false, cfg, nil

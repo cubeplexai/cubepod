@@ -49,6 +49,57 @@ func TestResolveSecretsConfig(t *testing.T) {
 	}
 }
 
+func TestResolveEventsConfig(t *testing.T) {
+	kc := controller.NewMemoryKubeClient()
+
+	// 1. Unset backend + live hasKube + empty CUBEPOD_EVENTS_DIR -> defaults to k8s (HA)
+	enabled, isK8s, cfg, err := resolveEventsConfig("", "", "/var/lib/cubepod/state", "", "", "", true, kc, "cubepod-workloads")
+	if err != nil || !enabled || !isK8s || cfg.Backend != "k8s" || cfg.Namespace != "cubepod-workloads" || cfg.KubeClient == nil {
+		t.Fatalf("unexpected auto k8s result: enabled=%v isK8s=%v cfg=%+v err=%v", enabled, isK8s, cfg, err)
+	}
+
+	// 2. Local (no kube) mode falls back to file under <state-dir>/events
+	rawKey := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	enabled, isK8s, cfg, err = resolveEventsConfig("", "", "/var/lib/cubepod/state", "", rawKey, "1", false, nil, "")
+	if err != nil || !enabled || isK8s || cfg.Backend != "file" || cfg.Dir != "/var/lib/cubepod/state/events" || len(cfg.EncryptionKey) != 32 || !cfg.AllowPrivateIPs {
+		t.Fatalf("unexpected local file result: enabled=%v isK8s=%v cfg=%+v err=%v", enabled, isK8s, cfg, err)
+	}
+
+	// 3. Explicit CUBEPOD_EVENTS_DIR keeps file backend even with hasKube
+	enabled, isK8s, cfg, err = resolveEventsConfig("", "/tmp/events", "", "", "", "", true, kc, "ns1")
+	if err != nil || !enabled || isK8s || cfg.Backend != "file" || cfg.Dir != "/tmp/events" {
+		t.Fatalf("unexpected explicit dir result: enabled=%v isK8s=%v cfg=%+v err=%v", enabled, isK8s, cfg, err)
+	}
+
+	// 4. Volume-dir sibling fallback when no state dir is configured
+	enabled, _, cfg, err = resolveEventsConfig("file", "", "", "/var/lib/cubepod/e2b-volumes", "", "", false, nil, "")
+	if err != nil || !enabled || cfg.Dir != "/var/lib/cubepod/events" {
+		t.Fatalf("unexpected volume sibling result: enabled=%v cfg=%+v err=%v", enabled, cfg, err)
+	}
+
+	// 5. Explicit k8s without KubeClient errors; disabled wins over everything
+	if _, _, _, err := resolveEventsConfig("k8s", "", "", "", "", "", false, nil, ""); err == nil {
+		t.Fatal("expected error for k8s backend without KubeClient")
+	}
+	for _, tc := range [][2]string{{"disabled", ""}, {"", "disabled"}} {
+		enabled, isK8s, _, err = resolveEventsConfig(tc[0], tc[1], "/state", "", "", "", true, kc, "ns1")
+		if err != nil || enabled || isK8s {
+			t.Fatalf("expected disabled events for %v, got enabled=%v isK8s=%v err=%v", tc, enabled, isK8s, err)
+		}
+	}
+
+	// 6. No directory known in file mode -> disabled; invalid backend / key -> error
+	if enabled, _, _, err := resolveEventsConfig("", "", "", "", "", "", false, nil, ""); err != nil || enabled {
+		t.Fatalf("expected events disabled without any dir, got enabled=%v err=%v", enabled, err)
+	}
+	if _, _, _, err := resolveEventsConfig("postgres", "", "", "", "", "", false, nil, ""); err == nil {
+		t.Fatal("expected error for unsupported backend")
+	}
+	if _, _, _, err := resolveEventsConfig("file", "/tmp/events", "", "", "short", "", false, nil, ""); err == nil {
+		t.Fatal("expected error for invalid CUBEPOD_EVENTS_KEY")
+	}
+}
+
 func TestBuildEgressMTLSServerEnforcesClientCerts(t *testing.T) {
 	ca, err := egress.NewCA()
 	if err != nil {

@@ -111,6 +111,13 @@ secrets:
   # Optional inline 32-byte base64/64-hex key; when set without existingSecret, creates a release Secret
   encryptionKey: ""
 
+events:
+  enabled: true
+  # Backend for /events, /webhooks, and /webhooks/dead-letters: "k8s" (multi-replica HA via SandboxWebhook CRDs, Secrets, and PodBox Events), "file", or "disabled"
+  backend: "k8s"
+  # Directory used when events.backend is "file"
+  dir: "/var/lib/cubepod/events"
+
 featureGates:
   # Default on (GA in v0.7.0); set false to roll back GET /templates to the legacy {"templates":[...]} wrapper
   e2bTemplateAPI: true

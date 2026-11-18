@@ -1857,7 +1857,168 @@ paths:
             type: string
       responses:
         "204":
-          description: Webhook deleted
+          description: Webhook deleted (also deletes its dead letters)
+
+  /webhooks/dead-letters:
+    get:
+      tags:
+        - Webhooks
+      summary: List dead letters
+      description: |
+        List tenant webhook dead letters (deliveries that failed after max retries or were
+        dropped on a full delivery queue). Requires `X-API-Key`. Never returns signatureKey
+        or the webhook URL. Added in v0.7.0.
+      operationId: listDeadLetters
+      parameters:
+        - name: webhookID
+          in: query
+          schema:
+            type: string
+        - name: sandboxID
+          in: query
+          schema:
+            type: string
+        - name: reason
+          in: query
+          schema:
+            $ref: "#/components/schemas/DeadLetterReason"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - name: nextToken
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Dead-letter page
+          headers:
+            X-Next-Token:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DeadLetter"
+        "501":
+          description: Sandbox events are not configured or the SandboxEventsAndWebhooks feature gate is off
+
+  /webhooks/{webhookID}/dead-letters:
+    get:
+      tags:
+        - Webhooks
+      summary: List webhook dead letters
+      description: List dead letters for a single tenant-owned webhook. Requires `X-API-Key`. Added in v0.7.0.
+      operationId: listWebhookDeadLetters
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: sandboxID
+          in: query
+          schema:
+            type: string
+        - name: reason
+          in: query
+          schema:
+            $ref: "#/components/schemas/DeadLetterReason"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - name: nextToken
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Dead-letter page
+          headers:
+            X-Next-Token:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DeadLetter"
+        "404":
+          description: Webhook not found or not owned by the caller's tenant
+        "501":
+          description: Sandbox events are not configured or the SandboxEventsAndWebhooks feature gate is off
+
+  /webhooks/{webhookID}/dead-letters/{deadLetterID}/retry:
+    post:
+      tags:
+        - Webhooks
+      summary: Retry dead letter
+      description: |
+        Re-sign the dead-lettered event with the webhook's current signatureKey and re-enqueue it
+        for delivery. A failed retry re-records the same dead-letter id with retryCount+1.
+        Requires `X-API-Key`. Added in v0.7.0.
+      operationId: retryDeadLetter
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: deadLetterID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "202":
+          description: Retry enqueued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeadLetter"
+        "404":
+          description: Webhook or dead letter not found
+        "409":
+          description: Webhook is disabled
+        "501":
+          description: Sandbox events are not configured or the SandboxEventsAndWebhooks feature gate is off
+        "503":
+          description: Delivery queue is full
+
+  /webhooks/{webhookID}/dead-letters/{deadLetterID}:
+    delete:
+      tags:
+        - Webhooks
+      summary: Delete dead letter
+      description: Discard a dead letter without retrying it. Requires `X-API-Key`. Added in v0.7.0.
+      operationId: deleteDeadLetter
+      parameters:
+        - name: webhookID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: deadLetterID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Dead letter deleted
+        "404":
+          description: Webhook or dead letter not found
+        "501":
+          description: Sandbox events are not configured or the SandboxEventsAndWebhooks feature gate is off
 
   /events:
     get:
@@ -2177,6 +2338,13 @@ components:
         updatedAt:
           type: string
           format: date-time
+        lastDeliveryTime:
+          type: string
+          format: date-time
+          description: Time of the most recent delivery attempt (added in v0.7.0)
+        consecutiveFailures:
+          type: integer
+          description: Number of consecutive failed deliveries; resets on success (added in v0.7.0)
     WebhookWithSecret:
       allOf:
         - $ref: "#/components/schemas/WebhookInfo"
@@ -2184,6 +2352,60 @@ components:
           properties:
             signatureKey:
               type: string
+    DeadLetterReason:
+      type: string
+      enum:
+        - delivery_failed
+        - queue_full
+    DeadLetter:
+      type: object
+      description: |
+        A webhook delivery that failed after max retries (`delivery_failed`) or was dropped on a
+        full delivery queue (`queue_full`). Never includes signatureKey or the webhook URL.
+        Added in v0.7.0.
+      required:
+        - id
+        - webhookId
+        - eventId
+        - eventType
+        - reason
+        - attempts
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          description: Dead-letter identifier (`dlq_...`)
+          example: dlq_3f9a1c2b7d4e
+        webhookId:
+          type: string
+        eventId:
+          type: string
+        eventType:
+          type: string
+        sandboxId:
+          type: string
+        reason:
+          $ref: "#/components/schemas/DeadLetterReason"
+        attempts:
+          type: integer
+        lastStatusCode:
+          type: integer
+          description: Last HTTP status code returned by the receiver, if any
+        lastError:
+          type: string
+          description: Sanitized error class (e.g. `timeout`, `connection_error`, `http_status`, `ssrf_blocked`)
+        retryCount:
+          type: integer
+          description: Number of manual retries already attempted
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        event:
+          $ref: "#/components/schemas/LifecycleEvent"
     LifecycleEvent:
       type: object
       properties:

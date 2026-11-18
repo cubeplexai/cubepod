@@ -51,3 +51,44 @@ spec:
                   format: date-time
                 consecutiveFailures:
                   type: integer
+                deadLetters:
+                  type: array
+                  maxItems: 50
+                  items:
+                    type: object
+                    required:
+                      - id
+                      - eventId
+                      - eventType
+                      - reason
+                    properties:
+                      id:
+                        type: string
+                      eventId:
+                        type: string
+                      eventType:
+                        type: string
+                      sandboxId:
+                        type: string
+                      reason:
+                        type: string
+                        enum:
+                          - delivery_failed
+                          - queue_full
+                      attempts:
+                        type: integer
+                      lastStatusCode:
+                        type: integer
+                      lastError:
+                        type: string
+                      retryCount:
+                        type: integer
+                      createdAt:
+                        type: string
+                        format: date-time
+                      updatedAt:
+                        type: string
+                        format: date-time
+                      event:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true

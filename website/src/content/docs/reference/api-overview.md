@@ -131,6 +131,24 @@ Enabled by default since *v0.7.0* (set `--e2b-template-api=false` or `--feature-
 - **E2B Secrets (`E2BSecretsAPI`, *Changed in v0.6.0*)**: `POST /secrets`, `GET /secrets`, `GET /secrets/{secretID}`, `POST /secrets/{secretID}`, `DELETE /secrets/{secretID}` — tenant-isolated write-only secret store (`KubeSecretBackend` HA or AES-256-GCM file store) resolved via `${e2b.secrets.<name>}` (`Secret.fill()`).
 - **E2B Volumes (*Changed in v0.7.0*)**: `POST /volumes`, `GET /volumes`, `GET /volumes/{volumeID}`, `DELETE /volumes/{volumeID}`, `POST /volumes/rotate-key` (*Added in v0.7.0* — migrates tenant volume & mount ownership from `{"previousApiKey": "<oldKey>"}` to `X-API-Key: <newKey>`, revoking `<oldKey>` via the RWX `flock`-guarded `tenants.json` keyring), plus content endpoints `/volumecontent/{volumeID}/{file,dir,path}` and `volumeMounts` on `POST /sandboxes` (K8s Kata RWX mounts gated by `K8sE2BVolumeMounts` / Helm `e2bVolumes.rwxStorageClassName`). Supports envelope encryption of volume content tokens via `CUBEPOD_E2B_VOLUMES_KEK` or `CUBEPOD_E2B_VOLUMES_KMS_URL` (`CUBEPOD_E2B_VOLUMES_KMS_TOKEN`), per-tenant byte/count quotas (`CUBEPOD_E2B_MAX_TENANT_BYTES`, `CUBEPOD_E2B_MAX_VOLUMES_PER_TENANT`), and `PrometheusRule` alerts in `deploy/monitoring/e2b-volumes-alerts.yaml` (*Added in v0.7.0*).
 - **Lifecycle Events & Webhooks (`SandboxEventsAndWebhooks`, *Added in v0.6.0*)**: `GET /events`, `GET /sandboxes/{sandboxID}/events`, `POST /webhooks`, `GET /webhooks`, `GET /webhooks/{webhookID}`, `PATCH /webhooks/{webhookID}`, `DELETE /webhooks/{webhookID}`.
+  - *Changed in v0.7.0.* On Kubernetes, the default `k8s` events backend (`CUBEPOD_EVENTS_BACKEND`) stores webhooks as `SandboxWebhook` CRs (HMAC key only in a companion `Secret`) and lifecycle events as core/v1 `Event`s on the `PodBox`, so all gateway replicas share them. `GET /webhooks` and `GET /webhooks/{webhookID}` additionally return optional `lastDeliveryTime` (RFC 3339) and `consecutiveFailures` (resets on a successful delivery). Deleting a webhook also deletes its dead letters.
+- **Webhook Dead Letters (`SandboxEventsAndWebhooks`, *Added in v0.7.0*)**: deliveries that fail after max retries (`reason: delivery_failed`) or are dropped on a full delivery queue (`reason: queue_full`) are kept as tenant-scoped dead letters (bounded to 500 per tenant on the file backend and 50 per webhook on the `k8s` backend). All routes require `X-API-Key` and return `501` when events are not configured.
+
+| Endpoint | Description | Errors |
+| :--- | :--- | :--- |
+| `GET /webhooks/dead-letters` | List tenant dead letters; query `webhookID`, `sandboxID`, `reason`, `limit` (≤ 100), `nextToken` (next page in `X-Next-Token`) | `501` |
+| `GET /webhooks/{webhookID}/dead-letters` | List dead letters for one webhook (same filters minus `webhookID`) | `404` webhook not owned, `501` |
+| `POST /webhooks/{webhookID}/dead-letters/{deadLetterID}/retry` | Re-sign with the current `signatureKey` and re-enqueue; returns `202` + `DeadLetter`. A failed retry re-records the same id with `retryCount + 1` | `404`, `409` webhook disabled, `503` queue full, `501` |
+| `DELETE /webhooks/{webhookID}/dead-letters/{deadLetterID}` | Discard a dead letter (`204`) | `404`, `501` |
+
+A `DeadLetter` contains `id` (`dlq_...`), `webhookId`, `eventId`, `eventType`, `sandboxId`, `reason`, `attempts`, optional `lastStatusCode`, optional sanitized `lastError` (`timeout`, `connection_error`, `http_status`, `ssrf_blocked`), optional `retryCount`, `createdAt`, `updatedAt`, and the original lifecycle `event`. It never includes the `signatureKey` or webhook URL.
+
+```bash
+curl -s -H "X-API-Key: $CUBEPOD_API_KEY" \
+  "$CUBEPOD_URL/webhooks/dead-letters?reason=delivery_failed&limit=20"
+curl -s -X POST -H "X-API-Key: $CUBEPOD_API_KEY" \
+  "$CUBEPOD_URL/webhooks/whk_123/dead-letters/dlq_abc/retry"
+```
 
 ## Feature Gates (`--feature-gate`) *(Added in v0.6.0)*
 
@@ -145,7 +163,7 @@ Both `cubepod-gateway` and `cubepod-controller` accept `--feature-gate=GateA=tru
 | `StatelessGatewayHA` | `true` | `gateway` | Enables Kubernetes `PodBox` cache-miss reconstruction across gateway replicas. |
 | `E2BFilesystemWatch` | `true` | `gateway` | Enables Connect-RPC `WatchDir` / watcher endpoints. |
 | `E2BSecretsAPI` | `true` | `gateway` | Enables `/secrets` CRUD and `${e2b.secrets.<name>}` resolution. |
-| `SandboxEventsAndWebhooks` | `true` | `gateway` | Enables `/events` and `/webhooks` APIs and async HMAC webhook dispatch. |
+| `SandboxEventsAndWebhooks` | `true` | `gateway` | Enables `/events`, `/webhooks`, and (*v0.7.0*) `/webhooks/dead-letters` APIs and async HMAC webhook dispatch. |
 
 ## Prometheus Observability & `podd` Metrics *(Added in v0.6.0)*
 
@@ -187,6 +205,7 @@ Both `cubepod-gateway` and `cubepod-controller` accept `--feature-gate=GateA=tru
 | **Gateway** | `cubepod_e2b_volumes_total` *(Added in v0.7.0)* | Gauge | Total active E2B volumes stored across tenants |
 | **Gateway** | `cubepod_events_recorded_total` | Counter | Sandbox lifecycle events recorded (when events manager is enabled) |
 | **Gateway** | `cubepod_webhook_deliveries_total` / `cubepod_webhook_queue_depth` | Counter / Gauge | Webhook delivery outcomes (`result`: `ok`, `failed`, `dropped`) and queue depth |
+| **Gateway** | `cubepod_webhook_dead_letters_total` / `cubepod_webhook_dead_letters_pending` | Counter / Gauge | *Added in v0.7.0.* Dead letters recorded and currently pending (alerts in `deploy/monitoring/webhook-alerts.yaml`) |
 | **Gateway & Controller** | `cubepod_sandbox_forks_total` / `cubepod_sandbox_fork_duration_seconds` | Counter / Histogram | CoW fork attempts (`mode`, `result`) and provisioning duration |
 | **Gateway & Controller** | `cubepod_templates` / `cubepod_gateway_templates_total` | Gauge | Templates by `status` (when `E2BTemplateAPI=true`) or total templates |
 | **Controller** | `cubepod_active_sandboxes` / `cubepod_paused_sandboxes` | Gauge | Reconciled `Running` and `Paused` `PodBox` counts |

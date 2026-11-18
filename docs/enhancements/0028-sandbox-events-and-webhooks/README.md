@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `alpha` | `implemented` | `2026-11-16` | `2026-11-16` | `gateway` |
+| `stable` | `implemented` | `2026-11-16` | `2026-11-18` | `gateway` |
 
 ## Table of Contents
 
@@ -37,12 +37,15 @@
 - [x] Dual-runtime behavior (Production Kubernetes `Kata + CSI Block` and Local Development `Docker + Loopback ext4`) is specified.
 - [x] Test plan covers unit tests (`go test -race`) and end-to-end delivery/retry/SSRF verification.
 - [x] Graduation criteria for Alpha, Beta, and Stable are defined.
+- [x] Beta (`SandboxWebhook` CRD + `Secret` backend, PodBox Kubernetes `Event`s) and Stable (dead-letter inspection/retry API, PrometheusRule alerts) delivered in `v0.7.0`.
 
 ---
 
 ## Summary
 
 CEP-0028 introduces a tenant-isolated **Sandbox Lifecycle Events** store and **Signed Webhook Delivery** subsystem (`pkg/events`) in `cubepod-gateway`. It enables users and external orchestrators to query sandbox lifecycle audit history (`GET /events`, `GET /sandboxes/{sandboxID}/events`) and subscribe to real-time HTTP webhook notifications (`POST/GET/PATCH/DELETE /webhooks`) for `created`, `paused`, `resumed`, `updated`, `forked`, and `killed` transitions.
+
+As of `v0.7.0` (Stable), Kubernetes deployments persist webhooks as `SandboxWebhook` CRs (HMAC key isolated in a companion `Secret`) and lifecycle events as labeled core/v1 `Event`s on `PodBox`, so multi-replica HA gateways share webhook and event state with zero external database. Failed or dropped deliveries are captured as tenant-scoped **dead letters** that can be listed, retried, or discarded via `/webhooks/dead-letters` APIs, and a reference `PrometheusRule` (`deploy/monitoring/webhook-alerts.yaml`) alerts on failed/dropped deliveries.
 
 ---
 
@@ -110,10 +113,37 @@ type SandboxWebhookSpec struct {
 }
 
 type SandboxWebhookStatus struct {
-	LastDeliveryTime    *metav1.Time `json:"lastDeliveryTime,omitempty"`
-	ConsecutiveFailures int          `json:"consecutiveFailures,omitempty"`
+	LastDeliveryTime    *time.Time `json:"lastDeliveryTime,omitempty"`
+	ConsecutiveFailures int        `json:"consecutiveFailures,omitempty"`
+	// Bounded (max 50 per webhook); never contains the signatureKey. Added in v0.7.0.
+	DeadLetters []SandboxWebhookDeadLetter `json:"deadLetters,omitempty"`
+}
+
+type SandboxWebhookDeadLetter struct {
+	ID             string          `json:"id"` // dlq_...
+	EventID        string          `json:"eventId"`
+	EventType      string          `json:"eventType"`
+	SandboxID      string          `json:"sandboxId,omitempty"`
+	Reason         string          `json:"reason"` // delivery_failed | queue_full
+	Attempts       int             `json:"attempts,omitempty"`
+	LastStatusCode int             `json:"lastStatusCode,omitempty"`
+	LastError      string          `json:"lastError,omitempty"` // sanitized class
+	RetryCount     int             `json:"retryCount,omitempty"`
+	CreatedAt      time.Time       `json:"createdAt"`
+	UpdatedAt      time.Time       `json:"updatedAt"`
+	Event          json.RawMessage `json:"event,omitempty"`
 }
 ```
+
+Concrete Kubernetes object layout (v0.7.0):
+
+| Object | Name | Labels / Annotations | Contents |
+| :--- | :--- | :--- | :--- |
+| `SandboxWebhook` CR | `cubepod-whk-<hex>` | `cubepod.io/resource=sandbox-webhook`, `cubepod.io/tenant=<16-char tenant prefix>`, annotation `cubepod.io/webhook-id` | `spec` (name, URL, events, enabled, `secretName`) and gateway-maintained `status.lastDeliveryTime`, `status.consecutiveFailures`, `status.deadLetters` |
+| `Secret` | `cubepod-whk-sec-<hex>` | `cubepod.io/resource=sandbox-webhook-secret` | data key `signatureKey` only (referenced via `spec.secretName`) |
+| core/v1 `Event` | deterministic per transition | `cubepod.io/resource=sandbox-event`, `cubepod.io/tenant`, `cubepod.io/sandbox`, `cubepod.io/source=gateway`, annotation `cubepod.io/lifecycle-event` (JSON payload) | `involvedObject` = `PodBox <sandboxID>` |
+
+Gateways resync `SandboxWebhook` CRs every `5s` and reload on cache miss, so a webhook created on one replica is visible on all replicas.
 
 In Kubernetes mode, `cubepod-controller` / `cubepod-gateway` also emits labeled Kubernetes `Event`s (`core/v1`) attached to `PodBox` (`involvedObject.name = <sandboxID>`, label `cubepod.io/tenant=<tenantPrefix>`), allowing `GET /events` and `GET /sandboxes/{id}/events` to query recent lifecycle events directly from Kubernetes without an external database.
 
@@ -127,7 +157,19 @@ All routes require `X-API-Key` (`requireManagementKey`).
 - **`GET /webhooks`**: List tenant webhooks (omitting `signatureKey`).
 - **`GET /webhooks/{webhookID}`**: Get single webhook metadata (omitting `signatureKey`).
 - **`PATCH /webhooks/{webhookID}`**: Update `url`, `events`, `enabled`, or `"rotateSecret": true`.
-- **`DELETE /webhooks/{webhookID}`**: Remove webhook (`204 No Content`).
+- **`DELETE /webhooks/{webhookID}`**: Remove webhook and its dead letters (`204 No Content`).
+- `WebhookInfo` additionally exposes optional `lastDeliveryTime` and `consecutiveFailures` (v0.7.0).
+
+#### 1a. Dead-Letter Endpoints (v0.7.0)
+
+All routes require `X-API-Key` and return `501` when events are not configured or the feature gate is off.
+
+- **`GET /webhooks/dead-letters?webhookID=...&sandboxID=...&reason=...&limit=<=100&nextToken=...`**: Paginated tenant dead letters (`X-Next-Token` header).
+- **`GET /webhooks/{webhookID}/dead-letters`**: Same filters minus `webhookID`; `404` if the webhook is not owned by the tenant.
+- **`POST /webhooks/{webhookID}/dead-letters/{deadLetterID}/retry`**: Re-sign with the current `signatureKey` and re-enqueue (`202` + `DeadLetter`); `404` not found, `409` webhook disabled, `503` delivery queue full. A failed retry re-records the same id with `retryCount+1`.
+- **`DELETE /webhooks/{webhookID}/dead-letters/{deadLetterID}`**: Discard (`204`); `404` not found.
+
+`DeadLetter` schema: `id` (`dlq_...`), `webhookId`, `eventId`, `eventType`, `sandboxId`, `reason` (`delivery_failed` | `queue_full`), `attempts`, optional `lastStatusCode`, optional sanitized `lastError` class (`timeout`, `connection_error`, `http_status`, `ssrf_blocked`), optional `retryCount`, `createdAt`, `updatedAt`, and the original lifecycle `event`. It never contains the `signatureKey` or webhook URL.
 
 #### 2. Events Endpoints & E2B-Compatible Event Payload Schema
 
@@ -182,53 +224,71 @@ flowchart LR
     Worker -->|"SSRF-safe Dialer + HMAC Sign"| Target["HTTPS Receiver"]
     Target -->|"5xx / Timeout"| Retry["Exponential Backoff (max 3 retries)"]
     Retry --> Worker
+    Retry -->|"max retries exhausted"| DLQ["Dead Letters (CR status / file)"]
+    Queue -->|"queue full"| DLQ
+    DLQ -->|"POST .../retry (re-sign)"| Queue
 ```
 
 ### Boundary Conditions & Failure Recovery
 
-- **Queue Saturation**: If the delivery queue is full, new deliveries are dropped and `cubepod_webhook_deliveries_total{result="dropped"}` increments; `/sandboxes` latency is never impacted.
+- **Queue Saturation**: If the delivery queue is full, new deliveries are dropped and `cubepod_webhook_deliveries_total{result="dropped"}` increments; `/sandboxes` latency is never impacted. Since v0.7.0 the dropped delivery is recorded as a dead letter with reason `queue_full`.
+- **Retry Exhaustion**: After max retries the delivery is recorded as a dead letter with reason `delivery_failed` and `cubepod_webhook_dead_letters_total` increments. Dead letters are bounded to 500 per tenant (file/memory backend) and 50 per webhook (`SandboxWebhook` `status.deadLetters`); oldest entries are evicted first.
+- **Multi-Replica Deduplication**: Lifecycle `Event` names are deterministic, so concurrent replicas observing the same sync transition collide on create and only the replica that wins delivers webhooks.
+- **Event Retention**: Kubernetes `Event`s are subject to the apiserver event TTL (default `1h`); the gateway additionally keeps a bounded in-memory ring. Long-term archival remains a non-goal.
 - **HTTP Redirects**: Webhook client disables automatic `3xx` redirects (`CheckRedirect: func(...) error { return http.ErrUseLastResponse }`) to prevent redirect-based SSRF bypasses.
-- **Gateway Restart**: Registered webhooks persist encrypted on disk; in-flight retries are best-effort in Alpha.
+- **Gateway Restart**: Registered webhooks persist in `SandboxWebhook` CRs + `Secret`s (K8s) or encrypted on disk (file backend); in-flight retries are best-effort, but exhausted or dropped deliveries survive as dead letters.
 
 ### Test Plan
 
 - **Unit Tests (`go test -race`)**:
   - `pkg/events`: Event emission, per-tenant & per-sandbox filtering, cursor pagination, webhook CRUD, HMAC-SHA256 signature verification, SSRF dialer rejecting `127.0.0.1`, `10.0.0.1`, `169.254.169.254`, and `http://` when TLS-only is enforced, redirect blocking, and retry backoff.
   - `pkg/gateway`: `/webhooks` and `/events` HTTP handlers, tenant isolation (`404`), and end-to-end `POST /sandboxes` -> `POST /pause` -> `POST /connect` -> `DELETE /sandboxes/{id}` delivering signed events to a test receiver.
+  - Beta/Stable (v0.7.0): Kubernetes backend against a fake client (CR + Secret create/sync/delete, `signatureKey` never in CR, cross-replica visibility, deterministic `Event` dedupe), dead-letter recording on retry exhaustion and queue saturation, list/filter/pagination, retry (`202`/`404`/`409`/`503`), delete, bounds, and tenant isolation.
 
 ### Graduation Criteria
 
-- **Alpha (`v0.6`)**: `pkg/events` + `/webhooks` + `/events` routes + SSRF-safe HMAC dispatcher passing `make test` (local file store).
-- **Beta (`v0.7`)**: `SandboxWebhook` CRD + `secretRef` K8s `Secret` backend and labeled Kubernetes `Event`s on `PodBox` for multi-replica HA gateways (zero external DB).
-- **Stable (`v1.0`)**: Production soak in CubePlex with dead-letter inspection and alerting.
+- **Alpha (`v0.6.0`) — delivered**: `pkg/events` + `/webhooks` + `/events` routes + SSRF-safe HMAC dispatcher passing `make test` (local file store).
+- **Beta (`v0.7.0`) — delivered**: `SandboxWebhook` CRD + companion `Secret` backend (`CUBEPOD_EVENTS_BACKEND=k8s`, Helm `events.backend: k8s`) and labeled core/v1 `Event`s on `PodBox` for multi-replica HA gateways (zero external DB); `cubepod-controller` also emits PodBox `Event`s (`PodBoxRunning`, `PodBoxPaused`, `IdlePaused`, `PausedTTLExpired`, `PodBoxDeleted`).
+- **Stable (`v0.7.0`) — delivered**: Dead-letter recording (`delivery_failed`, `queue_full`) with list/retry/delete APIs, `lastDeliveryTime` / `consecutiveFailures` on webhook info, `cubepod_webhook_dead_letters_total` / `cubepod_webhook_dead_letters_pending` metrics, and the reference `PrometheusRule` in `deploy/monitoring/webhook-alerts.yaml`.
 
 ### Upgrade / Downgrade Strategy
 
-- **Upgrade**: Purely additive gateway routes and local state directory; zero CRD or storage PVC impact.
-- **Downgrade**: Disabling `SandboxEventsAndWebhooks` stops event recording and returns `501 Not Implemented` on `/events` and `/webhooks`.
+- **Upgrade**: Additive gateway routes; no storage PVC impact. In v0.7.0 Kubernetes gateways default to the `k8s` backend and need the `SandboxWebhook` CRD with the `status.deadLetters` schema. Helm does **not** upgrade CRDs shipped in `crds/`, so on upgrade run:
+
+  ```bash
+  kubectl apply -f deploy/helm/cubepod/crds/cubepod.io_sandboxwebhooks.yaml
+  ```
+
+  Webhooks previously stored in the Alpha file backend (`<state-dir>/events/webhooks.enc.json`) are not migrated automatically; re-register them, or pin `events.backend: file` to keep using the file store.
+- **Downgrade**: Disabling `SandboxEventsAndWebhooks` (or `events.enabled=false`) stops event recording and returns `501 Not Implemented` on `/events`, `/webhooks`, and dead-letter routes. Downgrading to v0.6.x leaves `SandboxWebhook` CRs and Secrets in place (unused); v0.6.x gateways ignore `status.deadLetters`.
 
 ---
 
 ## Production Readiness Review Questionnaire (PRR)
 
-- **Feature Enablement and Rollback**: Controlled via `CUBEPOD_EVENTS_DIR` / `CUBEPOD_WEBHOOK_ALLOW_PRIVATE`.
+- **Feature Enablement and Rollback**: Feature gate `SandboxEventsAndWebhooks` plus `CUBEPOD_EVENTS_BACKEND` (`k8s` | `file` | `disabled`). Default is `k8s` when the gateway has a Kubernetes client and `CUBEPOD_EVENTS_DIR` is unset; otherwise `file` under `<state-dir>/events` (`webhooks.enc.json`, `events.json`, `dead_letters.json`). `CUBEPOD_EVENTS_DIR=disabled` still disables. Helm: `events.enabled`, `events.backend`, `events.dir`. `CUBEPOD_WEBHOOK_ALLOW_PRIVATE=1` is for local test harnesses only.
 - **Rollout, Upgrade and Rollback Planning**: Existing sandboxes and PVCs are unaffected.
-- **Monitoring Requirements**: `cubepod_events_recorded_total`, `cubepod_webhook_deliveries_total{result}`, `cubepod_webhook_queue_depth`.
-- **Dependencies**: Go stdlib `crypto/hmac`, `crypto/sha256`, `net`.
-- **Scalability**: Bounded event retention per tenant and bounded delivery queue protect gateway memory.
-- **Troubleshooting**: Inspect `cubepod_webhook_deliveries_total` and structured logs (`webhookID`, `eventID`, `statusCode`).
+- **Monitoring Requirements**: `cubepod_events_recorded_total`, `cubepod_webhook_deliveries_total{result="ok|failed|dropped"}`, `cubepod_webhook_queue_depth`, `cubepod_webhook_dead_letters_total`, `cubepod_webhook_dead_letters_pending`. `deploy/monitoring/webhook-alerts.yaml` ships a `PrometheusRule` with `CubePodWebhookDeliveriesFailed`, `CubePodWebhookDeliveriesDropped`, and `CubePodWebhookDeadLettersPending`.
+- **Dependencies**: Go stdlib `crypto/hmac`, `crypto/sha256`, `net`; in `k8s` mode, the Kubernetes API server (gateway RBAC on `sandboxwebhooks`, `secrets`, and `events`).
+- **Scalability**: Bounded event retention per tenant, bounded delivery queue, and bounded dead letters (500 per tenant file/memory, 50 per webhook CR) protect gateway memory and etcd object size.
+- **Troubleshooting**: Inspect `cubepod_webhook_deliveries_total`, `GET /webhooks/dead-letters` (sanitized `lastError` / `lastStatusCode`), `kubectl get sandboxwebhooks -o yaml` (`status.consecutiveFailures`), `kubectl get events -l cubepod.io/resource=sandbox-event`, and structured logs (`webhookID`, `eventID`, `statusCode`).
 
 ---
 
 ## Implementation History
 
 - `2026-11-16`: CEP-0028 drafted and marked `implementable`.
+- `2026-11-16`: Alpha implemented in `v0.6.0` (file backend, `/webhooks`, `/events`, SSRF-safe HMAC dispatcher).
+- `2026-11-18`: Beta and Stable implemented for `v0.7.0` (GitHub Issue #97): `SandboxWebhook` CR + `Secret` backend, PodBox Kubernetes `Event`s with multi-replica dedupe, controller PodBox `Event`s, dead-letter API, new metrics, Helm `events.*` values, and `PrometheusRule` alerts. Stage promoted to `stable`.
 
 ---
 
 ## Drawbacks
 
-- In Alpha, single-instance file storage means webhook deliveries and `/events` history are node-local until Beta shared storage is added.
+- The `file` backend remains single-instance and node-local; multi-replica gateways must use the `k8s` backend.
+- Kubernetes `Event`s expire with the apiserver event TTL (default `1h`), so `/events` history in `k8s` mode is short-lived; the in-memory ring is per replica.
+- Dead letters are bounded (50 per webhook in CR status, 500 per tenant otherwise); sustained receiver outages evict the oldest entries, so alerting on `cubepod_webhook_dead_letters_pending` matters.
+- Webhook status writes add API-server traffic proportional to delivery volume.
 
 ---
 

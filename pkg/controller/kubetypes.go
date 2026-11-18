@@ -2,6 +2,7 @@ package controller
 
 import (
 	"slices"
+	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 )
@@ -14,6 +15,44 @@ type KubeSecret struct {
 	Type       string              `json:"type,omitempty"`
 	Data       map[string][]byte   `json:"data,omitempty"`
 	StringData map[string]string   `json:"stringData,omitempty"`
+}
+
+// Kubernetes core/v1 Event types.
+const (
+	KubeEventTypeNormal  = "Normal"
+	KubeEventTypeWarning = "Warning"
+)
+
+// KubeObjectReference identifies the object a Kubernetes Event is attached to (involvedObject).
+type KubeObjectReference struct {
+	APIVersion string `json:"apiVersion,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	Name       string `json:"name"`
+	Namespace  string `json:"namespace,omitempty"`
+	UID        string `json:"uid,omitempty"`
+}
+
+// KubeEventSource identifies the component that emitted a Kubernetes Event.
+type KubeEventSource struct {
+	Component string `json:"component,omitempty"`
+	Host      string `json:"host,omitempty"`
+}
+
+// KubeEvent represents a Kubernetes core/v1 Event payload.
+type KubeEvent struct {
+	APIVersion          string              `json:"apiVersion,omitempty"`
+	Kind                string              `json:"kind,omitempty"`
+	Metadata            v1alpha1.ObjectMeta `json:"metadata"`
+	InvolvedObject      KubeObjectReference `json:"involvedObject"`
+	Reason              string              `json:"reason,omitempty"`
+	Message             string              `json:"message,omitempty"`
+	Type                string              `json:"type,omitempty"`
+	Source              KubeEventSource     `json:"source,omitempty"`
+	FirstTimestamp      *time.Time          `json:"firstTimestamp,omitempty"`
+	LastTimestamp       *time.Time          `json:"lastTimestamp,omitempty"`
+	Count               int32               `json:"count,omitempty"`
+	ReportingController string              `json:"reportingComponent,omitempty"`
+	ReportingInstance   string              `json:"reportingInstance,omitempty"`
 }
 
 // VolumeSnapshotSource identifies the PersistentVolumeClaim used as the snapshot source.

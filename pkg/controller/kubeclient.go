@@ -8,10 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +30,10 @@ var (
 	ErrCRDNotInstalled = errors.New("CRD not installed (404 NotFound)")
 	// ErrCASConflict is returned when a conditional CAS claim fails because the pod was already claimed or precondition failed.
 	ErrCASConflict = errors.New("CAS conflict: pod already claimed or precondition failed")
+	// ErrKubeNotFound is returned when a requested Kubernetes object does not exist (404 NotFound).
+	ErrKubeNotFound = errors.New("kubernetes object not found")
+	// ErrKubeAlreadyExists is returned when creating a Kubernetes object whose name is already taken (409 AlreadyExists).
+	ErrKubeAlreadyExists = errors.New("kubernetes object already exists")
 )
 
 // KubeClient abstracts Kubernetes resource operations for PodBox workloads.
@@ -67,6 +74,21 @@ type KubeClient interface {
 	GetVolumeSnapshot(ctx context.Context, namespace, name string) (*VolumeSnapshot, error)
 	WaitVolumeSnapshotReady(ctx context.Context, namespace, name string) error
 	DeleteVolumeSnapshot(ctx context.Context, namespace, name string) error
+
+	// UpsertSandboxWebhook creates a SandboxWebhook CR (including initial /status when non-zero)
+	// or replaces metadata/spec when it already exists without overwriting /status.
+	UpsertSandboxWebhook(ctx context.Context, webhook v1alpha1.SandboxWebhook) error
+	// UpdateSandboxWebhookStatus replaces only the /status subresource. When
+	// webhook.Metadata.ResourceVersion is set, a stale version yields ErrCASConflict.
+	UpdateSandboxWebhookStatus(ctx context.Context, webhook v1alpha1.SandboxWebhook) error
+	GetSandboxWebhook(ctx context.Context, namespace, name string) (*v1alpha1.SandboxWebhook, error)
+	ListSandboxWebhooks(ctx context.Context, namespace string, labelSelector string) ([]v1alpha1.SandboxWebhook, error)
+	DeleteSandboxWebhook(ctx context.Context, namespace, name string) error
+
+	// CreateKubeEvent creates a core/v1 Event. An existing Event with the same name
+	// returns an error wrapping ErrKubeAlreadyExists so callers can deduplicate.
+	CreateKubeEvent(ctx context.Context, event KubeEvent) error
+	ListKubeEvents(ctx context.Context, namespace string, labelSelector string) ([]KubeEvent, error)
 }
 
 // MemoryKubeClient is an in-memory, thread-safe implementation of KubeClient
@@ -82,13 +104,22 @@ type MemoryKubeClient struct {
 	Templates       map[string]v1alpha1.PodTemplate
 	Secrets         map[string]KubeSecret
 	VolumeSnapshots map[string]VolumeSnapshot
-	templateRVSeq   uint64
+	Webhooks        map[string]v1alpha1.SandboxWebhook
+	// Events holds core/v1 Events in insertion order, bounded by MaxMemoryKubeEvents.
+	Events []KubeEvent
+
+	rvCounter     int64
+	templateRVSeq uint64
 }
 
 func (m *MemoryKubeClient) nextTemplateRVLocked() string {
 	m.templateRVSeq++
 	return strconv.FormatUint(m.templateRVSeq, 10)
 }
+
+// MaxMemoryKubeEvents bounds the number of core/v1 Events retained by MemoryKubeClient,
+// emulating the APIServer event TTL so long-running local gateways do not leak memory.
+const MaxMemoryKubeEvents = 2048
 
 // NewMemoryKubeClient creates a new in-memory KubeClient.
 func NewMemoryKubeClient() *MemoryKubeClient {
@@ -102,6 +133,7 @@ func NewMemoryKubeClient() *MemoryKubeClient {
 		Templates:       make(map[string]v1alpha1.PodTemplate),
 		Secrets:         make(map[string]KubeSecret),
 		VolumeSnapshots: make(map[string]VolumeSnapshot),
+		Webhooks:        make(map[string]v1alpha1.SandboxWebhook),
 	}
 	if stateDir := os.Getenv("CUBEPOD_STATE"); stateDir != "" {
 		m.LoadLocalTemplates(stateDir)
@@ -777,6 +809,197 @@ func (m *MemoryKubeClient) DeleteVolumeSnapshot(_ context.Context, namespace, na
 	}
 	delete(m.VolumeSnapshots, podKey(namespace, name))
 	return nil
+}
+
+func matchesLabelSelectors(labels, selectors map[string]string) bool {
+	for k, v := range selectors {
+		if labels == nil || labels[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+func copySandboxWebhook(wh v1alpha1.SandboxWebhook) v1alpha1.SandboxWebhook {
+	cp := wh
+	cp.Metadata.Labels = maps.Clone(wh.Metadata.Labels)
+	cp.Metadata.Annotations = maps.Clone(wh.Metadata.Annotations)
+	cp.Spec.Events = slices.Clone(wh.Spec.Events)
+	if wh.Status.LastDeliveryTime != nil {
+		t := *wh.Status.LastDeliveryTime
+		cp.Status.LastDeliveryTime = &t
+	}
+	if wh.Status.DeadLetters != nil {
+		cp.Status.DeadLetters = make([]v1alpha1.SandboxWebhookDeadLetter, len(wh.Status.DeadLetters))
+		for i, dl := range wh.Status.DeadLetters {
+			dl.Event = slices.Clone(dl.Event)
+			cp.Status.DeadLetters[i] = dl
+		}
+	}
+	return cp
+}
+
+func (m *MemoryKubeClient) nextResourceVersionLocked() string {
+	m.rvCounter++
+	return strconv.FormatInt(m.rvCounter, 10)
+}
+
+// UpsertSandboxWebhook creates a SandboxWebhook (with initial status) or replaces
+// metadata and spec when it already exists, preserving existing status in memory.
+func (m *MemoryKubeClient) UpsertSandboxWebhook(_ context.Context, webhook v1alpha1.SandboxWebhook) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if webhook.Metadata.Name == "" {
+		return fmt.Errorf("SandboxWebhook metadata.name is required")
+	}
+	if m.Webhooks == nil {
+		m.Webhooks = make(map[string]v1alpha1.SandboxWebhook)
+	}
+	ns := webhook.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	webhook.Metadata.Namespace = ns
+	if webhook.APIVersion == "" {
+		webhook.APIVersion = "cubepod.io/v1alpha1"
+	}
+	if webhook.Kind == "" {
+		webhook.Kind = "SandboxWebhook"
+	}
+	key := podKey(ns, webhook.Metadata.Name)
+	cp := copySandboxWebhook(webhook)
+	if existing, exists := m.Webhooks[key]; exists {
+		cp.Status = copySandboxWebhook(existing).Status
+	}
+	cp.Metadata.ResourceVersion = m.nextResourceVersionLocked()
+	m.Webhooks[key] = cp
+	return nil
+}
+
+// UpdateSandboxWebhookStatus replaces the status of an existing in-memory SandboxWebhook.
+func (m *MemoryKubeClient) UpdateSandboxWebhookStatus(_ context.Context, webhook v1alpha1.SandboxWebhook) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ns := webhook.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	key := podKey(ns, webhook.Metadata.Name)
+	existing, ok := m.Webhooks[key]
+	if !ok {
+		return fmt.Errorf("sandboxwebhook %s/%s: %w", ns, webhook.Metadata.Name, ErrKubeNotFound)
+	}
+	if rv := webhook.Metadata.ResourceVersion; rv != "" && rv != existing.Metadata.ResourceVersion {
+		return fmt.Errorf("sandboxwebhook %s/%s resourceVersion %s is stale: %w", ns, webhook.Metadata.Name, rv, ErrCASConflict)
+	}
+	updated := copySandboxWebhook(webhook)
+	existing.Status = updated.Status
+	existing.Metadata.ResourceVersion = m.nextResourceVersionLocked()
+	m.Webhooks[key] = existing
+	return nil
+}
+
+// GetSandboxWebhook retrieves a SandboxWebhook from memory, returning ErrKubeNotFound when absent.
+func (m *MemoryKubeClient) GetSandboxWebhook(_ context.Context, namespace, name string) (*v1alpha1.SandboxWebhook, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	wh, ok := m.Webhooks[podKey(namespace, name)]
+	if !ok {
+		return nil, fmt.Errorf("sandboxwebhook %s/%s: %w", namespace, name, ErrKubeNotFound)
+	}
+	cp := copySandboxWebhook(wh)
+	return &cp, nil
+}
+
+// ListSandboxWebhooks lists in-memory SandboxWebhooks matching namespace and labelSelector.
+func (m *MemoryKubeClient) ListSandboxWebhooks(_ context.Context, namespace string, labelSelector string) ([]v1alpha1.SandboxWebhook, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	selectors := parseLabelSelector(labelSelector)
+	out := make([]v1alpha1.SandboxWebhook, 0, len(m.Webhooks))
+	for _, wh := range m.Webhooks {
+		if namespace != "" && wh.Metadata.Namespace != namespace {
+			continue
+		}
+		if !matchesLabelSelectors(wh.Metadata.Labels, selectors) {
+			continue
+		}
+		out = append(out, copySandboxWebhook(wh))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Metadata.Name < out[j].Metadata.Name })
+	return out, nil
+}
+
+// DeleteSandboxWebhook removes a SandboxWebhook from memory (idempotent).
+func (m *MemoryKubeClient) DeleteSandboxWebhook(_ context.Context, namespace, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if namespace == "" {
+		namespace = "default"
+	}
+	delete(m.Webhooks, podKey(namespace, name))
+	return nil
+}
+
+// CreateKubeEvent appends a core/v1 Event to memory. Duplicate names in the same
+// namespace return ErrKubeAlreadyExists, mirroring APIServer 409 semantics.
+func (m *MemoryKubeClient) CreateKubeEvent(_ context.Context, event KubeEvent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if event.Metadata.Name == "" {
+		return fmt.Errorf("Event metadata.name is required")
+	}
+	ns := event.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	event.Metadata.Namespace = ns
+	if event.InvolvedObject.Namespace == "" {
+		event.InvolvedObject.Namespace = ns
+	}
+	if event.APIVersion == "" {
+		event.APIVersion = "v1"
+	}
+	if event.Kind == "" {
+		event.Kind = "Event"
+	}
+	for _, existing := range m.Events {
+		if existing.Metadata.Namespace == ns && existing.Metadata.Name == event.Metadata.Name {
+			return fmt.Errorf("event %s/%s: %w", ns, event.Metadata.Name, ErrKubeAlreadyExists)
+		}
+	}
+	event.Metadata.Labels = maps.Clone(event.Metadata.Labels)
+	event.Metadata.Annotations = maps.Clone(event.Metadata.Annotations)
+	event.Metadata.ResourceVersion = m.nextResourceVersionLocked()
+	m.Events = append(m.Events, event)
+	if over := len(m.Events) - MaxMemoryKubeEvents; over > 0 {
+		m.Events = append([]KubeEvent(nil), m.Events[over:]...)
+	}
+	return nil
+}
+
+// ListKubeEvents lists in-memory core/v1 Events matching namespace and labelSelector in creation order.
+func (m *MemoryKubeClient) ListKubeEvents(_ context.Context, namespace string, labelSelector string) ([]KubeEvent, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	selectors := parseLabelSelector(labelSelector)
+	out := make([]KubeEvent, 0)
+	for _, ev := range m.Events {
+		if namespace != "" && ev.Metadata.Namespace != namespace {
+			continue
+		}
+		if !matchesLabelSelectors(ev.Metadata.Labels, selectors) {
+			continue
+		}
+		cp := ev
+		cp.Metadata.Labels = maps.Clone(ev.Metadata.Labels)
+		cp.Metadata.Annotations = maps.Clone(ev.Metadata.Annotations)
+		out = append(out, cp)
+	}
+	return out, nil
 }
 
 // ClaimPod conditionally claims an unclaimed standby pod in memory.

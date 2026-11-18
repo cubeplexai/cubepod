@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -363,6 +364,10 @@ func TestFeatureGateSandboxEventsAndWebhooksDisabled(t *testing.T) {
 		{http.MethodDelete, "/webhooks/whk_123", nil},
 		{http.MethodGet, "/events", nil},
 		{http.MethodGet, "/sandboxes/sbx-1/events", nil},
+		{http.MethodGet, "/webhooks/dead-letters", nil},
+		{http.MethodGet, "/webhooks/whk_123/dead-letters", nil},
+		{http.MethodPost, "/webhooks/whk_123/dead-letters/dlq_123/retry", nil},
+		{http.MethodDelete, "/webhooks/whk_123/dead-letters/dlq_123", nil},
 	} {
 		rr := doJSONReq(t, h, tc.method, tc.path, "tenant-a", tc.body)
 		if rr.Code != http.StatusNotImplemented {
@@ -390,5 +395,253 @@ func TestFeatureGateSandboxEventsAndWebhooksDisabled(t *testing.T) {
 	_ = json.Unmarshal(rrEv.Body.Bytes(), &items)
 	if len(items) != 0 {
 		t.Fatalf("expected 0 events recorded while SandboxEventsAndWebhooks was disabled, got %d", len(items))
+	}
+}
+
+func newK8sEventsTestServer(t *testing.T, kube controller.KubeClient) *gateway.Server {
+	t.Helper()
+	rec := controller.NewReconciler(
+		controller.WithKubeClient(kube),
+		controller.WithNamespace("default"),
+	)
+	srv := gateway.NewServer(rec)
+	srv.SetWorkspaceBaseDir(t.TempDir())
+	srv.SetLivePodRouting(true)
+	if err := srv.ConfigureEvents(gateway.E2BEventsConfig{
+		Backend:         "k8s",
+		KubeClient:      kube,
+		Namespace:       "default",
+		AllowPrivateIPs: true,
+	}); err != nil {
+		t.Fatalf("ConfigureEvents(k8s): %v", err)
+	}
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestK8sHAMultiReplicaWebhooksEventsAndDeadLetters(t *testing.T) {
+	var failMode atomic.Bool
+	failMode.Store(true)
+	var okDeliveries atomic.Int32
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if failMode.Load() {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		okDeliveries.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer receiver.Close()
+
+	kube := controller.NewMemoryKubeClient()
+	replicaA := newK8sEventsTestServer(t, kube)
+	replicaB := newK8sEventsTestServer(t, kube)
+	hA := replicaA.Handler()
+	hB := replicaB.Handler()
+
+	// 1. Register webhook on replica A; verify SandboxWebhook CR + isolated Secret in kube.
+	rrCreateWh := doJSONReq(t, hA, http.MethodPost, "/webhooks", "tenant-a", map[string]any{
+		"name":   "ha-dlq-hook",
+		"url":    receiver.URL,
+		"events": []string{events.EventCreated, events.EventPaused},
+	})
+	if rrCreateWh.Code != http.StatusCreated {
+		t.Fatalf("POST /webhooks = %d (%s)", rrCreateWh.Code, rrCreateWh.Body.String())
+	}
+	var wh events.WebhookWithSecret
+	if err := json.Unmarshal(rrCreateWh.Body.Bytes(), &wh); err != nil {
+		t.Fatalf("unmarshal webhook: %v", err)
+	}
+	cr, err := kube.GetSandboxWebhook(context.Background(), "default", events.KubeWebhookName(wh.ID))
+	if err != nil {
+		t.Fatalf("GetSandboxWebhook: %v", err)
+	}
+	if cr.Spec.SecretName == "" {
+		t.Fatal("expected spec.secretName to reference companion Secret")
+	}
+	rawCR, _ := json.Marshal(cr)
+	if bytesContains(rawCR, wh.SignatureKey) {
+		t.Fatal("SandboxWebhook CR leaked signatureKey")
+	}
+
+	// Replica B sees the webhook via cache-miss reload without signatureKey.
+	rrGetB := doJSONReq(t, hB, http.MethodGet, "/webhooks/"+wh.ID, "tenant-a", nil)
+	if rrGetB.Code != http.StatusOK {
+		t.Fatalf("replica B GET /webhooks/{id} = %d (%s)", rrGetB.Code, rrGetB.Body.String())
+	}
+	if bytesContains(rrGetB.Body.Bytes(), wh.SignatureKey) {
+		t.Fatal("GET /webhooks/{id} leaked signatureKey")
+	}
+
+	// 2. Create sandbox on replica A; replica B lists the lifecycle event via K8s Events.
+	rrSbx := doJSONReq(t, hA, http.MethodPost, "/sandboxes", "tenant-a", map[string]any{"templateID": "base"})
+	if rrSbx.Code != http.StatusCreated {
+		t.Fatalf("POST /sandboxes = %d (%s)", rrSbx.Code, rrSbx.Body.String())
+	}
+	var sbx struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	_ = json.Unmarshal(rrSbx.Body.Bytes(), &sbx)
+
+	rrEvB := doJSONReq(t, hB, http.MethodGet, "/sandboxes/"+sbx.SandboxID+"/events", "tenant-a", nil)
+	if rrEvB.Code != http.StatusOK {
+		t.Fatalf("replica B GET /sandboxes/{id}/events = %d (%s)", rrEvB.Code, rrEvB.Body.String())
+	}
+	var sbxEvents []events.LifecycleEvent
+	_ = json.Unmarshal(rrEvB.Body.Bytes(), &sbxEvents)
+	if len(sbxEvents) != 1 || sbxEvents[0].Type != events.EventCreated {
+		t.Fatalf("replica B expected 1 created event from K8s Events, got %+v", sbxEvents)
+	}
+
+	// 3. Wait for failing delivery on replica A to record a dead letter; inspect via replica B.
+	var deadLetters []events.DeadLetter
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		rrDL := doJSONReq(t, hB, http.MethodGet, "/webhooks/dead-letters?webhookID="+wh.ID, "tenant-a", nil)
+		if rrDL.Code == http.StatusOK {
+			var list []events.DeadLetter
+			if json.Unmarshal(rrDL.Body.Bytes(), &list) == nil && len(list) == 1 {
+				deadLetters = list
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if len(deadLetters) != 1 {
+		t.Fatalf("expected 1 dead letter visible on replica B, got %d", len(deadLetters))
+	}
+	dl := deadLetters[0]
+	if dl.Reason != events.DeadLetterReasonDeliveryFailed || dl.LastStatusCode != http.StatusBadGateway || dl.LastError != "http_status" {
+		t.Fatalf("unexpected dead letter: %+v", dl)
+	}
+	rawDL, _ := json.Marshal(dl)
+	if bytesContains(rawDL, wh.SignatureKey) || bytesContains(rawDL, receiver.URL) {
+		t.Fatalf("dead letter response exposed secret or URL: %s", rawDL)
+	}
+
+	// Scoped list, validation errors, and cross-tenant isolation.
+	if rrScoped := doJSONReq(t, hB, http.MethodGet, "/webhooks/"+wh.ID+"/dead-letters?sandboxID="+sbx.SandboxID, "tenant-a", nil); rrScoped.Code != http.StatusOK || !bytesContains(rrScoped.Body.Bytes(), dl.ID) {
+		t.Fatalf("GET /webhooks/{id}/dead-letters = %d (%s)", rrScoped.Code, rrScoped.Body.String())
+	}
+	if rrBad := doJSONReq(t, hB, http.MethodGet, "/webhooks/dead-letters?reason=bogus", "tenant-a", nil); rrBad.Code != http.StatusBadRequest {
+		t.Fatalf("bad reason = %d; want 400", rrBad.Code)
+	}
+	if rrCross := doJSONReq(t, hB, http.MethodGet, "/webhooks/"+wh.ID+"/dead-letters", "tenant-b", nil); rrCross.Code != http.StatusNotFound {
+		t.Fatalf("cross-tenant dead letters = %d; want 404", rrCross.Code)
+	}
+	if rrCrossRetry := doJSONReq(t, hB, http.MethodPost, "/webhooks/"+wh.ID+"/dead-letters/"+dl.ID+"/retry", "tenant-b", nil); rrCrossRetry.Code != http.StatusNotFound {
+		t.Fatalf("cross-tenant retry = %d; want 404", rrCrossRetry.Code)
+	}
+
+	// Metrics on replica A expose dead-letter counters and gauges.
+	rrMetrics := doJSONReq(t, hA, http.MethodGet, "/metrics", "", nil)
+	if rrMetrics.Code != http.StatusOK ||
+		!bytesContains(rrMetrics.Body.Bytes(), "cubepod_webhook_dead_letters_total 1") ||
+		!bytesContains(rrMetrics.Body.Bytes(), "cubepod_webhook_dead_letters_pending 1") ||
+		!bytesContains(rrMetrics.Body.Bytes(), "cubepod_webhook_deliveries_total{result=\"failed\"} 1") {
+		t.Fatalf("unexpected dead-letter metrics:\n%s", rrMetrics.Body.String())
+	}
+
+	// 4. Disabled webhook rejects retry with 409; re-enabling + recovering receiver retries with 202.
+	if rrDis := doJSONReq(t, hA, http.MethodPatch, "/webhooks/"+wh.ID, "tenant-a", map[string]any{"enabled": false}); rrDis.Code != http.StatusOK {
+		t.Fatalf("disable webhook = %d", rrDis.Code)
+	}
+	if rrConflict := doJSONReq(t, hB, http.MethodPost, "/webhooks/"+wh.ID+"/dead-letters/"+dl.ID+"/retry", "tenant-a", nil); rrConflict.Code != http.StatusConflict {
+		t.Fatalf("retry while disabled = %d (%s); want 409", rrConflict.Code, rrConflict.Body.String())
+	}
+	if rrEn := doJSONReq(t, hA, http.MethodPatch, "/webhooks/"+wh.ID, "tenant-a", map[string]any{"enabled": true}); rrEn.Code != http.StatusOK {
+		t.Fatalf("re-enable webhook = %d", rrEn.Code)
+	}
+	failMode.Store(false)
+	rrRetry := doJSONReq(t, hB, http.MethodPost, "/webhooks/"+wh.ID+"/dead-letters/"+dl.ID+"/retry", "tenant-a", nil)
+	if rrRetry.Code != http.StatusAccepted {
+		t.Fatalf("POST retry = %d (%s); want 202", rrRetry.Code, rrRetry.Body.String())
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if okDeliveries.Load() == 1 {
+			rrCheck := doJSONReq(t, hA, http.MethodGet, "/webhooks/"+wh.ID, "tenant-a", nil)
+			var info events.WebhookInfo
+			if json.Unmarshal(rrCheck.Body.Bytes(), &info) == nil && info.LastDeliveryTime != nil && info.ConsecutiveFailures == 0 {
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if okDeliveries.Load() != 1 {
+		t.Fatalf("expected 1 retried OK delivery, got %d", okDeliveries.Load())
+	}
+	rrEmptyDL := doJSONReq(t, hA, http.MethodGet, "/webhooks/dead-letters", "tenant-a", nil)
+	if rrEmptyDL.Code != http.StatusOK || stringContains(rrEmptyDL.Body.String(), dl.ID) {
+		t.Fatalf("dead letter not cleared after successful retry: %s", rrEmptyDL.Body.String())
+	}
+
+	// 5. Multi-replica PodBox idle-pause observed by BOTH replica A and replica B triggers exactly 1 webhook delivery.
+	if rrKill := doJSONReq(t, hA, http.MethodDelete, "/sandboxes/"+sbx.SandboxID, "tenant-a", nil); rrKill.Code != http.StatusNoContent {
+		t.Fatalf("DELETE sandbox = %d", rrKill.Code)
+	}
+	okDeliveries.Store(0)
+	rrSbx2 := doJSONReq(t, hA, http.MethodPost, "/sandboxes", "tenant-a", map[string]any{"templateID": "base"})
+	if rrSbx2.Code != http.StatusCreated {
+		t.Fatalf("POST sbx2 = %d", rrSbx2.Code)
+	}
+	var sbx2 struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	_ = json.Unmarshal(rrSbx2.Body.Bytes(), &sbx2)
+	// Warm replica B cache with sbx2 while Running (restores OwnerTenantHash from PodBox annotation),
+	// then idle-pause in K8s and sync both replicas.
+	if rrWarm := doJSONReq(t, hB, http.MethodGet, "/sandboxes/"+sbx2.SandboxID, "tenant-a", nil); rrWarm.Code != http.StatusOK {
+		t.Fatalf("GET sbx2 on B = %d", rrWarm.Code)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && okDeliveries.Load() < 1 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	box2, _ := kube.GetPodBox(context.Background(), "default", sbx2.SandboxID)
+	pausedAt2 := time.Now().UTC()
+	box2.Spec.DesiredState = v1alpha1.DesiredStatePaused
+	box2.Status.Phase = v1alpha1.PodBoxPhasePaused
+	box2.Status.PodIP = ""
+	box2.Status.PodName = ""
+	box2.Status.PausedAt = &pausedAt2
+	box2.Status.Reason = "IdlePaused"
+	_ = kube.UpsertPodBox(context.Background(), *box2)
+	replicaA.SyncPodBoxesOnce(context.Background())
+	replicaB.SyncPodBoxesOnce(context.Background())
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && okDeliveries.Load() < 2 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := okDeliveries.Load(); got != 2 {
+		t.Fatalf("expected 2 total OK deliveries (1 create + 1 deduplicated sync pause), got %d", got)
+	}
+
+	// Verify DELETE dead letter 204 and 404.
+	failMode.Store(true)
+	_ = doJSONReq(t, hA, http.MethodPost, "/sandboxes/"+sbx2.SandboxID+"/connect", "tenant-a", nil)
+	_ = doJSONReq(t, hA, http.MethodPost, "/sandboxes/"+sbx2.SandboxID+"/pause", "tenant-a", nil)
+	var dl2ID string
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		rrDL := doJSONReq(t, hB, http.MethodGet, "/webhooks/"+wh.ID+"/dead-letters", "tenant-a", nil)
+		var list []events.DeadLetter
+		if json.Unmarshal(rrDL.Body.Bytes(), &list) == nil && len(list) == 1 {
+			dl2ID = list[0].ID
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if dl2ID == "" {
+		t.Fatal("expected dead letter for failed pause webhook")
+	}
+	if rrDel := doJSONReq(t, hB, http.MethodDelete, "/webhooks/"+wh.ID+"/dead-letters/"+dl2ID, "tenant-a", nil); rrDel.Code != http.StatusNoContent {
+		t.Fatalf("DELETE dead letter = %d (%s); want 204", rrDel.Code, rrDel.Body.String())
+	}
+	if rrDel2 := doJSONReq(t, hB, http.MethodDelete, "/webhooks/"+wh.ID+"/dead-letters/"+dl2ID, "tenant-a", nil); rrDel2.Code != http.StatusNotFound {
+		t.Fatalf("second DELETE dead letter = %d; want 404", rrDel2.Code)
 	}
 }

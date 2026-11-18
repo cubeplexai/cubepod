@@ -274,6 +274,7 @@ func WithDefaultImagePullSecrets(secrets ...string) ReconcilerOption {
 // and dual Raw Block PVCs.
 type Reconciler struct {
 	mu                       sync.RWMutex
+	podBoxEventsDisabled     bool
 	boxes                    map[string]*v1alpha1.PodBoxStatus
 	specs                    map[string]v1alpha1.PodBoxSpec
 	resolvedImages           map[string]string
@@ -1207,6 +1208,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 
 	now := time.Now().UTC()
 	status, exists := r.boxes[name]
+	var prevPhase v1alpha1.PodBoxPhase
+	if exists && status != nil {
+		prevPhase = status.Phase
+	}
 
 	isFork := !exists && spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != ""
 	var forkStart time.Time
@@ -1561,6 +1566,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	}
 	_ = r.kubeClient.UpsertPodBox(ctx, box)
 	forkResult = "ok"
+	r.recordPhaseTransitionLocked(ctx, name, prevPhase, cp)
 
 	return &cp, nil
 }
@@ -1613,6 +1619,17 @@ func (r *Reconciler) mergeBoxAnnotationsLocked(name string, incoming map[string]
 		cur[k] = v
 	}
 	r.boxAnnotations[name] = cur
+}
+
+// SetBoxAnnotations merges annotations for PodBox name so subsequent Reconcile and Pause
+// calls persist them on PodBox.Metadata.Annotations.
+func (r *Reconciler) SetBoxAnnotations(name string, annotations map[string]string) {
+	if name == "" || len(annotations) == 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.mergeBoxAnnotationsLocked(name, annotations)
 }
 
 func (r *Reconciler) podBoxAnnotationsLocked(name, fallbackImage string) map[string]string {
@@ -1928,6 +1945,7 @@ func (r *Reconciler) rollbackColdCreateLocked(ctx context.Context, name string, 
 	delete(r.boxes, name)
 	delete(r.specs, name)
 	delete(r.resolvedImages, name)
+	delete(r.boxAnnotations, name)
 }
 
 func forkSnapshotName(boxName, suffix string) string {
@@ -2079,6 +2097,7 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 	delete(r.specs, name)
 	delete(r.resolvedImages, name)
 	delete(r.boxAnnotations, name)
+	r.recordPodBoxEventLocked(ctx, name, PodBoxEventReasonDeleted, KubeEventTypeNormal, "PodBox deleted", time.Now().UTC())
 	return nil
 }
 
@@ -2409,6 +2428,8 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 						spec.DesiredState = v1alpha1.DesiredStatePaused
 						r.specs[name] = spec
 						paused = append(paused, name)
+						r.recordPodBoxEventLocked(ctx, name, PodBoxEventReasonIdlePaused, KubeEventTypeNormal,
+							"Paused due to idle timeout", now)
 					}
 				}
 			}
@@ -2424,6 +2445,8 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 					status.Reason = "PausedTTLExpired"
 					status.Message = "Terminated due to paused TTL expiration"
 					terminated = append(terminated, name)
+					r.recordPodBoxEventLocked(ctx, name, PodBoxEventReasonPausedTTLExpired, KubeEventTypeNormal,
+						"Terminated due to paused TTL expiration", now)
 				}
 			}
 		}
