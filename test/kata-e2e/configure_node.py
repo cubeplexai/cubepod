@@ -93,3 +93,12 @@ snapshotter = "{snapshotter}"
 ConfigPath = "/etc/kata-containers/configuration-e2e.toml"
 '''
 Path('/etc/containerd/config.toml').write_text(original + extra)
+
+if vmm == 'fc':
+    # Install after creating our pool; containerd creates only child snapshots.
+    # Official containerd source: plugins/snapshots/devmapper/dmsetup/dmsetup.go.
+    assert Path('/usr/sbin/dmsetup').is_file()
+    wrapper = Path('/usr/local/bin/dmsetup')
+    assert not wrapper.exists(), 'Refusing an existing dmsetup wrapper'
+    wrapper.write_text('#!/bin/sh\nexec /usr/bin/python3 /usr/local/libexec/cubepod-kata-e2e/dmsetup_node.py ' + cluster + ' "$@"\n')
+    wrapper.chmod(0o755)

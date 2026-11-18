@@ -117,6 +117,11 @@ owned thin mappings/pool/loops were cleaned. Do not fix this by mounting the
 host's entire `/dev` read-write, running broad host udev rules, skipping volumes
 or accepting a native guest as full E2E. A node-scoped, ownership-checked device
 publication mechanism (including every child snapshot, not just the pool) is
-still required before claiming FC Kata/SDK coverage. The full lane deliberately
-fails visibly until resolved. Native Linux guest success is not the missing
+required before claiming FC Kata/SDK coverage. This PR now implements a
+synchronous node-only `dmsetup create` wrapper, matching containerd 2.3.1's actual
+CLI calls. It validates both requested and actual kernel thin parents, own pool
+UUID and name, then publishes only that owned device before returning. It does
+not start udev, mount host /dev or change a host service. Ten safety/contract unit
+tests pass; **actual FC revalidation is still required**. The full lane deliberately
+fails visibly until real integration succeeds. Native Linux guest success is not the missing
 Kata/SDK proof.
