@@ -38,7 +38,11 @@ def main(cluster):
     pods = subprocess.run(['crictl', 'pods', '-q'], capture_output=True, text=True, timeout=40)
     if pods.returncode == 0:
         if pods.stdout.split():
-            run(['crictl', 'stopp', *pods.stdout.split()])
+            run(['crictl', '--timeout=20s', 'stopp', *pods.stdout.split()])
+        # StopPodSandbox alone need not remove containers/mount namespaces.
+        # Release the owned CSI container before unmounting its propagated binds.
+        run(['crictl', '--timeout=20s', 'rm', '--all', '--force'])
+        run(['crictl', '--timeout=20s', 'rmp', '--all', '--force'])
     else:
         # A broken snapshotter can disable CRI before any Kata Pod starts.
         # Kill only tasks from THIS owned node's containerd, never host tasks.
