@@ -3,7 +3,7 @@ title: Kubernetes & Helm Deployment
 description: Deploy the CubePod operator, gateway, egress proxy, CRDs, and optional rootless BuildKit builder on Kubernetes using Helm.
 ---
 
-For Kubernetes deployments, CubePod is packaged as Helm chart `cubepod` (`version: 0.5.4`, `appVersion: "0.5.4"`) under `deploy/helm/cubepod/`. It installs the Custom Resource Definitions (`PodBox`, `PodTemplate`, `PodWarmPool`, `SandboxWebhook`), RBAC rules, workload namespace, Control Plane Gateway, Kubernetes Controller, and—when enabled—an isolated rootless BuildKit builder deployment.
+For Kubernetes deployments, CubePod is packaged as Helm chart `cubepod` (`version: 0.6.0`, `appVersion: "0.6.0"`) under `deploy/helm/cubepod/`. It installs the Custom Resource Definitions (`PodBox`, `PodTemplate`, `PodWarmPool`, `SandboxWebhook`), RBAC rules, workload namespace, Control Plane Gateway, Kubernetes Controller, and—when enabled—an isolated rootless BuildKit builder deployment.
 
 For the exhaustive key-by-key schema generated directly from `deploy/helm/cubepod/values.yaml`, see the [Helm Values Reference](/reference/helm-values/) and [CRD Reference](/reference/crds/).
 
@@ -18,7 +18,7 @@ Install directly from the published GHCR OCI registry into a control-plane names
 
 ```bash
 helm install cubepod oci://ghcr.io/cubeplexai/charts/cubepod \
-  --version 0.5.4 \
+  --version 0.6.0 \
   --namespace cubepod-system \
   --create-namespace
 ```
@@ -85,7 +85,7 @@ gateway:
 runtime:
   runtimeClassName: kata-qemu
   defaultTemplate: cubeplex-ubuntu24-desktop
-  poddInjectorImage: ghcr.io/cubeplexai/cubepod-podd:v0.5.4
+  poddInjectorImage: ghcr.io/cubeplexai/cubepod-podd:v0.6.0
   defaultSandboxImage: ghcr.io/cubeplexai/cubeplex-sandbox:v0.4.0
 
 storage:
@@ -103,7 +103,7 @@ egress:
   image:
     registry: "ghcr.io"
     repository: "cubeplexai/cubepod-egress"
-    tag: "v0.5.4"
+    tag: "v0.6.0"
   port: 18080
   exchangeUrl: "https://cubeplex-backend.cubeplex.svc:8443/api/v1/internal/egress/exchange"
 ```
@@ -119,7 +119,7 @@ helm upgrade --install cubepod ./deploy/helm/cubepod \
 
 ### Key Runtime & Storage Defaults
 
-- **Runtime injection (`runtime.poddInjectorImage`)**: Defaults to `ghcr.io/cubeplexai/cubepod-podd:v0.5.4`. Every sandbox pod uses an `initContainer` to copy `podd-init` and `podd` into an `emptyDir` mounted at `/opt/cubepod/bin` so user images remain clean.
+- **Runtime injection (`runtime.poddInjectorImage`)**: Defaults to `ghcr.io/cubeplexai/cubepod-podd:v0.6.0`. Every sandbox pod uses an `initContainer` to copy `podd-init` and `podd` into an `emptyDir` mounted at `/opt/cubepod/bin` so user images remain clean.
 - **Registry pull secrets (`global.imagePullSecrets`, `runtime.templatePullSecret`)**: Added in `v0.5.2`. Attaches private registry pull secrets to control-plane pods (`controller`, `gateway`, `buildkit`) and sandbox pods even when `templateBuild.enabled` is `false`.
 - **Egress CA & state persistence (`egress.caSecretName`, `gateway.persistence`)**: Added in `v0.5.2`. Mounts a persistent root CA secret into both controller and gateway and optionally persists Gateway `stateDir` (`CUBEPOD_STATE`) for templates, E2B secrets, and webhooks.
 - **Dual block PVCs (`storage.*`)**: Defaults to `storageClassName: longhorn-v2-block-thin`, `volumeMode: Block`, `rootfsSize: "10Gi"`, and `workspaceSize: "20Gi"`.
