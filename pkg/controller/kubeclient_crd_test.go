@@ -1209,6 +1209,319 @@ func TestMemoryKubeClient_VolumeSnapshot_CRUDAndWaitReady(t *testing.T) {
 	}
 }
 
+// mockWebhookEventServer emulates the APIServer for sandboxwebhooks.cubepod.io and core/v1 Events.
+type mockWebhookEventServer struct {
+	mu          sync.Mutex
+	webhooks    map[string]v1alpha1.SandboxWebhook
+	events      map[string]controller.KubeEvent
+	rv          int
+	statusPuts  int
+	specPuts    int
+	lastListSel string
+}
+
+func newMockWebhookEventServer(t *testing.T) (*mockWebhookEventServer, *httptest.Server) {
+	t.Helper()
+	m := &mockWebhookEventServer{
+		webhooks: make(map[string]v1alpha1.SandboxWebhook),
+		events:   make(map[string]controller.KubeEvent),
+	}
+	matches := func(labels map[string]string, sel string) bool {
+		if sel == "" {
+			return true
+		}
+		for _, part := range strings.Split(sel, ",") {
+			kv := strings.SplitN(part, "=", 2)
+			if len(kv) != 2 || labels[kv[0]] != kv[1] {
+				return false
+			}
+		}
+		return true
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		path := r.URL.Path
+		const whPrefix = "/apis/cubepod.io/v1alpha1/namespaces/cubepod-workloads/sandboxwebhooks"
+		const evPrefix = "/api/v1/namespaces/cubepod-workloads/events"
+		switch {
+		case strings.HasPrefix(path, whPrefix):
+			rest := strings.Trim(strings.TrimPrefix(path, whPrefix), "/")
+			parts := strings.Split(rest, "/")
+			switch {
+			case rest == "" && r.Method == http.MethodGet:
+				m.lastListSel = r.URL.Query().Get("labelSelector")
+				items := []v1alpha1.SandboxWebhook{}
+				for _, wh := range m.webhooks {
+					if matches(wh.Metadata.Labels, m.lastListSel) {
+						items = append(items, wh)
+					}
+				}
+				_ = json.NewEncoder(w).Encode(v1alpha1.SandboxWebhookList{Items: items})
+			case rest == "" && r.Method == http.MethodPost:
+				var wh v1alpha1.SandboxWebhook
+				_ = json.NewDecoder(r.Body).Decode(&wh)
+				if _, ok := m.webhooks[wh.Metadata.Name]; ok {
+					w.WriteHeader(http.StatusConflict)
+					return
+				}
+				m.rv++
+				wh.Metadata.ResourceVersion = fmt.Sprint(m.rv)
+				wh.Status = v1alpha1.SandboxWebhookStatus{} // status ignored on create
+				m.webhooks[wh.Metadata.Name] = wh
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(wh)
+			case len(parts) >= 1:
+				name := parts[0]
+				existing, ok := m.webhooks[name]
+				if !ok {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				var in v1alpha1.SandboxWebhook
+				if r.Method == http.MethodPut {
+					_ = json.NewDecoder(r.Body).Decode(&in)
+					if in.Metadata.ResourceVersion != existing.Metadata.ResourceVersion {
+						w.WriteHeader(http.StatusConflict)
+						return
+					}
+					m.rv++
+				}
+				switch {
+				case r.Method == http.MethodGet:
+					_ = json.NewEncoder(w).Encode(existing)
+				case r.Method == http.MethodDelete:
+					delete(m.webhooks, name)
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodPut && len(parts) == 2 && parts[1] == "status":
+					m.statusPuts++
+					existing.Status = in.Status
+					existing.Metadata.ResourceVersion = fmt.Sprint(m.rv)
+					m.webhooks[name] = existing
+					_ = json.NewEncoder(w).Encode(existing)
+				case r.Method == http.MethodPut:
+					m.specPuts++
+					in.Status = existing.Status
+					in.Metadata.ResourceVersion = fmt.Sprint(m.rv)
+					m.webhooks[name] = in
+					_ = json.NewEncoder(w).Encode(in)
+				}
+			}
+		case path == evPrefix && r.Method == http.MethodPost:
+			var ev controller.KubeEvent
+			_ = json.NewDecoder(r.Body).Decode(&ev)
+			if _, ok := m.events[ev.Metadata.Name]; ok {
+				w.WriteHeader(http.StatusConflict)
+				return
+			}
+			m.events[ev.Metadata.Name] = ev
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(ev)
+		case path == evPrefix && r.Method == http.MethodGet:
+			sel := r.URL.Query().Get("labelSelector")
+			items := []controller.KubeEvent{}
+			for _, ev := range m.events {
+				if matches(ev.Metadata.Labels, sel) {
+					items = append(items, ev)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"items": items})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	ts := httptest.NewServer(handler)
+	t.Cleanup(ts.Close)
+	return m, ts
+}
+
+func sampleSandboxWebhook(name string) v1alpha1.SandboxWebhook {
+	return v1alpha1.SandboxWebhook{
+		Metadata: v1alpha1.ObjectMeta{
+			Name:   name,
+			Labels: map[string]string{"cubepod.io/resource": "sandbox-webhook", "cubepod.io/tenant": "abcd"},
+		},
+		Spec: v1alpha1.SandboxWebhookSpec{
+			TenantHash: "abcd",
+			Name:       "billing",
+			URL:        "https://example.com/hook",
+			Events:     []string{"sandbox.lifecycle.created"},
+			Enabled:    true,
+			SecretName: "cubepod-whk-sec-1",
+		},
+	}
+}
+
+func TestRESTKubeClient_SandboxWebhook_CRUDAndStatus(t *testing.T) {
+	mock, ts := newMockWebhookEventServer(t)
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+	ctx := context.Background()
+
+	wh := sampleSandboxWebhook("cubepod-whk-1")
+	now := time.Now().UTC().Truncate(time.Second)
+	wh.Status = v1alpha1.SandboxWebhookStatus{LastDeliveryTime: &now, ConsecutiveFailures: 2}
+	if err := client.UpsertSandboxWebhook(ctx, wh); err != nil {
+		t.Fatalf("UpsertSandboxWebhook create: %v", err)
+	}
+	got, err := client.GetSandboxWebhook(ctx, "", "cubepod-whk-1")
+	if err != nil {
+		t.Fatalf("GetSandboxWebhook: %v", err)
+	}
+	if got.Status.ConsecutiveFailures != 2 || got.Status.LastDeliveryTime == nil || !got.Status.LastDeliveryTime.Equal(now) {
+		t.Fatalf("status not persisted via /status on create: %+v", got.Status)
+	}
+	if got.Spec.SecretName != "cubepod-whk-sec-1" || got.Spec.URL != "https://example.com/hook" {
+		t.Fatalf("unexpected spec: %+v", got.Spec)
+	}
+
+	// Conflict path: second upsert replaces metadata/spec via PUT without overwriting /status.
+	wh.Spec.URL = "https://example.com/v2"
+	wh.Status.ConsecutiveFailures = 0
+	if err := client.UpsertSandboxWebhook(ctx, wh); err != nil {
+		t.Fatalf("UpsertSandboxWebhook update: %v", err)
+	}
+	got, _ = client.GetSandboxWebhook(ctx, "", "cubepod-whk-1")
+	if got.Spec.URL != "https://example.com/v2" || got.Status.ConsecutiveFailures != 2 {
+		t.Fatalf("update spec or preserved status wrong: spec=%+v status=%+v", got.Spec, got.Status)
+	}
+	if mock.specPuts != 1 || mock.statusPuts != 1 {
+		t.Fatalf("specPuts=%d statusPuts=%d; want 1 and 1", mock.specPuts, mock.statusPuts)
+	}
+
+	// Status-only update with stale resourceVersion yields ErrCASConflict.
+	stale := *got
+	stale.Metadata.ResourceVersion = "1"
+	stale.Status.ConsecutiveFailures = 9
+	if err := client.UpdateSandboxWebhookStatus(ctx, stale); !errors.Is(err, controller.ErrCASConflict) {
+		t.Fatalf("stale status update err = %v; want ErrCASConflict", err)
+	}
+	fresh := *got
+	fresh.Status.DeadLetters = []v1alpha1.SandboxWebhookDeadLetter{{ID: "dlq_1", EventID: "e1", EventType: "sandbox.lifecycle.created", Reason: "queue_full", Event: json.RawMessage(`{"id":"e1"}`)}}
+	if err := client.UpdateSandboxWebhookStatus(ctx, fresh); err != nil {
+		t.Fatalf("fresh status update: %v", err)
+	}
+	got, _ = client.GetSandboxWebhook(ctx, "", "cubepod-whk-1")
+	if len(got.Status.DeadLetters) != 1 || got.Status.DeadLetters[0].ID != "dlq_1" {
+		t.Fatalf("dead letters not persisted: %+v", got.Status.DeadLetters)
+	}
+
+	list, err := client.ListSandboxWebhooks(ctx, "", "cubepod.io/resource=sandbox-webhook,cubepod.io/tenant=abcd")
+	if err != nil || len(list) != 1 {
+		t.Fatalf("ListSandboxWebhooks = %d, %v; want 1", len(list), err)
+	}
+	if mock.lastListSel != "cubepod.io/resource=sandbox-webhook,cubepod.io/tenant=abcd" {
+		t.Fatalf("labelSelector not forwarded: %q", mock.lastListSel)
+	}
+	if list, _ := client.ListSandboxWebhooks(ctx, "", "cubepod.io/tenant=other"); len(list) != 0 {
+		t.Fatalf("expected tenant selector isolation, got %d", len(list))
+	}
+
+	if err := client.DeleteSandboxWebhook(ctx, "", "cubepod-whk-1"); err != nil {
+		t.Fatalf("DeleteSandboxWebhook: %v", err)
+	}
+	if err := client.DeleteSandboxWebhook(ctx, "", "cubepod-whk-1"); err != nil {
+		t.Fatalf("DeleteSandboxWebhook idempotent: %v", err)
+	}
+	if _, err := client.GetSandboxWebhook(ctx, "", "cubepod-whk-1"); !errors.Is(err, controller.ErrKubeNotFound) {
+		t.Fatalf("Get after delete err = %v; want ErrKubeNotFound", err)
+	}
+}
+
+func TestRESTKubeClient_KubeEvent_CreateDedupAndList(t *testing.T) {
+	_, ts := newMockWebhookEventServer(t)
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+	ctx := context.Background()
+	now := time.Now().UTC()
+	ev := controller.KubeEvent{
+		Metadata: v1alpha1.ObjectMeta{
+			Name:   "sbx-1.abc123",
+			Labels: map[string]string{"cubepod.io/resource": "sandbox-event", "cubepod.io/sandbox": "sbx-1"},
+		},
+		InvolvedObject: controller.KubeObjectReference{APIVersion: "cubepod.io/v1alpha1", Kind: "PodBox", Name: "sbx-1"},
+		Reason:         "PodBoxPaused",
+		Type:           controller.KubeEventTypeNormal,
+		FirstTimestamp: &now,
+		LastTimestamp:  &now,
+		Count:          1,
+	}
+	if err := client.CreateKubeEvent(ctx, ev); err != nil {
+		t.Fatalf("CreateKubeEvent: %v", err)
+	}
+	if err := client.CreateKubeEvent(ctx, ev); !errors.Is(err, controller.ErrKubeAlreadyExists) {
+		t.Fatalf("duplicate CreateKubeEvent err = %v; want ErrKubeAlreadyExists", err)
+	}
+	list, err := client.ListKubeEvents(ctx, "", "cubepod.io/resource=sandbox-event,cubepod.io/sandbox=sbx-1")
+	if err != nil || len(list) != 1 {
+		t.Fatalf("ListKubeEvents = %d, %v; want 1", len(list), err)
+	}
+	if list[0].InvolvedObject.Namespace != "cubepod-workloads" || list[0].InvolvedObject.Kind != "PodBox" {
+		t.Fatalf("involvedObject not defaulted: %+v", list[0].InvolvedObject)
+	}
+	if list, _ := client.ListKubeEvents(ctx, "", "cubepod.io/sandbox=other"); len(list) != 0 {
+		t.Fatalf("expected label filtering, got %d", len(list))
+	}
+}
+
+func TestMemoryKubeClient_SandboxWebhookAndEvents(t *testing.T) {
+	client := controller.NewMemoryKubeClient()
+	ctx := context.Background()
+	wh := sampleSandboxWebhook("cubepod-whk-2")
+	wh.Metadata.Namespace = "cubepod-workloads"
+	if err := client.UpsertSandboxWebhook(ctx, wh); err != nil {
+		t.Fatalf("UpsertSandboxWebhook: %v", err)
+	}
+	got, err := client.GetSandboxWebhook(ctx, "cubepod-workloads", "cubepod-whk-2")
+	if err != nil {
+		t.Fatalf("GetSandboxWebhook: %v", err)
+	}
+	stale := *got
+	got.Status.ConsecutiveFailures = 3
+	if err := client.UpdateSandboxWebhookStatus(ctx, *got); err != nil {
+		t.Fatalf("UpdateSandboxWebhookStatus: %v", err)
+	}
+	if err := client.UpdateSandboxWebhookStatus(ctx, stale); !errors.Is(err, controller.ErrCASConflict) {
+		t.Fatalf("stale status update err = %v; want ErrCASConflict", err)
+	}
+	// Upserting spec on existing webhook must preserve ConsecutiveFailures=3.
+	wh.Spec.URL = "https://example.com/updated"
+	wh.Status.ConsecutiveFailures = 0
+	if err := client.UpsertSandboxWebhook(ctx, wh); err != nil {
+		t.Fatalf("UpsertSandboxWebhook spec update: %v", err)
+	}
+	afterUpsert, _ := client.GetSandboxWebhook(ctx, "cubepod-workloads", "cubepod-whk-2")
+	if afterUpsert.Spec.URL != "https://example.com/updated" || afterUpsert.Status.ConsecutiveFailures != 3 {
+		t.Fatalf("UpsertSandboxWebhook overwrote status: spec=%+v status=%+v", afterUpsert.Spec, afterUpsert.Status)
+	}
+	if list, _ := client.ListSandboxWebhooks(ctx, "cubepod-workloads", "cubepod.io/tenant=abcd"); len(list) != 1 {
+		t.Fatalf("ListSandboxWebhooks = %d; want 1", len(list))
+	}
+	if err := client.DeleteSandboxWebhook(ctx, "cubepod-workloads", "cubepod-whk-2"); err != nil {
+		t.Fatalf("DeleteSandboxWebhook: %v", err)
+	}
+	if _, err := client.GetSandboxWebhook(ctx, "cubepod-workloads", "cubepod-whk-2"); !errors.Is(err, controller.ErrKubeNotFound) {
+		t.Fatalf("Get after delete err = %v; want ErrKubeNotFound", err)
+	}
+
+	for i := 0; i < controller.MaxMemoryKubeEvents+5; i++ {
+		ev := controller.KubeEvent{Metadata: v1alpha1.ObjectMeta{Name: fmt.Sprintf("ev-%d", i), Namespace: "cubepod-workloads", Labels: map[string]string{"cubepod.io/resource": "sandbox-event"}}}
+		if err := client.CreateKubeEvent(ctx, ev); err != nil {
+			t.Fatalf("CreateKubeEvent %d: %v", i, err)
+		}
+	}
+	dup := controller.KubeEvent{Metadata: v1alpha1.ObjectMeta{Name: fmt.Sprintf("ev-%d", controller.MaxMemoryKubeEvents), Namespace: "cubepod-workloads"}}
+	if err := client.CreateKubeEvent(ctx, dup); !errors.Is(err, controller.ErrKubeAlreadyExists) {
+		t.Fatalf("duplicate err = %v; want ErrKubeAlreadyExists", err)
+	}
+	list, _ := client.ListKubeEvents(ctx, "cubepod-workloads", "cubepod.io/resource=sandbox-event")
+	if len(list) != controller.MaxMemoryKubeEvents {
+		t.Fatalf("memory events = %d; want bounded at %d", len(list), controller.MaxMemoryKubeEvents)
+	}
+	if list[0].Metadata.Name != "ev-5" {
+		t.Fatalf("oldest retained = %s; want ev-5", list[0].Metadata.Name)
+	}
+}
+
 func TestMemoryKubeClient_UpdatePodTemplateStatusCAS(t *testing.T) {
 	mk := controller.NewMemoryKubeClient()
 	ctx := context.Background()

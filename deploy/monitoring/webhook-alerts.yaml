@@ -1,0 +1,60 @@
+# CubePod sandbox webhook delivery alerts (CEP-0028, added in v0.7.0).
+#
+# Requires the Prometheus Operator (monitoring.coreos.com/v1) and a scrape of the
+# cubepod-gateway /metrics endpoint (:8080). Adjust metadata.namespace and
+# metadata.labels (e.g. `release: kube-prometheus-stack`) to match your
+# Prometheus `ruleSelector`, then:
+#
+#   kubectl -n cubepod-system apply -f deploy/monitoring/webhook-alerts.yaml
+#
+# Inspect and replay failed deliveries with `GET /webhooks/dead-letters` and
+# `POST /webhooks/{webhookID}/dead-letters/{deadLetterID}/retry`.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cubepod-webhook-alerts
+  namespace: cubepod-system
+  labels:
+    app.kubernetes.io/name: cubepod
+    app.kubernetes.io/part-of: cubepod
+    app.kubernetes.io/component: gateway
+spec:
+  groups:
+    - name: cubepod-webhooks
+      rules:
+        - alert: CubePodWebhookDeliveriesFailed
+          expr: sum by (namespace, pod) (increase(cubepod_webhook_deliveries_total{result="failed"}[10m])) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: CubePod webhook deliveries are failing
+            description: >-
+              cubepod-gateway {{ $labels.pod }} recorded {{ $value | humanize }} failed webhook
+              deliveries (after max retries) in the last 10 minutes. Failed deliveries are kept as
+              dead letters; inspect them with GET /webhooks/dead-letters and check receiver
+              availability, TLS, and SSRF policy.
+        - alert: CubePodWebhookDeliveriesDropped
+          expr: sum by (namespace, pod) (increase(cubepod_webhook_deliveries_total{result="dropped"}[10m])) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: CubePod webhook deliveries are being dropped (queue full)
+            description: >-
+              cubepod-gateway {{ $labels.pod }} dropped {{ $value | humanize }} webhook deliveries in
+              the last 10 minutes because the delivery queue was full. Dropped deliveries are
+              recorded as dead letters with reason queue_full; check slow receivers and
+              cubepod_webhook_queue_depth.
+        - alert: CubePodWebhookDeadLettersPending
+          expr: sum by (namespace, pod) (cubepod_webhook_dead_letters_pending) > 0
+          for: 30m
+          labels:
+            severity: info
+          annotations:
+            summary: CubePod webhook dead letters are pending
+            description: >-
+              {{ $value | humanize }} webhook dead letters have been pending on cubepod-gateway
+              {{ $labels.pod }} for more than 30 minutes. Retry them with
+              POST /webhooks/{webhookID}/dead-letters/{deadLetterID}/retry or discard them with
+              DELETE; dead letters are bounded and the oldest are evicted first.

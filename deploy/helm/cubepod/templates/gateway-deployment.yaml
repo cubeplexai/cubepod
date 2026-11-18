@@ -30,6 +30,9 @@ spec:
       {{- $secretsEnabled := and (eq (include "cubepod.boolDefaultTrue" $secretsCfg.enabled) "true") (eq (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) "true") }}
       {{- $secretsBackend := default "k8s" $secretsCfg.backend }}
       {{- $secretsKeySecret := include "cubepod.secretsKeySecretName" . }}
+      {{- $eventsCfg := .Values.events | default dict }}
+      {{- $eventsBackend := default "k8s" $eventsCfg.backend }}
+      {{- $eventsEnabled := and (eq (include "cubepod.boolDefaultTrue" $eventsCfg.enabled) "true") (eq (include "cubepod.boolDefaultTrue" $fg.sandboxEventsAndWebhooks) "true") (ne $eventsBackend "disabled") }}
       {{- $ctxBackend := include "cubepod.contextStoreBackend" . }}
       {{- $s3Env := include "cubepod.s3ContextEnv" . }}
       {{- $hasEnv := true }}
@@ -112,12 +115,25 @@ spec:
                   key: key
             {{- end }}
             {{- end }}
-            {{- if .Values.gateway.eventsKeySecret }}
+            {{- if not $eventsEnabled }}
+            - name: CUBEPOD_EVENTS_BACKEND
+              value: "disabled"
+            - name: CUBEPOD_EVENTS_DIR
+              value: "disabled"
+            {{- else }}
+            - name: CUBEPOD_EVENTS_BACKEND
+              value: {{ $eventsBackend | quote }}
+            {{- if and (eq $eventsBackend "file") $eventsCfg.dir }}
+            - name: CUBEPOD_EVENTS_DIR
+              value: {{ $eventsCfg.dir | quote }}
+            {{- end }}
+            {{- if and (eq $eventsBackend "file") .Values.gateway.eventsKeySecret }}
             - name: CUBEPOD_EVENTS_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ .Values.gateway.eventsKeySecret | quote }}
                   key: key
+            {{- end }}
             {{- end }}
             {{- if $e2bVolumesActive }}
             - name: CUBEPOD_E2B_VOLUME_DIR

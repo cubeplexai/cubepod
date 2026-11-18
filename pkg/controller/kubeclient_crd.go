@@ -950,3 +950,266 @@ func (c *RESTKubeClient) DeleteVolumeSnapshot(ctx context.Context, namespace, na
 	body, _ := io.ReadAll(resp.Body)
 	return fmt.Errorf("DeleteVolumeSnapshot failed: status %d (%s)", resp.StatusCode, string(body))
 }
+
+func (c *RESTKubeClient) sandboxWebhooksURL(ns string) string {
+	return fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/sandboxwebhooks", c.baseURL, ns)
+}
+
+func hasWebhookStatus(st v1alpha1.SandboxWebhookStatus) bool {
+	return st.LastDeliveryTime != nil || st.ConsecutiveFailures != 0 || len(st.DeadLetters) > 0
+}
+
+// UpsertSandboxWebhook creates a SandboxWebhook Custom Resource (and sets initial /status if
+// non-zero). On 409 Conflict it re-reads metadata.resourceVersion and PUTs only metadata/spec
+// so concurrent /status writes (LastDeliveryTime, ConsecutiveFailures, DeadLetters) are never
+// clobbered.
+func (c *RESTKubeClient) UpsertSandboxWebhook(ctx context.Context, webhook v1alpha1.SandboxWebhook) error {
+	ns := c.resolveNamespace(webhook.Metadata.Namespace)
+	webhook.Metadata.Namespace = ns
+	name := webhook.Metadata.Name
+	if name == "" {
+		return fmt.Errorf("SandboxWebhook metadata.name is required")
+	}
+	if webhook.APIVersion == "" {
+		webhook.APIVersion = "cubepod.io/v1alpha1"
+	}
+	if webhook.Kind == "" {
+		webhook.Kind = "SandboxWebhook"
+	}
+
+	createObj := webhook
+	createObj.Metadata.ResourceVersion = ""
+	payload, err := json.Marshal(createObj)
+	if err != nil {
+		return fmt.Errorf("failed to marshal SandboxWebhook JSON: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPost, c.sandboxWebhooksURL(ns), bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("UpsertSandboxWebhook POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated:
+		var created v1alpha1.SandboxWebhook
+		if err := json.NewDecoder(resp.Body).Decode(&created); err == nil && created.Metadata.ResourceVersion != "" {
+			webhook.Metadata.ResourceVersion = created.Metadata.ResourceVersion
+		}
+		if hasWebhookStatus(webhook.Status) {
+			return c.UpdateSandboxWebhookStatus(ctx, webhook)
+		}
+		return nil
+	case http.StatusConflict:
+		existing, err := c.GetSandboxWebhook(ctx, ns, name)
+		if err != nil {
+			return fmt.Errorf("failed to get existing SandboxWebhook on conflict: %w", err)
+		}
+		// Update metadata and spec only; preserve server /status by not PUTting .../status.
+		specObj := webhook
+		specObj.Metadata.ResourceVersion = existing.Metadata.ResourceVersion
+		specObj.Status = existing.Status
+		putPayload, err := json.Marshal(specObj)
+		if err != nil {
+			return fmt.Errorf("failed to marshal SandboxWebhook JSON for update: %w", err)
+		}
+		putResp, err := c.doRequest(ctx, http.MethodPut, c.sandboxWebhooksURL(ns)+"/"+name, bytes.NewReader(putPayload))
+		if err != nil {
+			return fmt.Errorf("UpsertSandboxWebhook PUT failed: %w", err)
+		}
+		defer putResp.Body.Close()
+		if putResp.StatusCode == http.StatusConflict {
+			return fmt.Errorf("UpsertSandboxWebhook PUT %s/%s: %w", ns, name, ErrCASConflict)
+		}
+		if putResp.StatusCode != http.StatusOK && putResp.StatusCode != http.StatusCreated {
+			body, _ := io.ReadAll(putResp.Body)
+			return fmt.Errorf("UpsertSandboxWebhook PUT failed: status %d (%s)", putResp.StatusCode, string(body))
+		}
+		return nil
+	case http.StatusNotFound:
+		return fmt.Errorf("UpsertSandboxWebhook %s/%s: %w (sandboxwebhooks.cubepod.io)", ns, name, ErrCRDNotInstalled)
+	default:
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("UpsertSandboxWebhook failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+}
+
+// UpdateSandboxWebhookStatus PUTs the /status subresource of a SandboxWebhook. When
+// metadata.resourceVersion is empty the latest version is fetched first (last-writer-wins);
+// otherwise a 409 Conflict is reported as ErrCASConflict so callers can re-read and merge.
+func (c *RESTKubeClient) UpdateSandboxWebhookStatus(ctx context.Context, webhook v1alpha1.SandboxWebhook) error {
+	ns := c.resolveNamespace(webhook.Metadata.Namespace)
+	webhook.Metadata.Namespace = ns
+	name := webhook.Metadata.Name
+	if name == "" {
+		return fmt.Errorf("SandboxWebhook metadata.name is required")
+	}
+	if webhook.APIVersion == "" {
+		webhook.APIVersion = "cubepod.io/v1alpha1"
+	}
+	if webhook.Kind == "" {
+		webhook.Kind = "SandboxWebhook"
+	}
+	if webhook.Metadata.ResourceVersion == "" {
+		existing, err := c.GetSandboxWebhook(ctx, ns, name)
+		if err != nil {
+			return fmt.Errorf("UpdateSandboxWebhookStatus failed to get existing SandboxWebhook: %w", err)
+		}
+		webhook.Metadata.ResourceVersion = existing.Metadata.ResourceVersion
+	}
+	payload, err := json.Marshal(webhook)
+	if err != nil {
+		return fmt.Errorf("failed to marshal SandboxWebhook for status update: %w", err)
+	}
+	resp, err := c.doRequest(ctx, http.MethodPut, c.sandboxWebhooksURL(ns)+"/"+name+"/status", bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("UpdateSandboxWebhookStatus PUT failed: %w", err)
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated:
+		return nil
+	case resp.StatusCode == http.StatusConflict:
+		return fmt.Errorf("UpdateSandboxWebhookStatus %s/%s: %w", ns, name, ErrCASConflict)
+	case resp.StatusCode == http.StatusNotFound:
+		return fmt.Errorf("UpdateSandboxWebhookStatus %s/%s: %w", ns, name, ErrKubeNotFound)
+	default:
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("UpdateSandboxWebhookStatus failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+}
+
+// GetSandboxWebhook retrieves a SandboxWebhook Custom Resource, returning ErrKubeNotFound on 404.
+func (c *RESTKubeClient) GetSandboxWebhook(ctx context.Context, namespace, name string) (*v1alpha1.SandboxWebhook, error) {
+	ns := c.resolveNamespace(namespace)
+	resp, err := c.doRequest(ctx, http.MethodGet, c.sandboxWebhooksURL(ns)+"/"+name, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GetSandboxWebhook GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("SandboxWebhook %s/%s: %w", ns, name, ErrKubeNotFound)
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("GetSandboxWebhook failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+	var wh v1alpha1.SandboxWebhook
+	if err := json.NewDecoder(resp.Body).Decode(&wh); err != nil {
+		return nil, fmt.Errorf("failed to decode SandboxWebhook: %w", err)
+	}
+	return &wh, nil
+}
+
+// ListSandboxWebhooks lists SandboxWebhook Custom Resources matching an optional labelSelector.
+func (c *RESTKubeClient) ListSandboxWebhooks(ctx context.Context, namespace string, labelSelector string) ([]v1alpha1.SandboxWebhook, error) {
+	ns := c.resolveNamespace(namespace)
+	reqURL := c.sandboxWebhooksURL(ns)
+	if labelSelector != "" {
+		reqURL += "?labelSelector=" + url.QueryEscape(labelSelector)
+	}
+	resp, err := c.doRequest(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ListSandboxWebhooks GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("ListSandboxWebhooks: %w (sandboxwebhooks.cubepod.io)", ErrCRDNotInstalled)
+	}
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("ListSandboxWebhooks failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+	var list v1alpha1.SandboxWebhookList
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("failed to decode SandboxWebhookList: %w", err)
+	}
+	if list.Items == nil {
+		return []v1alpha1.SandboxWebhook{}, nil
+	}
+	return list.Items, nil
+}
+
+// DeleteSandboxWebhook removes a SandboxWebhook Custom Resource, ignoring 404 NotFound.
+func (c *RESTKubeClient) DeleteSandboxWebhook(ctx context.Context, namespace, name string) error {
+	ns := c.resolveNamespace(namespace)
+	resp, err := c.doRequest(ctx, http.MethodDelete, c.sandboxWebhooksURL(ns)+"/"+name, nil)
+	if err != nil {
+		return fmt.Errorf("DeleteSandboxWebhook DELETE failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted ||
+		resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("DeleteSandboxWebhook failed: status %d (%s)", resp.StatusCode, string(body))
+}
+
+// CreateKubeEvent POSTs a core/v1 Event. A 409 AlreadyExists response returns an error
+// wrapping ErrKubeAlreadyExists so deterministic event names deduplicate multi-replica emitters.
+func (c *RESTKubeClient) CreateKubeEvent(ctx context.Context, event KubeEvent) error {
+	ns := c.resolveNamespace(event.Metadata.Namespace)
+	event.Metadata.Namespace = ns
+	if event.Metadata.Name == "" {
+		return fmt.Errorf("Event metadata.name is required")
+	}
+	if event.InvolvedObject.Namespace == "" {
+		event.InvolvedObject.Namespace = ns
+	}
+	if event.APIVersion == "" {
+		event.APIVersion = "v1"
+	}
+	if event.Kind == "" {
+		event.Kind = "Event"
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("failed to marshal Event JSON: %w", err)
+	}
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/events", c.baseURL, ns)
+	resp, err := c.doRequest(ctx, http.MethodPost, reqURL, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("CreateKubeEvent POST failed: %w", err)
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusAccepted:
+		return nil
+	case http.StatusConflict:
+		return fmt.Errorf("event %s/%s: %w", ns, event.Metadata.Name, ErrKubeAlreadyExists)
+	default:
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("CreateKubeEvent failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+}
+
+// ListKubeEvents lists core/v1 Events in namespace matching an optional labelSelector.
+func (c *RESTKubeClient) ListKubeEvents(ctx context.Context, namespace string, labelSelector string) ([]KubeEvent, error) {
+	ns := c.resolveNamespace(namespace)
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/events", c.baseURL, ns)
+	if labelSelector != "" {
+		reqURL += "?labelSelector=" + url.QueryEscape(labelSelector)
+	}
+	resp, err := c.doRequest(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ListKubeEvents GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return []KubeEvent{}, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("ListKubeEvents failed: status %d (%s)", resp.StatusCode, string(body))
+	}
+	var list struct {
+		Items []KubeEvent `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("failed to decode EventList: %w", err)
+	}
+	if list.Items == nil {
+		return []KubeEvent{}, nil
+	}
+	return list.Items, nil
+}

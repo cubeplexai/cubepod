@@ -131,6 +131,24 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 - **E2B 密钥（`E2BSecretsAPI`，*v0.6.0 变更*）**：`POST /secrets`、`GET /secrets`、`GET /secrets/{secretID}`、`POST /secrets/{secretID}`、`DELETE /secrets/{secretID}` — 租户隔离的 Write-Only 密钥存储（`KubeSecretBackend` 多副本 HA 或 AES-256-GCM 文件存储），配合 `${e2b.secrets.<name>}`（`Secret.fill()`）解析。
 - **E2B 卷（Volumes，*v0.7.0 变更*）**：`POST /volumes`、`GET /volumes`、`GET /volumes/{volumeID}`、`DELETE /volumes/{volumeID}`、`POST /volumes/rotate-key`（*v0.7.0 新增。* 通过请求头 `X-API-Key: <newKey>` 与请求体 `{"previousApiKey": "<oldKey>"}` 将租户卷与挂载所有权原子迁移至新密钥并吊销旧密钥，持久化于带 RWX `flock` 锁保护的 `tenants.json`），内容传输 `/volumecontent/{volumeID}/{file,dir,path}`，以及 `POST /sandboxes` 的 `volumeMounts`（K8s Kata RWX 挂载由 `K8sE2BVolumeMounts` / Helm `e2bVolumes.rwxStorageClassName` 控制）。支持基于 `CUBEPOD_E2B_VOLUMES_KEK` 或外部 KMS `CUBEPOD_E2B_VOLUMES_KMS_URL`（可选 `CUBEPOD_E2B_VOLUMES_KMS_TOKEN`）的卷令牌信封加密、单租户字节与数量配额（`CUBEPOD_E2B_MAX_TENANT_BYTES`、`CUBEPOD_E2B_MAX_VOLUMES_PER_TENANT`）以及 `deploy/monitoring/e2b-volumes-alerts.yaml` 中的 `PrometheusRule` 容量告警（*v0.7.0 新增。*）。
 - **生命周期事件与 Webhook（`SandboxEventsAndWebhooks`，*v0.6.0 新增*）**：`GET /events`、`GET /sandboxes/{sandboxID}/events`、`POST /webhooks`、`GET /webhooks`、`GET /webhooks/{webhookID}`、`PATCH /webhooks/{webhookID}`、`DELETE /webhooks/{webhookID}`。
+  - *v0.7.0 变更。* 在 Kubernetes 上，默认的 `k8s` 事件后端（`CUBEPOD_EVENTS_BACKEND`）将 Webhook 存储为 `SandboxWebhook` CR（HMAC 密钥仅保存在配套 `Secret` 中），并将生命周期事件写为 `PodBox` 上的 core/v1 `Event`，所有 Gateway 副本共享这些数据。`GET /webhooks` 与 `GET /webhooks/{webhookID}` 新增可选字段 `lastDeliveryTime`（RFC 3339）与 `consecutiveFailures`（投递成功后清零）。删除 Webhook 时会同时删除其死信。
+- **Webhook 死信（`SandboxEventsAndWebhooks`，*v0.7.0 新增*）**：超过最大重试次数仍失败（`reason: delivery_failed`）或因投递队列已满被丢弃（`reason: queue_full`）的投递会保存为租户隔离的死信（file 后端每租户最多 500 条，`k8s` 后端每个 Webhook 最多 50 条）。所有接口均需 `X-API-Key`，未配置事件功能时返回 `501`。
+
+| 接口 | 说明 | 错误码 |
+| :--- | :--- | :--- |
+| `GET /webhooks/dead-letters` | 列出租户死信；查询参数 `webhookID`、`sandboxID`、`reason`、`limit`（≤ 100）、`nextToken`（下一页游标见 `X-Next-Token`） | `501` |
+| `GET /webhooks/{webhookID}/dead-letters` | 列出单个 Webhook 的死信（过滤参数同上，不含 `webhookID`） | `404` Webhook 不属于当前租户、`501` |
+| `POST /webhooks/{webhookID}/dead-letters/{deadLetterID}/retry` | 使用当前 `signatureKey` 重新签名并重新入队，返回 `202` + `DeadLetter`；重试失败时以相同 id 重新记录且 `retryCount + 1` | `404`、`409` Webhook 已禁用、`503` 队列已满、`501` |
+| `DELETE /webhooks/{webhookID}/dead-letters/{deadLetterID}` | 丢弃死信（`204`） | `404`、`501` |
+
+`DeadLetter` 包含 `id`（`dlq_...`）、`webhookId`、`eventId`、`eventType`、`sandboxId`、`reason`、`attempts`、可选 `lastStatusCode`、可选的脱敏 `lastError`（`timeout`、`connection_error`、`http_status`、`ssrf_blocked`）、可选 `retryCount`、`createdAt`、`updatedAt` 以及原始生命周期 `event`。死信永远不会包含 `signatureKey` 或 Webhook URL。
+
+```bash
+curl -s -H "X-API-Key: $CUBEPOD_API_KEY" \
+  "$CUBEPOD_URL/webhooks/dead-letters?reason=delivery_failed&limit=20"
+curl -s -X POST -H "X-API-Key: $CUBEPOD_API_KEY" \
+  "$CUBEPOD_URL/webhooks/whk_123/dead-letters/dlq_abc/retry"
+```
 
 ## 特性开关（`--feature-gate`） *(v0.6.0 新增)*
 
@@ -145,7 +163,7 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 | `StatelessGatewayHA` | `true` | `gateway` | 控制多副本网关跨副本基于 `PodBox` CRD 的缓存未命中重建。 |
 | `E2BFilesystemWatch` | `true` | `gateway` | 控制 Connect-RPC `WatchDir` 目录变更监听接口。 |
 | `E2BSecretsAPI` | `true` | `gateway` | 控制 `/secrets` 增删改查与 `${e2b.secrets.<name>}` 解析。 |
-| `SandboxEventsAndWebhooks` | `true` | `gateway` | 控制 `/events` 与 `/webhooks` 接口及异步 HMAC Webhook 投递。 |
+| `SandboxEventsAndWebhooks` | `true` | `gateway` | 控制 `/events`、`/webhooks`、（*v0.7.0*）`/webhooks/dead-letters` 接口及异步 HMAC Webhook 投递。 |
 
 ## Prometheus 可观测性与 `podd` 指标 *(v0.6.0 新增)*
 
@@ -187,6 +205,7 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 | **Gateway** | `cubepod_e2b_volumes_total` *(v0.7.0 新增。)* | Gauge | 全租户当前存储的活跃 E2B 卷总数 |
 | **Gateway** | `cubepod_events_recorded_total` | Counter | 已记录的沙箱生命周期事件总数（启用事件管理器时导出） |
 | **Gateway** | `cubepod_webhook_deliveries_total` / `cubepod_webhook_queue_depth` | Counter / Gauge | Webhook 投递结果（`result`：`ok`、`failed`、`dropped`）与队列深度 |
+| **Gateway** | `cubepod_webhook_dead_letters_total` / `cubepod_webhook_dead_letters_pending` | Counter / Gauge | *v0.7.0 新增。* 已记录与当前待处理的死信数量（告警见 `deploy/monitoring/webhook-alerts.yaml`） |
 | **Gateway & Controller** | `cubepod_sandbox_forks_total` / `cubepod_sandbox_fork_duration_seconds` | Counter / Histogram | CoW Fork 次数（`mode`、`result`）与耗时分布 |
 | **Gateway & Controller** | `cubepod_templates` / `cubepod_gateway_templates_total` | Gauge | 按 `status` 统计的模板数（开启 `E2BTemplateAPI` 时）或模板总数 |
 | **Controller** | `cubepod_active_sandboxes` / `cubepod_paused_sandboxes` | Gauge | 控制器调谐的 `Running` 与 `Paused` `PodBox` 数量 |

@@ -475,8 +475,20 @@ const HELM_VALUE_DESCRIPTIONS = {
     zh: '*v0.6.0 新增。* 注入 `--feature-gate=E2BSecretsAPI=...`，控制 `/secrets` 管理与 `${e2b.secrets.<name>}` 占位符解析。',
   },
   'featureGates.sandboxEventsAndWebhooks': {
-    en: '*Added in v0.6.0.* Wired into `--feature-gate=SandboxEventsAndWebhooks=...`; controls `/events` and `/webhooks` APIs.',
-    zh: '*v0.6.0 新增。* 注入 `--feature-gate=SandboxEventsAndWebhooks=...`，控制 `/events` 与 `/webhooks` 接口。',
+    en: '*Added in v0.6.0; changed in v0.7.0.* Wired into `--feature-gate=SandboxEventsAndWebhooks=...`; controls `/events`, `/webhooks`, and (since v0.7.0) `/webhooks/dead-letters` APIs. Events are disabled when this gate or `events.enabled` is `false`.',
+    zh: '*v0.6.0 新增，v0.7.0 变更。* 注入 `--feature-gate=SandboxEventsAndWebhooks=...`，控制 `/events`、`/webhooks` 以及（自 v0.7.0 起）`/webhooks/dead-letters` 接口。该开关或 `events.enabled` 为 `false` 时禁用事件功能。',
+  },
+  'events.enabled': {
+    en: '*Added in v0.7.0.* Enable sandbox lifecycle events, webhooks, and dead letters in `cubepod-gateway` (combined with `featureGates.sandboxEventsAndWebhooks`).',
+    zh: '*v0.7.0 新增。* 是否在 `cubepod-gateway` 中启用沙箱生命周期事件、Webhook 与死信（与 `featureGates.sandboxEventsAndWebhooks` 共同生效）。',
+  },
+  'events.backend': {
+    en: '*Added in v0.7.0.* Events backend (`CUBEPOD_EVENTS_BACKEND`): `"k8s"` (`SandboxWebhook` CRs + companion Secrets and PodBox Kubernetes Events for multi-replica HA), `"file"`, or `"disabled"`.',
+    zh: '*v0.7.0 新增。* 事件后端（`CUBEPOD_EVENTS_BACKEND`）：`"k8s"`（基于 `SandboxWebhook` CR + 配套 Secret 与 PodBox Kubernetes Event 的多副本高可用）、`"file"` 或 `"disabled"`。',
+  },
+  'events.dir': {
+    en: '*Added in v0.7.0.* Filesystem directory (`CUBEPOD_EVENTS_DIR`) used only when `events.backend` is `"file"`.',
+    zh: '*v0.7.0 新增。* 仅当 `events.backend` 为 `"file"` 时使用的本地事件目录（`CUBEPOD_EVENTS_DIR`）。',
   },
   'featureGates.k8sE2BVolumeMounts': {
     en: '*Changed in v0.6.0.* Wired into `--feature-gate=K8sE2BVolumeMounts=...`; auto-enabled whenever `e2bVolumes.enabled` is `true` or `e2bVolumes.rwxStorageClassName` is non-empty.',
@@ -534,6 +546,10 @@ function syncHelmValues() {
       isZh
         ? '> **v0.6.0 配置变更：** 新增 `gateway.podDisruptionBudget.*`（`pdb.yaml`）、`egress.transparent`、`secrets.*`（支持 `"k8s"` 多副本 HA 后端与密钥引用），统一通过 `--feature-gate` 注入 `featureGates.*`，且配置 `e2bVolumes.rwxStorageClassName` 后会自动激活 `e2bVolumes` 并开启 `K8sE2BVolumeMounts`。'
         : '> **Changed / Added in v0.6.0:** Added `gateway.podDisruptionBudget.*` (`pdb.yaml`), `egress.transparent`, and `secrets.*` (`"k8s"` HA backend + encryption key Secret wiring); unified `featureGates.*` `--feature-gate` flags; and made setting `e2bVolumes.rwxStorageClassName` automatically activate `e2bVolumes` and `K8sE2BVolumeMounts`.',
+      '',
+      isZh
+        ? '> **v0.7.0 配置变更：** 新增 `events.*`（`events.enabled`、`events.backend`，默认 `"k8s"` 多副本 HA 后端，以及 `events.dir`），用于沙箱生命周期事件、Webhook 与死信。'
+        : '> **Added in v0.7.0:** Added `events.*` (`events.enabled`, `events.backend` with the default `"k8s"` multi-replica HA backend, and `events.dir`) for sandbox lifecycle events, webhooks, and dead letters.',
       '',
       isZh ? '## 参数列表' : '## Parameter Reference',
       '',

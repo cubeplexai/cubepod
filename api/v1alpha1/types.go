@@ -2,6 +2,7 @@
 package v1alpha1
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -419,6 +420,25 @@ type SandboxWebhookSpec struct {
 type SandboxWebhookStatus struct {
 	LastDeliveryTime    *time.Time `json:"lastDeliveryTime,omitempty"`
 	ConsecutiveFailures int        `json:"consecutiveFailures,omitempty"`
+	// DeadLetters is a bounded list of deliveries that failed after max retries or
+	// were dropped on a full queue. It never contains the HMAC signatureKey.
+	DeadLetters []SandboxWebhookDeadLetter `json:"deadLetters,omitempty"`
+}
+
+// SandboxWebhookDeadLetter records one undeliverable webhook event for inspection and retry.
+type SandboxWebhookDeadLetter struct {
+	ID             string          `json:"id"`
+	EventID        string          `json:"eventId"`
+	EventType      string          `json:"eventType"`
+	SandboxID      string          `json:"sandboxId,omitempty"`
+	Reason         string          `json:"reason"`
+	Attempts       int             `json:"attempts,omitempty"`
+	LastStatusCode int             `json:"lastStatusCode,omitempty"`
+	LastError      string          `json:"lastError,omitempty"`
+	RetryCount     int             `json:"retryCount,omitempty"`
+	CreatedAt      time.Time       `json:"createdAt"`
+	UpdatedAt      time.Time       `json:"updatedAt"`
+	Event          json.RawMessage `json:"event,omitempty"`
 }
 
 // SandboxWebhook is the Custom Resource representing a tenant webhook subscription.

@@ -732,6 +732,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&buf, "# HELP cubepod_webhook_queue_depth Current number of queued webhook deliveries\n")
 		fmt.Fprintf(&buf, "# TYPE cubepod_webhook_queue_depth gauge\n")
 		fmt.Fprintf(&buf, "cubepod_webhook_queue_depth %d\n", evMgr.QueueDepth())
+
+		fmt.Fprintf(&buf, "# HELP cubepod_webhook_dead_letters_total Total webhook deliveries dead-lettered after max retries or a full queue\n")
+		fmt.Fprintf(&buf, "# TYPE cubepod_webhook_dead_letters_total counter\n")
+		fmt.Fprintf(&buf, "cubepod_webhook_dead_letters_total %d\n", evMgr.DeadLettersTotal.Load())
+
+		fmt.Fprintf(&buf, "# HELP cubepod_webhook_dead_letters_pending Current number of retained webhook dead letters awaiting inspection or retry\n")
+		fmt.Fprintf(&buf, "# TYPE cubepod_webhook_dead_letters_pending gauge\n")
+		fmt.Fprintf(&buf, "cubepod_webhook_dead_letters_pending %d\n", evMgr.DeadLettersPending())
 	}
 
 	s.writeSandboxMetricsSamplerProm(&buf)

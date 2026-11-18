@@ -3260,3 +3260,92 @@ func TestReconcile_ForkFrom_SnapshotMode_LongNameHashAndFilesystemRejection(t *t
 		seen[sn.Metadata.Name] = struct{}{}
 	}
 }
+
+func TestReconciler_PodBoxKubeEventEmission(t *testing.T) {
+	ctx := context.Background()
+	mk := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(mk),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	spec := v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+		Lifecycle: v1alpha1.LifecyclePolicy{
+			IdleTimeoutSeconds: 10,
+			PausedTTLSeconds:   20,
+		},
+	}
+	if _, err := r.Reconcile(ctx, "sbx-evt-1", spec); err != nil {
+		t.Fatalf("create Reconcile: %v", err)
+	}
+	// Idempotent Reconcile in the same phase must not emit a duplicate Event.
+	if _, err := r.Reconcile(ctx, "sbx-evt-1", spec); err != nil {
+		t.Fatalf("repeat Reconcile: %v", err)
+	}
+	if _, err := r.Pause(ctx, "sbx-evt-1"); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, "sbx-evt-1", spec); err != nil {
+		t.Fatalf("resume Reconcile: %v", err)
+	}
+
+	// Idle-timeout pause and PausedTTL expiration via ReapIdle.
+	t0 := time.Now().UTC().Add(-100 * time.Second)
+	if err := r.TouchActivity("sbx-evt-1", t0); err != nil {
+		t.Fatalf("TouchActivity: %v", err)
+	}
+	paused, _ := r.ReapIdle(ctx, t0.Add(15*time.Second))
+	if len(paused) != 1 || paused[0] != "sbx-evt-1" {
+		t.Fatalf("expected sbx-evt-1 idle-paused, got %v", paused)
+	}
+	_, terminated := r.ReapIdle(ctx, t0.Add(60*time.Second))
+	if len(terminated) != 1 || terminated[0] != "sbx-evt-1" {
+		t.Fatalf("expected sbx-evt-1 ttl-terminated, got %v", terminated)
+	}
+	if err := r.DeleteBox(ctx, "sbx-evt-1", true); err != nil {
+		t.Fatalf("DeleteBox: %v", err)
+	}
+
+	evs, err := mk.ListKubeEvents(ctx, "cubepod-workloads",
+		controller.PodBoxEventResourceLabel+"="+controller.PodBoxEventResourceValue+","+
+			controller.PodBoxEventSandboxLabel+"=sbx-evt-1,"+
+			controller.PodBoxEventSourceLabel+"="+controller.PodBoxEventSourceValue)
+	if err != nil {
+		t.Fatalf("ListKubeEvents: %v", err)
+	}
+	wantReasons := []string{
+		controller.PodBoxEventReasonRunning,
+		controller.PodBoxEventReasonPaused,
+		controller.PodBoxEventReasonRunning,
+		controller.PodBoxEventReasonIdlePaused,
+		controller.PodBoxEventReasonPausedTTLExpired,
+		controller.PodBoxEventReasonDeleted,
+	}
+	if len(evs) != len(wantReasons) {
+		t.Fatalf("got %d PodBox Events (%+v); want %d (%v)", len(evs), evs, len(wantReasons), wantReasons)
+	}
+	for i, want := range wantReasons {
+		if evs[i].Reason != want {
+			t.Fatalf("event[%d].Reason = %q; want %q", i, evs[i].Reason, want)
+		}
+		if evs[i].InvolvedObject.Kind != "PodBox" || evs[i].InvolvedObject.Name != "sbx-evt-1" || evs[i].InvolvedObject.Namespace != "cubepod-workloads" {
+			t.Fatalf("event[%d] unexpected involvedObject: %+v", i, evs[i].InvolvedObject)
+		}
+	}
+
+	// WithPodBoxEvents(false) suppresses emission.
+	rSilent := controller.NewReconciler(
+		controller.WithKubeClient(mk),
+		controller.WithNamespace("cubepod-workloads"),
+		controller.WithPodBoxEvents(false),
+	)
+	if _, err := rSilent.Reconcile(ctx, "sbx-evt-silent", spec); err != nil {
+		t.Fatalf("silent Reconcile: %v", err)
+	}
+	if silentEvs, _ := mk.ListKubeEvents(ctx, "cubepod-workloads", controller.PodBoxEventSandboxLabel+"=sbx-evt-silent"); len(silentEvs) != 0 {
+		t.Fatalf("expected 0 events when WithPodBoxEvents(false), got %d", len(silentEvs))
+	}
+}
