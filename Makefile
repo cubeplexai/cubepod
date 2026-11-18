@@ -108,3 +108,7 @@ docs-build:
 .PHONY: test-kind-e2e
 test-kind-e2e:
 	bash test/kind-e2e/run.sh
+
+.PHONY: test-compose-e2e
+test-compose-e2e:
+	bash test/compose-e2e/run.sh

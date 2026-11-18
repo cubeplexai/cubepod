@@ -102,3 +102,27 @@ make test-e2e
 - Deploy to Kubernetes with Helm in [Kubernetes & Helm Deployment](/deployment/kubernetes-helm/).
 - Configure Kata Containers and block storage drivers in [Kata & Block Storage](/deployment/kata-and-block-storage/).
 - Explore the SDKs in [Python SDK](/sdks/python/), [TypeScript SDK](/sdks/typescript/), and [Go SDK & CLI](/sdks/go-and-cli/).
+
+## Reproducible dual-SDK E2E
+
+Added after v0.6.0. From a Linux x86_64 checkout, run:
+
+```sh
+make test-compose-e2e
+```
+
+This builds and deploys a separate Compose project and runs the same official
+Python and TypeScript SDK scenarios as [kind E2E](/deployment/kind-e2e/), including
+PTY/watch, real service ports and volume persistence. It does not use mocked
+processes or treat skipped scenarios as passing. Install Compose **v2.39.4**, Go
+1.27.3, Rust 1.100.0, Python 3.12.16, Node 24.22.1 and Docker first; allow at least
+1.5 GiB available RAM and 10 GiB free disk (4 GiB total RAM recommended).
+
+The test overlay explicitly enables `CUBEPOD_RUNTIME=docker` and disables
+Kubernetes Pod-IP routing; `CUBEPOD_RUNTIME_MODE` alone does not select the Docker
+backend. It supplies injected runtime binaries and independent filesystem-backed
+workspace/RootFS binds, using unprivileged no-pivot container mode, not Kata or
+raw-block storage. The test uses unique project/volume/network names and an
+automatically allocated loopback port. It removes only its own resources,
+leaving existing Compose stacks and kind clusters intact. Failure diagnostics
+and both SDK reports are retained under `.compose-e2e/PROJECT/artifacts/`.

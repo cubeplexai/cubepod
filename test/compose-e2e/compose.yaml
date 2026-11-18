@@ -1,0 +1,62 @@
+# Overlay the shipped topology; never use its fixed host ports in tests.
+services:
+  cubepod-gateway:
+    build: !reset null
+    image: ${E2E_CONTROL_IMAGE:?}
+    command: !override
+      - /usr/local/bin/cubepod-gateway
+      - -addr=:8080
+      - --live-pod-routing=false
+      - --e2b-template-api=false
+      - --template-build=false
+      - --state-dir=/var/lib/cubepod/state
+      - --template-probe-timeout=120s
+    ports: !override
+      - target: 8080
+        published: "0"
+        host_ip: 127.0.0.1
+    environment:
+      CUBEPOD_RUNTIME: docker
+      DOCKER_HOST: unix:///var/run/docker.sock
+      CUBEPOD_DOCKER_NETWORK: ${COMPOSE_PROJECT_NAME:?}_default
+      CUBEPOD_DOCKER_IMAGE: ${E2E_SANDBOX_IMAGE:?}
+      CUBEPOD_DOCKER_CONTAINER_PREFIX: ${COMPOSE_PROJECT_NAME}-sb-
+      CUBEPOD_DOCKER_BIN_DIR: ${E2E_HOST_BIN:?}
+      CUBEPOD_DOCKER_BASE_DIR: /var/lib/cubepod/docker
+      CUBEPOD_DOCKER_HOST_BASE_DIR: ${E2E_HOST_DATA:?}
+      CUBEPOD_E2B_VOLUME_DIR: /var/lib/cubepod/volumes/e2b
+      CUBEPOD_E2B_VOLUME_HOST_DIR: ${E2E_HOST_VOLUMES:?}/e2b
+      CUBEPOD_E2B_DOCKER_VOLUMES: "true"
+      CUBEPOD_E2B_DOCKER_PREFIX: cubepod-e2bvol-${COMPOSE_PROJECT_NAME}-
+    volumes:
+      - runtime-bin:/opt/cubepod/bin:ro
+      - sandbox-data:/var/lib/cubepod/docker
+    mem_limit: 256m
+  cubepod-controller:
+    build: !reset null
+    image: ${E2E_CONTROL_IMAGE:?}
+    ports: !reset []
+    mem_limit: 256m
+  cubepod-egress:
+    build: !reset null
+    image: ${E2E_CONTROL_IMAGE:?}
+    ports: !reset []
+    mem_limit: 128m
+  network-target:
+    image: ${E2E_SANDBOX_IMAGE:?}
+    hostname: network-target-compose
+    command: [bash, -ec, 'mkdir -p /tmp/http; hostname > /tmp/http/hostname; exec python3 -m http.server 8080 --bind 0.0.0.0 --directory /tmp/http']
+    networks:
+      default:
+        aliases: [network-target.cubepod-kind.svc]
+    mem_limit: 128m
+volumes:
+  runtime-bin:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME}-runtime-bin
+  sandbox-data:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME}-sandbox-data
+  cubepod-volumes:
+    external: true
+    name: ${COMPOSE_PROJECT_NAME}-volumes
