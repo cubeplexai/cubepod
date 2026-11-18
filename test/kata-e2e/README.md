@@ -101,30 +101,34 @@ Production RWX CSI, multi-node, zero-trust egress, desktop and performance SLAs
 are outside this single-node integration harness.
 
 
-## Current integration evidence and unresolved FC dependency
+## Current integration evidence and unresolved FC failure
 
 On 2026-11-18, hosted `ubuntu-24.04` booted native FC and CLH Linux guests.
-CLH additionally passed all five official Python and all five official
-TypeScript scenarios, with zero skips, actual VMM process proof and twelve
-RuntimeClass-matching Pods (run `44248528618`). That run remained red due strict
-CSI cleanup; a successful test report is not a successful cleanup check.
+Run [44255298746](https://github.com/cubeplexai/cubepod/actions/runs/44255298746)
+passed the entire **CLH lane in one run**: five official Python plus five official
+TypeScript scenarios, zero skips, actual selected VMM/guest proof, twelve
+RuntimeClass-matching Pods and strict CSI/unmount/owned-loop/cluster cleanup.
+Older CLH SDK-only successes with cleanup failures are not counted as green.
 
-FC currently remains red before the SDK suite: containerd's devmapper plugin
-creates thin mappings, but their `/dev/mapper/OWNED-pool-snap-N` device entries
-are absent in kind's private `/dev` without udev (run `44249767997`). The owned
-pool itself, CRI and explicit transfer unpack configuration are working; the
-owned thin mappings/pool/loops were cleaned. Do not fix this by mounting the
-host's entire `/dev` read-write, running broad host udev rules, skipping volumes
-or accepting a native guest as full E2E. A node-scoped, ownership-checked device
-publication mechanism (including every child snapshot, not just the pool) is
-required before claiming FC Kata/SDK coverage. This PR now implements a
-synchronous node-only `dmsetup create` wrapper, matching containerd 2.3.1's actual
-CLI calls. It validates both requested and actual kernel thin parents, own pool
-UUID and name, then publishes only that owned device before returning. It does
-not start udev, mount host /dev or change a host service. Ten safety/contract unit
-tests pass; **actual FC revalidation is still required**. The full lane deliberately
-fails visibly until real integration succeeds. Native Linux guest success is not the missing
-Kata/SDK proof.
+FC also boots both its native guest and actual kind/Kata smoke guest. The prior
+missing device-mapper aliases are fixed by a synchronous node-only wrapper:
+for each containerd-created snapshot it validates requested and actual kernel
+thin parents, the owned pool UUID and name, then publishes both friendly and
+canonical aliases. It does not start udev or mount the host's /dev.
+
+FC's full SDK lane remains red: in run44255298746 Python has two passes,
+one failure/two errors and TypeScript has three passes/two failures, zero skips;
+strict cleanup passes. Some sandbox creates fail mounting the pause container
+root at guest `/dev/vdb` with EIO. Independently, the Python volume test reaches
+a second real sandbox and fails reading `/data/persist.txt` with FileNotFound:
+actual mounted-volume persistence is not working. EIO alone does **not** prove
+the separate E2B shared-volume architecture blocker. Smoke/native guest success cannot substitute for full SDK success.
+Extra FC node-daemon debug logging now preserves Kata's existing guest-console
+records (the node's default info filter hid them). Bounded read-only diagnostics
+capture the owned thin pool's status/table and each validated child's geometry,
+read-only flag and filesystem header before SDK execution and on failure.
+They never mount, fsck, repair, resize, discard or read unrelated block devices;
+missing diagnostic data cannot turn an SDK or cleanup failure green.
 
 
 ### Test CSI reclaim policy (not production reclaim coverage)

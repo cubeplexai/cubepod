@@ -39,6 +39,14 @@ shim = Path('/usr/local/bin/containerd-shim-kata-e2e-v2')
 shim.write_text('#!/bin/sh\nexport KATA_CONF_FILE=/etc/kata-containers/configuration-e2e.toml\nexec /opt/kata/bin/containerd-shim-kata-v2 "$@"\n')
 shim.chmod(0o755)
 original = subprocess.check_output(['containerd', 'config', 'migrate'], text=True)
+if vmm == 'fc':
+    # Kata's debug/guest-console records are otherwise filtered by the node daemon's
+    # default info level. Change only this freshly owned node, never the host daemon.
+    original, changed = re.subn(
+        r'(?m)^(\[debug\]\n(?:[ \t].*\n|\n)*?[ \t]*level[ \t]*=[ \t]*)[^\n]*',
+        lambda match: match[1] + '"debug"', original, count=1)
+    assert changed == 1, 'Missing containerd debug level'
+    assert tomllib.loads(original)['debug']['level'] == 'debug'
 snapshotter = 'overlayfs'
 extra = ''
 if vmm == 'fc':
