@@ -24,6 +24,7 @@ kata_prepare() {
   printf '%s\n' "$CLUSTER_NAME" >"$STATE/kata-owned"
   printf '%s\n' "$KATA_VMM" >"$STATE/kata-profile"
   KATA_ACTIVE=1
+  rm -f "$STATE/kata-diagnostics-collected" "$STATE/kata-quiesced"
   local cache=${KATA_DOWNLOAD_CACHE:-$STATE/downloads}
   mkdir -p "$cache"
   local bundle="$cache/kata-go-static-$KATA_VERSION-amd64.tar.zst"
@@ -150,6 +151,30 @@ kata_teardown_node() {
   [[ -f "$STATE/kata-owned" ]] || return 0
   # Requires live owned node: never lose the namespace holding owned loop files.
   kata_node true || return 1
+  # Quiesce our own product before stopping kubelet/CSI: a late reconciliation
+  # otherwise publishes new raw-block mounts while teardown is already running.
+  if [[ ! -f "$STATE/kata-quiesced" ]]; then
+    local namespace
+    namespace=$(k get namespace "$NS" --ignore-not-found -o name) || return 1
+    if [[ -n "$namespace" ]]; then
+      k scale deployment --all -n "$NS" --replicas=0 || return 1
+      local deployments deployment
+      deployments=$(k get deployment -n "$NS" -o name) || return 1
+      while read -r deployment; do
+        [[ -z "$deployment" ]] || k rollout status "$deployment" -n "$NS" --timeout=60s || return 1
+      done <<<"$deployments"
+      k delete pods --all -n "$NS" --wait=true --timeout=90s || return 1
+      kata_node python3 -c 'import subprocess,time,sys
+end=time.monotonic()+60
+while True:
+ targets=subprocess.check_output(["findmnt","-rn","-o","TARGET"],text=True).splitlines()
+ pending=[p for p in targets if p.startswith("/var/lib/kubelet/plugins/kubernetes.io/csi/volumeDevices/")]
+ if not pending:break
+ if time.monotonic()>=end:print("CSI block binds still published:",pending);sys.exit(1)
+ time.sleep(0.5)' || return 1
+    fi
+    touch "$STATE/kata-quiesced"
+  fi
   if kata_node test ! -d "/var/lib/cubepod-kata-e2e/$CLUSTER_NAME"; then return 0; fi
   timeout 180s docker exec -i "$CLUSTER_NAME-control-plane" python3 - "$CLUSTER_NAME" <"$KATA_HERE/cleanup_node.py" >>"$ARTIFACTS/kata-node-cleanup.log" 2>&1
 }

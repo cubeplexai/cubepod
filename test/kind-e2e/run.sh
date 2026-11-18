@@ -45,9 +45,11 @@ finish() {
     echo "No cluster acquired by this invocation; artifacts: $ARTIFACTS"
     exit "$rc"
   fi
-  collect
+  if [[ -z ${KATA_VMM:-} || ! -f "$STATE/kata-diagnostics-collected" ]]; then
+    collect
+    if [[ -n ${KATA_VMM:-} ]]; then kata_collect; touch "$STATE/kata-diagnostics-collected"; fi
+  fi
   if [[ -n ${KATA_VMM:-} ]]; then
-    kata_collect
     if ! kata_teardown_node; then
       echo "Kata device cleanup failed; retaining owned node and state for safe recovery" >&2
       KEEP_CLUSTER=1; rc=1

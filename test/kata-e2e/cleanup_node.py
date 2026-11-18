@@ -33,23 +33,28 @@ def main(cluster):
     base = Path('/var/lib/cubepod-kata-e2e') / cluster
     if not base.exists():
         return
-    run(['systemctl', 'stop', 'kubelet'])
-    # All containers in this checked, newly owned kind node are disposable.
-    pods = subprocess.run(['crictl', 'pods', '-q'], capture_output=True, text=True, timeout=40)
-    if pods.returncode == 0:
-        if pods.stdout.split():
-            run(['crictl', '--timeout=20s', 'stopp', *pods.stdout.split()])
-        # StopPodSandbox alone need not remove containers/mount namespaces.
-        # Release the owned CSI container before unmounting its propagated binds.
-        run(['crictl', '--timeout=20s', 'rm', '--all', '--force'])
-        run(['crictl', '--timeout=20s', 'rmp', '--all', '--force'])
+    stopped = base / 'containers-removed'
+    if stopped.exists():
+        assert stopped.read_text() == cluster, 'Cleanup phase ownership mismatch'
     else:
-        # A broken snapshotter can disable CRI before any Kata Pod starts.
-        # Kill only tasks from THIS owned node's containerd, never host tasks.
-        print('CRI unavailable during cleanup:', pods.stderr, flush=True)
-        tasks = subprocess.check_output(['ctr', '-n', 'k8s.io', 'tasks', 'list', '-q'], text=True, timeout=40).split()
-        for task in tasks:
-            run(['ctr', '-n', 'k8s.io', 'tasks', 'kill', '--signal', 'SIGKILL', '--all', task])
+        run(['systemctl', 'stop', 'kubelet'])
+        # All containers in this checked, newly owned kind node are disposable.
+        pods = subprocess.run(['crictl', 'pods', '-q'], capture_output=True, text=True, timeout=40)
+        if pods.returncode == 0:
+            if pods.stdout.split():
+                run(['crictl', '--timeout=20s', 'stopp', *pods.stdout.split()])
+            # StopPodSandbox alone need not remove containers/mount namespaces.
+            # Release the owned CSI container before unmounting its propagated binds.
+            run(['crictl', '--timeout=20s', 'rm', '--all', '--force'])
+            run(['crictl', '--timeout=20s', 'rmp', '--all', '--force'])
+        else:
+            # A broken snapshotter can disable CRI before any Kata Pod starts.
+            # Kill only tasks from THIS owned node's containerd, never host tasks.
+            print('CRI unavailable during cleanup:', pods.stderr, flush=True)
+            tasks = subprocess.check_output(['ctr', '-n', 'k8s.io', 'tasks', 'list', '-q'], text=True, timeout=40).split()
+            for task in tasks:
+                run(['ctr', '-n', 'k8s.io', 'tasks', 'kill', '--signal', 'SIGKILL', '--all', task])
+        stopped.write_text(cluster)
     run(['systemctl', 'stop', 'containerd'])
     mounts = subprocess.check_output(['findmnt', '-rn', '-o', 'TARGET'], text=True).splitlines()
     for target in sorted(mounts, key=len, reverse=True):
