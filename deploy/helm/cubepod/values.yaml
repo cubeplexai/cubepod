@@ -41,6 +41,8 @@ gateway:
   # Optional state directory for local templates, secrets, and events (defaults to /var/lib/cubepod/state when persistence is enabled)
   stateDir: ""
   webhookAllowPrivate: false
+  # Background sandbox metrics sampling interval (Go duration; "0" disables). Added in v0.7.0.
+  metricsSampleInterval: "10s"
   # Optional Kubernetes Secrets holding 32-byte base64/64-hex keys (secret key: "key")
   secretsKeySecret: ""
   eventsKeySecret: ""

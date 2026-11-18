@@ -145,6 +145,9 @@ type Metrics struct {
 	sandboxForks       labeledCounterMap
 	sandboxForkDur     promHistogram
 
+	SandboxMetricsSamplesOK    atomic.Uint64
+	SandboxMetricsSamplesError atomic.Uint64
+
 	sandboxMetricsOnce sync.Once
 	sandboxMetrics     *sandboxMetricsStore
 }
@@ -562,6 +565,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 				"count": forkCount,
 				"sum":   forkSum,
 			},
+			"cubepod_sandbox_metrics_samples_total": map[string]uint64{
+				"ok":    m.SandboxMetricsSamplesOK.Load(),
+				"error": m.SandboxMetricsSamplesError.Load(),
+			},
 			"cubepod_desktop_activations_total": map[string]uint64{
 				"ok":          m.DesktopActivationsOK.Load(),
 				"unsupported": m.DesktopActivationsUnsupported.Load(),
@@ -685,6 +692,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&buf, "# TYPE cubepod_webhook_queue_depth gauge\n")
 		fmt.Fprintf(&buf, "cubepod_webhook_queue_depth %d\n", evMgr.QueueDepth())
 	}
+
+	writeSandboxMetricsSamplerProm(&buf, m)
 
 	// Gauges
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_sandboxes_active Current number of active sandboxes by state\n")

@@ -339,6 +339,9 @@ type Server struct {
 	runtime                   runtime.Backend
 	featureGates              FeatureGates
 	syncMu                    sync.Mutex
+	samplerMu                 sync.Mutex
+	samplerCancel             context.CancelFunc
+	samplerWG                 sync.WaitGroup
 	syncInterval              time.Duration
 	syncCancel                context.CancelFunc
 	syncWG                    sync.WaitGroup

@@ -163,6 +163,28 @@ Operational constraints when `templateBuild.enabled: true`:
 
 See [Templates & Image Builds](/sdks/templates/) for the SDK and CLI workflow.
 
+## Sandbox Metrics Sampling & Monitoring
+
+*Added in v0.7.0.*
+
+`cubepod-gateway` runs a background sampler that polls `podd /metrics` for every `Running` sandbox and fills the per-sandbox ring buffers behind `GET /sandboxes/{sandboxID}/metrics`, so history exists even when nobody queries it. Paused and terminated sandboxes are skipped.
+
+```yaml
+gateway:
+  metricsSampleInterval: "10s"   # Go duration; "0" disables (flag --metrics-sample-interval, env CUBEPOD_METRICS_SAMPLE_INTERVAL)
+```
+
+The gateway `/metrics` endpoint exposes `cubepod_sandbox_metrics_samples_total{result="ok|error"}` plus per-sandbox gauges (`cubepod_sandbox_cpu_used_pct`, `cubepod_sandbox_memory_used_bytes`, `cubepod_sandbox_memory_total_bytes`, `cubepod_sandbox_disk_used_bytes`, `cubepod_sandbox_disk_total_bytes`, `cubepod_sandbox_cpu_count`, all labeled `sandbox_id`).
+
+Ready-made Prometheus Operator rules and a Grafana dashboard live in `deploy/monitoring/`:
+
+```bash
+kubectl apply -f deploy/monitoring/sandbox-metrics-rules.yaml
+# Import deploy/monitoring/sandbox-metrics-dashboard.json in Grafana
+```
+
+The rules record `cubepod:sandbox_cpu_used_pct:avg5m`, `cubepod:sandbox_memory_utilization_ratio` and `cubepod:sandbox_disk_utilization_ratio`, and alert on `CubePodSandboxHighMemoryPressure`, `CubePodSandboxDiskNearFull` and `CubePodMetricsSamplerFailing`.
+
 ## Verifying the Deployment
 
 Confirm pods, CRDs, and health probes are green:
