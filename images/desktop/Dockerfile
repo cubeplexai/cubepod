@@ -11,8 +11,13 @@
 #
 # Nothing GUI-related starts on boot; the container remains idle (~0 MiB GUI overhead)
 # until `/opt/cubepod/desktop/cubepod-desktop-ctl start` is invoked.
-# Optional WebRTC: if `/usr/local/bin/neko` (or `CUBEPOD_NEKO_BIN`) is installed,
-# `--transport webrtc` launches Neko alongside noVNC; otherwise it falls back to noVNC.
+# WebRTC & Fallback: `/usr/local/bin/neko` and `/opt/cubepod/desktop/neko-www` are packaged
+# from the official multi-arch Neko base image (`ghcr.io/m1k1o/neko/base`). Requesting
+# `--transport webrtc` launches Neko alongside `noVNC` (`:8081` + `:8080`), falling back
+# cleanly to `noVNC` if Neko is absent or fails to start.
+
+ARG NEKO_IMAGE=ghcr.io/m1k1o/neko/base:latest
+FROM ${NEKO_IMAGE} AS neko
 
 FROM ubuntu:24.04
 
@@ -26,6 +31,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # X11, window manager, VNC, noVNC/websockify, terminal, and fonts
     xvfb openbox x11vnc novnc websockify dbus-x11 xauth ttyd \
     fonts-liberation fonts-noto-cjk \
+    # Neko WebRTC GStreamer video/audio runtime & X11 capture/input libraries
+    libgtk-3-0t64 libxtst6 libxcvt0 pulseaudio \
+    libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
+    gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+    gstreamer1.0-x gstreamer1.0-pulseaudio \
+    libopus0 libvpx9 \
     && rm -rf /var/lib/apt/lists/* \
     # Python scientific/code-interpreter + Playwright browser automation packages
     && pip install --no-cache-dir --break-system-packages \
@@ -45,17 +57,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && if getent group 1000 >/dev/null 2>&1; then groupdel "$(getent group 1000 | cut -d: -f1)"; fi \
     && groupadd -g 1000 cubeplex \
     && useradd -m -u 1000 -g 1000 -s /bin/bash cubeplex \
+    && usermod -aG audio,video cubeplex \
     && mkdir -p /workspace /home/cubeplex/.config/chromium /run/cubepod/desktop /tmp/.X11-unix \
     && chown -R 1000:1000 /workspace /home/cubeplex /run/cubepod/desktop \
     && chmod 1777 /tmp/.X11-unix
 
+COPY --from=neko /usr/bin/neko /usr/local/bin/neko
+COPY --from=neko /var/www /opt/cubepod/desktop/neko-www
+
 COPY images/desktop/cubepod-desktop-ctl /opt/cubepod/desktop/cubepod-desktop-ctl
 COPY images/desktop/chromium-wrapper /opt/cubepod/desktop/chromium-wrapper
+COPY images/desktop/browser_tab_follow.py /opt/cubepod/desktop/browser_tab_follow.py
 
-RUN chmod 0755 /opt/cubepod/desktop/cubepod-desktop-ctl /opt/cubepod/desktop/chromium-wrapper \
+RUN chmod 0755 \
+      /usr/local/bin/neko \
+      /opt/cubepod/desktop/cubepod-desktop-ctl \
+      /opt/cubepod/desktop/chromium-wrapper \
+      /opt/cubepod/desktop/browser_tab_follow.py \
+    && chmod -R a+rX /opt/cubepod/desktop/neko-www \
     && ln -sf /opt/cubepod/desktop/cubepod-desktop-ctl /usr/local/bin/cubepod-desktop-ctl \
     && ln -sf /opt/cubepod/desktop/chromium-wrapper /usr/local/bin/chromium \
-    && ln -sf /opt/cubepod/desktop/chromium-wrapper /usr/local/bin/chromium-browser
+    && ln -sf /opt/cubepod/desktop/chromium-wrapper /usr/local/bin/chromium-browser \
+    && ln -sf /opt/cubepod/desktop/browser_tab_follow.py /usr/local/bin/cubeplex-focus-browser-tab \
+    && ln -sf /opt/cubepod/desktop/browser_tab_follow.py /usr/local/bin/cubepod-focus-browser-tab
 
 WORKDIR /workspace
 

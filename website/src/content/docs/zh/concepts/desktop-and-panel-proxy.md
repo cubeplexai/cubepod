@@ -20,6 +20,7 @@ CubePod 通过两大协同设计解决了这一问题（参见 **[CEP 提案总�
 | **`chromium-wrapper`** | `127.0.0.1:9222` | 暴露 Chrome DevTools Protocol (CDP)，支持指定 `initialUrl`，并在启动前自动清理跨暂停/重启持久化的 RootFS 残留 `SingletonLock` / `SingletonSocket` / `SingletonCookie` 锁文件。 |
 | **`x11vnc`** | `127.0.0.1:5900` | 将 `:99` X11 显示画面本地绑定为 VNC 服务。 |
 | **`websockify` + `noVNC`** | `0.0.0.0:8080` | 将 VNC 转换为 WebSocket，并在浏览器提供 `vnc.html` 交互视图。 |
+| **`neko`（WebRTC）** | `0.0.0.0:8081` | 请求 `transport: "webrtc"` 时通过低延迟 WebRTC 推流 `:99` 桌面（`NEKO_STATIC=/opt/cubepod/desktop/neko-www`、`NEKO_ICELITE=1`；*v0.7.0 新增。*）。 |
 | **`ttyd`** | `:7681` | 提供基于浏览器的新建 `/bin/bash` Web 终端（默认工作目录 `/workspace`）。 |
 
 ### 可靠性与权限隔离 (`cubepod-desktop-ctl`)
@@ -27,8 +28,20 @@ CubePod 通过两大协同设计解决了这一问题（参见 **[CEP 提案总�
 - **最小权限降权**：`cubepod-desktop-ctl` 会自动降权为非特权用户 UID/GID `1000:1000`（`cubeplex`），确保浏览器缓存、下载产物和交互终端与 Agent 工作区 `/workspace` 的文件属主完全一致。
 - **并发锁保护**：所有启停操作通过 `flock` 串行化，防止并发调用 `start`/`stop` 产生重复的 `Xvfb` 或 `x11vnc` 进程。
 - **持久化 RootFS 锁文件自愈**：由于 CubePod 会持久化整个 RootFS，沙箱经历 `Paused` -> `Running` 后旧 PID 留下的 Chromium `Singleton*` 锁文件原本会阻塞浏览器重新启动；`cubepod-desktop-ctl` 会在拉起 `chromium-wrapper` 前自动清除过期锁。
+- **内置 Neko WebRTC 与自动降级保护**：*v0.7.0 新增。* `images/desktop/Dockerfile` 开箱预置 `/usr/local/bin/neko`、`/opt/cubepod/desktop/neko-www` 以及 GStreamer/Opus/VP8/H.264 运行时插件。若在未包含 Neko 的自定义镜像中请求 `transport: "webrtc"` 或 Neko 启动异常，`cubepod-desktop-ctl` 会保持 `noVNC` 正常运行，并自动回退至 `transportUsed: "novnc"`（`fallbackReason: "neko_not_installed"` 或 `"neko_start_failed"`）。
 
-> **流媒体协议说明：** 当前仓库内置的 `images/desktop/` 镜像交付 **`noVNC`（`:8080`）**、**`ttyd`（`:7681`）** 与 **Chromium CDP（`:9222`）**；同时 `cubepod-gateway` 的面板代理与平台架构蓝图亦支持针对自定义镜像暴露的 WebRTC / Neko 媒体端点进行反向代理。
+### CubePlex Tab-Follow 标签页自动跟随 (`browser_tab_follow.py`)
+
+*v0.7.0 新增。*
+
+由于 `x11vnc` 与 Neko 捕获的是当前前台 X11 Chromium 窗口而非独立的 CDP 标签页，当 Agent 通过 `agent-browser` 在后台标签页操作时，前端用户原本可能仍停留在旧标签页画面上。
+
+`images/desktop/` 内置 `/opt/cubepod/desktop/browser_tab_follow.py`（软链接至 `/usr/local/bin/cubeplex-focus-browser-tab` 与 `/usr/local/bin/cubepod-focus-browser-tab`）：
+
+1. 查询 `http://127.0.0.1:${CUBEPOD_CDP_PORT:-9222}/json` 中所有 `"type": "page"` 标签页目标。
+2. 通过 `--url <url>` 或 `$AGENT_BROWSER_REAL get url` 获取当前目标地址（附带 `AGENT_BROWSER_WRAPPER=1` 递归保护）。
+3. 执行**精确归一化 URL 匹配**（忽略末尾 `/`，严禁前缀匹配，确保 `https://ex.com` 绝不会误匹配 `https://ex.com/login`），并调用 `http://127.0.0.1:${CDP_PORT}/json/activate/<id>` 切换前台标签页。
+4. 支持 `--install-wrapper`（`cubepod-desktop-ctl start` 在检测到可写 `agent-browser` 时自动非致命调用，也可通过 Python SDK 的 `cubepod.browser_tab_follow.tab_follow_install_command()` 按需注入），幂等地为 `/usr/local/bin/agent-browser` 安装 `# CUBEPLEX_TAB_FOLLOW=1` 包装脚本并完整保留 `agent-browser.real`。
 
 ## 2. 网关桌面控制 API (`pkg/gateway/desktop.go`)
 
@@ -53,7 +66,15 @@ CubePod 无需为每个沙箱动态创建 Kubernetes `Ingress`，即可通过短
    base64url(sandboxID:port:expUnix).base64url(hmacSha256)
    ```
 2. **多副本无状态校验**：任意 `cubepod-gateway` 副本收到 `GET /panel/{token}/{rest...}`（或 WebSocket 握手请求）时，均可本地完成 HMAC 签名与过期时间验证，不依赖集中式 Session 存储。
-3. **自动唤醒与透明反代**：网关通过 `resolveSandbox` 自动唤醒可能处于 `Paused` 状态的沙箱，定位当前 `<status.podIP>:<port>`，并将 HTTP 资源与双向 WebSocket 帧（`noVNC`、`ttyd`、前端热更新 HMR 等）直接反向代理至目标 MicroVM。
+3. **自动唤醒与透明反代**：网关通过 `resolveSandbox` 自动唤醒可能处于 `Paused` 状态的沙箱，定位当前 `<status.podIP>:<port>`，并将 HTTP 资源与双向 WebSocket 帧（`noVNC`、`neko` 信令、`ttyd`、前端热更新 HMR 等）直接反向代理至目标 MicroVM。
+
+## 4. 50+ 并发桌面资源评估、音频与 GPU 演进路线
+
+*v0.7.0 新增。*
+
+- **50+ 并发浏览器会话容量规划**：`cubepod-gateway` 已通过 `-race` 下 55 路并发 HTTP + WebSocket 桌面面板连接压测（`TestDesktopConcurrentSessions50Plus`），断开后活跃会话计数（`cubepod_panel_active_sessions`）严格归零、无连接泄漏。针对 `1280x800@30` 多标签页 Chromium + Neko WebRTC 活跃沙箱，建议将 `PodTemplate` 资源上限配置为 `2 vCPU / 2Gi` 内存（单标签页 `noVNC` 最低建议 `1Gi`），每路 WebRTC 预留约 `2 Mbps` 带宽（`NEKO_EPR=52000-52100`，跨严格 NAT 场景建议配合 coturn TURN 中继），网关侧建议部署 2+ 副本并设置 `ulimit -n >= 65536`。
+- **PulseAudio + GStreamer Opus 双向音频**：`images/desktop/` 已内置 `pulseaudio`、`gstreamer1.0-pulseaudio` 与 `libopus0`，支持在非特权 `1000:1000` 用户态下采集虚拟声卡监听源（`audio_output.monitor` -> 128 kbps Opus）及可选麦克风上行输入（`audio_input`；注：`noVNC` RFB 协议仅传输视频画面）。
+- **GPU 直通（`vfio-pci`）评估结论**：默认桌面模板保持 CPU 软件渲染（`--disable-gpu` + `vp8enc`），以确保跨节点秒级暂停/唤醒与零 GPU 成本的 WarmPool 能力；基于 `vfio-pci` / vGPU + `nvh264enc` 硬件编码的能力规划为 `v1.0.0` 可选专用 `gpu-desktop` `PodTemplate` 档位（详见 **[CEP 提案总览](/zh/ceps/)** 中的 CEP-0021）。
 
 ## 下一步
 

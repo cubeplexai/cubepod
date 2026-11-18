@@ -229,6 +229,34 @@ panel = await client.get_panel_endpoint(box.sandbox_id, port=8080, expires_in_se
 print(panel.url, panel.token, panel.expires_at)
 ```
 
+### Browser Tab-Follow Helper (`cubepod.browser_tab_follow`)
+
+*Added in v0.7.0.*
+
+When an agent drives background Chromium tabs via `agent-browser` over CDP (`127.0.0.1:9222`), `cubepod.browser_tab_follow` keeps the live Neko WebRTC / `noVNC` desktop window focused on the active `"type": "page"` target via `/json/activate/<id>` using exact normalized URL matching (trailing `/` ignored, never prefix-matching):
+
+```python
+from cubepod.browser_tab_follow import (
+    FOCUS_SCRIPT,
+    WRAPPER_SCRIPT,
+    choose_target_id,
+    tab_follow_install_command,
+)
+
+# Pick the exact CDP page target id (returns "tab-login", never prefix-matching "tab-home")
+target_id = choose_target_id(
+    [
+        {"id": "tab-home", "type": "page", "url": "https://ex.com/"},
+        {"id": "tab-login", "type": "page", "url": "https://ex.com/login"},
+    ],
+    "https://ex.com/login/",
+)
+
+# Idempotently install the # CUBEPLEX_TAB_FOLLOW=1 wrapper into an existing sandbox as root
+# (pre-installed at /opt/cubepod/desktop/browser_tab_follow.py in images/desktop >= v0.7.0)
+await client.execute(box.sandbox_id, tab_follow_install_command(), uid=0, gid=0)
+```
+
 ## Zero-Trust `cpodref_` Egress Secret Bindings
 
 Never pass raw external API keys inside `envs` or files. Register `secret_bindings` at sandbox creation time so only opaque `cpodref_` placeholders exist inside the MicroVM, while `cubepod-egress` substitutes the real credential exclusively on approved target hosts:
