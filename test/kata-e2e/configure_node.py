@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 
@@ -47,8 +48,21 @@ if vmm == 'fc':
         assert associated == [device], f'Loop backing-file identity mismatch: {path}'
     sectors = (8 * 1024**3) // 512
     table = f'0 {sectors} thin-pool {devices["meta"]} {devices["data"]} 128 1024'
-    subprocess.run(['dmsetup', '--noudevsync', 'create', pool, '--uuid', 'CUBEPOD_E2E_' + cluster, '--table', table], check=True, timeout=30)
     (base / 'pool').write_text(pool)
+    subprocess.run(['dmsetup', '--noudevsync', 'create', pool, '--uuid', 'CUBEPOD_E2E_' + cluster, '--table', table], check=True, timeout=30)
+    # No udev daemon runs inside kind. Materialize ONLY this newly created,
+    # UUID-verified pool's device in the node's private /dev mount.
+    info = subprocess.check_output(['dmsetup', 'info', '-c', '--noheadings', '--separator', ':', '-o', 'uuid,major,minor', pool], text=True).strip().split(':')
+    info = [field.strip() for field in info]
+    assert info[0] == 'CUBEPOD_E2E_' + cluster, 'Pool ownership changed'
+    device = os.makedev(int(info[1]), int(info[2]))
+    pool_path = Path('/dev/mapper') / pool
+    if pool_path.is_symlink():
+        pool_path.unlink()
+    if not pool_path.exists():
+        os.mknod(pool_path, stat.S_IFBLK | 0o600, device)
+    actual = pool_path.stat()
+    assert stat.S_ISBLK(actual.st_mode) and actual.st_rdev == device
     snapshotter = 'devmapper'
     extra = f'''\n[plugins."io.containerd.snapshotter.v1.devmapper"]
 root_path = "/var/lib/containerd/io.containerd.snapshotter.v1.devmapper"

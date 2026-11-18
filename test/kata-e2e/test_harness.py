@@ -6,6 +6,8 @@ import sys
 import tempfile
 import unittest
 
+from cleanup_node import owned_files, validate_pool, validate_thin
+
 class RuntimeProofTest(unittest.TestCase):
     def verify(self, runtime='kata-clh-e2e', count=12, expected='kata-clh-e2e'):
         events = [{'type':'ADDED', 'object':{'kind':'Pod','metadata':{'name':f'sandbox-{i}'},'spec':{'runtimeClassName':runtime}}} for i in range(count)]
@@ -20,4 +22,29 @@ class RuntimeProofTest(unittest.TestCase):
     def test_partial_or_empty_execution_fails(self):
         for count in (0,1,11):self.assertNotEqual(self.verify(count=count),0)
 
-if __name__=='__main__':unittest.main()
+
+
+class DeviceOwnershipTest(unittest.TestCase):
+    def test_pool_name_and_uuid_must_both_match(self):
+        validate_pool('cubepod-own', 'cubepod-own-pool', 'CUBEPOD_E2E_cubepod-own')
+        for name, uuid in [('other-pool', 'CUBEPOD_E2E_cubepod-own'), ('cubepod-own-pool', 'FOREIGN')]:
+            with self.assertRaises(AssertionError):
+                validate_pool('cubepod-own', name, uuid)
+
+    def test_thin_device_parent_must_be_owned_pool(self):
+        validate_thin('253:1', ['0', '1000', 'thin', '253:1', '2'])
+        with self.assertRaises(AssertionError):
+            validate_thin('253:1', ['0', '1000', 'thin', '253:9', '2'])
+
+    def test_symlink_cannot_select_external_backing_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / 'owned'; base.mkdir()
+            own = base / 'data'; own.write_text('owned')
+            external = root / 'foreign'; external.write_text('never detach')
+            (base / 'link').symlink_to(external)
+            self.assertEqual(list(owned_files(base)), [own])
+
+
+if __name__ == '__main__':
+    unittest.main()
