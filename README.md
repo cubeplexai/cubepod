@@ -225,7 +225,7 @@ Beyond the standard E2B interface, CubePod exposes high-throughput enterprise ex
 
 | Path | Responsibility | Tech Stack |
 | :--- | :--- | :--- |
-| [`docs/architecture.md`](docs/architecture.md) | Platform architecture specification & CubePlex integration blueprint | Markdown / Mermaid |
+| [`docs/architecture.md`](docs/architecture.md) · [`中文`](docs/architecture_zh.md) | Platform architecture specification & CubePlex integration blueprint | Markdown / Mermaid |
 | [`docs/enhancements/`](docs/enhancements/README.md) | CubePod Enhancement Proposals (CEPs) | CEP Specification |
 | [`api/v1alpha1/`](api/v1alpha1/types.go) | Kubernetes CRD schemas (`PodBox`, `PodTemplate`, `PodWarmPool`) | Go (`controller-gen`) |
 | [`api/openapi/`](api/openapi/cubepod-v1.yaml) | Canonical E2B-compatible superset OpenAPI 3.1 specification | OpenAPI 3.1 |
