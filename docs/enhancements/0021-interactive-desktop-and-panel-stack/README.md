@@ -8,7 +8,7 @@
 | **Participating Areas** | `gateway`, `controller` |
 | **Authors** | @cubepod-maintainers |
 | **Created** | 2026-11-13 |
-| **Last Updated** | 2026-11-16 |
+| **Last Updated** | 2026-11-17 |
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
@@ -187,9 +187,13 @@ flowchart LR
 
 ### Graduation Criteria
 
-- **Alpha (`v0.5.0`)**: `images/desktop` Dockerfile + `cubepod-desktop-ctl` + Gateway `desktop/{start,status,stop}` merged and verified via WebSocket E2E tests.
-- **Beta (`v0.6.0`)**: Optional Neko WebRTC H.264/VP8 transport alongside `noVNC` WebSocket fallback, plus CubePlex Tab-Follow integration (`browser_tab_follow.py`).
-- **Stable (`v1.0.0`)**: Verified under 50+ concurrent browser sessions in CubePlex production.
+- **Alpha (`v0.5.0`)**:
+  - [x] `images/desktop` Dockerfile + `cubepod-desktop-ctl` + Gateway `desktop/{start,status,stop}` merged and verified via WebSocket E2E tests.
+- **Beta (`v0.6.0`)**:
+  - [x] In-guest lazy supervisor, gateway desktop lifecycle, signed panel proxy (`/panel/{token}/`), and WebSocket `noVNC` streaming implemented.
+  - [ ] Remaining Beta packaging items: `/usr/local/bin/neko` WebRTC binary in `images/desktop/Dockerfile` and `browser_tab_follow.py` (tracked in [#99](https://github.com/cubeplexai/cubepod/issues/99)).
+- **Stable (`v1.0.0`)**:
+  - [ ] Verified under 50+ concurrent browser sessions in CubePlex production with GPU passthrough (`vfio-pci`) and audio capture/playback evaluation (tracked in [#99](https://github.com/cubeplexai/cubepod/issues/99)).
 
 ### Upgrade / Downgrade Strategy
 
@@ -223,6 +227,8 @@ flowchart LR
 ## Implementation History
 
 - `2026-11-13`: Initial CEP drafted and marked `implementable` for `v0.5.0`.
+- `2026-11-16`: Alpha core implemented with `cubepod-desktop-ctl`, gateway desktop lifecycle APIs, and signed panel streaming; promoted to `beta`.
+- `2026-11-17`: Updated Beta status note clarifying implemented core (`noVNC` WebSocket streaming, lazy activation) vs. remaining Beta packaging items (`/usr/local/bin/neko` in `images/desktop/Dockerfile` and `browser_tab_follow.py` tracked in [#99](https://github.com/cubeplexai/cubepod/issues/99)), alongside GPU passthrough, audio capture, and 50+ concurrent browser session evaluation.
 
 ---
 

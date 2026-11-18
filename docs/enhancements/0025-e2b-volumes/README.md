@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `alpha` | `implemented` | `2026-11-15` | `2026-11-16` | `storage` (`gateway`, `runtime`, `controller`) |
+| `beta` | `implemented` | `2026-11-15` | `2026-11-17` | `storage` (`gateway`, `runtime`, `controller`) |
 
 ## Table of Contents
 
@@ -62,9 +62,8 @@ Official E2B 2.64.0 SDKs (`Volume.create`, `Volume.write_file`, `Sandbox.create(
 
 ### Non-Goals
 
-1. **Live Kubernetes Kata + CSI shared volume content**: Backing `/volumecontent` with a cluster-wide RWX/CSI-attached PVC and carrying mounts across `podd-init` `pivot_root` is deferred to Beta.
-2. **External KMS / API-key rotation migration**: Tenant identity is derived from `sha256(X-API-KEY)` in Alpha; rotating a key orphans that key's volumes.
-3. **Refactored per-sandbox gateway locking**: Eliminating `Server.mu` across slow `startRuntimeSandbox`/`pauseRuntimeSandbox` calls in `pkg/gateway/sandboxes.go` is deferred to a dedicated gateway concurrency cleanup.
+1. **External KMS / API-key rotation migration**: Tenant identity is derived from `sha256(X-API-KEY)` in Alpha/Beta; rotating a key orphans that key's volumes (tracked in [#102](https://github.com/cubeplexai/cubepod/issues/102)).
+2. **Live cluster automated RWX PVC capacity alerting and multi-tenant quota enforcement**: Tracked in [#102](https://github.com/cubeplexai/cubepod/issues/102).
 
 ---
 
@@ -129,7 +128,7 @@ flowchart LR
 ### Security & Concurrency Model
 
 1. **Tenant Trust Model**: Any non-empty `X-API-KEY` hashes to `tenant = sha256("cubepod-e2b-volume-v1\x00" + apiKey)`. Rotating an API key changes the tenant hash and orphans prior volumes. Gateway deployments rely on upstream ingress/auth or trusted callers; per-tenant volume count is capped (`MaxVolumesPerTenant`, default 64). Note: `/sandboxes` routes themselves do not enforce per-tenant ownership in Alpha, so tenant isolation applies to `/volumes`, `/volumecontent`, and `volumeMounts` lookup/commit.
-2. **Locking**: `Store.mu` protects in-memory maps (`vols`, `byName`, `mounts`) and is never held across `io.Copy` or Docker Engine HTTP calls. Each `volRec` has its own `mu sync.Mutex` for filesystem commit and `attrs.json` persistence. Known limitation: `Server.mu` in `pkg/gateway/sandboxes.go` is still held across `startRuntimeSandbox`/`pauseRuntimeSandbox` (deferred).
+2. **Locking**: `Store.mu` protects in-memory maps (`vols`, `byName`, `mounts`) and is never held across `io.Copy` or Docker Engine HTTP calls. Each `volRec` has its own `mu sync.Mutex` for filesystem commit and `attrs.json` persistence. Per-sandbox gateway locking is decoupled via `acquireSandboxLock` in `pkg/gateway/sandboxes.go` so slow runtime starts and pauses lock only the affected sandbox.
 
 ### Boundary Conditions & Failure Recovery
 
@@ -151,9 +150,13 @@ flowchart LR
 
 ### Graduation Criteria
 
-- **Alpha (Current)**: Local Docker runtime supported; symlink-safe fd I/O, upload caps, tenant quota, and `nosuid,nodev` verified; live K8s gated off with `501`.
-- **Beta**: Shared CSI/Kata volume content backend, `podd-init` `pivot_root` mount preservation, per-sandbox `Server.mu` decoupling, and live K8s E2E tests.
-- **GA**: Production bake time in CubePlex with API-key rotation/tenant auth integration.
+- **Alpha (`v0.4.0`)**:
+  - [x] Local Docker runtime supported; symlink-safe fd I/O, upload caps, tenant quota, and `nosuid,nodev` verified; live K8s gated off with `501`.
+- **Beta (`v0.6.0`)**:
+  - [x] Shared CSI/Kata volume content backend and `podd-init` `pivot_root` mount preservation implemented (via [CEP-0026](../0026-k8s-kata-e2b-volumes/README.md)).
+  - [x] Per-sandbox gateway locking implemented via `acquireSandboxLock` in `pkg/gateway/sandboxes.go`.
+- **GA / Stable (`v1.0.0`)**:
+  - [ ] Live Kubernetes Kata + RWX CSI E2E verification (`TestK8sLiveE2EVolumeMountsAndFork`), external KMS/API-key rotation, and automated RWX PVC capacity alerting (tracked in [#102](https://github.com/cubeplexai/cubepod/issues/102)).
 
 ### Upgrade / Downgrade Strategy
 
@@ -175,6 +178,7 @@ flowchart LR
 ## Implementation History
 
 - **2026-11-15**: Implemented E2B 2.64.0 Volume store, gateway REST API, Docker runtime mounts, CRD/controller plumbing, security hardening (symlink-safe fd I/O, `1000:1000` + `0o777` masking, per-volume locks, upload/tenant caps, K8s Alpha gating), and CEP-0025.
+- **2026-11-17**: Promoted to `beta`. Per-sandbox gateway locking (`acquireSandboxLock` in `pkg/gateway/sandboxes.go`) and Kubernetes shared RWX backend (via [CEP-0026](../0026-k8s-kata-e2b-volumes/README.md)) implemented; live Kata + RWX CSI verification, external KMS/API-key rotation, and automated alerting tracked in [#102](https://github.com/cubeplexai/cubepod/issues/102).
 
 ---
 

@@ -23,7 +23,7 @@ CubePod removes this compromise by booting **stock, unmodified OCI images** insi
 | Capability | Plain Containers | Ephemeral MicroVMs | CubePod |
 | :--- | :--- | :--- | :--- |
 | **Compute Isolation** | Shared host Linux kernel | Hardware VM (`Firecracker` / `QEMU`) | Hardware VM (`Kata QEMU` / `Cloud Hypervisor`) + local Docker loopback |
-| **OS RootFS Persistence** | Ephemeral writable layer | Ephemeral scratch layer | **Persistent `OverlayFS` `upperdir`** (`<box>-rootfs-pvc`) |
+| **OS RootFS Persistence** | Ephemeral writable layer | Ephemeral scratch layer (or VM snapshot) | **Persistent `OverlayFS` `upperdir`** (`<box>-rootfs-pvc`) |
 | **Workspace Persistence** | Optional PVC mount | Optional or lost on stop | **Decoupled persistent volume** (`<box>-workspace-pvc`) |
 | **RootFS Reset / OS Upgrade** | Recreate container | Image rebuild | Monotonic `rootfsGeneration` swap — **`/workspace` stays intact** |
 | **Cold Start Latency** | ~1–3 s | ~150 ms | **`< 50 ms`** via pre-attached `PodWarmPool` CAS claims |

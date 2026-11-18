@@ -8,13 +8,13 @@ participating-areas:
   - "sdk"
 status: "implemented"
 creation-date: "2026-11-11"
-last-updated: "2026-11-11"
+last-updated: "2026-11-17"
 target-version: "v0.3.1"
-stage: "alpha"
-latest-milestone: "v0.3.1"
+stage: "beta"
+latest-milestone: "v0.6.0"
 milestone:
   alpha: "v0.3.1"
-  beta: "v0.4.0"
+  beta: "v0.6.0"
   stable: "v1.0.0"
 feature-gates:
   - name: "E2BProtocolCompatibility"

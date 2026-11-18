@@ -4,12 +4,12 @@
 | :--- | :--- |
 | **CEP Number** | `0024` |
 | **Status** | `implemented` |
-| **Stage** | `alpha` |
+| **Stage** | `beta` |
 | **Owning Area** | `gateway` |
 | **Participating Areas** | `runtime` |
 | **Authors** | @xfgong |
 | **Created** | 2026-11-15 |
-| **Updated** | 2026-11-15 |
+| **Updated** | 2026-11-17 |
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
@@ -189,10 +189,13 @@ flowchart LR
 
 ### Graduation Criteria
 
-- **Alpha (current)**: Implemented in `podd` and `cubepod-gateway` with unit/multi-process tests passing (`cargo test -p podd`, `go test -race ./pkg/gateway/...`).
-- **Beta**: Verified against official Python and TypeScript E2B SDKs in CI and live Kubernetes Kata cluster.
-- **Stable**: Baked in CubePlex production with Prometheus watcher/stream metrics.
-  - Watcher/stream metrics exported (*Added in v0.7.0*): `podd` exposes `cubepod_podd_watchers_active`, `cubepod_podd_watch_events_emitted_total`, and `cubepod_podd_watch_overflows_total{kind="inotify_queue|ring_buffer|subscriber_queue"}`; the gateway exposes `cubepod_watch_streams_active`, `cubepod_watchers_active`, `cubepod_watch_events_total`, and `cubepod_watch_overflows_total`. The `CubePodWatchOverflowDetected` alert lives in `deploy/monitoring/watcher-secret-alerts.yaml`.
+- **Alpha (`v0.5.0`)**:
+  - [x] Implemented in `podd` and `cubepod-gateway` with unit/multi-process tests passing (`cargo test -p podd`, `go test -race ./pkg/gateway/...`).
+- **Beta (`v0.6.0`)**:
+  - [x] Verified against official Python and TypeScript E2B SDKs in CI and live Kubernetes Kata cluster (`TestK8sLiveE2EWatchAndMakeDir`).
+- **Stable (`v1.0.0`)**:
+  - [x] Watcher/stream metrics exported (*Added in v0.7.0*, [#103](https://github.com/cubeplexai/cubepod/issues/103)): `podd` exposes `cubepod_podd_watchers_active`, `cubepod_podd_watch_events_emitted_total`, and `cubepod_podd_watch_overflows_total{kind="inotify_queue|ring_buffer|subscriber_queue"}`; the gateway exposes `cubepod_watch_streams_active`, `cubepod_watchers_active`, `cubepod_watch_events_total`, and `cubepod_watch_overflows_total`. The `CubePodWatchOverflowDetected` alert lives in `deploy/monitoring/watcher-secret-alerts.yaml`.
+  - [ ] Baked in CubePlex production.
 
 ### Upgrade / Downgrade Strategy
 
@@ -214,6 +217,7 @@ No CRD or persistent on-disk schema changes. Watchers are ephemeral in-memory ke
 ## Implementation History
 
 - `2026-11-15`: Initial implementation in `crates/podd/src/watch.rs`, `pkg/gateway/watch.go`, and `pkg/gateway/connectrpc.go`; review hardening (stream/poll separation, `eventfd` fd-ownership, `MakeDir` chown, symlink containment, path alignment, watcher caps/TTL, clean end-stream/keepalive frames, `fsnotify` event mapping) and CEP-0024 documented.
+- `2026-11-17`: Promoted to `beta`. Live Kubernetes Kata E2E tests (`TestK8sLiveE2EWatchAndMakeDir`) and official Python/TypeScript SDK test suites verified; remaining Stable watcher/stream metrics tracked in [#103](https://github.com/cubeplexai/cubepod/issues/103).
 
 ---
 
