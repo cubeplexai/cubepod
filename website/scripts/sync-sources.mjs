@@ -407,8 +407,52 @@ const HELM_VALUE_DESCRIPTIONS = {
     zh: '*v0.6.0 新增。* 可选内联 32 字节 Base64/64-Hex 加密密钥；未指定 `existingSecret` 时自动创建 `<fullname>-secrets-key` Secret。',
   },
   'featureGates.e2bTemplateAPI': {
-    en: '*Changed in v0.6.0.* Wired into `--feature-gate=E2BTemplateAPI=...` and `--e2b-template-api`; switches `GET /templates` to the E2B JSON array format.',
-    zh: '*v0.6.0 变更。* 同步注入 `--feature-gate=E2BTemplateAPI=...` 与 `--e2b-template-api`，开启后 `GET /templates` 返回 E2B JSON 数组格式。',
+    en: '*Changed in v0.7.0.* Defaults to `true` (GA). Wired into `--feature-gate=E2BTemplateAPI=...` and `--e2b-template-api`; set `false` to roll back `GET /templates` to the legacy `{"templates":[...]}` wrapper.',
+    zh: '*v0.7.0 变更。* 默认值升级为 `true`（GA）。同步注入 `--feature-gate=E2BTemplateAPI=...` 与 `--e2b-template-api`；设为 `false` 可将 `GET /templates` 回滚为旧版 `{"templates":[...]}` 包装响应。',
+  },
+  'templateBuild.contextStore.backend': {
+    en: '*Added in v0.7.0.* Context archive and build log backend: `"local"` (single-replica `cubepod-template-context` RWO PVC, forces `controller.replicaCount=1`) or `"s3"` (shared S3-compatible object storage allowing HA controller replicas).',
+    zh: '*v0.7.0 新增。* 模板构建上下文与日志存储后端：`"local"`（单副本 `cubepod-template-context` RWO PVC，强制 `controller.replicaCount=1`）或 `"s3"`（共享 S3 兼容对象存储，支持 Controller 多副本高可用）。',
+  },
+  'templateBuild.contextStore.s3.endpoint': {
+    en: '*Added in v0.7.0.* S3-compatible endpoint URL (e.g., `https://minio.cubepod-system.svc:9000` or empty for AWS S3) when `contextStore.backend=s3`.',
+    zh: '*v0.7.0 新增。* 当 `contextStore.backend=s3` 时使用的 S3 兼容对象存储端点 URL（例如 MinIO 地址或留空使用 AWS S3）。',
+  },
+  'templateBuild.contextStore.s3.bucket': {
+    en: '*Added in v0.7.0.* S3 bucket storing context tarballs (`<prefix>contexts/<hash>.tar`) and chunked build logs (`<prefix>logs/<buildID>/*.jsonl`).',
+    zh: '*v0.7.0 新增。* 用于存放上下文压缩包（`<prefix>contexts/<hash>.tar`）与分片构建日志（`<prefix>logs/<buildID>/*.jsonl`）的 S3 Bucket 名称。',
+  },
+  'templateBuild.contextStore.s3.region': {
+    en: '*Added in v0.7.0.* AWS SigV4 region used when signing requests against S3-compatible object storage.',
+    zh: '*v0.7.0 新增。* 对 S3 兼容对象存储请求执行 AWS SigV4 签名时使用的 Region。',
+  },
+  'templateBuild.contextStore.s3.prefix': {
+    en: '*Added in v0.7.0.* Optional object key prefix inside the S3 context store bucket.',
+    zh: '*v0.7.0 新增。* S3 Bucket 内的可选对象键前缀。',
+  },
+  'templateBuild.contextStore.s3.forcePathStyle': {
+    en: '*Added in v0.7.0.* Enable path-style S3 requests (`<endpoint>/<bucket>/<key>`) for MinIO, SeaweedFS, or Cloudflare R2.',
+    zh: '*v0.7.0 新增。* 是否强制使用路径风格（Path-Style）S3 请求（适用于 MinIO、SeaweedFS 或 Cloudflare R2）。',
+  },
+  'templateBuild.contextStore.s3.credentialsSecretName': {
+    en: '*Added in v0.7.0.* Existing Kubernetes Secret (`accessKeyId`, `secretAccessKey`, optional `sessionToken`) injected as `CUBEPOD_S3_*` env vars on Controller and Gateway Pods.',
+    zh: '*v0.7.0 新增。* 已存在的 Kubernetes Secret 名称（需含 `accessKeyId`、`secretAccessKey` 及可选 `sessionToken` 键），以环境变量形式安全注入 `CUBEPOD_S3_*`。',
+  },
+  'templateBuild.buildkit.replicaCount': {
+    en: '*Added in v0.7.0.* Number of `buildkitd` replicas. Setting `> 1` switches `cubepod-buildkit` from a single-replica `Deployment` to a `StatefulSet` with per-replica cache `volumeClaimTemplates` and a headless Service.',
+    zh: '*v0.7.0 新增。* `buildkitd` 副本数。设为 `> 1` 时，`cubepod-buildkit` 从单副本 `Deployment` 切换为带每副本 `volumeClaimTemplates` 与 Headless Service 的 `StatefulSet`。',
+  },
+  'templateBuild.buildkit.tls.enabled': {
+    en: '*Added in v0.7.0.* Enable mutual TLS (`:1234`) between `cubepod-controller` and `cubepod-buildkit`.',
+    zh: '*v0.7.0 新增。* 是否在 `cubepod-controller` 与 `cubepod-buildkit`（`:1234`）之间启用双向 mTLS 认证。',
+  },
+  'templateBuild.buildkit.tls.secretName': {
+    en: '*Added in v0.7.0.* Kubernetes Secret holding `ca.crt`, `tls.crt`, and `tls.key` mounted into `buildkitd` and `cubepod-controller` when `buildkit.tls.enabled=true`.',
+    zh: '*v0.7.0 新增。* 当 `buildkit.tls.enabled=true` 时挂载至 `buildkitd` 与 `cubepod-controller` 的 Secret 名称（需包含 `ca.crt`、`tls.crt` 与 `tls.key`）。',
+  },
+  'templateBuild.buildkit.tls.serverName': {
+    en: '*Added in v0.7.0.* TLS ServerName (SAN) verified by `cubepod-controller` when dialing `cubepod-buildkit` over mTLS.',
+    zh: '*v0.7.0 新增。* `cubepod-controller` 通过 mTLS 连接 `cubepod-buildkit` 时校验证书 SAN 使用的 `serverName`。',
   },
   'featureGates.transparentEgress': {
     en: '*Added in v0.6.0.* Wired into `--feature-gate=TransparentEgress=...` (combined with `egress.transparent`).',

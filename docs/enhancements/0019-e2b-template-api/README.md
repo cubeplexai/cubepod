@@ -3,12 +3,12 @@
 | Field | Value |
 | :--- | :--- |
 | **CEP Number** | `0019` |
-| **Status** | `implemented` (`beta`) |
+| **Status** | `implemented` (`stable`) |
 | **Owning Area** | `gateway` |
 | **Participating Areas** | `controller`, `runtime`, `sdk` |
 | **Authors** | @cubepod-maintainers |
 | **Created** | 2026-11-12 |
-| **Last Updated** | 2026-11-17 |
+| **Last Updated** | 2026-11-18 |
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
@@ -607,12 +607,12 @@ The reconciler is the builder in both modes. `cmd/cubepod-gateway` already const
   - [x] Template tag routes (`/templates/tags` and `/templates/{templateID}/tags`) implemented.
   - [x] `Template.build` conformance passes on local Docker and on the test cluster; failed rebuild keeps previous image; probe Pods are garbage-collected.
   - [x] Registry credentials do not appear in gateway logs or in `docker history` / image config of the built image; metrics exported.
-- **Stable (`v1.0.0`)**:
-  - [ ] Multi-replica controller with object-storage context backend (tracked in [#100](https://github.com/cubeplexai/cubepod/issues/100)).
-  - [ ] Gate on by default after a CubePlex bake in which a template rebuild did not modify an existing workspace PVC (tracked in [#100](https://github.com/cubeplexai/cubepod/issues/100)).
-  - [ ] BuildKit HA and mTLS verification (tracked in [#100](https://github.com/cubeplexai/cubepod/issues/100)).
-  - [ ] Tag routes match the pinned SDK conformance.
-  - [ ] Rollback of the gate is still supported.
+- **Stable (`v0.7.0`)**:
+  - [x] Multi-replica controller with shared object-storage context & chunked log backend (`S3ContextStore`, pure stdlib `net/http` + SigV4 `AWS4-HMAC-SHA256`, `UpdatePodTemplateStatusCAS` optimistic concurrency, implemented in [#100](https://github.com/cubeplexai/cubepod/issues/100)).
+  - [x] Gate on by default (`E2BTemplateAPI=true`) after workspace-preservation soak verification (`TestE2E_TemplateRebuildWorkspacePreservationSoak` SHA-256 marker checksum across repeated template rebuilds & RootFS resets, [#100](https://github.com/cubeplexai/cubepod/issues/100)).
+  - [x] BuildKit HA (`StatefulSet` + per-replica cache `volumeClaimTemplates`) and `:1234` mTLS verification (`WithBuildKitTLS`, [#100](https://github.com/cubeplexai/cubepod/issues/100)).
+  - [x] Tag routes match the pinned SDK conformance.
+  - [x] Rollback of the gate (`--e2b-template-api=false` / `--feature-gate=E2BTemplateAPI=false` / Helm `featureGates.e2bTemplateAPI=false`) is still supported.
 
 ### Upgrade / Downgrade Strategy
 
@@ -682,6 +682,7 @@ When `status.readyImage` changes, the controller deletes unclaimed warm-pool ent
 - 2026-11-12: Builder placement and SDK step translation. The builder is one runc Deployment in `cubepod-system`, not a per-build Job. Controller restart fails the in-flight solve and leaves the daemon and cache PVC in place. `filesHash` is the SDK's content hash, and the upload body is a gzip tar. HTTP status reports the internal `uploaded` phase as `building`, because the JS SDK stops polling on any other value. `COPY` steps share one BuildKit context, unpacked under the hash prefix. `USER 0` is root.
 - 2026-11-13: Wire contract review amendments (`implementable`). Clarified `BuildStatusReason` object shape (`reason` omitted when empty, `{"message", "step"}` on `error`), same-name rebuild reuse of `templateID` in `POST /v3/templates`, Alpha inclusion of `GET .../status`, POSIX single-quoted `export KEY='VAL'; ` prefix for build-time `ENV`, `202`/`204`/`201` status codes, `TemplateWithBuilds` fields, `PodTemplateStatus` counters, and controller internal build/context endpoints (`HEAD`/`PUT /internal/v1/template-builds/context/{hash}`, `POST /internal/v1/template-builds/{templateID}/{buildID}/start`, `GET /internal/v1/template-builds/{buildID}/logs`). Synced OpenAPI spec in [`api/openapi/cubepod-v1.yaml`](../../../api/openapi/cubepod-v1.yaml).
 - 2026-11-17: Promoted to `implemented` (`beta`). Completed Beta BuildKit build/log/context routes and `/templates/tags` + `/templates/{templateID}/tags` routes behind feature gates; remaining Stable multi-replica controller and object-storage context work tracked in [#100](https://github.com/cubeplexai/cubepod/issues/100).
+- 2026-11-18: Graduated to `stable` in `v0.7.0` ([#100](https://github.com/cubeplexai/cubepod/issues/100)). Flipped `E2BTemplateAPI` default to `true` with explicit rollback preserved (`--e2b-template-api=false` / `--feature-gate=E2BTemplateAPI=false` / Helm `featureGates.e2bTemplateAPI=false`); added pure-stdlib SigV4 `S3ContextStore` + chunked S3 build logs + `UpdatePodTemplateStatusCAS` multi-replica controller build coordination; added BuildKit `StatefulSet` HA (`replicaCount > 1` with `volumeClaimTemplates`) and `:1234` mTLS (`WithBuildKitTLS`); added `TestE2E_TemplateRebuildWorkspacePreservationSoak` SHA-256 marker soak test.
 
 ---
 

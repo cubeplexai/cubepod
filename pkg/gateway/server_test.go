@@ -109,6 +109,8 @@ func TestSandboxLifecycleAndRootfsReset(t *testing.T) {
 
 func TestSandboxListTimeoutAndLease(t *testing.T) {
 	reconciler := controller.NewReconciler()
+	reconciler.RegisterTemplate("tpl-1", v1alpha1.PodTemplateSpec{Image: "ubuntu:24.04"})
+	reconciler.RegisterTemplate("tpl-2", v1alpha1.PodTemplateSpec{Image: "ubuntu:24.04"})
 	srv := gateway.NewServer(reconciler)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -198,6 +200,7 @@ func TestSandboxListTimeoutAndLease(t *testing.T) {
 
 func TestCommandExecutionAndAutoResume(t *testing.T) {
 	reconciler := controller.NewReconciler()
+	reconciler.RegisterTemplate("default", v1alpha1.PodTemplateSpec{Image: "ubuntu:24.04"})
 	srv := gateway.NewServer(reconciler)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -314,6 +317,7 @@ func TestCommandExecutionAndAutoResume(t *testing.T) {
 
 func TestFileOperationsAndArchiveSyncWithAutoResume(t *testing.T) {
 	reconciler := controller.NewReconciler()
+	reconciler.RegisterTemplate("default", v1alpha1.PodTemplateSpec{Image: "ubuntu:24.04"})
 	srv := gateway.NewServer(reconciler)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -437,6 +441,7 @@ func TestSignedPanelTokenAndReverseProxy(t *testing.T) {
 	defer mockUpstream.Close()
 
 	reconciler := controller.NewReconciler()
+	reconciler.RegisterTemplate("desktop", v1alpha1.PodTemplateSpec{Image: "ubuntu:24.04"})
 	srv := gateway.NewServer(reconciler)
 	srv.SetPanelSecret("test-secret-key-for-panel-proxy")
 	ts := httptest.NewServer(srv.Handler())
@@ -596,6 +601,7 @@ func TestPoddDataPlaneForwardingAndPrepareStopOnPause(t *testing.T) {
 	defer mockPodd.Close()
 
 	reconciler := controller.NewReconciler()
+	reconciler.RegisterTemplate("kata-pod", v1alpha1.PodTemplateSpec{Image: "ubuntu:24.04"})
 	srv := gateway.NewServer(reconciler)
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -1173,12 +1179,33 @@ func TestTemplateRoutesAndOpenAPI(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	// 1. GET /templates
+	// 1. GET /templates returns E2B JSON array by default
 	tplResp, err := http.Get(ts.URL + "/templates")
 	if err != nil || tplResp.StatusCode != http.StatusOK {
 		t.Fatalf("get templates failed: status=%d err=%v", tplResp.StatusCode, err)
 	}
 	defer tplResp.Body.Close()
+
+	var tplArray []struct {
+		TemplateID  string   `json:"templateID"`
+		BuildID     string   `json:"buildID"`
+		BuildStatus string   `json:"buildStatus"`
+		Aliases     []string `json:"aliases"`
+	}
+	if err := json.NewDecoder(tplResp.Body).Decode(&tplArray); err != nil {
+		t.Fatalf("expected E2B template array on GET /templates by default: %v", err)
+	}
+	if len(tplArray) == 0 {
+		t.Fatalf("expected non-empty default templates array")
+	}
+
+	// 1b. Rollback: SetFeatureGate(E2BTemplateAPI, false) restores wrapped {"templates":[...]}
+	srv.SetFeatureGate(gateway.FeatureGateE2BTemplateAPI, false)
+	rbResp, err := http.Get(ts.URL + "/templates")
+	if err != nil || rbResp.StatusCode != http.StatusOK {
+		t.Fatalf("rollback get templates failed: status=%d err=%v", rbResp.StatusCode, err)
+	}
+	defer rbResp.Body.Close()
 
 	var tplData struct {
 		Templates []struct {
@@ -1188,9 +1215,9 @@ func TestTemplateRoutesAndOpenAPI(t *testing.T) {
 			Description string `json:"description"`
 		} `json:"templates"`
 	}
-	_ = json.NewDecoder(tplResp.Body).Decode(&tplData)
+	_ = json.NewDecoder(rbResp.Body).Decode(&tplData)
 	if len(tplData.Templates) == 0 {
-		t.Fatalf("expected non-empty templates list")
+		t.Fatalf("expected non-empty wrapped templates list when gate rolled back")
 	}
 
 	// 2. GET /openapi.yaml
@@ -2298,6 +2325,7 @@ func TestNetworkPolicyPropagationAcrossLifecycleAndFailover(t *testing.T) {
 
 func TestArchiveSyncEmptyBodyRemovePaths(t *testing.T) {
 	reconciler := controller.NewReconciler()
+	reconciler.RegisterTemplate("desktop", v1alpha1.PodTemplateSpec{Image: "ubuntu:24.04"})
 	srv := gateway.NewServer(reconciler)
 	srv.SetWorkspaceBaseDir(t.TempDir())
 	ts := httptest.NewServer(srv.Handler())
@@ -2858,10 +2886,11 @@ func TestUnifiedFeatureGatesAndDisabling(t *testing.T) {
 	}
 
 	defs := gateway.DefaultFeatureGates()
-	if defs[gateway.FeatureGateE2BTemplateAPI] || defs[gateway.FeatureGateK8sE2BVolumeMounts] {
-		t.Fatalf("expected E2BTemplateAPI and K8sE2BVolumeMounts to default false: %+v", defs)
+	if defs[gateway.FeatureGateK8sE2BVolumeMounts] {
+		t.Fatalf("expected K8sE2BVolumeMounts to default false: %+v", defs)
 	}
 	for _, g := range []string{
+		gateway.FeatureGateE2BTemplateAPI,
 		gateway.FeatureGateTransparentEgress,
 		gateway.FeatureGateDesktopStack,
 		gateway.FeatureGateStatelessGatewayHA,

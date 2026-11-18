@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,7 @@ type KubeClient interface {
 	CreatePodTemplate(ctx context.Context, template v1alpha1.PodTemplate) error
 	UpdatePodTemplate(ctx context.Context, template v1alpha1.PodTemplate) error
 	UpdatePodTemplateStatus(ctx context.Context, template v1alpha1.PodTemplate) error
+	UpdatePodTemplateStatusCAS(ctx context.Context, template v1alpha1.PodTemplate) (*v1alpha1.PodTemplate, error)
 	DeletePodTemplate(ctx context.Context, namespace, name string) error
 
 	GetPodPhase(ctx context.Context, namespace, name string) (string, error)
@@ -80,6 +82,12 @@ type MemoryKubeClient struct {
 	Templates       map[string]v1alpha1.PodTemplate
 	Secrets         map[string]KubeSecret
 	VolumeSnapshots map[string]VolumeSnapshot
+	templateRVSeq   uint64
+}
+
+func (m *MemoryKubeClient) nextTemplateRVLocked() string {
+	m.templateRVSeq++
+	return strconv.FormatUint(m.templateRVSeq, 10)
 }
 
 // NewMemoryKubeClient creates a new in-memory KubeClient.
@@ -216,6 +224,8 @@ func (m *MemoryKubeClient) CreatePodTemplate(_ context.Context, template v1alpha
 	if _, exists := m.Templates[key]; exists {
 		return fmt.Errorf("podtemplate %s already exists: status 409", key)
 	}
+	template.Metadata.Namespace = ns
+	template.Metadata.ResourceVersion = m.nextTemplateRVLocked()
 	m.Templates[key] = template
 	persistLocalTemplate(template)
 	return nil
@@ -268,6 +278,8 @@ func (m *MemoryKubeClient) UpdatePodTemplate(_ context.Context, template v1alpha
 	}
 	existing.Spec = template.Spec
 	existing.Metadata = template.Metadata
+	existing.Metadata.Namespace = ns
+	existing.Metadata.ResourceVersion = m.nextTemplateRVLocked()
 	m.Templates[key] = existing
 	persistLocalTemplate(existing)
 	return nil
@@ -287,9 +299,34 @@ func (m *MemoryKubeClient) UpdatePodTemplateStatus(_ context.Context, template v
 		return fmt.Errorf("podtemplate %s/%s not found", ns, template.Metadata.Name)
 	}
 	existing.Status = template.Status
+	existing.Metadata.ResourceVersion = m.nextTemplateRVLocked()
 	m.Templates[key] = existing
 	persistLocalTemplate(existing)
 	return nil
+}
+
+// UpdatePodTemplateStatusCAS atomically updates PodTemplate.Status only if template.Metadata.ResourceVersion matches.
+func (m *MemoryKubeClient) UpdatePodTemplateStatusCAS(_ context.Context, template v1alpha1.PodTemplate) (*v1alpha1.PodTemplate, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ns := template.Metadata.Namespace
+	if ns == "" {
+		ns = "default"
+	}
+	key := templateKey(ns, template.Metadata.Name)
+	existing, ok := m.Templates[key]
+	if !ok {
+		return nil, fmt.Errorf("podtemplate %s/%s not found", ns, template.Metadata.Name)
+	}
+	if existing.Metadata.ResourceVersion != "" && template.Metadata.ResourceVersion != existing.Metadata.ResourceVersion {
+		return nil, fmt.Errorf("%w: podtemplate %s/%s resourceVersion mismatch (got %q, current %q)", ErrCASConflict, ns, template.Metadata.Name, template.Metadata.ResourceVersion, existing.Metadata.ResourceVersion)
+	}
+	existing.Status = template.Status
+	existing.Metadata.ResourceVersion = m.nextTemplateRVLocked()
+	m.Templates[key] = existing
+	persistLocalTemplate(existing)
+	cp := existing
+	return &cp, nil
 }
 
 // DeletePodTemplate removes a PodTemplate from memory.

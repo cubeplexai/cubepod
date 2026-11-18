@@ -24,6 +24,35 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/version"
 )
 
+func envOrDefault(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func resolveE2BTemplateAPIFlag(explicit bool, flagVal bool, gates map[string]bool) bool {
+	if explicit {
+		if gateVal, ok := gates[gateway.FeatureGateE2BTemplateAPI]; ok {
+			return flagVal && gateVal
+		}
+		return flagVal
+	}
+	if gateVal, ok := gates[gateway.FeatureGateE2BTemplateAPI]; ok {
+		return gateVal
+	}
+	return flagVal
+}
+
 func defaultEgressImage() string {
 	if env := strings.TrimSpace(os.Getenv("CUBEPOD_EGRESS_IMAGE")); env != "" {
 		return env
@@ -44,10 +73,16 @@ func main() {
 		sandboxImage         = flag.String("sandbox-image", "ubuntu:24.04", "Default sandbox image")
 		egressImage          = flag.String("egress-image", defaultEgressImage(), "Default cubepod-egress sidecar image when template egress.image is empty")
 		livePodRouting       = flag.Bool("live-pod-routing", true, "Route commands and files to live in-cluster Pod IP")
-		e2bTemplateAPI       = flag.Bool("e2b-template-api", false, "Enable E2B template API feature gate")
+		e2bTemplateAPI       = flag.Bool("e2b-template-api", true, "Enable E2B template API feature gate")
 		featureGate          = flag.String("feature-gate", "", "Comma-separated feature gates (e.g. E2BTemplateAPI=true)")
 		templateBuild        = flag.Bool("template-build", false, "Enable template image build Beta pipeline")
 		controllerURL        = flag.String("controller-url", "", "Base URL of cubepod-controller for forwarding template build operations")
+		contextStoreBackend  = flag.String("context-store-backend", envOrDefault("CUBEPOD_CONTEXT_STORE_BACKEND", "local"), "Template build context store backend (local or s3)")
+		s3Endpoint           = flag.String("s3-endpoint", os.Getenv("CUBEPOD_S3_ENDPOINT"), "S3-compatible endpoint URL for context store backend=s3")
+		s3Bucket             = flag.String("s3-bucket", os.Getenv("CUBEPOD_S3_BUCKET"), "S3 bucket name for context store backend=s3")
+		s3Region             = flag.String("s3-region", envOrDefault("CUBEPOD_S3_REGION", "us-east-1"), "S3 region for SigV4 signing")
+		s3Prefix             = flag.String("s3-prefix", os.Getenv("CUBEPOD_S3_PREFIX"), "Optional key prefix inside the S3 context store bucket")
+		s3ForcePathStyle     = flag.Bool("s3-force-path-style", envBoolOrDefault("CUBEPOD_S3_FORCE_PATH_STYLE", false), "Use path-style S3 URLs (required for MinIO/SeaweedFS/R2)")
 		stateDir             = flag.String("state-dir", "", "State directory for local template catalog, contexts, and logs")
 		templateProbeTimeout = flag.Duration("template-probe-timeout", 120*time.Second, "Timeout for template readyCmd probe")
 		templateRegistry     = flag.String("template-registry", "", "Target OCI registry URL for template builds (local single-process mode)")
@@ -64,7 +99,13 @@ func main() {
 	flag.Parse()
 
 	gates := gateway.ParseFeatureGates(*featureGate)
-	e2bAPIEnabled := *e2bTemplateAPI || gates[gateway.FeatureGateE2BTemplateAPI]
+	e2bFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "e2b-template-api" {
+			e2bFlagSet = true
+		}
+	})
+	e2bAPIEnabled := resolveE2BTemplateAPIFlag(e2bFlagSet, *e2bTemplateAPI, gates)
 
 	effectiveStateDir := *stateDir
 	if effectiveStateDir == "" {
@@ -85,6 +126,9 @@ func main() {
 		"e2bTemplateAPI", e2bAPIEnabled,
 		"templateBuild", *templateBuild,
 		"controllerURL", *controllerURL,
+		"contextStoreBackend", *contextStoreBackend,
+		"s3Bucket", *s3Bucket,
+		"s3Region", *s3Region,
 		"stateDir", effectiveStateDir,
 		"templateProbeTimeout", *templateProbeTimeout,
 	)
@@ -122,11 +166,20 @@ func main() {
 	var contextDir string
 	if effectiveStateDir != "" {
 		contextDir = filepath.Join(effectiveStateDir, "template-context")
-		opts = append(opts,
-			controller.WithStateDir(effectiveStateDir),
-			controller.WithContextStore(controller.NewMemoryContextStore(contextDir)),
-		)
+		opts = append(opts, controller.WithStateDir(effectiveStateDir))
 	}
+	ctxStore, err := controller.NewContextStoreFromConfig(*contextStoreBackend, effectiveStateDir, controller.S3ContextStoreConfig{
+		Endpoint:       *s3Endpoint,
+		Bucket:         *s3Bucket,
+		Region:         *s3Region,
+		Prefix:         *s3Prefix,
+		ForcePathStyle: *s3ForcePathStyle,
+	})
+	if err != nil {
+		slog.Error("failed to configure template context store", "backend", *contextStoreBackend, "err", err)
+		os.Exit(1)
+	}
+	opts = append(opts, controller.WithContextStore(ctxStore))
 	if *controllerURL == "" && !hasKube && *templateBuild {
 		opts = append(opts, controller.WithImageBuilder(controller.NewLocalDockerBuilder(contextDir)))
 	}
@@ -215,9 +268,7 @@ func main() {
 		slog.Info("E2B volume store enabled", "dir", volDir, "dockerVolumes", vcfg.DockerVolumes)
 	}
 	gw.ApplyFeatureGates(gates)
-	if *e2bTemplateAPI {
-		gw.SetFeatureGate(gateway.FeatureGateE2BTemplateAPI, true)
-	}
+	gw.SetFeatureGate(gateway.FeatureGateE2BTemplateAPI, e2bAPIEnabled)
 
 	secretsEnabled, secretsK8s, scfg, err := resolveSecretsConfig(
 		os.Getenv("CUBEPOD_SECRETS_BACKEND"),

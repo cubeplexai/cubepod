@@ -23,10 +23,11 @@ import (
 )
 
 func TestCEP0019_GatewayTemplateAPI(t *testing.T) {
-	// 1. gate off GET /templates stays wrapped
+	// 1. gate off GET /templates stays wrapped (explicit rollback)
 	t.Run("gate off GET /templates stays wrapped", func(t *testing.T) {
-		r := controller.NewReconciler()
+		r := controller.NewReconciler(controller.WithE2BTemplateAPI(false))
 		s := gateway.NewServer(r)
+		s.SetFeatureGate(gateway.FeatureGateE2BTemplateAPI, false)
 		ts := httptest.NewServer(s.Handler())
 		defer ts.Close()
 

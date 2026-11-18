@@ -1,4 +1,21 @@
 {{- if .Values.templateBuild.enabled }}
+{{- $ctxBackend := include "cubepod.contextStoreBackend" . }}
+{{- $bkReplicas := include "cubepod.buildkitReplicaCount" . | int }}
+{{- $bkTLSSecret := include "cubepod.buildkitTLSSecretName" . }}
+{{- $cacheSize := .Values.templateBuild.cacheSize | default "20Gi" | toString }}
+{{- $cacheSizeMB := 20480 }}
+{{- if hasSuffix "Gi" $cacheSize }}
+  {{- $cacheSizeMB = mul (trimSuffix "Gi" $cacheSize | int) 1024 }}
+{{- else if hasSuffix "G" $cacheSize }}
+  {{- $cacheSizeMB = mul (trimSuffix "G" $cacheSize | int) 1000 }}
+{{- else if hasSuffix "Mi" $cacheSize }}
+  {{- $cacheSizeMB = trimSuffix "Mi" $cacheSize | int }}
+{{- else if hasSuffix "M" $cacheSize }}
+  {{- $cacheSizeMB = trimSuffix "M" $cacheSize | int }}
+{{- else if regexMatch "^[0-9]+$" $cacheSize }}
+  {{- $cacheSizeMB = $cacheSize | int }}
+{{- end }}
+{{- if le $bkReplicas 1 }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -14,6 +31,8 @@ spec:
     requests:
       storage: {{ .Values.templateBuild.cacheSize }}
 ---
+{{- end }}
+{{- if ne $ctxBackend "s3" }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -29,6 +48,7 @@ spec:
     requests:
       storage: 10Gi
 ---
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -47,7 +67,44 @@ spec:
     app.kubernetes.io/name: cubepod
     app.kubernetes.io/instance: {{ .Release.Name }}
     app.kubernetes.io/component: buildkit
+{{- if gt $bkReplicas 1 }}
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cubepod-buildkit-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: buildkit
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: buildkit
+      port: 1234
+      targetPort: 1234
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: cubepod
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: buildkit
+{{- end }}
+---
+{{- if gt $bkReplicas 1 }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cubepod-buildkit
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: buildkit
+spec:
+  serviceName: cubepod-buildkit-headless
+  replicas: {{ $bkReplicas }}
+  podManagementPolicy: Parallel
+{{- else }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -58,6 +115,7 @@ metadata:
     app.kubernetes.io/component: buildkit
 spec:
   replicas: 1
+{{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: cubepod
@@ -75,19 +133,6 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- $cacheSize := .Values.templateBuild.cacheSize | default "20Gi" | toString }}
-      {{- $cacheSizeMB := 20480 }}
-      {{- if hasSuffix "Gi" $cacheSize }}
-        {{- $cacheSizeMB = mul (trimSuffix "Gi" $cacheSize | int) 1024 }}
-      {{- else if hasSuffix "G" $cacheSize }}
-        {{- $cacheSizeMB = mul (trimSuffix "G" $cacheSize | int) 1000 }}
-      {{- else if hasSuffix "Mi" $cacheSize }}
-        {{- $cacheSizeMB = trimSuffix "Mi" $cacheSize | int }}
-      {{- else if hasSuffix "M" $cacheSize }}
-        {{- $cacheSizeMB = trimSuffix "M" $cacheSize | int }}
-      {{- else if regexMatch "^[0-9]+$" $cacheSize }}
-        {{- $cacheSizeMB = $cacheSize | int }}
-      {{- end }}
       containers:
         - name: buildkitd
           image: {{ .Values.templateBuild.buildkit.image }}
@@ -96,6 +141,11 @@ spec:
             - "--oci-worker-no-process-sandbox"
             - "--oci-worker-gc"
             - "--oci-worker-gc-keepstorage={{ $cacheSizeMB }}"
+            {{- if $bkTLSSecret }}
+            - "--tlscacert=/etc/buildkit/tls/ca.crt"
+            - "--tlscert=/etc/buildkit/tls/tls.crt"
+            - "--tlskey=/etc/buildkit/tls/tls.key"
+            {{- end }}
           securityContext:
             runAsUser: 1000
             runAsGroup: 1000
@@ -110,10 +160,38 @@ spec:
           volumeMounts:
             - name: cache
               mountPath: /home/user/.local/share/buildkit
+            {{- if $bkTLSSecret }}
+            - name: buildkit-tls
+              mountPath: /etc/buildkit/tls
+              readOnly: true
+            {{- end }}
+      {{- if or (le $bkReplicas 1) $bkTLSSecret }}
       volumes:
+        {{- if le $bkReplicas 1 }}
         - name: cache
           persistentVolumeClaim:
             claimName: cubepod-buildkit-cache
+        {{- end }}
+        {{- if $bkTLSSecret }}
+        - name: buildkit-tls
+          secret:
+            secretName: {{ $bkTLSSecret | quote }}
+        {{- end }}
+      {{- end }}
+{{- if gt $bkReplicas 1 }}
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+        labels:
+          {{- include "cubepod.labels" . | nindent 10 }}
+          app.kubernetes.io/component: buildkit
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: {{ .Values.templateBuild.cacheSize }}
+{{- end }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

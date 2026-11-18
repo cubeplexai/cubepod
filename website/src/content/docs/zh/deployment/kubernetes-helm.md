@@ -63,12 +63,12 @@ flowchart TB
 | `rbac.yaml` | `ServiceAccount`、`ClusterRole`（`<fullname>-controller`）、`ClusterRoleBinding` | 授予核心资源 `pods`、`pods/exec`、`pods/log`、`persistentvolumeclaims`、`events`、`configmaps`、`secrets` 及 `cubepod.io`/`pod.cubeplex.ai` CRD（`podboxes`、`podtemplates`、`podwarmpools`、`sandboxwebhooks`）及其 `status` 子资源的增删改查权限，以及 `apps` `deployments`/`statefulsets` 只读权限 |
 | `gateway-deployment.yaml` | `Deployment`（`gateway.replicaCount`，默认 `2`） | 提供 `/health` 存活（`initialDelaySeconds: 5, periodSeconds: 10`）与就绪（`initialDelaySeconds: 2, periodSeconds: 5`）探针；统一注入运行时/存储/出站镜像参数、`--feature-gate`、`secrets.*`、`e2bVolumes.*`、`global.imagePullSecrets`、`egress.caSecretName` 与可选的 `gateway.persistence` |
 | `pdb.yaml` *(v0.6.0 新增)* | `PodDisruptionBudget`（`<fullname>-gateway`） | 当 `gateway.podDisruptionBudget.enabled` 为 `true`，或为 `null` 且 `gateway.replicaCount > 1` 时渲染（默认 `minAvailable: 1`） |
-| `controller-deployment.yaml` | `Deployment`（`controller.replicaCount`，若 `templateBuild.enabled` 为 true 则强制锁定为 `1`） | 提供 `/livez` 与 `/healthz`；按 `--sync-interval`（默认 `5s`）执行调谐；注入运行时/存储/出站镜像参数、`--feature-gate`、`global.imagePullSecrets` 与 `egress.caSecretName`，开启 `templateBuild.enabled` 时挂载 `cubepod-template-context` PVC |
+| `controller-deployment.yaml` | `Deployment`（`controller.replicaCount`，仅在 `templateBuild.enabled=true` 且 `contextStore.backend=local` 时锁定为 `1`；设为 `s3` 时支持多副本 HA） | 提供 `/livez` 与 `/healthz`；按 `--sync-interval`（默认 `5s`）执行调谐；注入运行时/存储/出站镜像参数、`--feature-gate`、`global.imagePullSecrets`、`egress.caSecretName`、S3 上下文存储（`--context-store-backend=s3`）及 BuildKit mTLS 参数，开启本地构建时挂载 `cubepod-template-context` PVC |
 | `gateway-state-pvc.yaml` | `PersistentVolumeClaim`（`<fullname>-gateway-state`，可选） | 仅当 `gateway.persistence.enabled: true` 且未指定 `existingClaim` 时渲染；用于持久化 Gateway `stateDir`（本地模板、文件密钥与生命周期事件/Webhook） |
 | `secrets-key-secret.yaml` *(v0.6.0 新增)* | `Secret`（`<fullname>-secrets-key`，可选） | 当内联设置 `secrets.encryptionKey` 且未设置 `secrets.existingSecret` 与 `gateway.secretsKeySecret` 时渲染 |
 | `e2b-volumes-pvc.yaml` | `PersistentVolumeClaim`（`e2bVolumes.pvcName`，`ReadWriteMany`） | 当 `e2bVolumes.rwxStorageClassName` 非空时创建，并通过 `helm.sh/resource-policy: keep` 在卸载时保留数据 |
 | `service.yaml` | `<fullname>-gateway`（`:8080`）、`<fullname>-controller`（`:8081`） | 默认均为 `ClusterIP`；切换为 `NodePort` 时支持通过 `gateway.service.nodePort` 固定端口 |
-| `buildkit.yaml` | `Deployment`、`Service`（`:1234`）、2 个 `PVC`、`NetworkPolicy` | 仅当 `templateBuild.enabled: true` 时渲染 |
+| `buildkit.yaml` | `Deployment`（当 `buildkit.replicaCount > 1` 时切换为 `StatefulSet` + Headless `Service`）、`Service`（`:1234`）、缓存 `PVC` / `volumeClaimTemplates`、可选 `cubepod-template-context` PVC 与 `NetworkPolicy` | 仅当 `templateBuild.enabled: true` 时渲染 *(v0.7.0 变更)* |
 
 ## 生产环境核心配置示例
 
@@ -127,26 +127,42 @@ helm upgrade --install cubepod ./deploy/helm/cubepod \
 - **Gateway PodDisruptionBudget（`gateway.podDisruptionBudget.*`）** *(v0.6.0 新增)*：当 `gateway.podDisruptionBudget.enabled` 为 `null`（默认值）且 `gateway.replicaCount > 1` 时，`pdb.yaml` 会自动创建 `PodDisruptionBudget`（默认 `minAvailable: 1`，也可显式配置 `maxUnavailable`）。
 - **Zero-Trust 出站代理（`egress.*`）** *(v0.6.0 变更)*：默认启用（`egress.enabled: true`、`egress.transparent: true`），为沙箱注入监听 `:18080` 的 `cubepod-egress` 边车容器（`egress.image.*`），并通过 `egress.exchangeUrl` 按单沙箱 mTLS 置换 `cpodref_` 占位符。仅当 `egress.transparent` 与 `featureGates.transparentEgress` 均为 `true` 时，才启用 `TransparentEgress`（`CUBEPOD_TRANSPARENT=1` + `NET_ADMIN`）。详情请参阅[零信任出站代理与密钥隔离](/zh/concepts/zero-trust-egress/)。
 - **E2B 密钥 HA 存储（`secrets.*`）** *(v0.6.0 新增)*：配置 `CUBEPOD_SECRETS_BACKEND`（默认 `"k8s"`，使用 `KubeSecretBackend` 实现多副本 HA；或 `"file"` 配合 `secrets.dir`；或 `"disabled"`）及加密密钥引用（`secrets.existingSecret`、内联 `secrets.encryptionKey` 或旧版回退 `gateway.secretsKeySecret`）。
-- **统一特性开关（`featureGates.*`）** *(v0.6.0 变更)*：`featureGates` 下的所有开关（`e2bTemplateAPI`、`transparentEgress`、`desktopStack`、`statelessGatewayHA`、`e2bFilesystemWatch`、`e2bSecretsAPI`、`sandboxEventsAndWebhooks`、`k8sE2BVolumeMounts`）会统一渲染为 `--feature-gate=...` 传入 `cubepod-gateway` 与 `cubepod-controller`。
+- **统一特性开关（`featureGates.*`）** *(v0.7.0 变更)*：`featureGates` 下的所有开关（`e2bTemplateAPI`、`transparentEgress`、`desktopStack`、`statelessGatewayHA`、`e2bFilesystemWatch`、`e2bSecretsAPI`、`sandboxEventsAndWebhooks`、`k8sE2BVolumeMounts`）会统一渲染为 `--feature-gate=...` 传入 `cubepod-gateway` 与 `cubepod-controller`。其中 `e2bTemplateAPI` 自 `v0.7.0` 起默认开启（GA；设为 `false` 可回滚）。
 - **共享 E2B RWX 持久化卷（`e2bVolumes.*`）** *(v0.6.0 变更)*：只要将 `e2bVolumes.rwxStorageClassName` 设为非空值（如 `"longhorn-rwx"` 或 `"nfs-storage"`），Chart 就会自动创建 `ReadWriteMany` PVC（`e2bVolumes.pvcName`）、挂载到 `cubepod-gateway` 并**自动开启 `K8sE2BVolumeMounts`**，即使 `e2bVolumes.enabled` 与 `featureGates.k8sE2BVolumeMounts` 保持默认 `false` 也会生效。
 
-## 开启集群内模板构建（`BuildKit`）
+## 开启集群内模板构建（`BuildKit` 与高可用 S3 上下文存储）
 
-`featureGates.e2bTemplateAPI` 与 `templateBuild.enabled` 默认均为 `false`。开启后，Chart 会同步部署隔离的无特权 `moby/buildkit:rootless` 构建 Pod：
+`featureGates.e2bTemplateAPI` 自 *v0.7.0* 起默认为 `true`，而 `templateBuild.enabled` 在未配置目标 OCI 仓库前默认保持 `false`。开启后，Chart 会部署隔离的无特权 `moby/buildkit:rootless` 构建 Pod：
 
 ```yaml
+controller:
+  replicaCount: 2
+
 featureGates:
   e2bTemplateAPI: true
 
 templateBuild:
   enabled: true
+  contextStore:
+    backend: "s3"                  # "local"（单副本 RWO PVC）或 "s3"（多副本高可用对象存储）
+    s3:
+      endpoint: "https://minio.cubepod-system.svc:9000"
+      bucket: "cubepod-template-contexts"
+      region: "us-east-1"
+      prefix: "prod/"
+      forcePathStyle: true
+      credentialsSecretName: "cubepod-s3-creds" # 包含 accessKeyId、secretAccessKey 及可选 sessionToken
   cacheSize: "20Gi"
   probeTimeout: "120s"
   buildkit:
+    replicaCount: 2                # >= 2 时渲染为带 volumeClaimTemplates 的 StatefulSet
     image: "moby/buildkit:rootless"
     address: "tcp://cubepod-buildkit.cubepod-system.svc:1234"
     nodeSelector: {}
-    # 可选 nodeSelector: { role: builder }
+    tls:
+      enabled: true
+      secretName: "cubepod-buildkit-tls" # 包含 ca.crt、tls.crt、tls.key
+      serverName: "cubepod-buildkit"
   registry:
     url: "ghcr.io/your-org"
     repositoryPrefix: "cubepod-templates"
@@ -154,12 +170,13 @@ templateBuild:
     pullSecret: "cubepod-buildkit-pull"
 ```
 
-开启 `templateBuild.enabled: true` 时的关键运维约束：
+开启 `templateBuild.enabled: true` 时的关键运维约束与高可用行为：
 
-1. **Controller 副本数锁定**：由于 `cubepod-template-context`（`10Gi`）以 `ReadWriteOnce` 模式挂载在 `/var/lib/cubepod/context`，`controller-deployment.yaml` 会强制将 Controller 副本数锁定为 `1`。
-2. **Rootless BuildKit 安全上下文**：`cubepod-buildkit` 以 `1000:1000` 运行，配置 `--oci-worker-no-process-sandbox`、`seccompProfile: Unconfined` 与 `appArmorProfile: Unconfined`，无需容器内 root 权限即可执行嵌套 `RUN` 构建步骤。
-3. **入口网络策略（NetworkPolicy）**：`cubepod-buildkit-netpol` 将 TCP `1234` 端口的入站流量严格限定为仅来自标签含 `app.kubernetes.io/component: controller` 的 Pod。
-4. **镜像推拉凭证 Secret**：触发构建前，请确保已在控制面命名空间与工作负载命名空间提前创建 `templateBuild.registry.pushSecret` 与 `pullSecret` 对应的 Docker Registry Secret。
+1. **HA Controller 与 S3 对象存储 *(v0.7.0 新增)***：采用 `contextStore.backend: "local"` 时，由于 `cubepod-template-context`（`10Gi`）为 `ReadWriteOnce` PVC，`controller-deployment.yaml` 会锁定为单副本；切换为 `contextStore.backend: "s3"` 后不再创建 RWO PVC，可直接支持 `controller.replicaCount > 1`，并通过 `PodTemplate` `ResourceVersion` 乐观锁 CAS 协调避免多副本重复构建。
+2. **BuildKit 多副本 `StatefulSet` 与 `:1234` mTLS *(v0.7.0 新增)***：当 `templateBuild.buildkit.replicaCount > 1` 时，`buildkit.yaml` 渲染为带独立缓存卷 `volumeClaimTemplates` 的 `StatefulSet` 及 Headless Service（`cubepod-buildkit-headless`），Controller 自动轮询与故障转移。开启 `templateBuild.buildkit.tls.enabled: true` 时会为 `buildkitd` 与 `cubepod-controller` 挂载 `ca.crt`/`tls.crt`/`tls.key` 并启用双向 mTLS。
+3. **Rootless BuildKit 安全上下文**：`cubepod-buildkit` 以 `1000:1000` 运行，配置 `--oci-worker-no-process-sandbox`、`seccompProfile: Unconfined` 与 `appArmorProfile: Unconfined`，无需容器内 root 权限即可执行嵌套 `RUN` 构建步骤。
+4. **入口网络策略（NetworkPolicy）**：`cubepod-buildkit-netpol` 将 TCP `1234` 端口的入站流量严格限定为仅来自标签含 `app.kubernetes.io/component: controller` 的 Pod。
+5. **镜像推拉凭证 Secret**：触发构建前，请确保已在控制面命名空间与工作负载命名空间提前创建 `templateBuild.registry.pushSecret` 与 `pullSecret` 对应的 Docker Registry Secret。
 
 SDK 与 CLI 构建工作流请参阅[模板目录与构建](/zh/sdks/templates/)。
 

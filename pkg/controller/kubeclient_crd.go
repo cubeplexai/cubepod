@@ -585,6 +585,52 @@ func (c *RESTKubeClient) UpdatePodTemplateStatus(ctx context.Context, template v
 	return fmt.Errorf("UpdatePodTemplateStatus failed: status %d (%s)", resp.StatusCode, string(body))
 }
 
+// UpdatePodTemplateStatusCAS performs an optimistic-concurrency status update using template.Metadata.ResourceVersion.
+// Returns ErrCASConflict if the APIServer rejects the PUT with 409 Conflict or 412 PreconditionFailed.
+func (c *RESTKubeClient) UpdatePodTemplateStatusCAS(ctx context.Context, template v1alpha1.PodTemplate) (*v1alpha1.PodTemplate, error) {
+	ns := c.resolveNamespace(template.Metadata.Namespace)
+	name := template.Metadata.Name
+	if name == "" {
+		return nil, fmt.Errorf("PodTemplate metadata.name is required")
+	}
+	if template.Metadata.ResourceVersion == "" {
+		return nil, fmt.Errorf("%w: PodTemplate %s/%s metadata.resourceVersion is required for CAS", ErrCASConflict, ns, name)
+	}
+	if template.APIVersion == "" {
+		template.APIVersion = "cubepod.io/v1alpha1"
+	}
+	if template.Kind == "" {
+		template.Kind = "PodTemplate"
+	}
+	template.Metadata.Namespace = ns
+
+	statusURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podtemplates/%s/status", c.baseURL, ns, name)
+	payload, err := json.Marshal(template)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal PodTemplate status JSON: %w", err)
+	}
+
+	resp, err := c.doRequest(ctx, http.MethodPut, statusURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("UpdatePodTemplateStatusCAS PUT failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+		var updated v1alpha1.PodTemplate
+		if len(body) > 0 && json.Unmarshal(body, &updated) == nil && updated.Metadata.Name != "" {
+			return &updated, nil
+		}
+		cp := template
+		return &cp, nil
+	}
+	if resp.StatusCode == http.StatusConflict || resp.StatusCode == http.StatusPreconditionFailed {
+		return nil, fmt.Errorf("%w: UpdatePodTemplateStatusCAS status %d (%s)", ErrCASConflict, resp.StatusCode, string(body))
+	}
+	return nil, fmt.Errorf("UpdatePodTemplateStatusCAS failed: status %d (%s)", resp.StatusCode, string(body))
+}
+
 // DeletePodTemplate deletes a PodTemplate Custom Resource by namespace and name, ignoring 404 NotFound.
 func (c *RESTKubeClient) DeletePodTemplate(ctx context.Context, namespace, name string) error {
 	ns := c.resolveNamespace(namespace)

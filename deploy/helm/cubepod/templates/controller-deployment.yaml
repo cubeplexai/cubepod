@@ -1,3 +1,8 @@
+{{- $ctxBackend := include "cubepod.contextStoreBackend" . }}
+{{- $bkTLSSecret := include "cubepod.buildkitTLSSecretName" . }}
+{{- $s3Env := include "cubepod.s3ContextEnv" . }}
+{{- $needsLocalContextPVC := and .Values.templateBuild.enabled (ne $ctxBackend "s3") }}
+{{- $needsBuildkitTLS := and .Values.templateBuild.enabled (ne $bkTLSSecret "") }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -7,7 +12,7 @@ metadata:
     {{- include "cubepod.labels" . | nindent 4 }}
     app.kubernetes.io/component: controller
 spec:
-  {{- if .Values.templateBuild.enabled }}
+  {{- if $needsLocalContextPVC }}
   replicas: 1
   {{- else }}
   replicas: {{ .Values.controller.replicaCount }}
@@ -56,14 +61,37 @@ spec:
             {{- if .Values.controller.kubeToken }}
             - "--kube-token={{ .Values.controller.kubeToken }}"
             {{- end }}
-            {{- if .Values.featureGates.e2bTemplateAPI }}
-            - "--e2b-template-api=true"
-            {{- end }}
+            {{- $fg := .Values.featureGates | default dict }}
+            - "--e2b-template-api={{ include "cubepod.boolDefaultTrue" $fg.e2bTemplateAPI }}"
             - "--feature-gate={{ include "cubepod.featureGatesCSV" . }}"
             {{- if .Values.templateBuild.enabled }}
             - "--template-build=true"
-            - "--buildkit-addr={{ .Values.templateBuild.buildkit.address }}"
+            - "--buildkit-addr={{ include "cubepod.buildkitEffectiveAddress" . }}"
+            - "--context-store-backend={{ $ctxBackend }}"
+            {{- if eq $ctxBackend "s3" }}
+            {{- $s3 := .Values.templateBuild.contextStore.s3 | default dict }}
+            {{- if $s3.endpoint }}
+            - "--s3-endpoint={{ $s3.endpoint }}"
+            {{- end }}
+            {{- if $s3.bucket }}
+            - "--s3-bucket={{ $s3.bucket }}"
+            {{- end }}
+            - "--s3-region={{ default "us-east-1" $s3.region }}"
+            {{- if $s3.prefix }}
+            - "--s3-prefix={{ $s3.prefix }}"
+            {{- end }}
+            - "--s3-force-path-style={{ default false $s3.forcePathStyle }}"
+            {{- else }}
             - "--state-dir=/var/lib/cubepod/context"
+            {{- end }}
+            {{- if $needsBuildkitTLS }}
+            - "--buildkit-ca-cert=/etc/cubepod-buildkit-tls/ca.crt"
+            - "--buildkit-tls-cert=/etc/cubepod-buildkit-tls/tls.crt"
+            - "--buildkit-tls-key=/etc/cubepod-buildkit-tls/tls.key"
+            {{- if .Values.templateBuild.buildkit.tls.serverName }}
+            - "--buildkit-tls-server-name={{ .Values.templateBuild.buildkit.tls.serverName }}"
+            {{- end }}
+            {{- end }}
             {{- if .Values.templateBuild.registry.url }}
             - "--template-registry={{ .Values.templateBuild.registry.url }}"
             {{- end }}
@@ -77,9 +105,14 @@ spec:
             - "--template-probe-timeout={{ .Values.templateBuild.probeTimeout }}"
             {{- end }}
             {{- end }}
-          {{- if .Values.egress.caSecretName }}
+          {{- if or $s3Env .Values.egress.caSecretName }}
           env:
+            {{- if $s3Env }}
+            {{- $s3Env | nindent 12 }}
+            {{- end }}
+            {{- if .Values.egress.caSecretName }}
             {{- include "cubepod.egressCAEnv" . | nindent 12 }}
+            {{- end }}
           {{- end }}
           ports:
             - name: healthz
@@ -99,20 +132,30 @@ spec:
             periodSeconds: 5
           resources:
             {{- toYaml .Values.controller.resources | nindent 12 }}
-          {{- if or .Values.templateBuild.enabled .Values.egress.caSecretName }}
+          {{- if or $needsLocalContextPVC $needsBuildkitTLS .Values.egress.caSecretName }}
           volumeMounts:
-            {{- if .Values.templateBuild.enabled }}
+            {{- if $needsLocalContextPVC }}
             - name: context-storage
               mountPath: /var/lib/cubepod/context
             {{- end }}
+            {{- if $needsBuildkitTLS }}
+            - name: buildkit-tls
+              mountPath: /etc/cubepod-buildkit-tls
+              readOnly: true
+            {{- end }}
             {{- include "cubepod.egressCAVolumeMount" . | nindent 12 }}
           {{- end }}
-      {{- if or .Values.templateBuild.enabled .Values.egress.caSecretName }}
+      {{- if or $needsLocalContextPVC $needsBuildkitTLS .Values.egress.caSecretName }}
       volumes:
-        {{- if .Values.templateBuild.enabled }}
+        {{- if $needsLocalContextPVC }}
         - name: context-storage
           persistentVolumeClaim:
             claimName: cubepod-template-context
+        {{- end }}
+        {{- if $needsBuildkitTLS }}
+        - name: buildkit-tls
+          secret:
+            secretName: {{ $bkTLSSecret | quote }}
         {{- end }}
         {{- include "cubepod.egressCAVolume" . | nindent 8 }}
       {{- end }}

@@ -39,6 +39,35 @@ func parseFeatureGates(raw string) map[string]bool {
 	return gates
 }
 
+func envOrDefault(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func envBoolOrDefault(key string, fallback bool) bool {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			return parsed
+		}
+	}
+	return fallback
+}
+
+func resolveE2BTemplateAPIFlag(explicit bool, flagVal bool, gates map[string]bool) bool {
+	if explicit {
+		if gateVal, ok := gates["E2BTemplateAPI"]; ok {
+			return flagVal && gateVal
+		}
+		return flagVal
+	}
+	if gateVal, ok := gates["E2BTemplateAPI"]; ok {
+		return gateVal
+	}
+	return flagVal
+}
+
 func defaultEgressImage() string {
 	if env := strings.TrimSpace(os.Getenv("CUBEPOD_EGRESS_IMAGE")); env != "" {
 		return env
@@ -64,10 +93,20 @@ func main() {
 		transparentEgress    = flag.Bool("transparent-egress", true, "Enable transparent nftables/DNS egress interception in sidecars")
 		forkMode             = flag.String("fork-mode", "pvc-clone", "Sandbox fork volume cloning mode (pvc-clone or snapshot)")
 		volumeSnapshotClass  = flag.String("volume-snapshot-class", "", "VolumeSnapshotClassName used when --fork-mode=snapshot")
-		e2bTemplateAPI       = flag.Bool("e2b-template-api", false, "Enable E2B template API feature gate")
+		e2bTemplateAPI       = flag.Bool("e2b-template-api", true, "Enable E2B template API feature gate")
 		featureGate          = flag.String("feature-gate", "", "Comma-separated feature gates (e.g. E2BTemplateAPI=true,TransparentEgress=true)")
 		templateBuild        = flag.Bool("template-build", false, "Enable template image build Beta pipeline")
-		buildkitAddr         = flag.String("buildkit-addr", "", "BuildKit daemon gRPC address (e.g. tcp://cubepod-buildkit:1234)")
+		buildkitAddr         = flag.String("buildkit-addr", "", "BuildKit daemon gRPC address(es) (comma-separated supported, e.g. tcp://cubepod-buildkit:1234)")
+		buildkitCACert       = flag.String("buildkit-ca-cert", envOrDefault("CUBEPOD_BUILDKIT_TLS_CA_CERT", os.Getenv("CUBEPOD_BUILDKIT_TLS_CA")), "Path to CA certificate PEM verifying buildkitd TLS server")
+		buildkitTLSCert      = flag.String("buildkit-tls-cert", os.Getenv("CUBEPOD_BUILDKIT_TLS_CERT"), "Path to client TLS certificate PEM for buildkitd mTLS")
+		buildkitTLSKey       = flag.String("buildkit-tls-key", os.Getenv("CUBEPOD_BUILDKIT_TLS_KEY"), "Path to client TLS private key PEM for buildkitd mTLS")
+		buildkitTLSServer    = flag.String("buildkit-tls-server-name", os.Getenv("CUBEPOD_BUILDKIT_TLS_SERVER_NAME"), "Optional TLS server name override for buildkitd verification")
+		contextStoreBackend  = flag.String("context-store-backend", envOrDefault("CUBEPOD_CONTEXT_STORE_BACKEND", "local"), "Template build context store backend (local or s3)")
+		s3Endpoint           = flag.String("s3-endpoint", os.Getenv("CUBEPOD_S3_ENDPOINT"), "S3-compatible endpoint URL for context store backend=s3")
+		s3Bucket             = flag.String("s3-bucket", os.Getenv("CUBEPOD_S3_BUCKET"), "S3 bucket name for context store backend=s3")
+		s3Region             = flag.String("s3-region", envOrDefault("CUBEPOD_S3_REGION", "us-east-1"), "S3 region for SigV4 signing")
+		s3Prefix             = flag.String("s3-prefix", os.Getenv("CUBEPOD_S3_PREFIX"), "Optional key prefix inside the S3 context store bucket")
+		s3ForcePathStyle     = flag.Bool("s3-force-path-style", envBoolOrDefault("CUBEPOD_S3_FORCE_PATH_STYLE", false), "Use path-style S3 URLs (required for MinIO/SeaweedFS/R2)")
 		stateDir             = flag.String("state-dir", "", "State directory for template contexts and logs")
 		templateRegistry     = flag.String("template-registry", "", "Target OCI registry URL for built templates")
 		templateRepoPrefix   = flag.String("template-repo-prefix", "cubepod-templates", "Repository prefix under target template registry")
@@ -82,7 +121,13 @@ func main() {
 	flag.Parse()
 
 	gates := parseFeatureGates(*featureGate)
-	e2bAPIEnabled := *e2bTemplateAPI || gates["E2BTemplateAPI"]
+	e2bFlagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "e2b-template-api" {
+			e2bFlagSet = true
+		}
+	})
+	e2bAPIEnabled := resolveE2BTemplateAPIFlag(e2bFlagSet, *e2bTemplateAPI, gates)
 	transparentEgressEnabled := *transparentEgress
 	if v, ok := gates["TransparentEgress"]; ok {
 		transparentEgressEnabled = v
@@ -123,6 +168,10 @@ func main() {
 		"e2bTemplateAPI", e2bAPIEnabled,
 		"templateBuild", *templateBuild,
 		"buildkitAddr", *buildkitAddr,
+		"buildkitTLSEnabled", *buildkitCACert != "" || *buildkitTLSCert != "",
+		"contextStoreBackend", *contextStoreBackend,
+		"s3Bucket", *s3Bucket,
+		"s3Region", *s3Region,
 		"stateDir", effectiveStateDir,
 		"templateRegistry", *templateRegistry,
 		"templateRepoPrefix", *templateRepoPrefix,
@@ -148,6 +197,10 @@ func main() {
 
 	var builder controller.ImageBuilder
 	if *buildkitAddr != "" {
+		if (*buildkitTLSCert != "") != (*buildkitTLSKey != "") {
+			slog.Error("both --buildkit-tls-cert and --buildkit-tls-key must be set together")
+			os.Exit(1)
+		}
 		bkOpts := []controller.BuildKitBuilderOption{
 			controller.WithBuildKitKubeClient(kubeClient, *namespace),
 		}
@@ -157,9 +210,24 @@ func main() {
 		if *templatePushSecret != "" {
 			bkOpts = append(bkOpts, controller.WithBuildKitPushSecret(*templatePushSecret))
 		}
+		if *buildkitCACert != "" || *buildkitTLSCert != "" || *buildkitTLSKey != "" || *buildkitTLSServer != "" {
+			bkOpts = append(bkOpts, controller.WithBuildKitTLS(*buildkitCACert, *buildkitTLSCert, *buildkitTLSKey, *buildkitTLSServer))
+		}
 		builder = controller.NewBuildKitBuilder(*buildkitAddr, bkOpts...)
 	} else {
 		builder = controller.NewLocalDockerBuilder(contextDir)
+	}
+
+	ctxStore, err := controller.NewContextStoreFromConfig(*contextStoreBackend, effectiveStateDir, controller.S3ContextStoreConfig{
+		Endpoint:       *s3Endpoint,
+		Bucket:         *s3Bucket,
+		Region:         *s3Region,
+		Prefix:         *s3Prefix,
+		ForcePathStyle: *s3ForcePathStyle,
+	})
+	if err != nil {
+		slog.Error("failed to configure template context store", "backend", *contextStoreBackend, "err", err)
+		os.Exit(1)
 	}
 
 	opts := []controller.ReconcilerOption{
@@ -178,6 +246,7 @@ func main() {
 		controller.WithE2BTemplateAPI(e2bAPIEnabled),
 		controller.WithTemplateBuildEnabled(*templateBuild),
 		controller.WithImageBuilder(builder),
+		controller.WithContextStore(ctxStore),
 		controller.WithTemplateRegistry(*templateRegistry),
 		controller.WithTemplateRepoPrefix(*templateRepoPrefix),
 		controller.WithTemplatePushSecret(*templatePushSecret),
@@ -186,10 +255,7 @@ func main() {
 		controller.WithTemplateProbeTimeout(*templateProbeTimeout),
 	}
 	if effectiveStateDir != "" {
-		opts = append(opts,
-			controller.WithStateDir(effectiveStateDir),
-			controller.WithContextStore(controller.NewMemoryContextStore(contextDir)),
-		)
+		opts = append(opts, controller.WithStateDir(effectiveStateDir))
 	}
 	if *egressCACert != "" || *egressCAKey != "" {
 		if *egressCACert == "" || *egressCAKey == "" {

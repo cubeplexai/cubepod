@@ -71,7 +71,10 @@ func TestMetricsInitialState(t *testing.T) {
 		`cubepod_gateway_sandboxes_active{state="Running"}`: "0",
 		`cubepod_gateway_sandboxes_active{state="Paused"}`:  "0",
 		"cubepod_gateway_warmpools_total":                   "0",
-		"cubepod_gateway_templates_total":                   "3",
+		`cubepod_templates{status="ready"}`:                 "3",
+		`cubepod_templates{status="building"}`:              "0",
+		`cubepod_templates{status="waiting"}`:               "0",
+		`cubepod_templates{status="error"}`:                 "0",
 	}
 
 	for metric, expectedVal := range expectedMetrics {
@@ -82,6 +85,13 @@ func TestMetricsInitialState(t *testing.T) {
 		if val != expectedVal {
 			t.Fatalf("metric %q: expected %s, got %s", metric, expectedVal, val)
 		}
+	}
+
+	// Rollback check: disabling E2BTemplateAPI restores cubepod_gateway_templates_total.
+	srv.SetFeatureGate(gateway.FeatureGateE2BTemplateAPI, false)
+	legacyBody := getMetricsText(t, ts.Client(), ts.URL)
+	if val, _ := parseMetricValue(legacyBody, "cubepod_gateway_templates_total"); val != "3" {
+		t.Fatalf("expected cubepod_gateway_templates_total 3 when gate disabled, got %q", val)
 	}
 }
 
@@ -213,13 +223,13 @@ func TestMetricsWarmpoolsAndTemplates(t *testing.T) {
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	// Initially 0 warmpools
+	// Initially 0 warmpools and 3 seeded ready templates
 	body := getMetricsText(t, ts.Client(), ts.URL)
 	if val, _ := parseMetricValue(body, "cubepod_gateway_warmpools_total"); val != "0" {
 		t.Fatalf("expected warmpools_total 0 initially, got %s", val)
 	}
-	if val, _ := parseMetricValue(body, "cubepod_gateway_templates_total"); val != "3" {
-		t.Fatalf("expected templates_total 3, got %s", val)
+	if val, _ := parseMetricValue(body, `cubepod_templates{status="ready"}`); val != "3" {
+		t.Fatalf(`expected cubepod_templates{status="ready"} 3, got %s`, val)
 	}
 
 	// Create a warmpool
@@ -277,13 +287,30 @@ func TestMetricsJSONAccept(t *testing.T) {
 		"cubepod_gateway_sandboxes_active_running",
 		"cubepod_gateway_sandboxes_active_paused",
 		"cubepod_gateway_warmpools_total",
-		"cubepod_gateway_templates_total",
+		"cubepod_templates",
 	}
 
 	for _, k := range expectedKeys {
 		if _, ok := data[k]; !ok {
 			t.Fatalf("expected key %q in JSON metrics output, got: %+v", k, data)
 		}
+	}
+
+	// Verify rollback JSON format emits cubepod_gateway_templates_total when gate disabled.
+	srv.SetFeatureGate(gateway.FeatureGateE2BTemplateAPI, false)
+	rbReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/metrics", nil)
+	rbReq.Header.Set("Accept", "application/json")
+	rbResp, err := ts.Client().Do(rbReq)
+	if err != nil {
+		t.Fatalf("rollback /metrics request failed: %v", err)
+	}
+	defer rbResp.Body.Close()
+	var rbData map[string]interface{}
+	if err := json.NewDecoder(rbResp.Body).Decode(&rbData); err != nil {
+		t.Fatalf("failed to decode rollback JSON response: %v", err)
+	}
+	if _, ok := rbData["cubepod_gateway_templates_total"]; !ok {
+		t.Fatalf("expected cubepod_gateway_templates_total when E2BTemplateAPI=false, got: %+v", rbData)
 	}
 }
 

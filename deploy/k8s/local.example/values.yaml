@@ -44,3 +44,6 @@ egress:
     tag: "v0.6.0"
   caSecretName: "cubepod-egress-ca"
   upstreamCAEnabled: true
+
+featureGates:
+  e2bTemplateAPI: true

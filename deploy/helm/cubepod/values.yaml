@@ -110,8 +110,8 @@ secrets:
   encryptionKey: ""
 
 featureGates:
-  # Turning on changes GET /templates from the wrapped stub to a JSON array
-  e2bTemplateAPI: false
+  # Default on (GA in v0.7.0); set false to roll back GET /templates to the legacy {"templates":[...]} wrapper
+  e2bTemplateAPI: true
   transparentEgress: true
   desktopStack: true
   statelessGatewayHA: true
@@ -122,10 +122,27 @@ featureGates:
 
 templateBuild:
   enabled: false
+  contextStore:
+    # Context archive and log backend: "local" (single-replica RWO PVC) or "s3" (shared object storage for HA controller replicas)
+    backend: "local"
+    s3:
+      endpoint: ""
+      bucket: ""
+      region: "us-east-1"
+      prefix: ""
+      forcePathStyle: false
+      # Existing Kubernetes Secret containing accessKeyId, secretAccessKey, and optional sessionToken keys
+      credentialsSecretName: ""
   buildkit:
+    replicaCount: 1
     image: "moby/buildkit:rootless"
     address: "tcp://cubepod-buildkit.cubepod-system.svc:1234"
     nodeSelector: {}
+    tls:
+      enabled: false
+      # Existing Kubernetes Secret containing ca.crt, tls.crt, and tls.key for BuildKit mTLS (:1234)
+      secretName: ""
+      serverName: "cubepod-buildkit"
   cacheSize: "20Gi"
   probeTimeout: "120s"
   registry:

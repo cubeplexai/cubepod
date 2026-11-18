@@ -9,17 +9,17 @@ participating-areas:
   - "sdk"
 status: "implemented"
 creation-date: "2026-11-12"
-last-updated: "2026-11-17"
+last-updated: "2026-11-18"
 reviewers:
   - "@cubepod-maintainers"
 approvers:
   - "@cubepod-maintainers"
-stage: "beta"
-latest-milestone: "v0.6.0"
+stage: "stable"
+latest-milestone: "v0.7.0"
 milestone:
   alpha: "v0.4.0"
   beta: "v0.6.0"
-  stable: "v1.0.0"
+  stable: "v0.7.0"
 feature-gates:
   - name: "E2BTemplateAPI"
     components:
