@@ -164,6 +164,7 @@ func (d *DockerBackend) apiCreateStart(ctx context.Context, plan dockerRunPlan) 
 	}
 	body := map[string]any{
 		"Image":      plan.Image,
+		"Hostname":   plan.Hostname,
 		"Env":        plan.Env,
 		"HostConfig": hostConfig,
 	}

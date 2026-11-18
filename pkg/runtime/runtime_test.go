@@ -732,3 +732,64 @@ func TestQuiesceSandbox_ThawsOnCloneError(t *testing.T) {
 		t.Fatalf("expected thaw to still execute on clone failure: got %v, want %v", calls, expected)
 	}
 }
+
+func TestDockerFilesystemProfilePreservesIsolation(t *testing.T) {
+	for _, sparse := range []bool{false, true} {
+		d := NewDockerBackend(DockerConfig{BinDir: "/runtime-bin", BaseDir: "/gateway/data", HostBaseDir: "/daemon/data", EnableSparseExt4: sparse})
+		plan, err := d.planRun(SandboxSpec{SandboxID: "cpod-real-hostname"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan.Hostname != "cpod-real-hostname" {
+			t.Fatalf("wrong sandbox hostname: %q", plan.Hostname)
+		}
+		if slices.Contains(plan.Env, "CUBEPOD_SKIP_PIVOT=1") == sparse {
+			t.Fatalf("wrong pivot mode for sparse=%v: %v", sparse, plan.Env)
+		}
+		for _, bind := range []string{"/runtime-bin:/opt/cubepod/bin:ro", "/daemon/data/cpod-real-hostname/workspace:/workspace", "/daemon/data/cpod-real-hostname/rootfs:/rootfs-upper"} {
+			if !slices.Contains(plan.Binds, bind) {
+				t.Fatalf("missing infrastructure injection or independent storage: %q in %v", bind, plan.Binds)
+			}
+		}
+		args, err := d.BuildRunArgs(SandboxSpec{SandboxID: "cpod-real-hostname"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(strings.Join(args, " "), "--privileged") {
+			t.Fatal("must not grant privileged Docker containers")
+		}
+	}
+}
+
+func TestDockerAPIForwardsSandboxHostname(t *testing.T) {
+	var body struct {
+		Hostname   string
+		HostConfig map[string]any
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/containers/create") {
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = io.WriteString(w, `{"Id":"test-container"}`)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	d := NewDockerBackend(DockerConfig{DockerHost: server.URL})
+	plan, err := d.planRun(SandboxSpec{SandboxID: "cpod-hostname"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = d.apiCreateStart(context.Background(), plan); err != nil {
+		t.Fatal(err)
+	}
+	if body.Hostname != "cpod-hostname" {
+		t.Fatalf("wrong Engine API hostname %q", body.Hostname)
+	}
+	if _, ok := body.HostConfig["Privileged"]; ok {
+		t.Fatal("must not add privilege")
+	}
+}

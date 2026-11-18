@@ -150,6 +150,7 @@ type dockerNamedMount struct {
 
 type dockerRunPlan struct {
 	Name       string
+	Hostname   string
 	Image      string
 	Env        []string
 	Binds      []string
@@ -166,7 +167,7 @@ func (d *DockerBackend) BuildRunArgs(spec SandboxSpec) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	args := []string{"run", "-d", "--name", plan.Name}
+	args := []string{"run", "-d", "--name", plan.Name, "--hostname", plan.Hostname}
 	if len(plan.Entrypoint) > 0 {
 		// Injection keeps the historical flag order: bin bind, then entrypoint.
 		if len(plan.Binds) > 0 && strings.Contains(plan.Binds[0], ":/opt/cubepod/bin:") {
@@ -230,13 +231,20 @@ func (d *DockerBackend) planRun(spec SandboxSpec) (dockerRunPlan, error) {
 	}
 
 	plan := dockerRunPlan{
-		Name:    d.containerName(spec.SandboxID),
-		Image:   image,
-		Network: d.cfg.Network,
+		Name:     d.containerName(spec.SandboxID),
+		Hostname: spec.SandboxID,
+		Image:    image,
+		Network:  d.cfg.Network,
 		Env: []string{
 			"CUBEPOD_ADDR=0.0.0.0:49983",
 			"CUBEPOD_WORKDIR=/workspace",
 		},
+	}
+	// Filesystem-backed Docker containers cannot pivot/mount raw block devices.
+	// Keep runtime injection and both independent storage binds, without granting
+	// privileged containers or CAP_SYS_ADMIN. Sparse-ext4 mode keeps its pivot path.
+	if !d.cfg.EnableSparseExt4 {
+		plan.Env = append(plan.Env, "CUBEPOD_SKIP_PIVOT=1")
 	}
 	if d.injectBin() {
 		plan.Binds = append(plan.Binds, fmt.Sprintf("%s:/opt/cubepod/bin:ro", binDir))
