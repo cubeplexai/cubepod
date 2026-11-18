@@ -179,7 +179,6 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 | **Gateway** | `cubepod_secrets_operation_duration_seconds` *(v0.7.0 新增)* | Histogram | 按 `operation`（`create`、`list`、`get`、`update`、`delete`、`resolve`）统计的密钥存储耗时；桶 0.005s–10s |
 | **Gateway** | `cubepod_watch_streams_active` / `cubepod_watchers_active` *(v0.7.0 新增)* | Gauge | 活跃 `WatchDir` 流数与活跃轮询监听器（`CreateWatcher`）数 |
 | **Gateway** | `cubepod_watch_events_total` / `cubepod_watch_overflows_total` *(v0.7.0 新增)* | Counter | 已发出的监听事件数与 `resource_exhausted` 监听溢出次数 |
-| **Egress** | `cubepod_egress_secret_exchanges_total` | Counter | `cpodref_` 密钥交换次数（`result`：`ok`、`denied`、`error`） |
 | **Gateway** | `cubepod_e2b_volume_mounts_total` / `cubepod_e2b_volume_mount_errors_total` | Counter | E2B 卷挂载次数与挂载规划/执行错误数 |
 | **Gateway** | `cubepod_events_recorded_total` | Counter | 已记录的沙箱生命周期事件总数（启用事件管理器时导出） |
 | **Gateway** | `cubepod_webhook_deliveries_total` / `cubepod_webhook_queue_depth` | Counter / Gauge | Webhook 投递结果（`result`：`ok`、`failed`、`dropped`）与队列深度 |
