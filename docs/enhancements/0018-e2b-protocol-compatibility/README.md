@@ -3,12 +3,12 @@
 | Field | Value |
 | :--- | :--- |
 | **CEP Number** | `0018` |
-| **Status** | `implementable` (`alpha`) |
+| **Status** | `implemented` (`beta`) |
 | **Owning Area** | `gateway` |
 | **Participating Areas** | `runtime`, `sdk` |
 | **Authors** | @cubepod-maintainers |
 | **Created** | 2026-11-11 |
-| **Last Updated** | 2026-11-11 |
+| **Last Updated** | 2026-11-17 |
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
@@ -466,15 +466,15 @@ def test_code_interpreter_execution():
 ### 10. Graduation Criteria
 
 - **Alpha (`v0.3.1`)**:
-  - `POST /sandboxes`, `DELETE /sandboxes/{id}`, `POST /sandboxes/{id}/refreshes` fully wire-compatible.
-  - Command execution, SSE streaming, and basic file operations pass standard E2B Python SDK smoke tests.
-- **Beta (`v0.4.0`)**:
-  - Full `e2b-code-interpreter` support with matplotlib image capture.
-  - Subdomain routing (`{port}-{sandboxID}`) verified in production ingress.
-  - Zero-Trust Egress secret binding transparently integrated with E2B `envVars`.
+  - [x] `POST /sandboxes`, `DELETE /sandboxes/{id}`, `POST /sandboxes/{id}/refreshes` fully wire-compatible.
+  - [x] Command execution, SSE streaming, and basic file operations pass standard E2B Python SDK smoke tests.
+- **Beta (`v0.6.0`)**:
+  - [x] Full `e2b-code-interpreter` support with matplotlib image capture.
+  - [x] Subdomain routing (`{port}-{sandboxID}`) verified in production ingress.
+  - [x] Zero-Trust Egress secret binding transparently integrated with E2B `envVars`.
 - **GA / Stable (`v1.0.0`)**:
-  - Complete conformance test suite with upstream E2B Python and TypeScript SDKs integrated into GitHub Actions CI.
-  - Production bake time in CubePlex agent platform across > 10,000 sandbox hours.
+  - [x] Complete conformance test suite with upstream E2B Python and TypeScript SDKs integrated into GitHub Actions CI (`make test-e2b-compat`, `make test-e2b-compat-ts` in `.github/workflows/ci.yml`).
+  - [ ] Production bake time in CubePlex agent platform across > 10,000 sandbox hours (tracked in [#104](https://github.com/cubeplexai/cubepod/issues/104)).
 
 ---
 
@@ -509,6 +509,7 @@ def test_code_interpreter_execution():
 
 - **2026-11-11**: Initial CEP-0018 proposal drafted and designated `implementable`.
 - **2026-11-15**: Official E2B 2.64.0 Volume API and `volumeMounts` specified separately in [CEP-0025](../0025-e2b-volumes/README.md).
+- **2026-11-17**: Promoted to `implemented` (`beta`). Completed Beta deliverables: `e2b-code-interpreter` matplotlib capture, subdomain ingress routing (`{port}-{sandboxID}`), and zero-trust secret binding for E2B `envVars`. Conformance test suites (`make test-e2b-compat`, `make test-e2b-compat-ts`) integrated into GitHub Actions CI (`.github/workflows/ci.yml`); long-term >10,000 sandbox-hour soak tracked in [#104](https://github.com/cubeplexai/cubepod/issues/104).
 
 ---
 
