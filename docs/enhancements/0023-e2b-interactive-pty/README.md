@@ -3,10 +3,10 @@
 | Field | Value |
 | :--- | :--- |
 | **CEP Number** | `0023` |
-| **Stage** | `alpha` |
+| **Stage** | `beta` |
 | **Status** | `implemented` |
 | **Created** | `2026-11-15` |
-| **Updated** | `2026-11-15` |
+| **Updated** | `2026-11-17` |
 | **Owning Area** | `runtime` (`podd`), `gateway` (`cubepod-gateway`) |
 
 <!-- toc -->
@@ -172,9 +172,13 @@ sequenceDiagram
 
 ### Graduation Criteria
 
-- **Alpha (Current)**: All unit and `-race` tests pass in `podd` and `cubepod-gateway`; official E2B 2.64 SDK wire shapes verified.
-- **Beta**: Live Kubernetes (`Kata + CSI Block`) and Docker E2E suite exercises `sandbox.pty.create` / `connect` / `resize` / `kill` end-to-end.
-- **Stable**: Multi-day soak testing with concurrent interactive terminals and `prepare_stop` cleanup.
+- **Alpha (`v0.5.0`)**:
+  - [x] All unit and `-race` tests pass in `podd` and `cubepod-gateway`; official E2B 2.64 SDK wire shapes verified.
+- **Beta (`v0.6.0`)**:
+  - [x] Live Kubernetes (`Kata + CSI Block`) and Docker E2E suite exercises `sandbox.pty.create` / `connect` / `resize` / `kill` end-to-end (`TestK8sLiveE2EPTY`).
+  - [x] Official E2B extended SDK suites verified (`test/e2b-compat/test_official_e2b_extended.py` and TypeScript suite).
+- **Stable (`v1.0.0`)**:
+  - [ ] Multi-day soak testing with concurrent interactive terminals and `prepare_stop` cleanup (tracked in [#104](https://github.com/cubeplexai/cubepod/issues/104)).
 
 ### Upgrade / Downgrade Strategy
 
@@ -196,6 +200,7 @@ sequenceDiagram
 ## Implementation History
 
 - `2026-11-15`: Initial implementation in `crates/podd` and `pkg/gateway`, followed by review hardening (`OwnedFd` lifetime, atomic `O_CLOEXEC`, waiter thread reaping, gateway sandbox isolation, `safeSandboxEnv`, and regression tests).
+- `2026-11-17`: Promoted to `beta`. Live Kubernetes E2E suite (`TestK8sLiveE2EPTY`) and official E2B extended SDK suites (`test/e2b-compat/test_official_e2b_extended.py` and TypeScript suite) verified; multi-day concurrent interactive PTY soak testing tracked in [#104](https://github.com/cubeplexai/cubepod/issues/104).
 
 ---
 

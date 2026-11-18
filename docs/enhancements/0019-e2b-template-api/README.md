@@ -3,12 +3,12 @@
 | Field | Value |
 | :--- | :--- |
 | **CEP Number** | `0019` |
-| **Status** | `implementable` (`alpha`) |
+| **Status** | `implemented` (`beta`) |
 | **Owning Area** | `gateway` |
 | **Participating Areas** | `controller`, `runtime`, `sdk` |
 | **Authors** | @cubepod-maintainers |
 | **Created** | 2026-11-12 |
-| **Last Updated** | 2026-11-13 |
+| **Last Updated** | 2026-11-17 |
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
@@ -598,9 +598,21 @@ The reconciler is the builder in both modes. `cmd/cubepod-gateway` already const
 
 ### Graduation Criteria
 
-- **Alpha (`v0.4.0`)**: Gate off by default. Gate on passes the catalog tests, from-image registration, sandbox resource fields, seeded aliases, and the local plus Kubernetes from-image E2E. Delete cannot remove a referenced template. No BuildKit Deployment is installed unless `templateBuild.enabled=true`, and Alpha Helm leaves that false.
-- **Beta (`v0.5.0`)**: Gate still off by default. `Template.build` conformance passes on local Docker and on the test cluster. A failed rebuild keeps the previous image. Probe Pods are garbage-collected. Registry credentials do not appear in gateway logs or in `docker history` / image config of the built image. Metrics below are exported.
-- **Stable (`v1.0.0`)**: Gate on by default after a CubePlex bake in which a template rebuild did not modify an existing workspace PVC (verified by a checksum of a marker file). Controller can run with more than one replica, with context tars in object storage. Tag routes match the pinned SDK. Rollback of the gate is still supported.
+- **Alpha (`v0.4.0`)**:
+  - [x] Gate off by default. Gate on passes the catalog tests, from-image registration, sandbox resource fields, seeded aliases, and the local plus Kubernetes from-image E2E.
+  - [x] Delete cannot remove a referenced template.
+  - [x] No BuildKit Deployment is installed unless `templateBuild.enabled=true`, and Alpha Helm leaves that false.
+- **Beta (`v0.6.0`)**:
+  - [x] BuildKit build, logs, and context routes implemented behind feature gates (`E2BTemplateAPI`, `templateBuild.enabled`).
+  - [x] Template tag routes (`/templates/tags` and `/templates/{templateID}/tags`) implemented.
+  - [x] `Template.build` conformance passes on local Docker and on the test cluster; failed rebuild keeps previous image; probe Pods are garbage-collected.
+  - [x] Registry credentials do not appear in gateway logs or in `docker history` / image config of the built image; metrics exported.
+- **Stable (`v1.0.0`)**:
+  - [ ] Multi-replica controller with object-storage context backend (tracked in [#100](https://github.com/cubeplexai/cubepod/issues/100)).
+  - [ ] Gate on by default after a CubePlex bake in which a template rebuild did not modify an existing workspace PVC (tracked in [#100](https://github.com/cubeplexai/cubepod/issues/100)).
+  - [ ] BuildKit HA and mTLS verification (tracked in [#100](https://github.com/cubeplexai/cubepod/issues/100)).
+  - [ ] Tag routes match the pinned SDK conformance.
+  - [ ] Rollback of the gate is still supported.
 
 ### Upgrade / Downgrade Strategy
 
@@ -669,6 +681,7 @@ When `status.readyImage` changes, the controller deletes unclaimed warm-pool ent
 - 2026-11-12: Review revisions. Source-pull credentials are build-scoped. The template registry pull Secret stays on sandbox Pods. Template steps must not use `/workspace`, and no other directory is prescribed. `PodTemplate` and `PodTemplateList` are specified, and the in-memory map is filled from the CRD. A new `readyImage` retires unclaimed warm standbys. An empty `templateID` becomes `base`. `startCmd` logs, reaping, and the create-time 503 are specified. Local builds are driven by the in-process reconciler through `pkg/runtime`. `podd` is not a feature-gate component. `GET /templates/{templateID}/files/{hash}` stays **201**, which is the status in the E2B OpenAPI.
 - 2026-11-12: Builder placement and SDK step translation. The builder is one runc Deployment in `cubepod-system`, not a per-build Job. Controller restart fails the in-flight solve and leaves the daemon and cache PVC in place. `filesHash` is the SDK's content hash, and the upload body is a gzip tar. HTTP status reports the internal `uploaded` phase as `building`, because the JS SDK stops polling on any other value. `COPY` steps share one BuildKit context, unpacked under the hash prefix. `USER 0` is root.
 - 2026-11-13: Wire contract review amendments (`implementable`). Clarified `BuildStatusReason` object shape (`reason` omitted when empty, `{"message", "step"}` on `error`), same-name rebuild reuse of `templateID` in `POST /v3/templates`, Alpha inclusion of `GET .../status`, POSIX single-quoted `export KEY='VAL'; ` prefix for build-time `ENV`, `202`/`204`/`201` status codes, `TemplateWithBuilds` fields, `PodTemplateStatus` counters, and controller internal build/context endpoints (`HEAD`/`PUT /internal/v1/template-builds/context/{hash}`, `POST /internal/v1/template-builds/{templateID}/{buildID}/start`, `GET /internal/v1/template-builds/{buildID}/logs`). Synced OpenAPI spec in [`api/openapi/cubepod-v1.yaml`](../../../api/openapi/cubepod-v1.yaml).
+- 2026-11-17: Promoted to `implemented` (`beta`). Completed Beta BuildKit build/log/context routes and `/templates/tags` + `/templates/{templateID}/tags` routes behind feature gates; remaining Stable multi-replica controller and object-storage context work tracked in [#100](https://github.com/cubeplexai/cubepod/issues/100).
 
 ---
 

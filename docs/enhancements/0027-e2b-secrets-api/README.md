@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `beta` | `implemented` | `2026-11-15` | `2026-11-16` | `gateway` |
+| `beta` | `implemented` | `2026-11-15` | `2026-11-17` | `gateway` |
 
 ## Table of Contents
 
@@ -297,13 +297,14 @@ sequenceDiagram
 ### Graduation Criteria
 
 - **Alpha (`v0.5`)**:
-  - `E2BSecretsAPI` feature gate / gateway config enabled when secrets store is configured.
-  - All 5 `/secrets` endpoints + `pkg/secret` AES-256-GCM file backend + `egress.Vault` rotation/revocation + `HeaderTransforms` MITM injection implemented and passing `make test` and `make test-e2e`.
-- **Beta (`v0.6`)**:
-  - `KubeSecretBackend` enabled by default for multi-replica K8s gateways with Helm chart RBAC and `CUBEPOD_SECRETS_KEY` Secret management.
-  - Python & TypeScript SDK helpers (`Secret` / `AsyncSecret`, `Secret.fill`) verified against live gateway.
+  - [x] `E2BSecretsAPI` feature gate / gateway config enabled when secrets store is configured.
+  - [x] All 5 `/secrets` endpoints + `pkg/secret` AES-256-GCM file backend + `egress.Vault` rotation/revocation + `HeaderTransforms` MITM injection implemented and passing `make test` and `make test-e2e`.
+- **Beta (`v0.6.0`)**:
+  - [x] `KubeSecretBackend` enabled for multi-replica K8s gateways with Helm chart RBAC (`secrets.backend: "k8s"`), `CUBEPOD_SECRETS_KEY` Secret management, and HA Vault re-hydration.
+  - [x] Python & TypeScript SDK helpers (`Secret` / `AsyncSecret`, `Secret.fill`) verified against live gateway.
 - **Stable (`v1.0`)**:
-  - Production bake time in CubePlex with Prometheus alerting on secret exchange errors and store latency.
+  - [ ] Secret store operation latency histograms and Prometheus alerting rules for secret exchange errors and store latency (tracked in [#103](https://github.com/cubeplexai/cubepod/issues/103)).
+  - [ ] Production bake time in CubePlex.
 
 ### Upgrade / Downgrade Strategy
 
@@ -330,6 +331,7 @@ sequenceDiagram
 
 - `2026-11-15`: CEP-0027 drafted and marked `implementable`.
 - `2026-11-15`: Alpha implementation merged in PR #73 (`pkg/secret`, `pkg/egress`, `pkg/gateway`, `api/v1alpha1`, CRD & OpenAPI); marked `implemented`.
+- `2026-11-17`: Beta milestone completed. Implemented `KubeSecretBackend` for multi-replica K8s gateways with Helm chart RBAC (`secrets.backend: "k8s"`), HA Vault re-hydration, and official Python/TypeScript SDK `Secret` and `Secret.fill` support; Stable latency histograms and alerting tracked in [#103](https://github.com/cubeplexai/cubepod/issues/103).
 
 ---
 
