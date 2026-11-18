@@ -32,6 +32,8 @@ def sandbox():
 def test_lifecycle_commands_connect(sandbox):
     sbx = Sandbox.connect(sandbox.sandbox_id)
     assert sbx.commands.run("hostname").stdout.strip() == sbx.sandbox_id
+    if expected := os.environ.get("E2E_GUEST_KERNEL"):
+        assert sbx.commands.run("uname -r").stdout.strip() == expected
     result = sbx.commands.run("printf python-kind; printf err >&2")
     assert result.exit_code == 0
     assert result.stdout == "python-kind"

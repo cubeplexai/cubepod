@@ -22,6 +22,7 @@ test('lifecycle, connect, stdout/stderr and nonzero exit', { timeout: 120000 }, 
   await withSandbox(async (original) => {
     const sbx = await Sandbox.connect(original.sandboxId);
     assert.equal((await sbx.commands.run('hostname')).stdout.trim(), sbx.sandboxId);
+    if (process.env.E2E_GUEST_KERNEL) assert.equal((await sbx.commands.run('uname -r')).stdout.trim(), process.env.E2E_GUEST_KERNEL);
     const result = await sbx.commands.run('printf ts-kind; printf err >&2');
     assert.equal(result.exitCode, 0);
     assert.equal(result.stdout, 'ts-kind');
