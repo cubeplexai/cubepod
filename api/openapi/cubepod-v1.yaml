@@ -23,6 +23,8 @@ tags:
     description: Build, manage, and tag sandbox rootfs and image templates.
   - name: WarmPools
     description: Register and inspect pre-warmed standby MicroVM pools.
+  - name: Volumes
+    description: Create, list, inspect, delete, and rotate API keys for tenant-isolated E2B persistent volumes.
   - name: Secrets
     description: Create, list, update, and delete tenant-isolated write-only secrets.
   - name: Webhooks
@@ -1918,8 +1920,203 @@ paths:
                 items:
                   $ref: "#/components/schemas/LifecycleEvent"
 
+  /volumes:
+    post:
+      tags:
+        - Volumes
+      summary: Create volume
+      description: Create a tenant-isolated E2B persistent volume (`X-API-Key` required).
+      operationId: createVolume
+      parameters:
+        - name: X-API-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateVolumeRequest"
+      responses:
+        "201":
+          description: Volume created (includes content bearer token)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeWithToken"
+        "400":
+          description: Invalid volume name or duplicate volume name
+        "401":
+          description: Missing or revoked API key
+        "429":
+          description: Tenant volume limit exceeded
+    get:
+      tags:
+        - Volumes
+      summary: List volumes
+      description: List volumes owned by the caller's tenant (`X-API-Key` required; content tokens omitted).
+      operationId: listVolumes
+      parameters:
+        - name: X-API-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Tenant volume list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/VolumeInfo"
+        "401":
+          description: Missing or revoked API key
+
+  /volumes/rotate-key:
+    post:
+      tags:
+        - Volumes
+      summary: Rotate volume tenant API key
+      description: >
+        Migrate all volume and mount ownership from `previousApiKey` to the caller's new
+        `X-API-Key`, revoking `previousApiKey` from accessing migrated volumes and persisting
+        the alias mapping in the store keyring (`tenants.json`).
+      operationId: rotateVolumeAPIKey
+      parameters:
+        - name: X-API-Key
+          in: header
+          required: true
+          description: New API key that takes over ownership of the tenant's volumes.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RotateVolumeKeyRequest"
+      responses:
+        "200":
+          description: API key rotated successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RotateVolumeKeyResponse"
+        "400":
+          description: Invalid JSON or invalid `previousApiKey`
+        "401":
+          description: Missing `X-API-Key` or `previousApiKey` is unauthorized / already revoked
+        "409":
+          description: Target `X-API-Key` already belongs to another existing tenant or was previously revoked
+
+  /volumes/{volumeID}:
+    get:
+      tags:
+        - Volumes
+      summary: Get volume
+      description: Get volume metadata and content bearer token (`X-API-Key` required).
+      operationId: getVolume
+      parameters:
+        - name: volumeID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-API-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Volume metadata with content bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VolumeWithToken"
+        "401":
+          description: Missing or revoked API key
+        "404":
+          description: Volume not found
+    delete:
+      tags:
+        - Volumes
+      summary: Delete volume
+      description: Delete an unmounted volume owned by the caller's tenant.
+      operationId: deleteVolume
+      parameters:
+        - name: volumeID
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-API-Key
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Volume deleted
+        "401":
+          description: Missing or revoked API key
+        "404":
+          description: Volume not found
+        "409":
+          description: Volume is currently mounted by an active sandbox
+
 components:
   schemas:
+    CreateVolumeRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          pattern: "^[a-zA-Z0-9_-]+$"
+          maxLength: 128
+    VolumeInfo:
+      type: object
+      required:
+        - volumeID
+        - name
+      properties:
+        volumeID:
+          type: string
+        name:
+          type: string
+    VolumeWithToken:
+      allOf:
+        - $ref: "#/components/schemas/VolumeInfo"
+        - type: object
+          required:
+            - token
+          properties:
+            token:
+              type: string
+    RotateVolumeKeyRequest:
+      type: object
+      required:
+        - previousApiKey
+      properties:
+        previousApiKey:
+          type: string
+          writeOnly: true
+          description: Previous API key whose volume and mount ownership will be migrated and revoked.
+    RotateVolumeKeyResponse:
+      type: object
+      required:
+        - rotatedVolumes
+      properties:
+        rotatedVolumes:
+          type: integer
+          minimum: 0
+          description: Number of volumes owned by the rotated tenant.
     SecretInfo:
       type: object
       required:

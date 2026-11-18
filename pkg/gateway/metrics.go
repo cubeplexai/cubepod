@@ -16,6 +16,7 @@ import (
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
+	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
 var defaultDurationBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
@@ -137,6 +138,7 @@ type Metrics struct {
 	PanelActiveSessions           atomic.Int64
 	E2BVolumeMountsTotal          atomic.Uint64
 	E2BVolumeMountErrorsTotal     atomic.Uint64
+	E2BVolumeQuotaRejectionsTotal atomic.Uint64
 	CRDResyncsTotal               atomic.Uint64
 
 	e2bRequests        labeledCounterMap
@@ -175,6 +177,11 @@ func (m *Metrics) RecordE2BVolumeMount(n uint64) {
 // RecordE2BVolumeMountError increments the E2B volume mount error counter.
 func (m *Metrics) RecordE2BVolumeMountError() {
 	m.E2BVolumeMountErrorsTotal.Add(1)
+}
+
+// RecordE2BVolumeQuotaRejection increments the E2B volume quota rejection counter.
+func (m *Metrics) RecordE2BVolumeQuotaRejection() {
+	m.E2BVolumeQuotaRejectionsTotal.Add(1)
 }
 
 // RecordSandboxFork records a sandbox fork operation count and duration observation.
@@ -324,6 +331,9 @@ func classifyE2BEndpoint(method, cleanPath string) (string, bool) {
 	case "volumes":
 		if len(parts) == 1 {
 			return m + " /volumes", true
+		}
+		if len(parts) == 2 && parts[1] == "rotate-key" {
+			return m + " /volumes/rotate-key", true
 		}
 		return m + " /volumes/{volumeID}", true
 	case "volumecontent":
@@ -504,6 +514,13 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	volumeMountsTotal := s.E2BVolumeMountsTotal.Load() + m.E2BVolumeMountsTotal.Load()
 	volumeMountErrorsTotal := s.E2BVolumeMountErrorsTotal.Load() + m.E2BVolumeMountErrorsTotal.Load()
+	volumeQuotaRejectionsTotal := s.E2BVolumeQuotaRejectionsTotal.Load() + m.E2BVolumeQuotaRejectionsTotal.Load()
+	var volCapStats volume.CapacityStats
+	if volStore := s.e2b.Load(); volStore != nil {
+		if cs, err := volStore.CapacityStats(); err == nil {
+			volCapStats = cs
+		}
+	}
 	crdResyncsTotal := s.crdResyncsTotal.Load() + m.CRDResyncsTotal.Load()
 
 	e2bEnabled := s.E2BTemplateAPIEnabled()
@@ -540,20 +557,25 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		e2bCount, e2bSum := m.e2bRequestDuration.Snapshot()
 		forkCount, forkSum := m.sandboxForkDur.Snapshot()
 		payload := map[string]interface{}{
-			"cubepod_gateway_http_requests_total":      m.HTTPRequestsTotal.Load(),
-			"cubepod_gateway_requests_total":           m.HTTPRequestsTotal.Load(),
-			"cubepod_gateway_sandboxes_created_total":  m.SandboxesCreatedTotal.Load(),
-			"cubepod_gateway_autoresume_total":         m.AutoresumeTotal.Load(),
-			"cubepod_gateway_auto_resumes_total":       m.AutoresumeTotal.Load(),
-			"cubepod_gateway_commands_executed_total":  m.CommandsExecutedTotal.Load(),
-			"cubepod_gateway_sandboxes_active_running": runningCount,
-			"cubepod_gateway_sandboxes_active_paused":  pausedCount,
-			"cubepod_gateway_warmpools_total":          warmpoolsTotal,
-			"cubepod_panel_active_sessions":            m.PanelActiveSessions.Load(),
-			"cubepod_secrets_store_count":              secretsStoreCount,
-			"cubepod_e2b_volume_mounts_total":          volumeMountsTotal,
-			"cubepod_e2b_volume_mount_errors_total":    volumeMountErrorsTotal,
-			"cubepod_gateway_crd_resyncs_total":        crdResyncsTotal,
+			"cubepod_gateway_http_requests_total":         m.HTTPRequestsTotal.Load(),
+			"cubepod_gateway_requests_total":              m.HTTPRequestsTotal.Load(),
+			"cubepod_gateway_sandboxes_created_total":     m.SandboxesCreatedTotal.Load(),
+			"cubepod_gateway_autoresume_total":            m.AutoresumeTotal.Load(),
+			"cubepod_gateway_auto_resumes_total":          m.AutoresumeTotal.Load(),
+			"cubepod_gateway_commands_executed_total":     m.CommandsExecutedTotal.Load(),
+			"cubepod_gateway_sandboxes_active_running":    runningCount,
+			"cubepod_gateway_sandboxes_active_paused":     pausedCount,
+			"cubepod_gateway_warmpools_total":             warmpoolsTotal,
+			"cubepod_panel_active_sessions":               m.PanelActiveSessions.Load(),
+			"cubepod_secrets_store_count":                 secretsStoreCount,
+			"cubepod_e2b_volume_mounts_total":             volumeMountsTotal,
+			"cubepod_e2b_volume_mount_errors_total":       volumeMountErrorsTotal,
+			"cubepod_e2b_volume_quota_rejections_total":   volumeQuotaRejectionsTotal,
+			"cubepod_e2b_volumes_storage_capacity_bytes":  volCapStats.CapacityBytes,
+			"cubepod_e2b_volumes_storage_used_bytes":      volCapStats.UsedBytes,
+			"cubepod_e2b_volumes_storage_available_bytes": volCapStats.AvailableBytes,
+			"cubepod_e2b_volumes_total":                   volCapStats.VolumesTotal,
+			"cubepod_gateway_crd_resyncs_total":           crdResyncsTotal,
 			"cubepod_e2b_request_duration_seconds": map[string]interface{}{
 				"count": e2bCount,
 				"sum":   e2bSum,
@@ -652,6 +674,10 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&buf, "# TYPE cubepod_e2b_volume_mount_errors_total counter\n")
 	fmt.Fprintf(&buf, "cubepod_e2b_volume_mount_errors_total %d\n", volumeMountErrorsTotal)
 
+	fmt.Fprintf(&buf, "# HELP cubepod_e2b_volume_quota_rejections_total Total E2B volume creation or upload requests rejected due to tenant quota limits\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_e2b_volume_quota_rejections_total counter\n")
+	fmt.Fprintf(&buf, "cubepod_e2b_volume_quota_rejections_total %d\n", volumeQuotaRejectionsTotal)
+
 	fmt.Fprintf(&buf, "# HELP cubepod_sandbox_forks_total Total sandbox CoW fork operations by mode and result\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_sandbox_forks_total counter\n")
 	for _, entry := range m.sandboxForks.Snapshot() {
@@ -699,6 +725,22 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&buf, "# HELP cubepod_secrets_store_count Current number of stored E2B secrets across tenants\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_secrets_store_count gauge\n")
 	fmt.Fprintf(&buf, "cubepod_secrets_store_count %d\n", secretsStoreCount)
+
+	fmt.Fprintf(&buf, "# HELP cubepod_e2b_volumes_storage_capacity_bytes Total filesystem capacity in bytes of the E2B volumes store directory\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_e2b_volumes_storage_capacity_bytes gauge\n")
+	fmt.Fprintf(&buf, "cubepod_e2b_volumes_storage_capacity_bytes %d\n", volCapStats.CapacityBytes)
+
+	fmt.Fprintf(&buf, "# HELP cubepod_e2b_volumes_storage_used_bytes Used filesystem space in bytes of the E2B volumes store directory\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_e2b_volumes_storage_used_bytes gauge\n")
+	fmt.Fprintf(&buf, "cubepod_e2b_volumes_storage_used_bytes %d\n", volCapStats.UsedBytes)
+
+	fmt.Fprintf(&buf, "# HELP cubepod_e2b_volumes_storage_available_bytes Available filesystem space in bytes of the E2B volumes store directory\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_e2b_volumes_storage_available_bytes gauge\n")
+	fmt.Fprintf(&buf, "cubepod_e2b_volumes_storage_available_bytes %d\n", volCapStats.AvailableBytes)
+
+	fmt.Fprintf(&buf, "# HELP cubepod_e2b_volumes_total Current number of E2B volumes stored across tenants\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_e2b_volumes_total gauge\n")
+	fmt.Fprintf(&buf, "cubepod_e2b_volumes_total %d\n", volCapStats.VolumesTotal)
 
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_warmpools_total Total configured warm pools\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_warmpools_total gauge\n")

@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `beta` | `implemented` | `2026-11-15` | `2026-11-17` | `storage` (`gateway`, `runtime`, `controller`) |
+| `stable` | `implemented` | `2026-11-15` | `2026-11-18` | `storage` (`gateway`, `runtime`, `controller`) |
 
 ## Table of Contents
 
@@ -36,7 +36,10 @@
 - [x] Official E2B 2.64.0 Volume management and `/volumecontent` REST routes implemented
 - [x] Symlink-safe fd-based content API (`openat2` / `O_NOFOLLOW` dirfd walk + `fchown`/`fchmod`) verified
 - [x] On-disk UID/GID (`1000:1000`) and mode (`& 0o777`) invariants enforced; `nosuid,nodev` on Docker bind volumes
-- [x] Live Kubernetes runtime gated off (`501 Not Implemented`) in Alpha until shared CSI/Kata storage is implemented
+- [x] Live Kubernetes runtime gated (`501 Not Implemented`) unless `K8sE2BVolumeMounts` + shared RWX PVC are configured ([CEP-0026](../0026-k8s-kata-e2b-volumes/README.md))
+- [x] GA envelope encryption (`KMSProvider`: `LocalKEKProvider` + `HTTPKMSProvider`) for volume content tokens (`encryptedToken` + `kmsKeyID`) with legacy plaintext migration (`pkg/volume/kms.go`)
+- [x] GA tenant API-key rotation (`POST /volumes/rotate-key` + `Store.RotateAPIKey`) backed by `tenants.json` keyring with RWX `flock` + atomic temp-file rename
+- [x] GA multi-tenant volume-count & byte quotas (`MaxVolumesPerTenant`, `MaxBytesPerTenant` / `CUBEPOD_E2B_MAX_TENANT_BYTES`), `Store.CapacityStats()`, Prometheus metrics, and `deploy/monitoring/e2b-volumes-alerts.yaml`
 - [x] Unit and regression tests passing (`go test -race ./pkg/volume/... ./pkg/gateway/... ./pkg/controller/... ./pkg/runtime/...`)
 
 ---
@@ -55,15 +58,15 @@ Official E2B 2.64.0 SDKs (`Volume.create`, `Volume.write_file`, `Sandbox.create(
 
 ### Goals
 
-1. Implement E2B 2.64.0 Volume management (`/volumes`) and content (`/volumecontent/{volumeID}/...`) HTTP APIs.
-2. Isolate volume data per tenant (`sha256(X-API-KEY)`), protect against symlink TOCTOU host-root escapes, and enforce AGENTS.md Invariant 4 (`1000:1000` `cubeplex` ownership, no setuid/uid=0 on disk).
-3. Attach mounted volumes to Docker sandboxes (`HostConfig.Binds` or `nosuid,nodev` named Docker bind volumes) while keeping `/workspace` and `/rootfs-upper` strictly independent (Invariant 1).
-4. Record `PodBoxSpec.E2BVolumeMounts` and controller manifest plumbing (`e2bvol-<id>`) for future Kubernetes support, while gating off live Kubernetes `volumeMounts` in Alpha.
+1. Implement E2B 2.64.0 Volume management (`/volumes`, including `POST /volumes/rotate-key` in `v0.7.0`) and content (`/volumecontent/{volumeID}/...`) HTTP APIs.
+2. Isolate volume data per tenant via a durable keyring (`tenants.json` decoupling canonical `tnt_<id>` ownership from raw `sha256(X-API-KEY)`), envelope-encrypt content tokens at rest via `KMSProvider` (`LocalKEKProvider` or `HTTPKMSProvider`), protect against symlink TOCTOU host-root escapes, and enforce AGENTS.md Invariant 4 (`1000:1000` `cubeplex` ownership, no setuid/uid=0 on disk).
+3. Enforce multi-tenant volume-count (`MaxVolumesPerTenant`) and storage-byte (`MaxBytesPerTenant` / `CUBEPOD_E2B_MAX_TENANT_BYTES`) quotas, exporting capacity and quota-rejection Prometheus metrics with automated RWX capacity alerts.
+4. Attach mounted volumes to Docker sandboxes (`HostConfig.Binds` or `nosuid,nodev` named Docker bind volumes) while keeping `/workspace` and `/rootfs-upper` strictly independent (Invariant 1).
+5. Record `PodBoxSpec.E2BVolumeMounts` and controller manifest plumbing (`e2bvol-<id>` / shared RWX PVC in [CEP-0026](../0026-k8s-kata-e2b-volumes/README.md)).
 
 ### Non-Goals
 
-1. **External KMS / API-key rotation migration**: Tenant identity is derived from `sha256(X-API-KEY)` in Alpha/Beta; rotating a key orphans that key's volumes (tracked in [#102](https://github.com/cubeplexai/cubepod/issues/102)).
-2. **Live cluster automated RWX PVC capacity alerting and multi-tenant quota enforcement**: Tracked in [#102](https://github.com/cubeplexai/cubepod/issues/102).
+1. **Live Kubernetes Kata + CSI shared volume content in CEP-0025 itself**: Covered separately in [CEP-0026](../0026-k8s-kata-e2b-volumes/README.md) (`K8sE2BVolumeMounts` + shared RWX PVC).
 
 ---
 
@@ -100,9 +103,13 @@ Official E2B 2.64.0 SDKs (`Volume.create`, `Volume.write_file`, `Sandbox.create(
 
 - **Management API (`X-API-KEY`)**:
   - `POST /volumes` (`201`): creates volume, returns `{volumeID, name, token}`.
+  - `POST /volumes/rotate-key` (`200`, *Added in v0.7.0*): accepts header `X-API-Key: <newKey>` and body `{"previousApiKey": "<oldKey>"}`, migrates all volume & mount ownership to a canonical tenant ID in `tenants.json`, revokes `<oldKey>`, and returns `{"rotatedVolumes": N}`.
   - `GET /volumes` (`200`): lists tenant volumes (tokens omitted).
   - `GET /volumes/{volumeID}` (`200`): returns `{volumeID, name, token}`.
   - `DELETE /volumes/{volumeID}` (`204`, `409` if mounted).
+- **KMS Envelope Encryption (`pkg/volume/kms.go`, *Added in v0.7.0*)**:
+  - `KMSProvider` (`KeyID()`, `Wrap(ctx, plaintext)`, `Unwrap(ctx, wrapped)`) supports `LocalKEKProvider` (`CUBEPOD_E2B_VOLUMES_KEK`, 32-byte base64 or 64-hex AES-256-GCM) and `HTTPKMSProvider` (`CUBEPOD_E2B_VOLUMES_KMS_URL`, optional `CUBEPOD_E2B_VOLUMES_KMS_TOKEN`, TLS 1.2+ and redirect-blocking hardening).
+  - When configured, each volume token is encrypted under a random 256-bit DEK with AES-256-GCM bound to `volumeID` as AAD, the DEK is wrapped via `KMSProvider.Wrap` outside `Store.mu`, and `meta.json` stores `encryptedToken` + `kmsKeyID` with plaintext `token` omitted on disk. Legacy plaintext `meta.json` records are automatically migrated to envelope encryption on `Store.Open`.
 - **Content API (`Authorization: Bearer <token>`, constant-time compare)**:
   - `GET /volumecontent/{volumeID}/file?path=...`
   - `PUT /volumecontent/{volumeID}/file?path=...&uid=...&gid=...&mode=...&force=...` (`http.MaxBytesReader`, `413` on overflow)
@@ -127,8 +134,9 @@ flowchart LR
 
 ### Security & Concurrency Model
 
-1. **Tenant Trust Model**: Any non-empty `X-API-KEY` hashes to `tenant = sha256("cubepod-e2b-volume-v1\x00" + apiKey)`. Rotating an API key changes the tenant hash and orphans prior volumes. Gateway deployments rely on upstream ingress/auth or trusted callers; per-tenant volume count is capped (`MaxVolumesPerTenant`, default 64). Note: `/sandboxes` routes themselves do not enforce per-tenant ownership in Alpha, so tenant isolation applies to `/volumes`, `/volumecontent`, and `volumeMounts` lookup/commit.
-2. **Locking**: `Store.mu` protects in-memory maps (`vols`, `byName`, `mounts`) and is never held across `io.Copy` or Docker Engine HTTP calls. Each `volRec` has its own `mu sync.Mutex` for filesystem commit and `attrs.json` persistence. Per-sandbox gateway locking is decoupled via `acquireSandboxLock` in `pkg/gateway/sandboxes.go` so slow runtime starts and pauses lock only the affected sandbox.
+1. **Tenant Keyring & API-Key Rotation**: Unrotated keys resolve to `sha256("cubepod-e2b-volume-v1\x00" + apiKey)` for backward compatibility. Calling `Store.RotateAPIKey(oldKey, newKey)` (`POST /volumes/rotate-key`) mints or reuses an opaque canonical `tnt_<id>` tenant identifier in `<dir>/tenants.json` (protected by `flock` on `.store.lock` and `0600` temp-file + `fsync` + `rename`), migrates all volume `meta.json` and `mounts.json` records, revokes `oldKey` (`401 Unauthorized` on subsequent management/mount calls), and rejects collisions onto existing tenants (`409 Conflict`).
+2. **Envelope Encryption & Secret Redaction**: `LocalKEKProvider` and `HTTPKMSProvider` implement `String()`, `GoString()`, and `slog.LogValuer` redaction so KEKs and KMS bearer tokens never appear in logs or error strings (AGENTS.md Invariant 3). KMS `Wrap` runs outside `Store.mu` so external KMS latency cannot stall concurrent volume operations.
+3. **Locking & Multi-Tenant Quotas**: `Store.mu` protects in-memory maps (`vols`, `byName`, `mounts`, `tenantKeys`) and is never held across `io.Copy`, HTTP KMS calls, or Docker Engine HTTP calls. Per-sandbox gateway locking is decoupled via `acquireSandboxLock` in `pkg/gateway/sandboxes.go` so slow runtime starts and pauses lock only the affected sandbox. Per-tenant volume count (`MaxVolumesPerTenant`, default 64) and regular-file byte quota (`MaxBytesPerTenant` via `CUBEPOD_E2B_MAX_TENANT_BYTES`, serialized per-tenant without blocking other tenants) return `ErrLimitExceeded` (`429 Too Many Requests`) and increment `cubepod_e2b_volume_quota_rejections_total`.
 
 ### Boundary Conditions & Failure Recovery
 
@@ -155,30 +163,34 @@ flowchart LR
 - **Beta (`v0.6.0`)**:
   - [x] Shared CSI/Kata volume content backend and `podd-init` `pivot_root` mount preservation implemented (via [CEP-0026](../0026-k8s-kata-e2b-volumes/README.md)).
   - [x] Per-sandbox gateway locking implemented via `acquireSandboxLock` in `pkg/gateway/sandboxes.go`.
-- **GA / Stable (`v1.0.0`)**:
-  - [ ] Live Kubernetes Kata + RWX CSI E2E verification (`TestK8sLiveE2EVolumeMountsAndFork`), external KMS/API-key rotation, and automated RWX PVC capacity alerting (tracked in [#102](https://github.com/cubeplexai/cubepod/issues/102)).
+- **GA / Stable (`v0.7.0`)**:
+  - [x] External KMS / local KEK envelope encryption (`encryptedToken` + `kmsKeyID`) with legacy plaintext migration, `POST /volumes/rotate-key` (`tenants.json` RWX `flock` keyring), multi-tenant byte & count quota enforcement (`CUBEPOD_E2B_MAX_TENANT_BYTES`), `Store.CapacityStats()` Prometheus metrics, and `deploy/monitoring/e2b-volumes-alerts.yaml` `PrometheusRule` alerts (live Kubernetes Kata + RWX CSI cluster run tracked in [CEP-0026](../0026-k8s-kata-e2b-volumes/README.md)).
 
 ### Upgrade / Downgrade Strategy
 
 - `PodBoxSpec.E2BVolumeMounts` is an optional field (`omitempty`); existing `PodBox` CRs, `/workspace` PVCs, and `/rootfs-upper` PVCs are unaffected.
+- Existing `meta.json` records with plaintext `token` continue working unmodified when KMS is unset, and are transparently migrated on disk to `encryptedToken` + `kmsKeyID` as soon as `CUBEPOD_E2B_VOLUMES_KEK` or `CUBEPOD_E2B_VOLUMES_KMS_URL` is configured.
 
 ---
 
 ## Production Readiness Review Questionnaire (PRR)
 
 - **Feature Enablement and Rollback**: Enabled via `CUBEPOD_E2B_VOLUME_DIR` (or `stateDir/e2b-volumes`). Removing the dir config disables routes without affecting `/workspace`.
-- **Rollout, Upgrade and Rollback Planning**: Atomic JSON metadata survives gateway restarts; `ReconcileMounts` cleans stale mounts on startup.
-- **Monitoring Requirements**: Structured `slog` warnings on test-only Docker flags and mount copy/delete errors; HTTP `413`/`429`/`501` status codes.
-- **Dependencies**: Linux `openat2` (with `O_NOFOLLOW` dirfd walk fallback for older kernels) and Docker Engine API for named bind volumes.
-- **Scalability**: Per-volume locking and off-lock `WriteFile` staging prevent one slow upload from blocking other volumes; `MaxVolumesPerTenant` bounds disk usage.
-- **Troubleshooting**: Inspect `<e2b-volumes>/<id>/meta.json` and `mounts.json`; restart gateway to reconcile stale mounts.
+- **Rollout, Upgrade and Rollback Planning**: Atomic JSON metadata (`meta.json`, `attrs.json`, `mounts.json`, `tenants.json`) coordinated with `flock` survives gateway restarts and multi-replica RWX rollouts; `ReconcileMounts` cleans stale mounts on startup.
+- **Monitoring Requirements**:
+  - Gateway `/metrics` exports `cubepod_e2b_volumes_storage_capacity_bytes`, `cubepod_e2b_volumes_storage_used_bytes`, `cubepod_e2b_volumes_storage_available_bytes`, `cubepod_e2b_volumes_total`, `cubepod_e2b_volume_quota_rejections_total`, `cubepod_e2b_volume_mounts_total`, and `cubepod_e2b_volume_mount_errors_total`.
+  - `deploy/monitoring/e2b-volumes-alerts.yaml` defines `CubePodE2BVolumesRWXNearFull` (80% warning / 90% critical), `CubePodE2BVolumesMountErrors`, and `CubePodE2BVolumesQuotaRejections`.
+- **Dependencies**: Linux `openat2` (with `O_NOFOLLOW` dirfd walk fallback for older kernels), `unix.Statfs` / `unix.Flock`, optional external HTTPS KMS endpoint, and Docker Engine API for named bind volumes.
+- **Scalability**: Per-volume locking, per-tenant byte-quota locking, and off-lock `WriteFile` staging + KMS wrapping prevent one slow upload or KMS request from blocking other tenants; `MaxVolumesPerTenant` and `MaxBytesPerTenant` bound disk usage.
+- **Troubleshooting**: Inspect `<e2b-volumes>/<id>/meta.json`, `mounts.json`, and `tenants.json`; check `cubepod_e2b_volume_quota_rejections_total` for `429` quota throttling; restart gateway to reconcile stale mounts.
 
 ---
 
 ## Implementation History
 
 - **2026-11-15**: Implemented E2B 2.64.0 Volume store, gateway REST API, Docker runtime mounts, CRD/controller plumbing, security hardening (symlink-safe fd I/O, `1000:1000` + `0o777` masking, per-volume locks, upload/tenant caps, K8s Alpha gating), and CEP-0025.
-- **2026-11-17**: Promoted to `beta`. Per-sandbox gateway locking (`acquireSandboxLock` in `pkg/gateway/sandboxes.go`) and Kubernetes shared RWX backend (via [CEP-0026](../0026-k8s-kata-e2b-volumes/README.md)) implemented; live Kata + RWX CSI verification, external KMS/API-key rotation, and automated alerting tracked in [#102](https://github.com/cubeplexai/cubepod/issues/102).
+- **2026-11-17**: Promoted to `beta`. Per-sandbox gateway locking (`acquireSandboxLock` in `pkg/gateway/sandboxes.go`) and Kubernetes shared RWX backend (via [CEP-0026](../0026-k8s-kata-e2b-volumes/README.md)) implemented.
+- **2026-11-18**: Graduated CEP-0025 to `stable` (`v0.7.0`) with `KMSProvider` envelope encryption (`LocalKEKProvider` + `HTTPKMSProvider` + legacy plaintext migration), `POST /volumes/rotate-key` (`tenants.json` RWX `flock` keyring), `MaxBytesPerTenant` (`CUBEPOD_E2B_MAX_TENANT_BYTES`), `Store.CapacityStats()` Prometheus gauges/counters, and `deploy/monitoring/e2b-volumes-alerts.yaml`.
 
 ---
 

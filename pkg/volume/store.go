@@ -14,6 +14,7 @@
 package volume
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -66,17 +67,19 @@ var (
 	ErrIsDir = errors.New("is a directory")
 	// ErrConflict is a type clash (file where a directory is required, or the reverse).
 	ErrConflict = errors.New("conflict")
-	// ErrUnauthorized is a bad or missing content token.
+	// ErrUnauthorized is a bad, missing, or revoked API key or content token.
 	ErrUnauthorized = errors.New("unauthorized")
-	// ErrLimitExceeded means the tenant has reached its volume quota.
+	// ErrInvalidKey is an empty or self-identical API key during key rotation.
+	ErrInvalidKey = errors.New("invalid api key")
+	// ErrLimitExceeded means the tenant has reached its volume or byte quota.
 	ErrLimitExceeded = errors.New("volume limit exceeded")
 
 	volumeNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 	volumeIDRe   = regexp.MustCompile(`^[a-f0-9]{32}$`)
 )
 
-// Config controls where volume bytes live and whether a test-prefixed Docker
-// volume is provisioned for them.
+// Config controls where volume bytes live, KMS token encryption, tenant quotas,
+// and optional Docker volume provisioning.
 type Config struct {
 	// HostDir is the Docker-daemon view of the store directory. When empty,
 	// HostPath in mount specs is the local data directory.
@@ -90,20 +93,34 @@ type Config struct {
 	DockerHost string
 	// MaxVolumesPerTenant caps volumes per API key tenant (default 64).
 	MaxVolumesPerTenant int
+	// MaxBytesPerTenant caps total regular-file bytes across all volumes of a tenant (<=0 means unlimited).
+	MaxBytesPerTenant int64
+	// KMS optionally envelope-encrypts volume content tokens in meta.json.
+	KMS KMSProvider
+}
+
+// CapacityStats summarizes filesystem capacity of the store root and active volume count.
+type CapacityStats struct {
+	CapacityBytes  uint64 `json:"capacityBytes"`
+	UsedBytes      uint64 `json:"usedBytes"`
+	AvailableBytes uint64 `json:"availableBytes"`
+	VolumesTotal   int    `json:"volumesTotal"`
 }
 
 // Volume is the durable record returned to the management API.
 type Volume struct {
-	VolumeID      string    `json:"volumeID"`
-	Name          string    `json:"name"`
-	Token         string    `json:"token"`
-	Tenant        string    `json:"tenant"`
-	CreatedAt     time.Time `json:"createdAt"`
-	DockerVolume  string    `json:"dockerVolume,omitempty"`
-	PVCName       string    `json:"pvcName,omitempty"`
-	PVCNamespace  string    `json:"pvcNamespace,omitempty"`
-	DataDir       string    `json:"-"`
-	DaemonDataDir string    `json:"-"`
+	VolumeID       string    `json:"volumeID"`
+	Name           string    `json:"name"`
+	Token          string    `json:"token,omitempty"`
+	EncryptedToken string    `json:"encryptedToken,omitempty"`
+	KMSKeyID       string    `json:"kmsKeyID,omitempty"`
+	Tenant         string    `json:"tenant"`
+	CreatedAt      time.Time `json:"createdAt"`
+	DockerVolume   string    `json:"dockerVolume,omitempty"`
+	PVCName        string    `json:"pvcName,omitempty"`
+	PVCNamespace   string    `json:"pvcNamespace,omitempty"`
+	DataDir        string    `json:"-"`
+	DaemonDataDir  string    `json:"-"`
 }
 
 // Entry is a VolumeEntryStat payload.
@@ -175,15 +192,26 @@ type mountRec struct {
 	Tenant   string `json:"tenant"`
 }
 
+type tenantKeyring struct {
+	Version int               `json:"version"`
+	Keys    map[string]string `json:"keys,omitempty"`
+	Revoked map[string]string `json:"revoked,omitempty"`
+}
+
 // Store is a process-local, mutex-guarded view of an on-disk volume directory.
 type Store struct {
-	mu     sync.Mutex
-	dir    string
-	cfg    Config
-	vols   map[string]*volRec
-	byName map[string]string
-	mounts map[string][]mountRec
-	docker dockerClient
+	mu           sync.Mutex
+	dir          string
+	cfg          Config
+	vols         map[string]*volRec
+	byName       map[string]string
+	mounts       map[string][]mountRec
+	tenantKeys   map[string]string
+	revokedKeys  map[string]string
+	tenantsMtime int64
+	tenantsSize  int64
+	tenantQuota  map[string]*sync.Mutex
+	docker       dockerClient
 }
 
 // Open loads an existing store directory or creates it.
@@ -221,12 +249,15 @@ func Open(dir string, cfg Config) (*Store, error) {
 		cfg.MaxVolumesPerTenant = defaultMaxVolumesPerTenant
 	}
 	s := &Store{
-		dir:    abs,
-		cfg:    cfg,
-		vols:   map[string]*volRec{},
-		byName: map[string]string{},
-		mounts: map[string][]mountRec{},
-		docker: dockerClient{host: cfg.DockerHost, enabled: cfg.DockerVolumes},
+		dir:         abs,
+		cfg:         cfg,
+		vols:        map[string]*volRec{},
+		byName:      map[string]string{},
+		mounts:      map[string][]mountRec{},
+		tenantKeys:  map[string]string{},
+		revokedKeys: map[string]string{},
+		tenantQuota: map[string]*sync.Mutex{},
+		docker:      dockerClient{host: cfg.DockerHost, enabled: cfg.DockerVolumes},
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -237,9 +268,56 @@ func Open(dir string, cfg Config) (*Store, error) {
 // Dir returns the store root.
 func (s *Store) Dir() string { return s.dir }
 
-func tenantOf(apiKey string) string {
+// CapacityStats queries unix.Statfs on the store directory and returns capacity/used/available bytes plus active volume count.
+func (s *Store) CapacityStats() (CapacityStats, error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(s.dir, &st); err != nil {
+		return CapacityStats{}, err
+	}
+	bsize := uint64(st.Frsize)
+	if bsize == 0 && st.Bsize > 0 {
+		bsize = uint64(st.Bsize)
+	}
+	capBytes := st.Blocks * bsize
+	availBytes := st.Bavail * bsize
+	if availBytes > capBytes {
+		availBytes = capBytes
+	}
+	var usedBytes uint64
+	if st.Blocks >= st.Bfree {
+		usedBytes = (st.Blocks - st.Bfree) * bsize
+	}
+	s.mu.Lock()
+	volCount := len(s.vols)
+	s.mu.Unlock()
+	return CapacityStats{
+		CapacityBytes:  capBytes,
+		UsedBytes:      usedBytes,
+		AvailableBytes: availBytes,
+		VolumesTotal:   volCount,
+	}, nil
+}
+
+func rawKeyHash(apiKey string) string {
 	sum := sha256.Sum256([]byte("cubepod-e2b-volume-v1\x00" + apiKey))
 	return hex.EncodeToString(sum[:])
+}
+
+// resolveTenantLocked resolves an API key to its canonical tenant ID, rejecting
+// empty or rotated/revoked keys. Caller must hold s.mu.Lock().
+func (s *Store) resolveTenantLocked(apiKey string) (string, error) {
+	if apiKey == "" {
+		return "", ErrUnauthorized
+	}
+	s.syncKeyringFromDiskLocked()
+	kh := rawKeyHash(apiKey)
+	if _, revoked := s.revokedKeys[kh]; revoked {
+		return "", ErrUnauthorized
+	}
+	if tid, ok := s.tenantKeys[kh]; ok && tid != "" {
+		return tid, nil
+	}
+	return kh, nil
 }
 
 func nameKey(tenant, name string) string { return tenant + "\x00" + name }
@@ -250,6 +328,7 @@ func ValidName(name string) bool {
 }
 
 // Create inserts a volume for the API key's tenant.
+// KMS envelope wrapping runs outside Store.mu so external HTTP KMS calls never block other tenants.
 func (s *Store) Create(apiKey, name string) (Volume, error) {
 	if apiKey == "" {
 		return Volume{}, ErrUnauthorized
@@ -257,9 +336,13 @@ func (s *Store) Create(apiKey, name string) (Volume, error) {
 	if !ValidName(name) {
 		return Volume{}, ErrInvalidName
 	}
-	s.mu.Lock()
 
-	tenant := tenantOf(apiKey)
+	s.mu.Lock()
+	tenant, err := s.resolveTenantLocked(apiKey)
+	if err != nil {
+		s.mu.Unlock()
+		return Volume{}, err
+	}
 	if _, ok := s.byName[nameKey(tenant, name)]; ok {
 		s.mu.Unlock()
 		return Volume{}, ErrExists
@@ -274,25 +357,56 @@ func (s *Store) Create(apiKey, name string) (Volume, error) {
 		s.mu.Unlock()
 		return Volume{}, ErrLimitExceeded
 	}
+	kms := s.cfg.KMS
+	s.mu.Unlock()
+
 	id, err := newID()
 	if err != nil {
-		s.mu.Unlock()
 		return Volume{}, err
 	}
 	token, err := newToken()
 	if err != nil {
+		return Volume{}, err
+	}
+	var encToken, kmsKeyID string
+	if kms != nil {
+		encToken, kmsKeyID, err = sealVolumeToken(context.Background(), kms, id, token)
+		if err != nil {
+			return Volume{}, err
+		}
+	}
+
+	s.mu.Lock()
+	tenant, err = s.resolveTenantLocked(apiKey)
+	if err != nil {
 		s.mu.Unlock()
 		return Volume{}, err
 	}
+	if _, ok := s.byName[nameKey(tenant, name)]; ok {
+		s.mu.Unlock()
+		return Volume{}, ErrExists
+	}
+	tenantCount = 0
+	for _, r := range s.vols {
+		if r.meta.Tenant == tenant {
+			tenantCount++
+		}
+	}
+	if tenantCount >= s.cfg.MaxVolumesPerTenant {
+		s.mu.Unlock()
+		return Volume{}, ErrLimitExceeded
+	}
 	rec := &volRec{
 		meta: Volume{
-			VolumeID:      id,
-			Name:          name,
-			Token:         token,
-			Tenant:        tenant,
-			CreatedAt:     time.Now().UTC(),
-			DataDir:       filepath.Join(s.dir, id, "data"),
-			DaemonDataDir: s.daemonDataPath(id),
+			VolumeID:       id,
+			Name:           name,
+			Token:          token,
+			EncryptedToken: encToken,
+			KMSKeyID:       kmsKeyID,
+			Tenant:         tenant,
+			CreatedAt:      time.Now().UTC(),
+			DataDir:        filepath.Join(s.dir, id, "data"),
+			DaemonDataDir:  s.daemonDataPath(id),
 		},
 		attrs: map[string]fileAttr{},
 	}
@@ -344,14 +458,129 @@ func (s *Store) Create(apiKey, name string) (Volume, error) {
 	return out, nil
 }
 
+// RotateAPIKey migrates all volumes and active mount ownership from oldAPIKey to
+// newAPIKey, revokes oldAPIKey from accessing migrated volumes, and persists the
+// keyring in tenants.json with flock + atomic rename for RWX safety.
+func (s *Store) RotateAPIKey(oldAPIKey, newAPIKey string) (int, error) {
+	if oldAPIKey == "" || newAPIKey == "" || oldAPIKey == newAPIKey {
+		return 0, ErrInvalidKey
+	}
+	freshSuffix, err := newID()
+	if err != nil {
+		return 0, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rotated := 0
+	err = s.withStoreFlock(true, func() error {
+		if loadErr := s.reloadKeyringAndMetaUnlocked(); loadErr != nil {
+			return loadErr
+		}
+		oldHash := rawKeyHash(oldAPIKey)
+		newHash := rawKeyHash(newAPIKey)
+
+		if _, revoked := s.revokedKeys[oldHash]; revoked {
+			return ErrUnauthorized
+		}
+		if _, revoked := s.revokedKeys[newHash]; revoked {
+			return ErrConflict
+		}
+
+		oldTenant := s.tenantKeys[oldHash]
+		if oldTenant == "" {
+			oldTenant = oldHash
+		}
+
+		if existingTenant, ok := s.tenantKeys[newHash]; ok && existingTenant != "" && existingTenant != oldTenant {
+			return ErrConflict
+		}
+		for _, r := range s.vols {
+			if r.meta.Tenant == newHash && newHash != oldTenant {
+				return ErrConflict
+			}
+		}
+		for _, ms := range s.mounts {
+			for _, m := range ms {
+				if m.Tenant == newHash && newHash != oldTenant {
+					return ErrConflict
+				}
+			}
+		}
+
+		targetTenant := oldTenant
+		if !strings.HasPrefix(oldTenant, "tnt_") {
+			targetTenant = "tnt_" + freshSuffix
+		}
+
+		type prevVolTenant struct {
+			rec        *volRec
+			prevTenant string
+		}
+		var migrated []prevVolTenant
+		for _, r := range s.vols {
+			if r.meta.Tenant != oldTenant && r.meta.Tenant != targetTenant {
+				continue
+			}
+			rotated++
+			if r.meta.Tenant != targetTenant {
+				prev := r.meta.Tenant
+				r.meta.Tenant = targetTenant
+				if saveErr := s.saveMetaUnlocked(r); saveErr != nil {
+					r.meta.Tenant = prev
+					for _, m := range migrated {
+						delete(s.byName, nameKey(targetTenant, m.rec.meta.Name))
+						m.rec.meta.Tenant = m.prevTenant
+						s.byName[nameKey(m.prevTenant, m.rec.meta.Name)] = m.rec.meta.VolumeID
+						_ = s.saveMetaUnlocked(m.rec)
+					}
+					return saveErr
+				}
+				delete(s.byName, nameKey(prev, r.meta.Name))
+				s.byName[nameKey(targetTenant, r.meta.Name)] = r.meta.VolumeID
+				migrated = append(migrated, prevVolTenant{rec: r, prevTenant: prev})
+			}
+		}
+
+		mountsChanged := false
+		for sb, ms := range s.mounts {
+			for i := range ms {
+				if ms[i].Tenant == oldTenant && ms[i].Tenant != targetTenant {
+					ms[i].Tenant = targetTenant
+					mountsChanged = true
+				}
+			}
+			s.mounts[sb] = ms
+		}
+		if mountsChanged {
+			if saveErr := s.saveMountsUnlocked(); saveErr != nil {
+				return saveErr
+			}
+		}
+
+		delete(s.tenantKeys, oldHash)
+		s.tenantKeys[newHash] = targetTenant
+		s.revokedKeys[oldHash] = time.Now().UTC().Format(time.RFC3339Nano)
+		return s.saveKeyringUnlocked()
+	})
+	if err != nil {
+		return 0, err
+	}
+	return rotated, nil
+}
+
 // List returns volumes for this API key. Tokens are not included.
 func (s *Store) List(apiKey string) ([]Volume, error) {
 	if apiKey == "" {
 		return nil, ErrUnauthorized
 	}
-	tenant := tenantOf(apiKey)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tenant, err := s.resolveTenantLocked(apiKey)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]Volume, 0)
 	for _, rec := range s.vols {
 		if rec.meta.Tenant != tenant {
@@ -359,6 +588,7 @@ func (s *Store) List(apiKey string) ([]Volume, error) {
 		}
 		cp := rec.meta
 		cp.Token = ""
+		cp.EncryptedToken = ""
 		out = append(out, cp)
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -380,8 +610,12 @@ func (s *Store) Get(apiKey, id string) (Volume, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tenant, err := s.resolveTenantLocked(apiKey)
+	if err != nil {
+		return Volume{}, err
+	}
 	rec, ok := s.vols[id]
-	if !ok || rec.meta.Tenant != tenantOf(apiKey) {
+	if !ok || rec.meta.Tenant != tenant {
 		return Volume{}, ErrNotFound
 	}
 	return rec.meta, nil
@@ -410,8 +644,13 @@ func (s *Store) Delete(apiKey, id string) (Volume, error) {
 		return Volume{}, ErrNotFound
 	}
 	s.mu.Lock()
+	tenant, err := s.resolveTenantLocked(apiKey)
+	if err != nil {
+		s.mu.Unlock()
+		return Volume{}, err
+	}
 	rec, ok := s.vols[id]
-	if !ok || rec.meta.Tenant != tenantOf(apiKey) {
+	if !ok || rec.meta.Tenant != tenant {
 		s.mu.Unlock()
 		return Volume{}, ErrNotFound
 	}
@@ -469,9 +708,12 @@ func (s *Store) LookupMounts(apiKey string, reqs []MountRequest) ([]PlannedMount
 	if len(reqs) > maxMountsPerSandbox {
 		return nil, ErrInvalidPath
 	}
-	tenant := tenantOf(apiKey)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tenant, err := s.resolveTenantLocked(apiKey)
+	if err != nil {
+		return nil, err
+	}
 	seenPath := map[string]struct{}{}
 	out := make([]PlannedMount, 0, len(reqs))
 	for _, req := range reqs {
@@ -500,9 +742,12 @@ func (s *Store) CommitMounts(sandboxID, apiKey string, planned []PlannedMount) e
 	if sandboxID == "" || apiKey == "" {
 		return ErrInvalidPath
 	}
-	tenant := tenantOf(apiKey)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tenant, err := s.resolveTenantLocked(apiKey)
+	if err != nil {
+		return err
+	}
 	recs := make([]mountRec, 0, len(planned))
 	for _, p := range planned {
 		rec, ok := s.vols[p.VolumeID]
@@ -834,6 +1079,8 @@ func (s *Store) WriteFile(id, userPath string, r io.Reader, opts WriteOpts) (Ent
 		return Entry{}, err
 	}
 
+	maxTenantBytes := s.cfg.MaxBytesPerTenant
+
 	// Stage the upload into the volume's private 0700 directory (outside data/)
 	// so no lock is held during network I/O and partial writes never touch data/.
 	volDir := filepath.Join(s.dir, id)
@@ -850,8 +1097,20 @@ func (s *Store) WriteFile(id, userPath string, r io.Reader, opts WriteOpts) (Ent
 			_ = os.Remove(tmpPath)
 		}
 	}()
-	if _, err := io.Copy(tmpFile, r); err != nil {
-		return Entry{}, err
+	var written int64
+	if maxTenantBytes > 0 {
+		written, err = io.Copy(tmpFile, io.LimitReader(r, maxTenantBytes+1))
+		if err != nil {
+			return Entry{}, err
+		}
+		if written > maxTenantBytes {
+			return Entry{}, ErrLimitExceeded
+		}
+	} else {
+		written, err = io.Copy(tmpFile, r)
+		if err != nil {
+			return Entry{}, err
+		}
 	}
 	fileMode := os.FileMode(0o644)
 	if opts.Mode != nil {
@@ -862,6 +1121,16 @@ func (s *Store) WriteFile(id, userPath string, r io.Reader, opts WriteOpts) (Ent
 	}
 	if err := tmpFile.Close(); err != nil {
 		return Entry{}, err
+	}
+
+	if maxTenantBytes > 0 {
+		tenantID, ok := s.volumeTenant(id)
+		if !ok {
+			return Entry{}, ErrNotFound
+		}
+		qmu := s.tenantQuotaLock(tenantID)
+		qmu.Lock()
+		defer qmu.Unlock()
 	}
 
 	rec.mu.Lock()
@@ -884,13 +1153,32 @@ func (s *Store) WriteFile(id, userPath string, r io.Reader, opts WriteOpts) (Ent
 	}
 	defer parent.Close()
 
+	var existingSize int64
 	var st unix.Stat_t
 	if statErr := unix.Fstatat(int(parent.Fd()), base, &st, unix.AT_SYMLINK_NOFOLLOW); statErr == nil {
 		if st.Mode&unix.S_IFMT == unix.S_IFDIR || st.Mode&unix.S_IFMT == unix.S_IFLNK {
 			return Entry{}, ErrConflict
 		}
+		if st.Mode&unix.S_IFMT == unix.S_IFREG && st.Size > 0 {
+			existingSize = st.Size
+		}
 	} else if !errors.Is(statErr, unix.ENOENT) {
 		return Entry{}, mapUnixErr(statErr)
+	}
+
+	if maxTenantBytes > 0 {
+		tenantID, ok := s.volumeTenant(id)
+		if !ok {
+			return Entry{}, ErrNotFound
+		}
+		usedBytes, err := s.tenantUsedBytes(tenantID)
+		if err != nil {
+			return Entry{}, err
+		}
+		netBytes := usedBytes - existingSize + written
+		if netBytes > maxTenantBytes {
+			return Entry{}, ErrLimitExceeded
+		}
 	}
 
 	volDirFile, err := os.Open(volDir)
@@ -1086,34 +1374,275 @@ func (s *Store) dropAttrs(rec *volRec, abs string, dir bool) {
 	}
 }
 
-func (s *Store) load() error {
-	entries, err := os.ReadDir(s.dir)
+func (s *Store) volumeTenant(id string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.vols[id]
+	if !ok {
+		return "", false
+	}
+	return rec.meta.Tenant, true
+}
+
+func (s *Store) tenantQuotaLock(tenantID string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tenantQuota == nil {
+		s.tenantQuota = map[string]*sync.Mutex{}
+	}
+	qmu, ok := s.tenantQuota[tenantID]
+	if !ok {
+		qmu = &sync.Mutex{}
+		s.tenantQuota[tenantID] = qmu
+	}
+	return qmu
+}
+
+func (s *Store) tenantUsedBytes(tenantID string) (int64, error) {
+	s.mu.Lock()
+	dirs := make([]string, 0, len(s.vols))
+	for _, r := range s.vols {
+		if r.meta.Tenant == tenantID {
+			dirs = append(dirs, r.meta.DataDir)
+		}
+	}
+	s.mu.Unlock()
+
+	var total int64
+	for _, d := range dirs {
+		n, err := sumDataRootBytes(d)
+		if err != nil {
+			return 0, err
+		}
+		total += n
+	}
+	return total, nil
+}
+
+func (s *Store) withStoreFlock(exclusive bool, fn func() error) error {
+	lockPath := filepath.Join(s.dir, ".store.lock")
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
-	for _, e := range entries {
-		if !e.IsDir() || !volumeIDRe.MatchString(e.Name()) {
+	_ = f.Chmod(0o600)
+	how := unix.LOCK_SH
+	if exclusive {
+		how = unix.LOCK_EX
+	}
+	for {
+		lockErr := unix.Flock(int(f.Fd()), how)
+		if lockErr == nil {
+			break
+		}
+		if !errors.Is(lockErr, unix.EINTR) {
+			_ = f.Close()
+			return lockErr
+		}
+	}
+	defer func() {
+		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+		_ = f.Close()
+	}()
+	return fn()
+}
+
+func (s *Store) keyringPath() string {
+	return filepath.Join(s.dir, "tenants.json")
+}
+
+func (s *Store) loadKeyringUnlocked() error {
+	tp := s.keyringPath()
+	fi, err := os.Stat(tp)
+	if err != nil {
+		if os.IsNotExist(err) {
+			s.tenantKeys = map[string]string{}
+			s.revokedKeys = map[string]string{}
+			s.tenantsMtime = 0
+			s.tenantsSize = 0
+			return nil
+		}
+		return err
+	}
+	b, err := os.ReadFile(tp)
+	if err != nil {
+		return err
+	}
+	_ = os.Chmod(tp, 0o600)
+	var kr tenantKeyring
+	if len(b) > 0 {
+		if err := json.Unmarshal(b, &kr); err != nil {
+			return fmt.Errorf("tenants keyring: %w", err)
+		}
+	}
+	if kr.Keys == nil {
+		kr.Keys = map[string]string{}
+	}
+	if kr.Revoked == nil {
+		kr.Revoked = map[string]string{}
+	}
+	s.tenantKeys = kr.Keys
+	s.revokedKeys = kr.Revoked
+	s.tenantsMtime = fi.ModTime().UnixNano()
+	s.tenantsSize = fi.Size()
+	return nil
+}
+
+func (s *Store) saveKeyringUnlocked() error {
+	tp := s.keyringPath()
+	kr := tenantKeyring{
+		Version: 1,
+		Keys:    s.tenantKeys,
+		Revoked: s.revokedKeys,
+	}
+	if err := atomicWriteJSON(tp, kr); err != nil {
+		return err
+	}
+	if fi, err := os.Stat(tp); err == nil {
+		s.tenantsMtime = fi.ModTime().UnixNano()
+		s.tenantsSize = fi.Size()
+	}
+	return nil
+}
+
+// reloadKeyringAndMetaUnlocked refreshes tenants.json and any rotated volume/mount
+// tenant fields from disk while the caller holds both s.mu and the store flock.
+func (s *Store) reloadKeyringAndMetaUnlocked() error {
+	if err := s.loadKeyringUnlocked(); err != nil {
+		return err
+	}
+	for id, rec := range s.vols {
+		b, err := os.ReadFile(filepath.Join(s.dir, id, "meta.json"))
+		if err != nil {
 			continue
 		}
-		id := e.Name()
-		metaPath := filepath.Join(s.dir, id, "meta.json")
-		b, err := os.ReadFile(metaPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
+		var disk Volume
+		if json.Unmarshal(b, &disk) != nil || disk.Tenant == "" {
+			continue
+		}
+		if disk.Tenant != rec.meta.Tenant {
+			delete(s.byName, nameKey(rec.meta.Tenant, rec.meta.Name))
+			rec.meta.Tenant = disk.Tenant
+			s.byName[nameKey(rec.meta.Tenant, rec.meta.Name)] = id
+		}
+	}
+	mp := filepath.Join(s.dir, "mounts.json")
+	if b, err := os.ReadFile(mp); err == nil && len(b) > 0 {
+		var raw map[string][]mountRec
+		if json.Unmarshal(b, &raw) == nil {
+			rebuilt := map[string][]mountRec{}
+			for sb, ms := range raw {
+				kept := make([]mountRec, 0, len(ms))
+				for _, m := range ms {
+					rec, ok := s.vols[m.VolumeID]
+					if !ok || rec.meta.Tenant != m.Tenant {
+						continue
+					}
+					kept = append(kept, m)
+				}
+				if len(kept) > 0 {
+					rebuilt[sb] = kept
+				}
 			}
+			s.mounts = rebuilt
+		}
+	}
+	return nil
+}
+
+// syncKeyringFromDiskLocked checks if another RWX replica updated tenants.json
+// and reloads keyring + tenant mappings when needed. Caller must hold s.mu.
+func (s *Store) syncKeyringFromDiskLocked() {
+	fi, err := os.Stat(s.keyringPath())
+	if err != nil {
+		return
+	}
+	if fi.ModTime().UnixNano() == s.tenantsMtime && fi.Size() == s.tenantsSize {
+		return
+	}
+	_ = s.withStoreFlock(false, func() error {
+		return s.reloadKeyringAndMetaUnlocked()
+	})
+}
+
+func (s *Store) load() error {
+	type rawVolDisk struct {
+		id        string
+		metaBytes []byte
+		attrBytes []byte
+	}
+	var rawVols []rawVolDisk
+	var mountsBytes []byte
+
+	if err := s.withStoreFlock(false, func() error {
+		if err := s.loadKeyringUnlocked(); err != nil {
 			return err
 		}
+		entries, err := os.ReadDir(s.dir)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if !e.IsDir() || !volumeIDRe.MatchString(e.Name()) {
+				continue
+			}
+			id := e.Name()
+			metaPath := filepath.Join(s.dir, id, "meta.json")
+			b, err := os.ReadFile(metaPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				return err
+			}
+			ab, _ := os.ReadFile(filepath.Join(s.dir, id, "attrs.json"))
+			rawVols = append(rawVols, rawVolDisk{id: id, metaBytes: b, attrBytes: ab})
+		}
+		mp := filepath.Join(s.dir, "mounts.json")
+		if b, err := os.ReadFile(mp); err == nil {
+			mountsBytes = b
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	var migratedLegacy []*volRec
+	for _, rv := range rawVols {
+		id := rv.id
 		var meta Volume
-		if err := json.Unmarshal(b, &meta); err != nil {
+		if err := json.Unmarshal(rv.metaBytes, &meta); err != nil {
 			return fmt.Errorf("volume %s meta: %w", id, err)
 		}
-		if meta.VolumeID != id || !ValidName(meta.Name) || meta.Tenant == "" || meta.Token == "" {
+		if meta.VolumeID != id || !ValidName(meta.Name) || meta.Tenant == "" {
 			continue
 		}
+		wasLegacyPlaintext := false
+		switch {
+		case meta.EncryptedToken != "":
+			plainToken, err := openVolumeToken(context.Background(), s.cfg.KMS, id, meta.EncryptedToken)
+			if err != nil {
+				return fmt.Errorf("volume %s token unwrap: %w", id, err)
+			}
+			meta.Token = plainToken
+		case meta.Token != "":
+			if s.cfg.KMS != nil {
+				encTok, keyID, err := sealVolumeToken(context.Background(), s.cfg.KMS, id, meta.Token)
+				if err != nil {
+					return fmt.Errorf("volume %s legacy token KMS migration: %w", id, err)
+				}
+				meta.EncryptedToken = encTok
+				meta.KMSKeyID = keyID
+				wasLegacyPlaintext = true
+			}
+		default:
+			continue
+		}
+
 		meta.DataDir = filepath.Join(s.dir, id, "data")
 		meta.DaemonDataDir = s.daemonDataPath(id)
 		volDir := filepath.Join(s.dir, id)
+		metaPath := filepath.Join(volDir, "meta.json")
 		if err := os.MkdirAll(meta.DataDir, 0o755); err != nil {
 			return err
 		}
@@ -1124,21 +1653,37 @@ func (s *Store) load() error {
 			return err
 		}
 		_ = os.Chmod(metaPath, 0o600)
-		_ = os.Chmod(filepath.Join(s.dir, id, "attrs.json"), 0o600)
+		_ = os.Chmod(filepath.Join(volDir, "attrs.json"), 0o600)
 		rec := &volRec{meta: meta, attrs: map[string]fileAttr{}}
-		if ab, err := os.ReadFile(filepath.Join(s.dir, id, "attrs.json")); err == nil {
-			_ = json.Unmarshal(ab, &rec.attrs)
+		if len(rv.attrBytes) > 0 {
+			_ = json.Unmarshal(rv.attrBytes, &rec.attrs)
 			if rec.attrs == nil {
 				rec.attrs = map[string]fileAttr{}
 			}
 		}
 		s.vols[id] = rec
 		s.byName[nameKey(meta.Tenant, meta.Name)] = id
+		if wasLegacyPlaintext {
+			migratedLegacy = append(migratedLegacy, rec)
+		}
 	}
-	mp := filepath.Join(s.dir, "mounts.json")
-	if b, err := os.ReadFile(mp); err == nil && len(b) > 0 {
+
+	if len(migratedLegacy) > 0 {
+		if err := s.withStoreFlock(true, func() error {
+			for _, rec := range migratedLegacy {
+				if err := s.saveMetaUnlocked(rec); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
+	if len(mountsBytes) > 0 {
 		var raw map[string][]mountRec
-		if err := json.Unmarshal(b, &raw); err != nil {
+		if err := json.Unmarshal(mountsBytes, &raw); err != nil {
 			return fmt.Errorf("mounts: %w", err)
 		}
 		for sb, ms := range raw {
@@ -1155,15 +1700,27 @@ func (s *Store) load() error {
 			}
 		}
 	}
-	_ = os.Chmod(mp, 0o600)
+	_ = os.Chmod(filepath.Join(s.dir, "mounts.json"), 0o600)
+	_ = os.Chmod(s.keyringPath(), 0o600)
 	if err := os.Chmod(s.dir, 0o700); err != nil {
 		return err
 	}
 	return nil
 }
 
+func (s *Store) saveMetaUnlocked(rec *volRec) error {
+	disk := rec.meta
+	if disk.EncryptedToken != "" {
+		// Never persist plaintext content token on disk when envelope encryption is active.
+		disk.Token = ""
+	}
+	return atomicWriteJSON(filepath.Join(s.dir, rec.meta.VolumeID, "meta.json"), disk)
+}
+
 func (s *Store) saveMeta(rec *volRec) error {
-	return atomicWriteJSON(filepath.Join(s.dir, rec.meta.VolumeID, "meta.json"), rec.meta)
+	return s.withStoreFlock(true, func() error {
+		return s.saveMetaUnlocked(rec)
+	})
 }
 
 func (s *Store) saveAttrs(rec *volRec) error {
@@ -1173,8 +1730,14 @@ func (s *Store) saveAttrs(rec *volRec) error {
 	return atomicWriteJSON(filepath.Join(s.dir, rec.meta.VolumeID, "attrs.json"), rec.attrs)
 }
 
-func (s *Store) saveMounts() error {
+func (s *Store) saveMountsUnlocked() error {
 	return atomicWriteJSON(filepath.Join(s.dir, "mounts.json"), s.mounts)
+}
+
+func (s *Store) saveMounts() error {
+	return s.withStoreFlock(true, func() error {
+		return s.saveMountsUnlocked()
+	})
 }
 
 func (s *Store) daemonDataPath(id string) string {
