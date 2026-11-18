@@ -44,16 +44,21 @@ def main(cluster, args):
     validate(cluster, name, uuid, query('table', name).split(), parent)
     major, minor = query('info', '-c', '--noheadings', '--separator', ':', '-o', 'major,minor', name).split(':')
     device = os.makedev(int(major), int(minor))
-    path = Path('/dev/mapper') / name
-    if path.is_symlink():
-        path.unlink()  # This owned name only, in the node's private /dev.
-    if not path.exists():
-        os.mknod(path, stat.S_IFBLK | 0o600, device)
-    actual = path.stat()
-    assert stat.S_ISBLK(actual.st_mode) and actual.st_rdev == device
+    canonical = query('info', '-c', '--noheadings', '-o', 'blkdevname', name)
+    assert canonical == 'dm-' + str(int(minor)), 'Unexpected kernel block-device name'
+    assert int(major) == int(parent.split(':')[0]), 'Thin and pool device majors differ'
+    # Kata resolves source devices through sysfs DEVNAME (/dev/dm-N), not only
+    # the friendly mapper alias. Both entries name THIS verified owned mapping.
+    for path in (Path('/dev/mapper') / name, Path('/dev') / canonical):
+        if path.is_symlink():
+            path.unlink()  # Private node /dev; only a verified owned device.
+        if not path.exists():
+            os.mknod(path, stat.S_IFBLK | 0o600, device)
+        actual = path.stat()
+        assert stat.S_ISBLK(actual.st_mode) and actual.st_rdev == device
     with (base / 'device-publication.log').open('a') as log:
         log.write(json.dumps({'name': name, 'pool_uuid': uuid, 'parent': parent,
-                              'major': int(major), 'minor': int(minor)}) + '\n')
+                              'major': int(major), 'minor': int(minor), 'canonical': canonical}) + '\n')
 
 
 if __name__ == '__main__':

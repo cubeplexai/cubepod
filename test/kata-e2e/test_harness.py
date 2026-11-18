@@ -86,14 +86,16 @@ class DevicePublicationTest(unittest.TestCase):
         path.exists.return_value = False
         path.stat.return_value = SimpleNamespace(st_mode=stat.S_IFBLK, st_rdev=os.makedev(253, 2))
         answers = ['CUBEPOD_E2E_' + cluster, '253:1', 'CUBEPOD_E2E_' + cluster,
-                   '0 2048 thin 253:1 1', '253:2']
+                   '0 2048 thin 253:1 1', '253:2', 'dm-2']
         with patch.object(dmsetup_node, 'Path', return_value=path), \
              patch.object(dmsetup_node, 'query', side_effect=answers), \
              patch.object(dmsetup_node.subprocess, 'run') as create, \
              patch.object(dmsetup_node.os, 'mknod') as publish:
             dmsetup_node.main(cluster, ['create', name, '--table', '0 2048 thin /dev/mapper/' + pool + ' 1'])
             create.assert_called_once()
-            publish.assert_called_once_with(path, stat.S_IFBLK | 0o600, os.makedev(253, 2))
+            self.assertEqual(publish.call_count, 2)
+            for call in publish.call_args_list:
+                self.assertEqual(call.args, (path, stat.S_IFBLK | 0o600, os.makedev(253, 2)))
 
     def test_foreign_request_never_mutates_or_publishes(self):
         cluster = 'cubepod-fc-own'
