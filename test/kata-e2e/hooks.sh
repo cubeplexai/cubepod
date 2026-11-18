@@ -101,8 +101,15 @@ spec:
     command: [bash, -ec, 'uname -r; echo KATA_GUEST_READY; sleep 180']
 YAML
   k wait --for=condition=Ready pod/kata-smoke --timeout=180s
-  k logs kata-smoke >"$ARTIFACTS/kata-smoke.log"
-  python3 -c 'import pathlib,sys; lines=pathlib.Path(sys.argv[1]).read_text().splitlines(); assert "6.18.62" in lines and "KATA_GUEST_READY" in lines' "$ARTIFACTS/kata-smoke.log"
+  # Pod Ready can precede asynchronous shim/CRI stdout delivery. Wait for the
+  # SAME strict positive proof, never rerun the guest or accept an empty log.
+  local deadline=$((SECONDS + 30)) guest_proven=0
+  while (( SECONDS < deadline )); do
+    if timeout 3s kubectl --context "kind-$CLUSTER_NAME" --request-timeout=2s logs kata-smoke >"$ARTIFACTS/kata-smoke.log" &&
+       python3 "$KATA_HERE/verify_guest_log.py" "$ARTIFACTS/kata-smoke.log"; then guest_proven=1; break; fi
+    sleep 0.2
+  done
+  (( guest_proven == 1 )) || { echo 'Timed out waiting for actual Kata guest kernel and output'; return 1; }
   kata_node python3 -c 'import os,sys,json; target={"fc":"firecracker","clh":"cloud-hypervisor"}[sys.argv[1]]; found=[]
 for p in os.listdir("/proc"):
  if not p.isdigit(): continue
