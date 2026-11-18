@@ -9,6 +9,7 @@ kata_node() {
   timeout 180s docker exec "$CLUSTER_NAME-control-plane" "$@"
 }
 kata_prepare() {
+  python3 -m unittest discover -s "$KATA_HERE" -p test_harness.py
   [[ "$KATA_VMM" == fc || "$KATA_VMM" == clh ]] || return 1
   [[ ! -e "$STATE/kata-owned" ]] || { echo 'Refusing existing Kata state: use down first'; return 1; }
   [[ $(uname -m) == x86_64 && $(uname -r) != 6.18.62 ]] || { echo 'Need x64 host and distinguishable guest kernel'; return 1; }
@@ -101,7 +102,7 @@ spec:
 YAML
   k wait --for=condition=Ready pod/kata-smoke --timeout=180s
   k logs kata-smoke >"$ARTIFACTS/kata-smoke.log"
-  rg -q '^6\.18\.62$' "$ARTIFACTS/kata-smoke.log"
+  python3 -c 'import pathlib,sys; lines=pathlib.Path(sys.argv[1]).read_text().splitlines(); assert "6.18.62" in lines and "KATA_GUEST_READY" in lines' "$ARTIFACTS/kata-smoke.log"
   kata_node python3 -c 'import os,sys,json; target={"fc":"firecracker","clh":"cloud-hypervisor"}[sys.argv[1]]; found=[]
 for p in os.listdir("/proc"):
  if not p.isdigit(): continue
@@ -139,7 +140,7 @@ kata_teardown_node() {
   # Requires live owned node: never lose the namespace holding owned loop files.
   kata_node true || return 1
   if kata_node test ! -d "/var/lib/cubepod-kata-e2e/$CLUSTER_NAME"; then return 0; fi
-  timeout 180s docker exec -i "$CLUSTER_NAME-control-plane" python3 - "$CLUSTER_NAME" <"$KATA_HERE/cleanup_node.py" >"$ARTIFACTS/kata-node-cleanup.log" 2>&1
+  timeout 180s docker exec -i "$CLUSTER_NAME-control-plane" python3 - "$CLUSTER_NAME" <"$KATA_HERE/cleanup_node.py" >>"$ARTIFACTS/kata-node-cleanup.log" 2>&1
 }
 kata_cleanup() {
   kata_stop_watch
