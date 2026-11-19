@@ -2048,3 +2048,145 @@ func TestMultiReplicaController_S3AndBuildClaimCAS(t *testing.T) {
 		t.Fatalf("expected total 2 Build invocations after second race, got %d", calls)
 	}
 }
+
+func TestGetPodTemplateConcurrentBuildStatus(t *testing.T) {
+	ctx := context.Background()
+	fakeBuilder := controller.NewFakeImageBuilder()
+	buildStarted := make(chan struct{})
+	releaseBuild := make(chan struct{})
+	fakeBuilder.BuildHook = func(_ controller.BuildOptions) error {
+		close(buildStarted)
+		<-releaseBuild
+		return nil
+	}
+
+	r := controller.NewReconciler(
+		controller.WithE2BTemplateAPI(true),
+		controller.WithTemplateBuildEnabled(true),
+		controller.WithImageBuilder(fakeBuilder),
+	)
+
+	resp, err := r.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "race-tpl"}, "")
+	if err != nil {
+		t.Fatalf("CreateTemplate failed: %v", err)
+	}
+
+	if err := r.StartBuildAsync(ctx, resp.TemplateID, resp.BuildID, controller.StartBuildRequest{
+		FromImage: "alpine:3.20",
+		Steps:     []controller.BuildStep{{Type: "RUN", Args: []string{"echo hi"}}},
+	}); err != nil {
+		t.Fatalf("StartBuildAsync failed: %v", err)
+	}
+
+	<-buildStarted
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var reads atomic.Int64
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				tpl, ok := r.GetPodTemplate(resp.TemplateID)
+				if !ok {
+					t.Errorf("GetPodTemplate(%s) missed live template", resp.TemplateID)
+					return
+				}
+				// Read every aliased field so the race detector flags a shallow copy.
+				_ = tpl.Metadata.Name
+				for k, v := range tpl.Metadata.Labels {
+					_ = k + v
+				}
+				for k, v := range tpl.Metadata.Annotations {
+					_ = k + v
+				}
+				for _, name := range tpl.Spec.Names {
+					_ = name
+				}
+				for i := range tpl.Status.Builds {
+					rec := tpl.Status.Builds[i]
+					_ = rec.BuildID + rec.Status + rec.Reason + rec.FailedStep + rec.CreatedAt + rec.UpdatedAt
+					_ = rec.CPUCount + rec.MemoryMB
+				}
+				reads.Add(1)
+			}
+		}()
+	}
+
+	// Let readers overlap with upsertBuildRecord after Build() returns.
+	time.Sleep(20 * time.Millisecond)
+	close(releaseBuild)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		tpl, ok := r.GetPodTemplate(resp.TemplateID)
+		if ok && tpl.Status.BuildStatus == v1alpha1.BuildStatusReady {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	close(stop)
+	wg.Wait()
+
+	if reads.Load() == 0 {
+		t.Fatal("expected concurrent GetPodTemplate reads during the build")
+	}
+	tpl, ok := r.GetPodTemplate(resp.TemplateID)
+	if !ok || tpl.Status.BuildStatus != v1alpha1.BuildStatusReady {
+		t.Fatalf("expected ready status after build, ok=%v status=%s", ok, tpl.Status.BuildStatus)
+	}
+	if got := len(tpl.Status.Builds); got == 0 {
+		t.Fatal("expected at least one build record on the ready template")
+	}
+
+	// Returned objects must not alias the live template's maps or slices.
+	tpl.Status.Builds = append(tpl.Status.Builds, v1alpha1.PodTemplateBuildRecord{BuildID: "bld_alias"})
+	if tpl.Metadata.Annotations == nil {
+		t.Fatal("expected annotations on the created template")
+	}
+	tpl.Metadata.Annotations["cubepod.io/race-test"] = "mutated"
+	tpl.Spec.Names = append(tpl.Spec.Names, "race-tpl:alias")
+
+	fresh, ok := r.GetPodTemplate(resp.TemplateID)
+	if !ok {
+		t.Fatal("GetPodTemplate failed after mutating the prior copy")
+	}
+	for _, rec := range fresh.Status.Builds {
+		if rec.BuildID == "bld_alias" {
+			t.Fatal("mutating GetPodTemplate copy leaked into the live template Builds slice")
+		}
+	}
+	if fresh.Metadata.Annotations["cubepod.io/race-test"] == "mutated" {
+		t.Fatal("mutating GetPodTemplate copy leaked into the live template annotations")
+	}
+	if slices.Contains(fresh.Spec.Names, "race-tpl:alias") {
+		t.Fatal("mutating GetPodTemplate copy leaked into the live template Names slice")
+	}
+
+	tagged, err := r.AssignTemplateTags(ctx, resp.TemplateID, []string{"v1"})
+	if err != nil {
+		t.Fatalf("AssignTemplateTags failed: %v", err)
+	}
+	tagged.Spec.Names = append(tagged.Spec.Names, "race-tpl:leaked")
+	fresh, _ = r.GetPodTemplate(resp.TemplateID)
+	if slices.Contains(fresh.Spec.Names, "race-tpl:leaked") {
+		t.Fatal("mutating AssignTemplateTags copy leaked into the live template Names slice")
+	}
+
+	deleted, err := r.DeleteTemplateTags(ctx, resp.TemplateID, []string{"v1"})
+	if err != nil {
+		t.Fatalf("DeleteTemplateTags failed: %v", err)
+	}
+	deleted.Spec.Names = append(deleted.Spec.Names, "race-tpl:leaked-delete")
+	fresh, _ = r.GetPodTemplate(resp.TemplateID)
+	if slices.Contains(fresh.Spec.Names, "race-tpl:leaked-delete") {
+		t.Fatal("mutating DeleteTemplateTags copy leaked into the live template Names slice")
+	}
+}
