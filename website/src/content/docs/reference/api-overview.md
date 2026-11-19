@@ -129,7 +129,7 @@ When `--e2b-template-api=true` is enabled on the Gateway and Controller, the ful
 ## Secrets, Volumes, Events & Webhooks
 
 - **E2B Secrets (`E2BSecretsAPI`, *Changed in v0.6.0*)**: `POST /secrets`, `GET /secrets`, `GET /secrets/{secretID}`, `POST /secrets/{secretID}`, `DELETE /secrets/{secretID}` — tenant-isolated write-only secret store (`KubeSecretBackend` HA or AES-256-GCM file store) resolved via `${e2b.secrets.<name>}` (`Secret.fill()`).
-- **E2B Volumes**: `POST /volumes`, `GET /volumes`, `GET /volumes/{volumeID}`, `DELETE /volumes/{volumeID}`, plus content endpoints `/volumecontent/{volumeID}/{file,dir,path}` and `volumeMounts` on `POST /sandboxes` (K8s Kata RWX mounts gated by `K8sE2BVolumeMounts` / Helm `e2bVolumes.rwxStorageClassName`).
+- **E2B Volumes (*Changed in v0.7.0*)**: `POST /volumes`, `GET /volumes`, `GET /volumes/{volumeID}`, `DELETE /volumes/{volumeID}`, `POST /volumes/rotate-key` (*Added in v0.7.0* — migrates tenant volume & mount ownership from `{"previousApiKey": "<oldKey>"}` to `X-API-Key: <newKey>`, revoking `<oldKey>` via the RWX `flock`-guarded `tenants.json` keyring), plus content endpoints `/volumecontent/{volumeID}/{file,dir,path}` and `volumeMounts` on `POST /sandboxes` (K8s Kata RWX mounts gated by `K8sE2BVolumeMounts` / Helm `e2bVolumes.rwxStorageClassName`). Supports envelope encryption of volume content tokens via `CUBEPOD_E2B_VOLUMES_KEK` or `CUBEPOD_E2B_VOLUMES_KMS_URL` (`CUBEPOD_E2B_VOLUMES_KMS_TOKEN`), per-tenant byte/count quotas (`CUBEPOD_E2B_MAX_TENANT_BYTES`, `CUBEPOD_E2B_MAX_VOLUMES_PER_TENANT`), and `PrometheusRule` alerts in `deploy/monitoring/e2b-volumes-alerts.yaml` (*Added in v0.7.0*).
 - **Lifecycle Events & Webhooks (`SandboxEventsAndWebhooks`, *Added in v0.6.0*)**: `GET /events`, `GET /sandboxes/{sandboxID}/events`, `POST /webhooks`, `GET /webhooks`, `GET /webhooks/{webhookID}`, `PATCH /webhooks/{webhookID}`, `DELETE /webhooks/{webhookID}`.
 
 ## Feature Gates (`--feature-gate`) *(Added in v0.6.0)*
@@ -182,6 +182,9 @@ Both `cubepod-gateway` and `cubepod-controller` accept `--feature-gate=GateA=tru
 | **Gateway** | `cubepod_watch_streams_active` / `cubepod_watchers_active` *(Added in v0.7.0)* | Gauge | Live `WatchDir` streams and active poll watchers (`CreateWatcher`) |
 | **Gateway** | `cubepod_watch_events_total` / `cubepod_watch_overflows_total` *(Added in v0.7.0)* | Counter | Watch events emitted and `resource_exhausted` watch overflows |
 | **Gateway** | `cubepod_e2b_volume_mounts_total` / `cubepod_e2b_volume_mount_errors_total` | Counter | E2B volume mounts attached and mount planning/attach errors |
+| **Gateway** | `cubepod_e2b_volume_quota_rejections_total` *(Added in v0.7.0)* | Counter | E2B volume creation or upload requests rejected (`429`) due to tenant volume-count or byte quotas |
+| **Gateway** | `cubepod_e2b_volumes_storage_capacity_bytes` / `cubepod_e2b_volumes_storage_used_bytes` / `cubepod_e2b_volumes_storage_available_bytes` *(Added in v0.7.0)* | Gauge | Filesystem capacity, used bytes, and available bytes (`statfs`) of the E2B volumes store directory |
+| **Gateway** | `cubepod_e2b_volumes_total` *(Added in v0.7.0)* | Gauge | Total active E2B volumes stored across tenants |
 | **Gateway** | `cubepod_events_recorded_total` | Counter | Sandbox lifecycle events recorded (when events manager is enabled) |
 | **Gateway** | `cubepod_webhook_deliveries_total` / `cubepod_webhook_queue_depth` | Counter / Gauge | Webhook delivery outcomes (`result`: `ok`, `failed`, `dropped`) and queue depth |
 | **Gateway & Controller** | `cubepod_sandbox_forks_total` / `cubepod_sandbox_fork_duration_seconds` | Counter / Histogram | CoW fork attempts (`mode`, `result`) and provisioning duration |

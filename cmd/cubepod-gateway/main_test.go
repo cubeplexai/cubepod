@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -125,4 +128,52 @@ func TestBuildEgressMTLSServerEnforcesClientCerts(t *testing.T) {
 		t.Fatalf("expected 400 BadRequest on empty body after mTLS auth, got %d", resp.StatusCode)
 	}
 	_ = ph
+}
+
+func TestResolveE2BVolumeConfig(t *testing.T) {
+	hexKEK := hex.EncodeToString(bytes.Repeat([]byte{0x22}, 32))
+	envMap := map[string]string{
+		"CUBEPOD_E2B_VOLUME_DIR":             "/tmp/e2b-vols",
+		"CUBEPOD_E2B_VOLUMES_KEK":            hexKEK,
+		"CUBEPOD_E2B_VOLUMES_KEK_ID":         "kek-prod-1",
+		"CUBEPOD_E2B_MAX_TENANT_BYTES":       "10485760",
+		"CUBEPOD_E2B_MAX_VOLUMES_PER_TENANT": "12",
+	}
+	enabled, vcfg, err := resolveE2BVolumeConfig(func(k string) string { return envMap[k] }, "")
+	if err != nil || !enabled {
+		t.Fatalf("resolveE2BVolumeConfig local KEK: enabled=%v err=%v", enabled, err)
+	}
+	if vcfg.KMS == nil || vcfg.KMS.KeyID() != "kek-prod-1" || vcfg.MaxBytesPerTenant != 10485760 || vcfg.MaxVolumesPerTenant != 12 {
+		t.Fatalf("unexpected vcfg: %+v", vcfg)
+	}
+
+	// External HTTP KMS URL takes precedence and validates HTTPS for remote hosts.
+	envHTTP := map[string]string{
+		"CUBEPOD_E2B_VOLUME_DIR":         "/tmp/e2b-vols",
+		"CUBEPOD_E2B_VOLUMES_KMS_URL":    "https://kms.internal.example:8443/v1",
+		"CUBEPOD_E2B_VOLUMES_KMS_TOKEN":  "secret-kms-bearer",
+		"CUBEPOD_E2B_VOLUMES_KMS_KEY_ID": "vault-vol-kek",
+	}
+	enabled, vcfg, err = resolveE2BVolumeConfig(func(k string) string { return envHTTP[k] }, "")
+	if err != nil || !enabled || vcfg.KMS == nil || vcfg.KMS.KeyID() != "vault-vol-kek" {
+		t.Fatalf("resolveE2BVolumeConfig HTTP KMS: enabled=%v vcfg=%+v err=%v", enabled, vcfg, err)
+	}
+
+	// Malformed KEK must return an error without echoing the raw secret string.
+	badEnv := map[string]string{
+		"CUBEPOD_E2B_VOLUME_DIR":  "/tmp/e2b-vols",
+		"CUBEPOD_E2B_VOLUMES_KEK": "super-sensitive-invalid-kek",
+	}
+	if _, _, err := resolveE2BVolumeConfig(func(k string) string { return badEnv[k] }, ""); err == nil || strings.Contains(err.Error(), "super-sensitive-invalid-kek") {
+		t.Fatalf("expected redacted error on malformed KEK, got %v", err)
+	}
+
+	// Invalid CUBEPOD_E2B_MAX_TENANT_BYTES must fail fast.
+	badQuota := map[string]string{
+		"CUBEPOD_E2B_VOLUME_DIR":       "/tmp/e2b-vols",
+		"CUBEPOD_E2B_MAX_TENANT_BYTES": "-5",
+	}
+	if _, _, err := resolveE2BVolumeConfig(func(k string) string { return badQuota[k] }, ""); err == nil {
+		t.Fatal("expected error for negative CUBEPOD_E2B_MAX_TENANT_BYTES")
+	}
 }

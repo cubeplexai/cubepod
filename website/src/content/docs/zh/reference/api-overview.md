@@ -129,7 +129,7 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 ## 密钥、持久化卷、事件与 Webhook
 
 - **E2B 密钥（`E2BSecretsAPI`，*v0.6.0 变更*）**：`POST /secrets`、`GET /secrets`、`GET /secrets/{secretID}`、`POST /secrets/{secretID}`、`DELETE /secrets/{secretID}` — 租户隔离的 Write-Only 密钥存储（`KubeSecretBackend` 多副本 HA 或 AES-256-GCM 文件存储），配合 `${e2b.secrets.<name>}`（`Secret.fill()`）解析。
-- **E2B 卷（Volumes）**：`POST /volumes`、`GET /volumes`、`GET /volumes/{volumeID}`、`DELETE /volumes/{volumeID}`，内容传输 `/volumecontent/{volumeID}/{file,dir,path}`，以及 `POST /sandboxes` 的 `volumeMounts`（K8s Kata RWX 挂载由 `K8sE2BVolumeMounts` / Helm `e2bVolumes.rwxStorageClassName` 控制）。
+- **E2B 卷（Volumes，*v0.7.0 变更*）**：`POST /volumes`、`GET /volumes`、`GET /volumes/{volumeID}`、`DELETE /volumes/{volumeID}`、`POST /volumes/rotate-key`（*v0.7.0 新增。* 通过请求头 `X-API-Key: <newKey>` 与请求体 `{"previousApiKey": "<oldKey>"}` 将租户卷与挂载所有权原子迁移至新密钥并吊销旧密钥，持久化于带 RWX `flock` 锁保护的 `tenants.json`），内容传输 `/volumecontent/{volumeID}/{file,dir,path}`，以及 `POST /sandboxes` 的 `volumeMounts`（K8s Kata RWX 挂载由 `K8sE2BVolumeMounts` / Helm `e2bVolumes.rwxStorageClassName` 控制）。支持基于 `CUBEPOD_E2B_VOLUMES_KEK` 或外部 KMS `CUBEPOD_E2B_VOLUMES_KMS_URL`（可选 `CUBEPOD_E2B_VOLUMES_KMS_TOKEN`）的卷令牌信封加密、单租户字节与数量配额（`CUBEPOD_E2B_MAX_TENANT_BYTES`、`CUBEPOD_E2B_MAX_VOLUMES_PER_TENANT`）以及 `deploy/monitoring/e2b-volumes-alerts.yaml` 中的 `PrometheusRule` 容量告警（*v0.7.0 新增。*）。
 - **生命周期事件与 Webhook（`SandboxEventsAndWebhooks`，*v0.6.0 新增*）**：`GET /events`、`GET /sandboxes/{sandboxID}/events`、`POST /webhooks`、`GET /webhooks`、`GET /webhooks/{webhookID}`、`PATCH /webhooks/{webhookID}`、`DELETE /webhooks/{webhookID}`。
 
 ## 特性开关（`--feature-gate`） *(v0.6.0 新增)*
@@ -182,6 +182,9 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 | **Gateway** | `cubepod_watch_streams_active` / `cubepod_watchers_active` *(v0.7.0 新增)* | Gauge | 活跃 `WatchDir` 流数与活跃轮询监听器（`CreateWatcher`）数 |
 | **Gateway** | `cubepod_watch_events_total` / `cubepod_watch_overflows_total` *(v0.7.0 新增)* | Counter | 已发出的监听事件数与 `resource_exhausted` 监听溢出次数 |
 | **Gateway** | `cubepod_e2b_volume_mounts_total` / `cubepod_e2b_volume_mount_errors_total` | Counter | E2B 卷挂载次数与挂载规划/执行错误数 |
+| **Gateway** | `cubepod_e2b_volume_quota_rejections_total` *(v0.7.0 新增。)* | Counter | 因超出单租户卷数量或字节配额上限而被拒绝（`429`）的 E2B 卷创建或文件上传请求数 |
+| **Gateway** | `cubepod_e2b_volumes_storage_capacity_bytes` / `cubepod_e2b_volumes_storage_used_bytes` / `cubepod_e2b_volumes_storage_available_bytes` *(v0.7.0 新增。)* | Gauge | E2B 卷存储目录的文件系统总容量、已用字节与可用字节（`statfs`） |
+| **Gateway** | `cubepod_e2b_volumes_total` *(v0.7.0 新增。)* | Gauge | 全租户当前存储的活跃 E2B 卷总数 |
 | **Gateway** | `cubepod_events_recorded_total` | Counter | 已记录的沙箱生命周期事件总数（启用事件管理器时导出） |
 | **Gateway** | `cubepod_webhook_deliveries_total` / `cubepod_webhook_queue_depth` | Counter / Gauge | Webhook 投递结果（`result`：`ok`、`failed`、`dropped`）与队列深度 |
 | **Gateway & Controller** | `cubepod_sandbox_forks_total` / `cubepod_sandbox_fork_duration_seconds` | Counter / Histogram | CoW Fork 次数（`mode`、`result`）与耗时分布 |

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"flag"
@@ -22,6 +23,7 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/gateway"
 	"github.com/cubeplexai/cubepod/pkg/runtime"
 	"github.com/cubeplexai/cubepod/pkg/version"
+	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
 func defaultEgressImage() string {
@@ -181,39 +183,28 @@ func main() {
 	// CUBEPOD_E2B_VOLUME_DIR wins; otherwise stateDir/e2b-volumes is used
 	// when a state directory is set. Docker named volumes stay off unless
 	// CUBEPOD_E2B_DOCKER_VOLUMES is explicitly enabled (compose/runc tests).
-	volDir := strings.TrimSpace(os.Getenv("CUBEPOD_E2B_VOLUME_DIR"))
-	if volDir == "" && effectiveStateDir != "" {
-		volDir = filepath.Join(effectiveStateDir, "e2b-volumes")
+	volEnabled, vcfg, volErr := resolveE2BVolumeConfig(os.Getenv, effectiveStateDir)
+	if volErr != nil {
+		slog.Error("invalid E2B volume store configuration", "err", volErr)
+		os.Exit(1)
 	}
-	if volDir != "" {
-		vcfg := gateway.E2BVolumeConfig{
-			Dir:           volDir,
-			HostDir:       strings.TrimSpace(os.Getenv("CUBEPOD_E2B_VOLUME_HOST_DIR")),
-			SharedPVCName: strings.TrimSpace(os.Getenv("CUBEPOD_E2B_SHARED_PVC")),
-		}
-		switch strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_K8S_E2B_VOLUME_MOUNTS"))) {
-		case "1", "true", "yes":
-			vcfg.K8sE2BVolumeMounts = true
-		}
-		if raw := strings.TrimSpace(os.Getenv("CUBEPOD_E2B_MAX_FILE_BYTES")); raw != "" {
-			if n, err := strconv.ParseInt(raw, 10, 64); err == nil && n > 0 {
-				vcfg.MaxFileSizeBytes = n
-			}
-		}
-		switch strings.ToLower(strings.TrimSpace(os.Getenv("CUBEPOD_E2B_DOCKER_VOLUMES"))) {
-		case "1", "true", "yes":
-			vcfg.DockerVolumes = true
-			vcfg.DockerPrefix = "cubepod-e2bvol-"
-			if p := strings.TrimSpace(os.Getenv("CUBEPOD_E2B_DOCKER_PREFIX")); p != "" {
-				vcfg.DockerPrefix = p
-			}
-			vcfg.DockerHost = os.Getenv("DOCKER_HOST")
-		}
+	volDir := vcfg.Dir
+	if volEnabled {
 		if err := gw.ConfigureE2BVolumes(vcfg); err != nil {
 			slog.Error("failed to configure E2B volume store", "dir", volDir, "err", err)
 			os.Exit(1)
 		}
-		slog.Info("E2B volume store enabled", "dir", volDir, "dockerVolumes", vcfg.DockerVolumes)
+		kmsKeyID := ""
+		if vcfg.KMS != nil {
+			kmsKeyID = vcfg.KMS.KeyID()
+		}
+		slog.Info("E2B volume store enabled",
+			"dir", volDir,
+			"dockerVolumes", vcfg.DockerVolumes,
+			"maxTenantBytes", vcfg.MaxBytesPerTenant,
+			"kmsEnabled", vcfg.KMS != nil,
+			"kmsKeyID", kmsKeyID,
+		)
 	}
 	gw.ApplyFeatureGates(gates)
 	if *e2bTemplateAPI {
@@ -349,6 +340,98 @@ func main() {
 	if mtlsSrv != nil {
 		_ = mtlsSrv.Shutdown(shutdownCtx)
 	}
+}
+
+func resolveE2BVolumeConfig(getenv func(string) string, effectiveStateDir string) (enabled bool, vcfg gateway.E2BVolumeConfig, err error) {
+	volDir := strings.TrimSpace(getenv("CUBEPOD_E2B_VOLUME_DIR"))
+	if volDir == "" && effectiveStateDir != "" {
+		volDir = filepath.Join(effectiveStateDir, "e2b-volumes")
+	}
+	if volDir == "" {
+		return false, gateway.E2BVolumeConfig{}, nil
+	}
+
+	vcfg = gateway.E2BVolumeConfig{
+		Dir:           volDir,
+		HostDir:       strings.TrimSpace(getenv("CUBEPOD_E2B_VOLUME_HOST_DIR")),
+		SharedPVCName: strings.TrimSpace(getenv("CUBEPOD_E2B_SHARED_PVC")),
+	}
+	switch strings.ToLower(strings.TrimSpace(getenv("CUBEPOD_K8S_E2B_VOLUME_MOUNTS"))) {
+	case "1", "true", "yes":
+		vcfg.K8sE2BVolumeMounts = true
+	}
+	if raw := strings.TrimSpace(getenv("CUBEPOD_E2B_MAX_FILE_BYTES")); raw != "" {
+		if n, convErr := strconv.ParseInt(raw, 10, 64); convErr == nil && n > 0 {
+			vcfg.MaxFileSizeBytes = n
+		}
+	}
+	if raw := strings.TrimSpace(getenv("CUBEPOD_E2B_MAX_VOLUMES_PER_TENANT")); raw != "" {
+		n, convErr := strconv.Atoi(raw)
+		if convErr != nil || n <= 0 {
+			return false, gateway.E2BVolumeConfig{}, fmt.Errorf("CUBEPOD_E2B_MAX_VOLUMES_PER_TENANT must be a positive integer")
+		}
+		vcfg.MaxVolumesPerTenant = n
+	}
+	if raw := strings.TrimSpace(getenv("CUBEPOD_E2B_MAX_TENANT_BYTES")); raw != "" {
+		n, convErr := strconv.ParseInt(raw, 10, 64)
+		if convErr != nil || n <= 0 {
+			return false, gateway.E2BVolumeConfig{}, fmt.Errorf("CUBEPOD_E2B_MAX_TENANT_BYTES must be a positive integer")
+		}
+		vcfg.MaxBytesPerTenant = n
+	}
+
+	kmsURL := strings.TrimSpace(getenv("CUBEPOD_E2B_VOLUMES_KMS_URL"))
+	rawKEK := strings.TrimSpace(getenv("CUBEPOD_E2B_VOLUMES_KEK"))
+	if kmsURL != "" {
+		httpCfg := volume.HTTPKMSConfig{
+			URL:         kmsURL,
+			BearerToken: strings.TrimSpace(getenv("CUBEPOD_E2B_VOLUMES_KMS_TOKEN")),
+			KeyID:       strings.TrimSpace(getenv("CUBEPOD_E2B_VOLUMES_KMS_KEY_ID")),
+		}
+		if rawTimeout := strings.TrimSpace(getenv("CUBEPOD_E2B_VOLUMES_KMS_TIMEOUT")); rawTimeout != "" {
+			dur, durErr := time.ParseDuration(rawTimeout)
+			if durErr != nil || dur <= 0 {
+				return false, gateway.E2BVolumeConfig{}, fmt.Errorf("invalid CUBEPOD_E2B_VOLUMES_KMS_TIMEOUT")
+			}
+			httpCfg.Timeout = dur
+		}
+		if caFile := strings.TrimSpace(getenv("CUBEPOD_E2B_VOLUMES_KMS_CA_FILE")); caFile != "" {
+			pemBytes, readErr := os.ReadFile(caFile)
+			if readErr != nil {
+				return false, gateway.E2BVolumeConfig{}, fmt.Errorf("read CUBEPOD_E2B_VOLUMES_KMS_CA_FILE: %w", readErr)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pemBytes) {
+				return false, gateway.E2BVolumeConfig{}, fmt.Errorf("CUBEPOD_E2B_VOLUMES_KMS_CA_FILE contains no valid PEM certificates")
+			}
+			httpCfg.TLSConfig = &tls.Config{
+				RootCAs:    pool,
+				MinVersion: tls.VersionTLS12,
+			}
+		}
+		kmsProv, kmsErr := volume.NewHTTPKMSProvider(httpCfg)
+		if kmsErr != nil {
+			return false, gateway.E2BVolumeConfig{}, kmsErr
+		}
+		vcfg.KMS = kmsProv
+	} else if rawKEK != "" {
+		kekProv, kekErr := volume.NewLocalKEKProviderFromString(getenv("CUBEPOD_E2B_VOLUMES_KEK_ID"), rawKEK)
+		if kekErr != nil {
+			return false, gateway.E2BVolumeConfig{}, kekErr
+		}
+		vcfg.KMS = kekProv
+	}
+
+	switch strings.ToLower(strings.TrimSpace(getenv("CUBEPOD_E2B_DOCKER_VOLUMES"))) {
+	case "1", "true", "yes":
+		vcfg.DockerVolumes = true
+		vcfg.DockerPrefix = "cubepod-e2bvol-"
+		if p := strings.TrimSpace(getenv("CUBEPOD_E2B_DOCKER_PREFIX")); p != "" {
+			vcfg.DockerPrefix = p
+		}
+		vcfg.DockerHost = getenv("DOCKER_HOST")
+	}
+	return true, vcfg, nil
 }
 
 func resolveSecretsConfig(backendEnv, secretsDirEnv, volDir, keyEnv, maxPerTenantEnv string, hasKube bool, kc controller.KubeClient, namespace string) (enabled bool, isK8s bool, cfg gateway.E2BSecretConfig, err error) {

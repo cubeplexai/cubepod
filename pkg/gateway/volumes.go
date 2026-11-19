@@ -39,6 +39,10 @@ type E2BVolumeConfig struct {
 	MaxFileSizeBytes int64
 	// MaxVolumesPerTenant caps volumes per API key tenant (default 64).
 	MaxVolumesPerTenant int
+	// MaxBytesPerTenant caps total stored file bytes across all volumes of a tenant (<=0 means unlimited).
+	MaxBytesPerTenant int64
+	// KMS optionally envelope-encrypts volume content tokens in meta.json.
+	KMS volume.KMSProvider
 	// K8sE2BVolumeMounts enables official E2B volumeMounts on live Kubernetes.
 	K8sE2BVolumeMounts bool
 	// SharedPVCName is the cluster-wide RWX PVC shared between gateway and Kata pods.
@@ -67,6 +71,8 @@ func (s *Server) ConfigureE2BVolumes(cfg E2BVolumeConfig) error {
 		DockerPrefix:        cfg.DockerPrefix,
 		DockerHost:          cfg.DockerHost,
 		MaxVolumesPerTenant: cfg.MaxVolumesPerTenant,
+		MaxBytesPerTenant:   cfg.MaxBytesPerTenant,
+		KMS:                 cfg.KMS,
 	}
 	st, err := volume.Open(cfg.Dir, vcfg)
 	if err != nil {
@@ -262,6 +268,9 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	}
 	vol, err := st.Create(key, req.Name)
 	if err != nil {
+		if errors.Is(err, volume.ErrLimitExceeded) {
+			s.E2BVolumeQuotaRejectionsTotal.Add(1)
+		}
 		writeVolumeMgmtError(w, err, req.Name)
 		return
 	}
@@ -272,6 +281,45 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		"volumeID": vol.VolumeID,
 		"name":     vol.Name,
 		"token":    vol.Token,
+	})
+}
+
+func (s *Server) handleRotateVolumeKey(w http.ResponseWriter, r *http.Request) {
+	newKey, ok := requireManagementKey(w, r)
+	if !ok {
+		return
+	}
+	st, ok := s.requireE2BStore(w)
+	if !ok {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req struct {
+		PreviousAPIKey string `json:"previousApiKey"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	prevKey := strings.TrimSpace(req.PreviousAPIKey)
+	rotated, err := st.RotateAPIKey(prevKey, newKey)
+	if err != nil {
+		switch {
+		case errors.Is(err, volume.ErrInvalidKey):
+			writeError(w, http.StatusBadRequest, "invalid previousApiKey")
+		case errors.Is(err, volume.ErrUnauthorized):
+			writeError(w, http.StatusUnauthorized, "previous API key is unauthorized or already revoked")
+		case errors.Is(err, volume.ErrConflict):
+			writeError(w, http.StatusConflict, "target API key already belongs to another tenant")
+		default:
+			writeError(w, http.StatusInternalServerError, "volume key rotation failed")
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]int{
+		"rotatedVolumes": rotated,
 	})
 }
 
@@ -440,6 +488,9 @@ func (s *Server) handlePutVolumeFile(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, s.maxVolumeFileBytes())
 	ent, err := st.WriteFile(vol.VolumeID, p, r.Body, opts)
 	if err != nil {
+		if errors.Is(err, volume.ErrLimitExceeded) {
+			s.E2BVolumeQuotaRejectionsTotal.Add(1)
+		}
 		writeVolumeContentError(w, err)
 		return
 	}
@@ -575,6 +626,8 @@ func writeVolumeContentError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.As(err, &maxErr):
 		writeContentError(w, http.StatusRequestEntityTooLarge, "file exceeds maximum allowed size")
+	case errors.Is(err, volume.ErrLimitExceeded):
+		writeContentError(w, http.StatusTooManyRequests, "tenant volume storage quota exceeded")
 	case errors.Is(err, volume.ErrNotExist):
 		writeContentError(w, http.StatusNotFound, "path not found")
 	case errors.Is(err, volume.ErrInvalidPath):
@@ -709,6 +762,8 @@ func (s *Server) planSandboxVolumeMounts(r *http.Request, mounts []sandboxVolume
 	if err != nil {
 		s.E2BVolumeMountErrorsTotal.Add(1)
 		switch {
+		case errors.Is(err, volume.ErrUnauthorized):
+			return nil, http.StatusUnauthorized, "API key is unauthorized or revoked"
 		case errors.Is(err, volume.ErrInvalidName):
 			return nil, http.StatusBadRequest, "invalid volume name"
 		case errors.Is(err, volume.ErrInvalidPath):
