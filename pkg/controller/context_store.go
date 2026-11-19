@@ -115,42 +115,42 @@ func validateTarEntry(hdr *tar.Header) error {
 	return nil
 }
 
-// Store reads the body, enforces maxBytes, decompresses if gzipped, validates tar headers, and saves it.
-func (s *MemoryContextStore) Store(hash string, r io.Reader) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	limit := s.maxBytes
+// parseAndValidateContextTar reads at most limit bytes (supporting optional gzip compression),
+// validates all tar headers against path traversal and unsafe entry types, and returns decompressed tar bytes.
+func parseAndValidateContextTar(r io.Reader, limit int64) ([]byte, error) {
 	if limit <= 0 {
 		limit = DefaultMaxContextBytes
+	}
+	if r == nil {
+		return nil, ErrInvalidContextTar
 	}
 
 	// Read bounded input (limit+1) so both compressed and raw tar uploads respect maxBytes.
 	rawInput, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
-		return fmt.Errorf("%w: failed to read stream: %v", ErrInvalidContextTar, err)
+		return nil, fmt.Errorf("%w: failed to read stream: %v", ErrInvalidContextTar, err)
 	}
 	if int64(len(rawInput)) > limit {
-		return ErrContextTooLarge
+		return nil, ErrContextTooLarge
 	}
 	if len(rawInput) < 2 {
-		return ErrInvalidContextTar
+		return nil, ErrInvalidContextTar
 	}
 
 	var tarBytes []byte
 	if rawInput[0] == 0x1f && rawInput[1] == 0x8b {
 		gz, err := gzip.NewReader(bytes.NewReader(rawInput))
 		if err != nil {
-			return fmt.Errorf("%w: invalid gzip: %v", ErrInvalidContextTar, err)
+			return nil, fmt.Errorf("%w: invalid gzip: %v", ErrInvalidContextTar, err)
 		}
 		defer gz.Close()
 
 		decompressed, err := io.ReadAll(io.LimitReader(gz, limit+1))
 		if err != nil {
-			return fmt.Errorf("%w: failed to decompress gzip stream: %v", ErrInvalidContextTar, err)
+			return nil, fmt.Errorf("%w: failed to decompress gzip stream: %v", ErrInvalidContextTar, err)
 		}
 		if int64(len(decompressed)) > limit {
-			return ErrContextTooLarge
+			return nil, ErrContextTooLarge
 		}
 		tarBytes = decompressed
 	} else {
@@ -166,16 +166,105 @@ func (s *MemoryContextStore) Store(hash string, r io.Reader) error {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("%w: invalid tar format: %v", ErrInvalidContextTar, err)
+			return nil, fmt.Errorf("%w: invalid tar format: %v", ErrInvalidContextTar, err)
 		}
 		hasEntries = true
 		if err := validateTarEntry(hdr); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	if !hasEntries && len(tarBytes) < 512 {
-		return ErrInvalidContextTar
+		return nil, ErrInvalidContextTar
+	}
+	return tarBytes, nil
+}
+
+// unpackTarBytes extracts validated tarBytes into destDir/<hash>/...
+func unpackTarBytes(data []byte, hash, destDir string) error {
+	targetDir := filepath.Join(destDir, hash)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", targetDir, err)
+	}
+
+	tr := tar.NewReader(bytes.NewReader(data))
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("error reading tar member: %w", err)
+		}
+
+		if err := validateTarEntry(hdr); err != nil {
+			return err
+		}
+
+		clean := filepath.Clean(hdr.Name)
+		if clean == "." {
+			continue
+		}
+
+		destPath := filepath.Join(targetDir, clean)
+		rel, err := filepath.Rel(targetDir, destPath)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("%w: member %s escapes target directory", ErrPathTraversal, hdr.Name)
+		}
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(destPath, 0755); err != nil {
+				return err
+			}
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				return err
+			}
+			_ = os.Remove(destPath)
+			if err := os.Symlink(hdr.Linkname, destPath); err != nil {
+				return err
+			}
+		case tar.TypeLink:
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				return err
+			}
+			linkTarget := filepath.Join(targetDir, filepath.Clean(hdr.Linkname))
+			_ = os.Remove(destPath)
+			if err := os.Link(linkTarget, destPath); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				return err
+			}
+			mode := hdr.FileInfo().Mode()
+			if mode == 0 {
+				mode = 0644
+			}
+			f, err := os.OpenFile(destPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				return err
+			}
+			f.Close()
+		}
+	}
+
+	return nil
+}
+
+// Store reads the body, enforces maxBytes, decompresses if gzipped, validates tar headers, and saves it.
+func (s *MemoryContextStore) Store(hash string, r io.Reader) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tarBytes, err := parseAndValidateContextTar(r, s.maxBytes)
+	if err != nil {
+		return err
 	}
 
 	now := time.Now().UTC()
@@ -261,93 +350,16 @@ func (s *MemoryContextStore) Unpack(hash, destDir string) error {
 	if err != nil {
 		return err
 	}
-
-	targetDir := filepath.Join(destDir, hash)
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", targetDir, err)
-	}
-
-	tr := tar.NewReader(bytes.NewReader(data))
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("error reading tar member: %w", err)
-		}
-
-		if err := validateTarEntry(hdr); err != nil {
-			return err
-		}
-
-		clean := filepath.Clean(hdr.Name)
-		if clean == "." {
-			continue
-		}
-
-		destPath := filepath.Join(targetDir, clean)
-		rel, err := filepath.Rel(targetDir, destPath)
-		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("%w: member %s escapes target directory", ErrPathTraversal, hdr.Name)
-		}
-
-		switch hdr.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(destPath, 0755); err != nil {
-				return err
-			}
-		case tar.TypeSymlink:
-			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-				return err
-			}
-			_ = os.Remove(destPath)
-			if err := os.Symlink(hdr.Linkname, destPath); err != nil {
-				return err
-			}
-		case tar.TypeLink:
-			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-				return err
-			}
-			linkTarget := filepath.Join(targetDir, filepath.Clean(hdr.Linkname))
-			_ = os.Remove(destPath)
-			if err := os.Link(linkTarget, destPath); err != nil {
-				return err
-			}
-		case tar.TypeReg, tar.TypeRegA:
-			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-				return err
-			}
-			mode := hdr.FileInfo().Mode()
-			if mode == 0 {
-				mode = 0644
-			}
-			f, err := os.OpenFile(destPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(f, tr); err != nil {
-				f.Close()
-				return err
-			}
-			f.Close()
-		}
-	}
-
-	return nil
+	return unpackTarBytes(data, hash, destDir)
 }
 
-// AppendLog appends structured build log lines to memory and, when baseDir is configured, to logs/<buildID>.log.
-func (s *MemoryContextStore) AppendLog(buildID string, lines []string) error {
-	if buildID == "" || len(lines) == 0 {
-		return nil
-	}
-	now := time.Now().UTC()
+func encodeBuildLogLines(lines []string, now time.Time) ([]BuildLogEntry, []byte) {
 	entries := make([]BuildLogEntry, 0, len(lines))
 	var encodedLines []byte
+	ts := now.UTC().Format(time.RFC3339Nano)
 	for _, line := range lines {
 		entry := BuildLogEntry{
-			Timestamp: now.Format(time.RFC3339Nano),
+			Timestamp: ts,
 			Message:   line,
 			Level:     inferLogLevel(line),
 		}
@@ -356,6 +368,74 @@ func (s *MemoryContextStore) AppendLog(buildID string, lines []string) error {
 		encodedLines = append(encodedLines, b...)
 		encodedLines = append(encodedLines, '\n')
 	}
+	return entries, encodedLines
+}
+
+func parseLogLines(r io.Reader, fallbackTS string) ([]BuildLogEntry, error) {
+	if fallbackTS == "" {
+		fallbackTS = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	var out []BuildLogEntry
+	scanner := bufio.NewScanner(r)
+	// Allow longer build log lines up to 1 MiB.
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		text := scanner.Text()
+		if text == "" {
+			continue
+		}
+		var parsed BuildLogEntry
+		if err := json.Unmarshal([]byte(text), &parsed); err == nil && (parsed.Message != "" || parsed.Timestamp != "") {
+			if parsed.Level == "" {
+				parsed.Level = inferLogLevel(parsed.Message)
+			}
+			if parsed.Timestamp == "" {
+				parsed.Timestamp = fallbackTS
+			}
+			out = append(out, parsed)
+			continue
+		}
+		out = append(out, BuildLogEntry{
+			Timestamp: fallbackTS,
+			Message:   text,
+			Level:     inferLogLevel(text),
+		})
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func filterAndPaginateLogs(all []BuildLogEntry, offset, limit int, level string) []BuildLogEntry {
+	var filtered []BuildLogEntry
+	for _, entry := range all {
+		if level != "" && !strings.EqualFold(entry.Level, level) {
+			continue
+		}
+		filtered = append(filtered, entry)
+	}
+
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(filtered) {
+		return []BuildLogEntry{}
+	}
+	filtered = filtered[offset:]
+	if limit > 0 && len(filtered) > limit {
+		filtered = filtered[:limit]
+	}
+	return filtered
+}
+
+// AppendLog appends structured build log lines to memory and, when baseDir is configured, to logs/<buildID>.log.
+func (s *MemoryContextStore) AppendLog(buildID string, lines []string) error {
+	if buildID == "" || len(lines) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	entries, encodedLines := encodeBuildLogLines(lines, now)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -404,59 +484,16 @@ func (s *MemoryContextStore) ReadLogs(buildID string, offset, limit int, level s
 			var fallbackTS string
 			if fi, statErr := f.Stat(); statErr == nil {
 				fallbackTS = fi.ModTime().UTC().Format(time.RFC3339Nano)
-			} else {
-				fallbackTS = time.Now().UTC().Format(time.RFC3339Nano)
 			}
-			scanner := bufio.NewScanner(f)
-			// Allow longer build log lines up to 1 MiB.
-			scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-			for scanner.Scan() {
-				text := scanner.Text()
-				if text == "" {
-					continue
-				}
-				var parsed BuildLogEntry
-				if err := json.Unmarshal([]byte(text), &parsed); err == nil && (parsed.Message != "" || parsed.Timestamp != "") {
-					if parsed.Level == "" {
-						parsed.Level = inferLogLevel(parsed.Message)
-					}
-					if parsed.Timestamp == "" {
-						parsed.Timestamp = fallbackTS
-					}
-					all = append(all, parsed)
-					continue
-				}
-				all = append(all, BuildLogEntry{
-					Timestamp: fallbackTS,
-					Message:   text,
-					Level:     inferLogLevel(text),
-				})
-			}
-			if err := scanner.Err(); err != nil {
+			parsed, err := parseLogLines(f, fallbackTS)
+			if err != nil {
 				return nil, err
 			}
+			all = parsed
 		}
 	}
 
-	var filtered []BuildLogEntry
-	for _, entry := range all {
-		if level != "" && !strings.EqualFold(entry.Level, level) {
-			continue
-		}
-		filtered = append(filtered, entry)
-	}
-
-	if offset < 0 {
-		offset = 0
-	}
-	if offset >= len(filtered) {
-		return []BuildLogEntry{}, nil
-	}
-	filtered = filtered[offset:]
-	if limit > 0 && len(filtered) > limit {
-		filtered = filtered[:limit]
-	}
-	return filtered, nil
+	return filterAndPaginateLogs(all, offset, limit, level), nil
 }
 
 // SweepExpired removes expired context tar archives and build logs older than their TTLs.

@@ -63,12 +63,12 @@ flowchart TB
 | `rbac.yaml` | `ServiceAccount`, `ClusterRole` (`<fullname>-controller`), `ClusterRoleBinding` | Grants CRUD on `pods`, `pods/exec`, `pods/log`, `persistentvolumeclaims`, `events`, `configmaps`, `secrets` and `cubepod.io`/`pod.cubeplex.ai` resources (`podboxes`, `podtemplates`, `podwarmpools`, `sandboxwebhooks`) + statuses; read access to `apps` `deployments`/`statefulsets` |
 | `gateway-deployment.yaml` | `Deployment` (`gateway.replicaCount`, default `2`) | Serves `/health` liveness (`initialDelaySeconds: 5, periodSeconds: 10`) & readiness (`initialDelaySeconds: 2, periodSeconds: 5`); wires runtime/storage/egress flags, `--feature-gate`, `secrets.*`, `e2bVolumes.*`, `global.imagePullSecrets`, `egress.caSecretName`, and optional `gateway.persistence` |
 | `pdb.yaml` *(Added in v0.6.0)* | `PodDisruptionBudget` (`<fullname>-gateway`) | Rendered when `gateway.podDisruptionBudget.enabled` is `true`, or `null` with `gateway.replicaCount > 1` (defaults to `minAvailable: 1`) |
-| `controller-deployment.yaml` | `Deployment` (`controller.replicaCount`, forced to `1` when `templateBuild.enabled` is true) | Serves `/livez` and `/healthz`; reconciles on `--sync-interval` (`5s`); wires runtime/storage/egress flags, `--feature-gate`, `global.imagePullSecrets`, `egress.caSecretName`, and mounts `cubepod-template-context` PVC when `templateBuild.enabled` is true |
+| `controller-deployment.yaml` | `Deployment` (`controller.replicaCount`; forced to `1` only when `templateBuild.enabled=true` and `contextStore.backend=local`) | Serves `/livez` and `/healthz`; reconciles on `--sync-interval` (`5s`); wires runtime/storage/egress flags, `--feature-gate`, `global.imagePullSecrets`, `egress.caSecretName`, S3 context store (`--context-store-backend=s3`), BuildKit mTLS (`--buildkit-*-cert`), or mounts `cubepod-template-context` PVC for `local` builds |
 | `gateway-state-pvc.yaml` | `PersistentVolumeClaim` (`<fullname>-gateway-state`, optional) | Rendered when `gateway.persistence.enabled: true` and `existingClaim` is empty; persists Gateway `stateDir` (templates, file secrets, events/webhooks) |
 | `secrets-key-secret.yaml` *(Added in v0.6.0)* | `Secret` (`<fullname>-secrets-key`, optional) | Rendered when `secrets.encryptionKey` is set inline without `secrets.existingSecret` or `gateway.secretsKeySecret` |
 | `e2b-volumes-pvc.yaml` | `PersistentVolumeClaim` (`e2bVolumes.pvcName`, `ReadWriteMany`) | Rendered when `e2bVolumes.rwxStorageClassName` is non-empty; kept on uninstall via `helm.sh/resource-policy: keep` |
 | `service.yaml` | `<fullname>-gateway` (`:8080`), `<fullname>-controller` (`:8081`) | Both default to `ClusterIP`; `gateway.service.nodePort` supported when switching to `NodePort` |
-| `buildkit.yaml` | `Deployment`, `Service` (`:1234`), 2 `PVC`s, `NetworkPolicy` | Rendered only when `templateBuild.enabled: true` |
+| `buildkit.yaml` | `Deployment` (or `StatefulSet` + headless `Service` when `buildkit.replicaCount > 1`), `Service` (`:1234`), cache `PVC` / `volumeClaimTemplates`, optional `cubepod-template-context` PVC, `NetworkPolicy` | Rendered only when `templateBuild.enabled: true` *(Changed in v0.7.0)* |
 
 ## Core Production Values
 
@@ -127,26 +127,42 @@ helm upgrade --install cubepod ./deploy/helm/cubepod \
 - **Gateway PodDisruptionBudget (`gateway.podDisruptionBudget.*`)** *(Added in v0.6.0)*: When `gateway.podDisruptionBudget.enabled` is `null` (default) and `gateway.replicaCount > 1`, `pdb.yaml` automatically provisions a `PodDisruptionBudget` with `minAvailable: 1` (or `maxUnavailable` if set).
 - **Zero-Trust Egress (`egress.*`)** *(Changed in v0.6.0)*: Enabled by default (`egress.enabled: true`, `egress.transparent: true`), injecting the `cubepod-egress` sidecar (`egress.image.*`) on port `18080` and swapping `cpodref_` placeholders against `egress.exchangeUrl`. Both `egress.transparent` and `featureGates.transparentEgress` must be `true` for `TransparentEgress` (`CUBEPOD_TRANSPARENT=1` + `NET_ADMIN`) to activate. See [Zero-Trust Egress](/concepts/zero-trust-egress/).
 - **E2B Secrets HA Store (`secrets.*`)** *(Added in v0.6.0)*: Configures `CUBEPOD_SECRETS_BACKEND` (`"k8s"` default for multi-replica HA via `KubeSecretBackend`, `"file"` using `secrets.dir`, or `"disabled"`) and encryption key wiring (`secrets.existingSecret`, inline `secrets.encryptionKey`, or legacy fallback `gateway.secretsKeySecret`).
-- **Unified Feature Gates (`featureGates.*`)** *(Changed in v0.6.0)*: Chart values under `featureGates` (`e2bTemplateAPI`, `transparentEgress`, `desktopStack`, `statelessGatewayHA`, `e2bFilesystemWatch`, `e2bSecretsAPI`, `sandboxEventsAndWebhooks`, `k8sE2BVolumeMounts`) are rendered into `--feature-gate=...` on both `cubepod-gateway` and `cubepod-controller`.
+- **Unified Feature Gates (`featureGates.*`)** *(Changed in v0.7.0)*: Chart values under `featureGates` (`e2bTemplateAPI`, `transparentEgress`, `desktopStack`, `statelessGatewayHA`, `e2bFilesystemWatch`, `e2bSecretsAPI`, `sandboxEventsAndWebhooks`, `k8sE2BVolumeMounts`) are rendered into `--feature-gate=...` on both `cubepod-gateway` and `cubepod-controller`. `e2bTemplateAPI` now defaults to `true` (GA in `v0.7.0`; set `false` for legacy rollback).
 - **Shared E2B RWX Volumes (`e2bVolumes.*`)** *(Changed in v0.6.0)*: Setting `e2bVolumes.rwxStorageClassName` (for example `"longhorn-rwx"` or `"nfs-storage"`) automatically creates the `ReadWriteMany` PVC (`e2bVolumes.pvcName`), mounts it into `cubepod-gateway`, and **automatically enables `K8sE2BVolumeMounts`** even if `e2bVolumes.enabled` and `featureGates.k8sE2BVolumeMounts` remain `false`.
 
-## Enabling In-Cluster Template Builds (`BuildKit`)
+## Enabling In-Cluster Template Builds (`BuildKit` & HA S3 Context Store)
 
-By default, both `featureGates.e2bTemplateAPI` and `templateBuild.enabled` are `false`. Enabling template builds deploys a locked-down `moby/buildkit:rootless` builder pod alongside the controller:
+`featureGates.e2bTemplateAPI` defaults to `true` *(Changed in v0.7.0)*, while `templateBuild.enabled` remains `false` by default until a target OCI registry is configured. Enabling template builds deploys isolated rootless `moby/buildkit:rootless` builder pods alongside the controller:
 
 ```yaml
+controller:
+  replicaCount: 2
+
 featureGates:
   e2bTemplateAPI: true
 
 templateBuild:
   enabled: true
+  contextStore:
+    backend: "s3"                  # "local" (1 replica RWO PVC) or "s3" (HA multi-replica)
+    s3:
+      endpoint: "https://minio.cubepod-system.svc:9000"
+      bucket: "cubepod-template-contexts"
+      region: "us-east-1"
+      prefix: "prod/"
+      forcePathStyle: true
+      credentialsSecretName: "cubepod-s3-creds" # accessKeyId, secretAccessKey, optional sessionToken
   cacheSize: "20Gi"
   probeTimeout: "120s"
   buildkit:
+    replicaCount: 2                # >= 2 renders a StatefulSet + volumeClaimTemplates
     image: "moby/buildkit:rootless"
     address: "tcp://cubepod-buildkit.cubepod-system.svc:1234"
     nodeSelector: {}
-    # Optional nodeSelector: { role: builder }
+    tls:
+      enabled: true
+      secretName: "cubepod-buildkit-tls" # ca.crt, tls.crt, tls.key
+      serverName: "cubepod-buildkit"
   registry:
     url: "ghcr.io/your-org"
     repositoryPrefix: "cubepod-templates"
@@ -154,12 +170,13 @@ templateBuild:
     pullSecret: "cubepod-buildkit-pull"
 ```
 
-Operational constraints when `templateBuild.enabled: true`:
+Operational behavior and constraints when `templateBuild.enabled: true`:
 
-1. **Controller replica pinning**: `controller-deployment.yaml` forces controller replicas to `1` because `cubepod-template-context` (`10Gi`) is mounted `ReadWriteOnce` at `/var/lib/cubepod/context`.
-2. **Rootless BuildKit security context**: `cubepod-buildkit` runs as `1000:1000` with `--oci-worker-no-process-sandbox`, `seccompProfile: Unconfined`, and `appArmorProfile: Unconfined` so nested `RUN` builds work without root inside the builder container.
-3. **Ingress NetworkPolicy**: `cubepod-buildkit-netpol` restricts TCP port `1234` strictly to pods carrying `app.kubernetes.io/component: controller`.
-4. **Image push/pull secrets**: Create the Kubernetes Docker registry secrets referenced by `templateBuild.registry.pushSecret` and `pullSecret` in your control-plane and workload namespaces before triggering builds.
+1. **HA Controller & S3 Object Storage *(Added in v0.7.0)***: With `contextStore.backend: "local"`, `controller-deployment.yaml` pins replicas to `1` and mounts the RWO `cubepod-template-context` PVC. Switching to `contextStore.backend: "s3"` omits the RWO PVC, honors `controller.replicaCount > 1`, stores contexts and ordered chunked logs (`<prefix>logs/<buildID>/*.jsonl`) in S3-compatible storage, and coordinates concurrent build claims using `PodTemplate` `ResourceVersion` optimistic concurrency.
+2. **BuildKit HA `StatefulSet` & `:1234` mTLS *(Added in v0.7.0)***: Setting `templateBuild.buildkit.replicaCount > 1` switches `buildkit.yaml` to a `StatefulSet` with per-replica cache `volumeClaimTemplates` and a headless Service (`cubepod-buildkit-headless`), with `cubepod-controller` round-robining and failing over across replicas. Setting `templateBuild.buildkit.tls.enabled: true` mounts `ca.crt`, `tls.crt`, and `tls.key` from `tls.secretName` into both `buildkitd` and `cubepod-controller`.
+3. **Rootless BuildKit security context**: `cubepod-buildkit` runs as `1000:1000` with `--oci-worker-no-process-sandbox`, `seccompProfile: Unconfined`, and `appArmorProfile: Unconfined` so nested `RUN` builds work without root inside the builder container.
+4. **Ingress NetworkPolicy**: `cubepod-buildkit-netpol` restricts TCP port `1234` strictly to pods carrying `app.kubernetes.io/component: controller`.
+5. **Image push/pull secrets**: Create the Kubernetes Docker registry secrets referenced by `templateBuild.registry.pushSecret` and `pullSecret` in your control-plane and workload namespaces before triggering builds.
 
 See [Templates & Image Builds](/sdks/templates/) for the SDK and CLI workflow.
 

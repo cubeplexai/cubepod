@@ -86,7 +86,7 @@ type FeatureGates map[string]bool
 // DefaultFeatureGates returns a fresh copy of the default gateway feature gates.
 func DefaultFeatureGates() FeatureGates {
 	return FeatureGates{
-		FeatureGateE2BTemplateAPI:           false,
+		FeatureGateE2BTemplateAPI:           true,
 		FeatureGateK8sE2BVolumeMounts:       false,
 		FeatureGateTransparentEgress:        true,
 		FeatureGateDesktopStack:             true,
@@ -374,13 +374,13 @@ func NewServer(reconciler *controller.Reconciler) *Server {
 	} else {
 		ca, _ = egress.NewCA()
 	}
-	e2bAPI := false
+	gates := DefaultFeatureGates()
+	e2bAPI := gates[FeatureGateE2BTemplateAPI]
 	tplBuild := false
 	if reconciler != nil {
 		e2bAPI = reconciler.E2BTemplateAPIEnabled()
 		tplBuild = reconciler.TemplateBuildEnabled()
 	}
-	gates := DefaultFeatureGates()
 	gates[FeatureGateE2BTemplateAPI] = e2bAPI
 	return &Server{
 		reconciler:       reconciler,

@@ -1139,29 +1139,128 @@ type preparedBuildPlan struct {
 	memoryMB          int32
 }
 
+func clonePodTemplate(tpl *v1alpha1.PodTemplate) v1alpha1.PodTemplate {
+	cp := *tpl
+	if tpl.Metadata.Labels != nil {
+		cp.Metadata.Labels = make(map[string]string, len(tpl.Metadata.Labels))
+		for k, v := range tpl.Metadata.Labels {
+			cp.Metadata.Labels[k] = v
+		}
+	}
+	if tpl.Metadata.Annotations != nil {
+		cp.Metadata.Annotations = make(map[string]string, len(tpl.Metadata.Annotations))
+		for k, v := range tpl.Metadata.Annotations {
+			cp.Metadata.Annotations[k] = v
+		}
+	}
+	if tpl.Spec.Names != nil {
+		cp.Spec.Names = append([]string(nil), tpl.Spec.Names...)
+	}
+	if tpl.Status.Builds != nil {
+		cp.Status.Builds = append([]v1alpha1.PodTemplateBuildRecord(nil), tpl.Status.Builds...)
+	}
+	return cp
+}
+
+func (r *Reconciler) commitTemplateStatusCAS(ctx context.Context, candidate *v1alpha1.PodTemplate, hasKubeObj bool, origLatestBuildID, origBuildStatus, origUpdatedAt string) (bool, error) {
+	if hasKubeObj && r.kubeClient != nil {
+		updated, err := r.kubeClient.UpdatePodTemplateStatusCAS(ctx, *candidate)
+		if err != nil {
+			if errors.Is(err, ErrCASConflict) {
+				if fresh, getErr := r.kubeClient.GetPodTemplate(ctx, r.namespace, candidate.Metadata.Name); getErr == nil && fresh != nil {
+					r.mu.Lock()
+					cp := clonePodTemplate(fresh)
+					r.templateObjects[candidate.Metadata.Name] = &cp
+					r.mu.Unlock()
+				}
+				return false, fmt.Errorf("%w: concurrent build claim conflict on template %s", ErrTemplateConflict, candidate.Metadata.Name)
+			}
+			return false, err
+		}
+		if updated != nil {
+			*candidate = clonePodTemplate(updated)
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cur, ok := r.templateObjects[candidate.Metadata.Name]
+	if ok && (!hasKubeObj || r.kubeClient == nil) {
+		if cur.Status.LatestBuildID != origLatestBuildID || cur.Status.BuildStatus != origBuildStatus || cur.Status.UpdatedAt != origUpdatedAt {
+			return false, fmt.Errorf("%w: concurrent build claim conflict on template %s", ErrTemplateConflict, candidate.Metadata.Name)
+		}
+	}
+	cp := clonePodTemplate(candidate)
+	r.templateObjects[candidate.Metadata.Name] = &cp
+	r.persistLocalTemplateLocked(&cp)
+	return true, nil
+}
+
 func (r *Reconciler) prepareBuild(ctx context.Context, templateID, buildID string, req StartBuildRequest) (*preparedBuildPlan, bool, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// 1. Validate fromImage vs fromTemplate
 	if (req.FromImage == "" && req.FromTemplate == "") || (req.FromImage != "" && req.FromTemplate != "") {
 		return nil, false, fmt.Errorf("400: exactly one of fromImage or fromTemplate must be set")
 	}
 
-	// 2. Find template object by templateID
-	var tpl *v1alpha1.PodTemplate
-	for _, obj := range r.templateObjects {
-		if obj.Status.TemplateID == templateID || obj.Metadata.Name == templateID {
-			tpl = obj
-			break
+	// 2. Locate template and optional parent template in local cache, syncing from Kubernetes if missing.
+	findLocal := func() (tplSnap *v1alpha1.PodTemplate, fromObjName string, fromSnap *v1alpha1.PodTemplate) {
+		r.mu.RLock()
+		defer r.mu.RUnlock()
+		for _, obj := range r.templateObjects {
+			if obj.Status.TemplateID == templateID || obj.Metadata.Name == templateID {
+				cp := clonePodTemplate(obj)
+				tplSnap = &cp
+				break
+			}
 		}
+		if req.FromTemplate != "" {
+			if mapped, ok := r.templateIndex[req.FromTemplate]; ok {
+				fromObjName = mapped
+				if fo := r.templateObjects[mapped]; fo != nil {
+					cp := clonePodTemplate(fo)
+					fromSnap = &cp
+				}
+			}
+		}
+		return tplSnap, fromObjName, fromSnap
 	}
-	if tpl == nil {
+
+	tplSnap, fromObjName, fromSnap := findLocal()
+	if (tplSnap == nil || (req.FromTemplate != "" && fromSnap == nil)) && r.kubeClient != nil {
+		_ = r.SyncTemplatesFromKube(ctx)
+		tplSnap, fromObjName, fromSnap = findLocal()
+	}
+	if tplSnap == nil {
 		return nil, false, fmt.Errorf("%w: %s", ErrTemplateNotFound, templateID)
 	}
+
+	// Refresh latest PodTemplate state and ResourceVersion from APIServer outside r.mu.
+	tpl := *tplSnap
+	hasKubeObj := false
+	if r.kubeClient != nil {
+		if fresh, getErr := r.kubeClient.GetPodTemplate(ctx, r.namespace, tpl.Metadata.Name); getErr == nil && fresh != nil {
+			tpl = clonePodTemplate(fresh)
+			hasKubeObj = true
+			r.mu.Lock()
+			cached := clonePodTemplate(fresh)
+			r.templateObjects[tpl.Metadata.Name] = &cached
+			r.mu.Unlock()
+		}
+		if req.FromTemplate != "" && fromObjName != "" {
+			if freshFrom, getErr := r.kubeClient.GetPodTemplate(ctx, r.namespace, fromObjName); getErr == nil && freshFrom != nil {
+				cp := clonePodTemplate(freshFrom)
+				fromSnap = &cp
+			}
+		}
+	}
+
+	origLatestBuildID := tpl.Status.LatestBuildID
+	origBuildStatus := tpl.Status.BuildStatus
+	origUpdatedAt := tpl.Status.UpdatedAt
 
 	// 3. Second build while latest is waiting or building: 409
 	if tpl.Status.LatestBuildID != "" && tpl.Status.LatestBuildID != buildID {
@@ -1182,28 +1281,33 @@ func (r *Reconciler) prepareBuild(ctx context.Context, templateID, buildID strin
 	var inheritedUsername string
 
 	if req.FromTemplate != "" {
-		fromObjName, ok := r.templateIndex[req.FromTemplate]
-		if !ok {
+		if fromSnap == nil {
 			return nil, false, fmt.Errorf("%w: fromTemplate %q not found", ErrTemplateNotFound, req.FromTemplate)
 		}
-		fromObj := r.templateObjects[fromObjName]
-		if fromObj == nil {
-			return nil, false, fmt.Errorf("%w: fromTemplate %q not found", ErrTemplateNotFound, req.FromTemplate)
-		}
-		if fromObj.Status.ReadyImage == "" {
+		if fromSnap.Status.ReadyImage == "" {
 			return nil, false, fmt.Errorf("%w: fromTemplate %q is not ready", ErrTemplateNotReady, req.FromTemplate)
 		}
-		baseImage = fromObj.Status.ReadyImage
+		baseImage = fromSnap.Status.ReadyImage
 		if effectiveStartCmd == "" {
-			effectiveStartCmd = fromObj.Spec.StartCmd
+			effectiveStartCmd = fromSnap.Spec.StartCmd
 		}
 		if effectiveReadyCmd == "" {
-			effectiveReadyCmd = fromObj.Spec.ReadyCmd
+			effectiveReadyCmd = fromSnap.Spec.ReadyCmd
 		}
-		inheritedUser = fromObj.Spec.RunAsUser
-		inheritedGroup = fromObj.Spec.RunAsGroup
-		inheritedUsername = fromObj.Spec.RunAsUsername
+		inheritedUser = fromSnap.Spec.RunAsUser
+		inheritedGroup = fromSnap.Spec.RunAsGroup
+		inheritedUsername = fromSnap.Spec.RunAsUsername
 	}
+
+	r.mu.RLock()
+	templateBuildEnabled := r.templateBuildEnabled
+	imageBuilder := r.imageBuilder
+	targetTag := r.targetImageTagLocked(tpl.Metadata.Name, buildID)
+	pullSecret := r.templatePullSecret
+	pushSecret := r.templatePushSecret
+	templateRegistry := r.templateRegistry
+	repoPrefix := r.templateRepoPrefix
+	r.mu.RUnlock()
 
 	// 5. Render and validate Dockerfile/steps synchronously
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -1221,8 +1325,11 @@ func (r *Reconciler) prepareBuild(ctx context.Context, templateID, buildID strin
 			CPUCount:  tpl.Spec.CPUCount,
 			MemoryMB:  tpl.Spec.MemoryMB,
 		})
-		_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
-		r.persistLocalTemplateLocked(tpl)
+		if _, casErr := r.commitTemplateStatusCAS(ctx, &tpl, hasKubeObj, origLatestBuildID, origBuildStatus, origUpdatedAt); casErr != nil {
+			if errors.Is(casErr, ErrTemplateConflict) {
+				return nil, false, casErr
+			}
+		}
 		return nil, false, err
 	}
 
@@ -1235,7 +1342,7 @@ func (r *Reconciler) prepareBuild(ctx context.Context, templateID, buildID strin
 		runAsUsername = meta.RunAsUsername
 	}
 
-	// 6. Validate context tars synchronously
+	// 6. Validate context tars synchronously outside r.mu
 	for _, hash := range meta.FilesHashes {
 		if !r.contextStore.IsPresent(hash) {
 			reason := fmt.Sprintf("missing context tar for hash %s", hash)
@@ -1251,8 +1358,11 @@ func (r *Reconciler) prepareBuild(ctx context.Context, templateID, buildID strin
 				CPUCount:  tpl.Spec.CPUCount,
 				MemoryMB:  tpl.Spec.MemoryMB,
 			})
-			_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
-			r.persistLocalTemplateLocked(tpl)
+			if _, casErr := r.commitTemplateStatusCAS(ctx, &tpl, hasKubeObj, origLatestBuildID, origBuildStatus, origUpdatedAt); casErr != nil {
+				if errors.Is(casErr, ErrTemplateConflict) {
+					return nil, false, casErr
+				}
+			}
 			return nil, false, fmt.Errorf("400: %s", reason)
 		}
 	}
@@ -1280,12 +1390,26 @@ func (r *Reconciler) prepareBuild(ctx context.Context, templateID, buildID strin
 		tpl.Spec.RunAsUser = runAsUser
 		tpl.Spec.RunAsGroup = runAsGroup
 		tpl.Spec.RunAsUsername = runAsUsername
+		desiredSpec := tpl.Spec
 
-		_ = r.kubeClient.UpdatePodTemplate(ctx, *tpl)
-		_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
-		r.templates[tpl.Metadata.Name] = tpl.Spec
-		r.persistLocalTemplateLocked(tpl)
+		if _, casErr := r.commitTemplateStatusCAS(ctx, &tpl, hasKubeObj, origLatestBuildID, origBuildStatus, origUpdatedAt); casErr != nil {
+			return nil, false, casErr
+		}
+		tpl.Spec = desiredSpec
+		if r.kubeClient != nil {
+			_ = r.kubeClient.UpdatePodTemplate(ctx, tpl)
+			if fresh, getErr := r.kubeClient.GetPodTemplate(ctx, r.namespace, tpl.Metadata.Name); getErr == nil && fresh != nil {
+				tpl = clonePodTemplate(fresh)
+			}
+		}
+
+		r.mu.Lock()
+		cp := clonePodTemplate(&tpl)
+		r.templateObjects[tpl.Metadata.Name] = &cp
+		r.templates[tpl.Metadata.Name] = cp.Spec
+		r.persistLocalTemplateLocked(&cp)
 		r.retireUnclaimedWarmEntriesForTemplateLocked(tpl.Metadata.Name, baseImage)
+		r.mu.Unlock()
 
 		r.buildMetrics.observe(v1alpha1.BuildStatusReady, 0)
 		slog.Info("template build finished",
@@ -1297,17 +1421,16 @@ func (r *Reconciler) prepareBuild(ctx context.Context, templateID, buildID strin
 	}
 
 	// 8. Otherwise require templateBuildEnabled && imageBuilder != nil
-	if !r.templateBuildEnabled || r.imageBuilder == nil {
+	if !templateBuildEnabled || imageBuilder == nil {
 		return nil, false, ErrTemplateBuildDisabled
 	}
 
 	skipBuild := len(req.Steps) == 0
-	targetTag := r.targetImageTagLocked(tpl.Metadata.Name, buildID)
 	if skipBuild {
 		targetTag = baseImage
 	}
 
-	// Transition to building without touching ReadyImage / ReadyBuildID
+	// Atomically claim transition to building using ResourceVersion CAS so concurrent controller replicas never duplicate a solve.
 	tpl.Status.BuildStatus = v1alpha1.BuildStatusBuilding
 	tpl.Status.LatestBuildID = buildID
 	tpl.Status.Reason = ""
@@ -1321,8 +1444,9 @@ func (r *Reconciler) prepareBuild(ctx context.Context, templateID, buildID strin
 		CPUCount:  tpl.Spec.CPUCount,
 		MemoryMB:  tpl.Spec.MemoryMB,
 	})
-	_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl)
-	r.persistLocalTemplateLocked(tpl)
+	if _, casErr := r.commitTemplateStatusCAS(ctx, &tpl, hasKubeObj, origLatestBuildID, origBuildStatus, origUpdatedAt); casErr != nil {
+		return nil, false, casErr
+	}
 
 	return &preparedBuildPlan{
 		slug:              tpl.Metadata.Name,
@@ -1340,11 +1464,11 @@ func (r *Reconciler) prepareBuild(ctx context.Context, templateID, buildID strin
 		fromImageRegistry: req.FromImageRegistry,
 		noCache:           req.Force,
 		skipBuild:         skipBuild,
-		builder:           r.imageBuilder,
-		pullSecretName:    r.templatePullSecret,
-		pushSecretName:    r.templatePushSecret,
-		templateRegistry:  r.templateRegistry,
-		repoPrefix:        r.templateRepoPrefix,
+		builder:           imageBuilder,
+		pullSecretName:    pullSecret,
+		pushSecretName:    pushSecret,
+		templateRegistry:  templateRegistry,
+		repoPrefix:        repoPrefix,
 		cpuCount:          tpl.Spec.CPUCount,
 		memoryMB:          tpl.Spec.MemoryMB,
 	}, false, nil
@@ -1485,6 +1609,7 @@ func (r *Reconciler) executeBuild(ctx context.Context, plan *preparedBuildPlan) 
 			PushSecretName: plan.pushSecretName,
 			Namespace:      r.namespace,
 			KubeClient:     r.kubeClient,
+			ContextStore:   r.contextStore,
 		}
 
 		if buildErr := plan.builder.Build(ctx, buildOpts); buildErr != nil {

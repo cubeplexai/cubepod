@@ -130,6 +130,21 @@ func TestBuildEgressMTLSServerEnforcesClientCerts(t *testing.T) {
 	_ = ph
 }
 
+func TestResolveE2BTemplateAPIFlag(t *testing.T) {
+	if !resolveE2BTemplateAPIFlag(false, true, nil) {
+		t.Fatalf("expected default true")
+	}
+	if resolveE2BTemplateAPIFlag(true, false, nil) {
+		t.Fatalf("expected explicit --e2b-template-api=false to disable")
+	}
+	if resolveE2BTemplateAPIFlag(false, true, map[string]bool{"E2BTemplateAPI": false}) {
+		t.Fatalf("expected --feature-gate=E2BTemplateAPI=false to disable")
+	}
+	if resolveE2BTemplateAPIFlag(true, true, map[string]bool{"E2BTemplateAPI": false}) {
+		t.Fatalf("expected explicit flag + gate=false to disable")
+	}
+}
+
 func TestResolveE2BVolumeConfig(t *testing.T) {
 	hexKEK := hex.EncodeToString(bytes.Repeat([]byte{0x22}, 32))
 	envMap := map[string]string{

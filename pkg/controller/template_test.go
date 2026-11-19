@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1880,4 +1881,170 @@ func TestCEP0019_TemplateCatalogAndBuild(t *testing.T) {
 			t.Fatalf("expected tag-alpha:v1 to no longer resolve after DeleteTemplateTags")
 		}
 	})
+}
+
+type haCountingBuilder struct {
+	buildDelay time.Duration
+	buildCalls atomic.Int32
+}
+
+func (b *haCountingBuilder) Build(ctx context.Context, opts controller.BuildOptions) error {
+	b.buildCalls.Add(1)
+	if b.buildDelay > 0 {
+		time.Sleep(b.buildDelay)
+	}
+	if opts.ContextStore != nil {
+		_ = opts.ContextStore.AppendLog(opts.BuildID, []string{"INFO: built in HA replica"})
+	}
+	return nil
+}
+
+func (b *haCountingBuilder) Probe(_ context.Context, _ string, _ controller.ProbeOptions) error {
+	return nil
+}
+
+func (b *haCountingBuilder) TagExists(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+
+func (b *haCountingBuilder) Ping(_ context.Context) error {
+	return nil
+}
+
+func TestMultiReplicaController_S3AndBuildClaimCAS(t *testing.T) {
+	ctx := context.Background()
+	srv := newMockS3Server("ha-ctrl", "us-east-1", "AKIAHA", "secret-ha", "")
+	defer srv.Close()
+
+	s3Cfg := controller.S3ContextStoreConfig{
+		Endpoint:        srv.URL(),
+		Bucket:          "ha-ctrl",
+		Region:          "us-east-1",
+		Prefix:          "ha/",
+		ForcePathStyle:  true,
+		AccessKeyID:     "AKIAHA",
+		SecretAccessKey: "secret-ha",
+	}
+	storeA, err := controller.NewS3ContextStore(s3Cfg)
+	if err != nil {
+		t.Fatalf("NewS3ContextStore A: %v", err)
+	}
+	storeB, err := controller.NewS3ContextStore(s3Cfg)
+	if err != nil {
+		t.Fatalf("NewS3ContextStore B: %v", err)
+	}
+
+	sharedKube := controller.NewMemoryKubeClient()
+	builder := &haCountingBuilder{buildDelay: 25 * time.Millisecond}
+
+	replicaA := controller.NewReconciler(
+		controller.WithKubeClient(sharedKube),
+		controller.WithContextStore(storeA),
+		controller.WithTemplateBuildEnabled(true),
+		controller.WithImageBuilder(builder),
+		controller.WithE2BTemplateAPI(true),
+	)
+	replicaB := controller.NewReconciler(
+		controller.WithKubeClient(sharedKube),
+		controller.WithContextStore(storeB),
+		controller.WithTemplateBuildEnabled(true),
+		controller.WithImageBuilder(builder),
+		controller.WithE2BTemplateAPI(true),
+	)
+
+	// Upload context archive via Replica A, create PodTemplate on Replica B.
+	const filesHash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	ctxTar := buildTestTar(t, true, []tarTestEntry{{name: "app.py", typeflag: tar.TypeReg, body: []byte("print('ha')")}})
+	if err := replicaA.ContextStore().Store(filesHash, bytes.NewReader(ctxTar)); err != nil {
+		t.Fatalf("storeA upload failed: %v", err)
+	}
+
+	created, err := replicaB.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "ha-shared-tpl"}, "")
+	if err != nil {
+		t.Fatalf("CreateTemplate on replicaB failed: %v", err)
+	}
+
+	req := controller.StartBuildRequest{
+		FromImage: "ubuntu:24.04",
+		Steps: []controller.BuildStep{
+			{Type: "COPY", Args: []string{".", "/app"}, FilesHash: filesHash},
+			{Type: "RUN", Args: []string{"echo hello"}},
+		},
+	}
+
+	// Race StartBuild on both replicas simultaneously for the initial waiting buildID.
+	startGate := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for idx, rec := range []*controller.Reconciler{replicaA, replicaB} {
+		wg.Add(1)
+		go func(i int, r *controller.Reconciler) {
+			defer wg.Done()
+			<-startGate
+			errs[i] = r.StartBuild(ctx, created.TemplateID, created.BuildID, req)
+		}(idx, rec)
+	}
+	close(startGate)
+	wg.Wait()
+
+	var okCount, conflictCount int
+	for _, e := range errs {
+		switch {
+		case e == nil:
+			okCount++
+		case errors.Is(e, controller.ErrTemplateConflict):
+			conflictCount++
+		default:
+			t.Fatalf("unexpected concurrent StartBuild error: %v", e)
+		}
+	}
+	if okCount != 1 || conflictCount != 1 {
+		t.Fatalf("expected 1 winner and 1 ErrTemplateConflict, got ok=%d conflict=%d errs=%v", okCount, conflictCount, errs)
+	}
+	if calls := builder.buildCalls.Load(); calls != 1 {
+		t.Fatalf("expected exactly 1 Build invocation across replicas, got %d", calls)
+	}
+
+	// Logs written by the winning replica via ContextStore are readable from the other replica via S3.
+	logsFromA, err := replicaA.ContextStore().ReadLogs(created.BuildID, 0, 10, "")
+	if err != nil || len(logsFromA) == 0 {
+		t.Fatalf("expected Replica A to read logs written to shared S3ContextStore, got %+v (err=%v)", logsFromA, err)
+	}
+	logsFromB, err := replicaB.ContextStore().ReadLogs(created.BuildID, 0, 10, "")
+	if err != nil || len(logsFromB) == 0 {
+		t.Fatalf("expected Replica B to read logs written to shared S3ContextStore, got %+v (err=%v)", logsFromB, err)
+	}
+
+	// Race two different buildIDs concurrently once ready; again exactly one must win CAS.
+	raceGate := make(chan struct{})
+	raceErrs := make([]error, 2)
+	buildIDs := []string{"bld_race_a", "bld_race_b"}
+	for idx, rec := range []*controller.Reconciler{replicaA, replicaB} {
+		wg.Add(1)
+		go func(i int, r *controller.Reconciler) {
+			defer wg.Done()
+			<-raceGate
+			raceErrs[i] = r.StartBuild(ctx, created.TemplateID, buildIDs[i], req)
+		}(idx, rec)
+	}
+	close(raceGate)
+	wg.Wait()
+
+	okCount, conflictCount = 0, 0
+	for _, e := range raceErrs {
+		switch {
+		case e == nil:
+			okCount++
+		case errors.Is(e, controller.ErrTemplateConflict):
+			conflictCount++
+		default:
+			t.Fatalf("unexpected concurrent rebuild error: %v", e)
+		}
+	}
+	if okCount != 1 || conflictCount != 1 {
+		t.Fatalf("expected 1 rebuild winner and 1 ErrTemplateConflict, got ok=%d conflict=%d errs=%v", okCount, conflictCount, raceErrs)
+	}
+	if calls := builder.buildCalls.Load(); calls != 2 {
+		t.Fatalf("expected total 2 Build invocations after second race, got %d", calls)
+	}
 }

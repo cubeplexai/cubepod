@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/moby/buildkit/client"
@@ -38,6 +39,7 @@ type BuildOptions struct {
 	PushSecretName string
 	Namespace      string
 	KubeClient     KubeClient
+	ContextStore   ContextStore
 }
 
 // ProbeOptions configures readiness probing for a built template image.
@@ -301,7 +303,7 @@ func (b *LocalDockerBuilder) Build(ctx context.Context, opts BuildOptions) error
 	if len(lines) == 1 && lines[0] == "" {
 		lines = nil
 	}
-	_ = AppendScrubbedLog(logBase, opts.BuildID, lines, opts.Passwords)
+	appendBuildLog(opts, logBase, lines, opts.Passwords)
 
 	if err != nil {
 		return fmt.Errorf("docker build failed: %w (output: %s)", err, ScrubString(rawOut, opts.Passwords))
@@ -442,6 +444,16 @@ func WithBuildKitInsecureRegistry(insecure bool) BuildKitBuilderOption {
 	}
 }
 
+// WithBuildKitTLS configures mTLS certificates and optional TLS server-name override for buildkitd gRPC connections.
+func WithBuildKitTLS(caCertPath, clientCertPath, clientKeyPath, serverName string) BuildKitBuilderOption {
+	return func(b *BuildKitBuilder) {
+		b.caCertPath = strings.TrimSpace(caCertPath)
+		b.clientCertPath = strings.TrimSpace(clientCertPath)
+		b.clientKeyPath = strings.TrimSpace(clientKeyPath)
+		b.tlsServerName = strings.TrimSpace(serverName)
+	}
+}
+
 // BuildKitBuilder implements ImageBuilder using a remote BuildKit daemon (`buildkitd`) and Kubernetes probe Pods.
 type BuildKitBuilder struct {
 	addr             string
@@ -451,6 +463,103 @@ type BuildKitBuilder struct {
 	pushSecretName   string
 	httpClient       *http.Client
 	insecureRegistry bool
+	caCertPath       string
+	clientCertPath   string
+	clientKeyPath    string
+	tlsServerName    string
+	addrCursor       atomic.Uint64
+}
+
+func appendBuildLog(opts BuildOptions, logBase string, lines, passwords []string) {
+	if opts.BuildID == "" || len(lines) == 0 {
+		return
+	}
+	scrubbed := make([]string, 0, len(lines))
+	for _, l := range lines {
+		scrubbed = append(scrubbed, ScrubString(l, passwords))
+	}
+	if opts.ContextStore != nil {
+		if err := opts.ContextStore.AppendLog(opts.BuildID, scrubbed); err == nil {
+			return
+		}
+	}
+	_ = AppendScrubbedLog(logBase, opts.BuildID, scrubbed, nil)
+}
+
+func parseBuildKitAddrs(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	addrs := make([]string, 0, len(parts))
+	for _, p := range parts {
+		trimmed := strings.TrimSpace(p)
+		if trimmed != "" {
+			addrs = append(addrs, trimmed)
+		}
+	}
+	return addrs
+}
+
+func (b *BuildKitBuilder) buildClientOpts() ([]client.ClientOpt, error) {
+	hasCert := b.clientCertPath != ""
+	hasKey := b.clientKeyPath != ""
+	if hasCert != hasKey {
+		return nil, fmt.Errorf("buildkit mTLS configuration incomplete: client cert and key must both be set")
+	}
+	var opts []client.ClientOpt
+	if b.caCertPath != "" {
+		opts = append(opts, client.WithServerConfig(b.tlsServerName, b.caCertPath))
+	} else if b.tlsServerName != "" {
+		opts = append(opts, client.WithServerConfigSystem(b.tlsServerName))
+	}
+	if hasCert && hasKey {
+		opts = append(opts, client.WithCredentials(b.clientCertPath, b.clientKeyPath))
+	}
+	return opts, nil
+}
+
+func (b *BuildKitBuilder) dialHealthyClient(ctx context.Context) (*client.Client, string, error) {
+	addrs := parseBuildKitAddrs(b.addr)
+	if len(addrs) == 0 {
+		return nil, "", fmt.Errorf("buildkit address is empty")
+	}
+	clientOpts, err := b.buildClientOpts()
+	if err != nil {
+		return nil, "", err
+	}
+
+	start := int(b.addrCursor.Add(1)-1) % len(addrs)
+	var lastErr error
+	for i := 0; i < len(addrs); i++ {
+		addr := addrs[(start+i)%len(addrs)]
+		c, dialErr := client.New(ctx, addr, clientOpts...)
+		if dialErr != nil {
+			lastErr = fmt.Errorf("failed to connect to buildkitd at %s: %w", addr, dialErr)
+			continue
+		}
+		if len(addrs) > 1 {
+			probeTimeout := 5 * time.Second
+			if dl, ok := ctx.Deadline(); ok {
+				if rem := time.Until(dl); rem < probeTimeout {
+					probeTimeout = rem
+				}
+			}
+			if probeTimeout <= 0 {
+				probeTimeout = time.Second
+			}
+			probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+			_, pingErr := c.ListWorkers(probeCtx)
+			cancel()
+			if pingErr != nil {
+				_ = c.Close()
+				lastErr = fmt.Errorf("buildkitd health probe failed at %s: %w", addr, pingErr)
+				continue
+			}
+		}
+		return c, addr, nil
+	}
+	return nil, "", lastErr
 }
 
 // NewBuildKitBuilder creates a BuildKitBuilder targeting the given buildkitd address.
@@ -581,7 +690,7 @@ func (p *buildKitRegistryAuthProvider) Credentials(_ context.Context, req *auth.
 
 // Build solves the Dockerfile on remote buildkitd, streams scrubbed logs, and optionally pushes to a registry.
 func (b *BuildKitBuilder) Build(ctx context.Context, opts BuildOptions) error {
-	if b.addr == "" {
+	if len(parseBuildKitAddrs(b.addr)) == 0 {
 		return fmt.Errorf("buildkit address is empty")
 	}
 	dockerfilePath := filepath.Join(opts.ContextDir, "Dockerfile")
@@ -612,9 +721,9 @@ func (b *BuildKitBuilder) Build(ctx context.Context, opts BuildOptions) error {
 	}
 	passwords = append(passwords, pushPasswords...)
 
-	c, err := client.New(ctx, b.addr)
+	c, _, err := b.dialHealthyClient(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to connect to buildkitd at %s: %w", b.addr, err)
+		return err
 	}
 	defer c.Close()
 
@@ -705,7 +814,7 @@ func (b *BuildKitBuilder) Build(ctx context.Context, opts BuildOptions) error {
 				}
 			}
 			if len(lines) > 0 {
-				_ = AppendScrubbedLog(logBase, opts.BuildID, lines, passwords)
+				appendBuildLog(opts, logBase, lines, passwords)
 			}
 		}
 	}()
@@ -997,19 +1106,32 @@ func parseBearerChallengeParams(header string) map[string]string {
 	return out
 }
 
-// Ping checks connectivity to buildkitd by listing configured workers.
+// Ping checks connectivity to buildkitd by listing configured workers across configured endpoints.
 func (b *BuildKitBuilder) Ping(ctx context.Context) error {
-	if b.addr == "" {
+	addrs := parseBuildKitAddrs(b.addr)
+	if len(addrs) == 0 {
 		return fmt.Errorf("buildkit address is empty")
 	}
-	c, err := client.New(ctx, b.addr)
+	clientOpts, err := b.buildClientOpts()
 	if err != nil {
-		return fmt.Errorf("buildkit ping failed to connect to %s: %w", b.addr, err)
+		return err
 	}
-	defer c.Close()
-
-	if _, err := c.ListWorkers(ctx); err != nil {
-		return fmt.Errorf("buildkit list workers failed: %w", err)
+	start := int(b.addrCursor.Add(1)-1) % len(addrs)
+	var lastErr error
+	for i := 0; i < len(addrs); i++ {
+		addr := addrs[(start+i)%len(addrs)]
+		c, dialErr := client.New(ctx, addr, clientOpts...)
+		if dialErr != nil {
+			lastErr = fmt.Errorf("buildkit ping failed to connect to %s: %w", addr, dialErr)
+			continue
+		}
+		_, listErr := c.ListWorkers(ctx)
+		_ = c.Close()
+		if listErr != nil {
+			lastErr = fmt.Errorf("buildkit list workers failed at %s: %w", addr, listErr)
+			continue
+		}
+		return nil
 	}
-	return nil
+	return lastErr
 }

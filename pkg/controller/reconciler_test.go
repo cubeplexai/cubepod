@@ -434,6 +434,7 @@ func TestPodWarmPool_ReconcileAndClaim(t *testing.T) {
 func TestReconcile_CoWFork(t *testing.T) {
 	ctx := context.Background()
 	r := controller.NewReconciler()
+	r.RegisterTemplate("standard-node", sampleTemplate())
 
 	// 1. Reconcile parent sandbox
 	parentSpec := v1alpha1.PodBoxSpec{
@@ -483,6 +484,7 @@ func TestReconcile_CoWFork(t *testing.T) {
 func TestReconcile_RootFSResetPreservesWorkspace(t *testing.T) {
 	ctx := context.Background()
 	r := controller.NewReconciler()
+	r.RegisterTemplate("ubuntu-node", sampleTemplate())
 
 	spec := v1alpha1.PodBoxSpec{
 		TemplateRef:      "ubuntu-node",
@@ -1698,6 +1700,7 @@ func TestReconciler_ReapIdle_RollbackOnUpsertPodBoxError(t *testing.T) {
 		controller.WithKubeClient(customKube),
 		controller.WithNamespace("cubepod-workloads"),
 	)
+	r.RegisterTemplate("base-tpl", sampleTemplate())
 
 	boxSpec := v1alpha1.PodBoxSpec{
 		TemplateRef:  "base-tpl",
@@ -1842,6 +1845,7 @@ func TestReconciler_WarmPool_ScaleUpAvoidsBoxPVCConflict(t *testing.T) {
 		controller.WithKubeClient(memKube),
 		controller.WithNamespace("cubepod-workloads"),
 	)
+	r.RegisterTemplate("base-tpl", sampleTemplate())
 
 	// Create a warm pool with 1 replica (index 1)
 	_, err := r.ReconcileWarmPool(ctx, "test-pool", v1alpha1.PodWarmPoolSpec{
@@ -2085,6 +2089,7 @@ func TestForkSandboxWithRootfsGeneration2(t *testing.T) {
 	ctx := context.Background()
 	memKube := controller.NewMemoryKubeClient()
 	r1 := controller.NewReconciler(controller.WithKubeClient(memKube))
+	r1.RegisterTemplate("ubuntu-node", sampleTemplate())
 
 	parentSpec := v1alpha1.PodBoxSpec{
 		TemplateRef:      "ubuntu-node",
@@ -2131,6 +2136,7 @@ func TestReconcile_PodBoxStatelessAnnotations(t *testing.T) {
 	ctx := context.Background()
 	memKube := controller.NewMemoryKubeClient()
 	r := controller.NewReconciler(controller.WithKubeClient(memKube))
+	r.RegisterTemplate("python-312", sampleTemplate())
 
 	parentSpec := v1alpha1.PodBoxSpec{
 		TemplateRef:      "python-312",

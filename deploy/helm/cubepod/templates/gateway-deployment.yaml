@@ -30,6 +30,8 @@ spec:
       {{- $secretsEnabled := and (eq (include "cubepod.boolDefaultTrue" $secretsCfg.enabled) "true") (eq (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) "true") }}
       {{- $secretsBackend := default "k8s" $secretsCfg.backend }}
       {{- $secretsKeySecret := include "cubepod.secretsKeySecretName" . }}
+      {{- $ctxBackend := include "cubepod.contextStoreBackend" . }}
+      {{- $s3Env := include "cubepod.s3ContextEnv" . }}
       {{- $hasEnv := true }}
       {{- $hasVolumes := or $e2bVolumesActive .Values.egress.caSecretName .Values.gateway.persistence.enabled }}
       containers:
@@ -52,12 +54,27 @@ spec:
             {{- if $tplPullSecret }}
             - "--template-pull-secret={{ $tplPullSecret }}"
             {{- end }}
-            - "--e2b-template-api={{ .Values.featureGates.e2bTemplateAPI }}"
+            - "--e2b-template-api={{ include "cubepod.boolDefaultTrue" $fg.e2bTemplateAPI }}"
             - "--feature-gate={{ include "cubepod.featureGatesCSV" . }}"
             - "--metrics-sample-interval={{ .Values.gateway.metricsSampleInterval | default "10s" }}"
             - "--template-build={{ .Values.templateBuild.enabled }}"
             - "--template-probe-timeout={{ .Values.templateBuild.probeTimeout }}"
             - "--controller-url=http://{{ include "cubepod.fullname" . }}-controller:{{ .Values.controller.healthzPort }}"
+            {{- if and .Values.templateBuild.enabled (eq $ctxBackend "s3") }}
+            - "--context-store-backend=s3"
+            {{- $s3 := .Values.templateBuild.contextStore.s3 | default dict }}
+            {{- if $s3.endpoint }}
+            - "--s3-endpoint={{ $s3.endpoint }}"
+            {{- end }}
+            {{- if $s3.bucket }}
+            - "--s3-bucket={{ $s3.bucket }}"
+            {{- end }}
+            - "--s3-region={{ default "us-east-1" $s3.region }}"
+            {{- if $s3.prefix }}
+            - "--s3-prefix={{ $s3.prefix }}"
+            {{- end }}
+            - "--s3-force-path-style={{ default false $s3.forcePathStyle }}"
+            {{- end }}
             {{- if $stateDir }}
             - "--state-dir={{ $stateDir }}"
             {{- end }}
@@ -109,6 +126,9 @@ spec:
               value: {{ ternary "1" "0" $k8sE2BMounts | quote }}
             - name: CUBEPOD_E2B_SHARED_PVC
               value: {{ .Values.e2bVolumes.pvcName | quote }}
+            {{- end }}
+            {{- if $s3Env }}
+            {{- $s3Env | nindent 12 }}
             {{- end }}
             {{- include "cubepod.egressCAEnv" . | nindent 12 }}
           {{- end }}

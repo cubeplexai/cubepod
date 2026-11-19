@@ -111,7 +111,7 @@ Both plain `application/json` payloads and framed `application/connect+json` str
 
 ## Template Catalog & Builds (`E2BTemplateAPI`)
 
-When `--e2b-template-api=true` is enabled on the Gateway and Controller, the full template registry and BuildKit build pipeline become available:
+Enabled by default since *v0.7.0* (set `--e2b-template-api=false` or `--feature-gate=E2BTemplateAPI=false` to roll back), exposing the full template registry and BuildKit build pipeline:
 
 | Method & Path | Purpose | Key Headers / Constraints |
 | :--- | :--- | :--- |
@@ -138,7 +138,7 @@ Both `cubepod-gateway` and `cubepod-controller` accept `--feature-gate=GateA=tru
 
 | Feature Gate | Default | Components | Purpose |
 | :--- | :--- | :--- | :--- |
-| `E2BTemplateAPI` | `false` | `gateway`, `controller` | Enables E2B JSON-array `GET /templates` and `/v2`–`/v3` template APIs (`--e2b-template-api` also toggles it). |
+| `E2BTemplateAPI` | `true` *(Changed in v0.7.0)* | `gateway`, `controller` | Enables E2B JSON-array `GET /templates` and `/v2`–`/v3` template APIs (`--e2b-template-api=false` rolls back to wrapped stub). |
 | `K8sE2BVolumeMounts` | `false` | `gateway` | Enables Kubernetes RWX E2B `volumeMounts` (auto-enabled in Helm when `e2bVolumes.rwxStorageClassName` is set). |
 | `TransparentEgress` | `true` | `gateway`, `controller` | Controls `CUBEPOD_TRANSPARENT=1` + `NET_ADMIN` `nftables` interception and `/internal/v1/egress/exchange`. |
 | `DesktopStack` | `true` | `gateway` | Enables `/sandboxes/{id}/desktop/{start,status,stop}` routes. |

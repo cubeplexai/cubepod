@@ -1306,3 +1306,178 @@ func TestE2E_E2BProductionHardening(t *testing.T) {
 		}
 	})
 }
+
+func TestE2E_TemplateRebuildWorkspacePreservationSoak(t *testing.T) {
+	ctx := context.Background()
+	kube := controller.NewMemoryKubeClient()
+	fakeBuilder := controller.NewFakeImageBuilder()
+	reconciler := controller.NewReconciler(
+		controller.WithKubeClient(kube),
+		controller.WithTemplateBuildEnabled(true),
+		controller.WithImageBuilder(fakeBuilder),
+		controller.WithTemplateRegistry("registry.local:5000"),
+	)
+	srv := gateway.NewServer(reconciler)
+	srv.SetWorkspaceBaseDir(t.TempDir())
+	t.Cleanup(srv.Close)
+
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	client := ts.Client()
+
+	// Verify E2BTemplateAPI is active by default (GET /templates returns JSON array).
+	listResp, err := client.Get(ts.URL + "/templates")
+	if err != nil || listResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /templates failed: resp=%v err=%v", listResp, err)
+	}
+	var tplList []map[string]any
+	if err := json.NewDecoder(listResp.Body).Decode(&tplList); err != nil {
+		listResp.Body.Close()
+		t.Fatalf("expected JSON array from GET /templates with default E2BTemplateAPI=true: %v", err)
+	}
+	listResp.Body.Close()
+
+	// Helper to trigger a template build and wait for ready status.
+	buildTemplateVersion := func(tag string) (string, string) {
+		createBody := []byte(`{"name":"soak-ws-tpl","cpuCount":2,"memoryMB":1024}`)
+		cResp, err := client.Post(ts.URL+"/templates", "application/json", bytes.NewReader(createBody))
+		if err != nil || (cResp.StatusCode != http.StatusCreated && cResp.StatusCode != http.StatusOK && cResp.StatusCode != http.StatusAccepted) {
+			t.Fatalf("POST /templates (%s) failed: resp=%v err=%v", tag, cResp, err)
+		}
+		var created struct {
+			TemplateID string `json:"templateID"`
+			BuildID    string `json:"buildID"`
+		}
+		if err := json.NewDecoder(cResp.Body).Decode(&created); err != nil {
+			cResp.Body.Close()
+			t.Fatalf("decode CreateTemplate response: %v", err)
+		}
+		cResp.Body.Close()
+
+		buildReq := fmt.Sprintf(`{"fromImage":"ubuntu:24.04","steps":[{"type":"RUN","args":["echo build-%s"]}],"readyCmd":"true"}`, tag)
+		bResp, err := client.Post(
+			fmt.Sprintf("%s/v2/templates/%s/builds/%s", ts.URL, created.TemplateID, created.BuildID),
+			"application/json",
+			strings.NewReader(buildReq),
+		)
+		if err != nil || bResp.StatusCode != http.StatusAccepted {
+			t.Fatalf("StartBuild (%s) failed: resp=%v err=%v", tag, bResp, err)
+		}
+		bResp.Body.Close()
+
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			sResp, err := client.Get(fmt.Sprintf("%s/templates/%s/builds/%s/status", ts.URL, created.TemplateID, created.BuildID))
+			if err == nil {
+				var st struct {
+					Status string `json:"status"`
+				}
+				_ = json.NewDecoder(sResp.Body).Decode(&st)
+				sResp.Body.Close()
+				if st.Status == "ready" {
+					return created.TemplateID, created.BuildID
+				}
+				if st.Status == "error" {
+					t.Fatalf("template build %s transitioned to error", created.BuildID)
+				}
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for template build %s ready", created.BuildID)
+		return "", ""
+	}
+
+	// Build initial v1 template and spawn long-lived user sandbox.
+	templateID, _ := buildTemplateVersion("v1")
+	sbResp, err := client.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"soak-ws-tpl"}`))
+	if err != nil || sbResp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /sandboxes failed: resp=%v err=%v", sbResp, err)
+	}
+	var sbx gateway.SandboxRecord
+	if err := json.NewDecoder(sbResp.Body).Decode(&sbx); err != nil {
+		sbResp.Body.Close()
+		t.Fatalf("decode SandboxRecord: %v", err)
+	}
+	sbResp.Body.Close()
+
+	// Write deterministic marker file under /workspace and compute expected SHA-256.
+	markerPayload := bytes.Repeat([]byte("cubepod-workspace-preservation-soak-marker-0123456789abcdef\n"), 64)
+	markerSum := sha256.Sum256(markerPayload)
+	expectedSHA := hex.EncodeToString(markerSum[:])
+
+	putReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/sandboxes/"+sbx.SandboxID+"/files?path=/workspace/soak-marker.bin", bytes.NewReader(markerPayload))
+	putResp, err := client.Do(putReq)
+	if err != nil || putResp.StatusCode >= 300 {
+		t.Fatalf("write soak marker failed: resp=%v err=%v", putResp, err)
+	}
+	putResp.Body.Close()
+
+	origBox, ok := reconciler.GetBox(sbx.SandboxID)
+	if !ok {
+		t.Fatalf("expected PodBox %s", sbx.SandboxID)
+	}
+	origWsPVC := origBox.WorkspacePVCName
+
+	// Run 5 consecutive template rebuilds + sandbox RootFS resets + pause/auto-resume cycles.
+	const iterations = 5
+	for i := 2; i <= iterations+1; i++ {
+		_, nextBuildID := buildTemplateVersion(fmt.Sprintf("v%d", i))
+		resolved, err := reconciler.ResolveTemplate(templateID)
+		if err != nil || !strings.Contains(resolved.Image, nextBuildID) {
+			t.Fatalf("iter %d: expected rebuilt ReadyImage containing %s, got %+v (err=%v)", i, nextBuildID, resolved, err)
+		}
+
+		// Trigger RootFS reset (rootfsGeneration=i) while template updates and box pauses/resumes.
+		curPodBox, err := kube.GetPodBox(ctx, "cubepod-workloads", sbx.SandboxID)
+		if err != nil {
+			t.Fatalf("iter %d: GetPodBox: %v", i, err)
+		}
+		curPodBox.Spec.RootfsGeneration = int64(i)
+		resetStatus, err := reconciler.Reconcile(ctx, sbx.SandboxID, curPodBox.Spec)
+		if err != nil {
+			t.Fatalf("iter %d: Reconcile RootfsGeneration=%d failed: %v", i, i, err)
+		}
+		wantRootPVC := fmt.Sprintf("%s-rootfs-gen%d-pvc", sbx.SandboxID, i)
+		if resetStatus.RootfsPVCName != wantRootPVC {
+			t.Fatalf("iter %d: expected RootfsPVCName=%s, got %s", i, wantRootPVC, resetStatus.RootfsPVCName)
+		}
+		if resetStatus.WorkspacePVCName != origWsPVC {
+			t.Fatalf("iter %d: WorkspacePVCName drifted from %s to %s", i, origWsPVC, resetStatus.WorkspacePVCName)
+		}
+
+		pResp, err := client.Post(ts.URL+"/sandboxes/"+sbx.SandboxID+"/pause", "application/json", nil)
+		if err != nil || pResp.StatusCode >= 300 {
+			t.Fatalf("iter %d: pause failed: resp=%v err=%v", i, pResp, err)
+		}
+		pResp.Body.Close()
+
+		getResp, err := client.Get(ts.URL + "/sandboxes/" + sbx.SandboxID + "/files?path=/workspace/soak-marker.bin")
+		if err != nil || getResp.StatusCode != http.StatusOK {
+			t.Fatalf("iter %d: read soak marker after auto-resume failed: resp=%v err=%v", i, getResp, err)
+		}
+		gotBytes, err := io.ReadAll(getResp.Body)
+		getResp.Body.Close()
+		if err != nil {
+			t.Fatalf("iter %d: read body: %v", i, err)
+		}
+		gotSum := sha256.Sum256(gotBytes)
+		gotSHA := hex.EncodeToString(gotSum[:])
+		if gotSHA != expectedSHA {
+			t.Fatalf("iter %d: /workspace marker checksum mismatch! got=%s want=%s", i, gotSHA, expectedSHA)
+		}
+
+		// Spawn an ephemeral sandbox from the latest rebuilt template to verify updated base image boots.
+		newSbResp, err := client.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"soak-ws-tpl"}`))
+		if err != nil || newSbResp.StatusCode != http.StatusCreated {
+			t.Fatalf("iter %d: spawn from rebuilt template failed: resp=%v err=%v", i, newSbResp, err)
+		}
+		var newSbx gateway.SandboxRecord
+		_ = json.NewDecoder(newSbResp.Body).Decode(&newSbx)
+		newSbResp.Body.Close()
+		delReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+newSbx.SandboxID, nil)
+		delResp, _ := client.Do(delReq)
+		if delResp != nil {
+			delResp.Body.Close()
+		}
+	}
+}

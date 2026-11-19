@@ -199,7 +199,107 @@ Comma-separated feature gates string for controller and gateway
 */}}
 {{- define "cubepod.featureGatesCSV" -}}
 {{- $fg := .Values.featureGates | default dict -}}
-{{- printf "E2BTemplateAPI=%t,TransparentEgress=%s,DesktopStack=%s,StatelessGatewayHA=%s,E2BFilesystemWatch=%s,E2BSecretsAPI=%s,SandboxEventsAndWebhooks=%s,K8sE2BVolumeMounts=%s" (default false $fg.e2bTemplateAPI) (include "cubepod.transparentEgressEnabled" .) (include "cubepod.boolDefaultTrue" $fg.desktopStack) (include "cubepod.boolDefaultTrue" $fg.statelessGatewayHA) (include "cubepod.boolDefaultTrue" $fg.e2bFilesystemWatch) (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) (include "cubepod.boolDefaultTrue" $fg.sandboxEventsAndWebhooks) (include "cubepod.k8sE2BVolumeMountsEnabled" .) -}}
+{{- printf "E2BTemplateAPI=%s,TransparentEgress=%s,DesktopStack=%s,StatelessGatewayHA=%s,E2BFilesystemWatch=%s,E2BSecretsAPI=%s,SandboxEventsAndWebhooks=%s,K8sE2BVolumeMounts=%s" (include "cubepod.boolDefaultTrue" $fg.e2bTemplateAPI) (include "cubepod.transparentEgressEnabled" .) (include "cubepod.boolDefaultTrue" $fg.desktopStack) (include "cubepod.boolDefaultTrue" $fg.statelessGatewayHA) (include "cubepod.boolDefaultTrue" $fg.e2bFilesystemWatch) (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) (include "cubepod.boolDefaultTrue" $fg.sandboxEventsAndWebhooks) (include "cubepod.k8sE2BVolumeMountsEnabled" .) -}}
+{{- end }}
+
+{{/*
+Normalized template context store backend ("local" or "s3")
+*/}}
+{{- define "cubepod.contextStoreBackend" -}}
+{{- $tb := .Values.templateBuild | default dict -}}
+{{- $cs := $tb.contextStore | default dict -}}
+{{- lower (default "local" $cs.backend) -}}
+{{- end }}
+
+{{/*
+Effective BuildKit replica count (>= 1)
+*/}}
+{{- define "cubepod.buildkitReplicaCount" -}}
+{{- $tb := .Values.templateBuild | default dict -}}
+{{- $bk := $tb.buildkit | default dict -}}
+{{- $rc := int (default 1 $bk.replicaCount) -}}
+{{- if lt $rc 1 -}}1{{- else -}}{{ $rc }}{{- end -}}
+{{- end }}
+
+{{/*
+Effective BuildKit TLS Secret name when templateBuild.buildkit.tls.enabled=true
+*/}}
+{{- define "cubepod.buildkitTLSSecretName" -}}
+{{- $tb := .Values.templateBuild | default dict -}}
+{{- $bk := $tb.buildkit | default dict -}}
+{{- $tls := $bk.tls | default dict -}}
+{{- if $tls.enabled -}}
+{{- default "cubepod-buildkit-tls" $tls.secretName -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Effective BuildKit gRPC address(es) for cubepod-controller
+*/}}
+{{- define "cubepod.buildkitEffectiveAddress" -}}
+{{- $tb := .Values.templateBuild | default dict -}}
+{{- $bk := $tb.buildkit | default dict -}}
+{{- $rc := int (include "cubepod.buildkitReplicaCount" .) -}}
+{{- $addr := default "" $bk.address -}}
+{{- if and (gt $rc 1) (or (eq $addr "") (eq $addr "tcp://cubepod-buildkit.cubepod-system.svc:1234")) -}}
+{{- $ns := .Release.Namespace -}}
+{{- $list := list -}}
+{{- range $i := until $rc -}}
+{{- $list = append $list (printf "tcp://cubepod-buildkit-%d.cubepod-buildkit-headless.%s.svc:1234" $i $ns) -}}
+{{- end -}}
+{{- join "," $list -}}
+{{- else if $addr -}}
+{{- $addr -}}
+{{- else -}}
+{{- printf "tcp://cubepod-buildkit.%s.svc:1234" .Release.Namespace -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+S3 ContextStore environment variables (credentials injected strictly via secretKeyRef)
+*/}}
+{{- define "cubepod.s3ContextEnv" -}}
+{{- $tb := .Values.templateBuild | default dict -}}
+{{- if and $tb.enabled (eq (include "cubepod.contextStoreBackend" .) "s3") -}}
+{{- $cs := $tb.contextStore | default dict -}}
+{{- $s3 := $cs.s3 | default dict -}}
+- name: CUBEPOD_CONTEXT_STORE_BACKEND
+  value: "s3"
+{{- if $s3.endpoint }}
+- name: CUBEPOD_S3_ENDPOINT
+  value: {{ $s3.endpoint | quote }}
+{{- end }}
+{{- if $s3.bucket }}
+- name: CUBEPOD_S3_BUCKET
+  value: {{ $s3.bucket | quote }}
+{{- end }}
+- name: CUBEPOD_S3_REGION
+  value: {{ default "us-east-1" $s3.region | quote }}
+{{- if $s3.prefix }}
+- name: CUBEPOD_S3_PREFIX
+  value: {{ $s3.prefix | quote }}
+{{- end }}
+- name: CUBEPOD_S3_FORCE_PATH_STYLE
+  value: {{ default false $s3.forcePathStyle | toString | quote }}
+{{- if $s3.credentialsSecretName }}
+- name: CUBEPOD_S3_ACCESS_KEY_ID
+  valueFrom:
+    secretKeyRef:
+      name: {{ $s3.credentialsSecretName | quote }}
+      key: accessKeyId
+- name: CUBEPOD_S3_SECRET_ACCESS_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ $s3.credentialsSecretName | quote }}
+      key: secretAccessKey
+- name: CUBEPOD_S3_SESSION_TOKEN
+  valueFrom:
+    secretKeyRef:
+      name: {{ $s3.credentialsSecretName | quote }}
+      key: sessionToken
+      optional: true
+{{- end }}
+{{- end -}}
 {{- end }}
 
 {{/*

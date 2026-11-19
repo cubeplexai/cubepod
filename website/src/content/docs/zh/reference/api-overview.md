@@ -111,7 +111,7 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 
 ## 模板目录与构建（`E2BTemplateAPI`）
 
-当 Gateway 与 Controller 开启 `--e2b-template-api=true` 时，完整的模板目录与 BuildKit 构建端点即刻生效：
+自 *v0.7.0* 起默认启用（可通过 `--e2b-template-api=false` 或 `--feature-gate=E2BTemplateAPI=false` 回滚），默认开放完整的模板目录与 BuildKit 构建端点：
 
 | 方法与路径 | 用途 | 关键请求头与约束 |
 | :--- | :--- | :--- |
@@ -138,7 +138,7 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 
 | 特性开关名称 | 默认值 | 生效组件 | 说明 |
 | :--- | :--- | :--- | :--- |
-| `E2BTemplateAPI` | `false` | `gateway`、`controller` | 启用 E2B JSON 数组格式 `GET /templates` 与 `/v2`–`/v3` 模板接口（也可通过 `--e2b-template-api` 开启）。 |
+| `E2BTemplateAPI` | `true` *(v0.7.0 变更)* | `gateway`、`controller` | 启用 E2B JSON 数组格式 `GET /templates` 与 `/v2`–`/v3` 模板接口（可通过 `--e2b-template-api=false` 回滚至旧版包装响应）。 |
 | `K8sE2BVolumeMounts` | `false` | `gateway` | 启用 Kubernetes RWX E2B `volumeMounts`（在 Helm 中设置 `e2bVolumes.rwxStorageClassName` 时会自动开启）。 |
 | `TransparentEgress` | `true` | `gateway`、`controller` | 控制 `CUBEPOD_TRANSPARENT=1` + `NET_ADMIN` `nftables` 透明劫持及 `/internal/v1/egress/exchange`。 |
 | `DesktopStack` | `true` | `gateway` | 控制 `/sandboxes/{id}/desktop/{start,status,stop}` 接口。 |

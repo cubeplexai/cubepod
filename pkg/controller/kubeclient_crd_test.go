@@ -1208,3 +1208,150 @@ func TestMemoryKubeClient_VolumeSnapshot_CRUDAndWaitReady(t *testing.T) {
 		t.Fatal("expected error getting deleted snapshot")
 	}
 }
+
+func TestMemoryKubeClient_UpdatePodTemplateStatusCAS(t *testing.T) {
+	mk := controller.NewMemoryKubeClient()
+	ctx := context.Background()
+
+	if err := mk.CreatePodTemplate(ctx, v1alpha1.PodTemplate{
+		Metadata: v1alpha1.ObjectMeta{Name: "tpl-cas", Namespace: "ns1"},
+		Status: v1alpha1.PodTemplateStatus{
+			TemplateID:    "tpl-cas",
+			LatestBuildID: "bld-1",
+			BuildStatus:   "waiting",
+		},
+	}); err != nil {
+		t.Fatalf("CreatePodTemplate failed: %v", err)
+	}
+
+	gotA, err := mk.GetPodTemplate(ctx, "ns1", "tpl-cas")
+	if err != nil {
+		t.Fatalf("GetPodTemplate A failed: %v", err)
+	}
+	gotB, err := mk.GetPodTemplate(ctx, "ns1", "tpl-cas")
+	if err != nil {
+		t.Fatalf("GetPodTemplate B failed: %v", err)
+	}
+	if gotA.Metadata.ResourceVersion == "" || gotA.Metadata.ResourceVersion != gotB.Metadata.ResourceVersion {
+		t.Fatalf("expected matching non-empty ResourceVersion, got A=%q B=%q", gotA.Metadata.ResourceVersion, gotB.Metadata.ResourceVersion)
+	}
+
+	gotA.Status.BuildStatus = "building"
+	updated, err := mk.UpdatePodTemplateStatusCAS(ctx, *gotA)
+	if err != nil {
+		t.Fatalf("first CAS update failed: %v", err)
+	}
+	if updated.Metadata.ResourceVersion == gotA.Metadata.ResourceVersion {
+		t.Fatalf("expected bumped ResourceVersion after CAS, still %q", updated.Metadata.ResourceVersion)
+	}
+
+	// Second replica holding stale ResourceVersion must fail with ErrCASConflict.
+	gotB.Status.BuildStatus = "building"
+	if _, err := mk.UpdatePodTemplateStatusCAS(ctx, *gotB); !errors.Is(err, controller.ErrCASConflict) {
+		t.Fatalf("expected ErrCASConflict on stale ResourceVersion, got %v", err)
+	}
+}
+
+func TestRESTKubeClient_UpdatePodTemplateStatusCAS(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		rv         = 1
+		storedTpl  v1alpha1.PodTemplate
+		hasStored  bool
+		statusPath = "/apis/cubepod.io/v1alpha1/namespaces/cubepod-workloads/podtemplates/tpl-rest/status"
+		objPath    = "/apis/cubepod.io/v1alpha1/namespaces/cubepod-workloads/podtemplates"
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == objPath:
+			var incoming v1alpha1.PodTemplate
+			if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			rv++
+			incoming.Metadata.ResourceVersion = fmt.Sprintf("%d", rv)
+			storedTpl = incoming
+			hasStored = true
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(storedTpl)
+		case r.Method == http.MethodGet && r.URL.Path == objPath+"/tpl-rest":
+			if !hasStored {
+				http.Error(w, "NotFound", http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(storedTpl)
+		case r.Method == http.MethodPut && r.URL.Path == statusPath:
+			var incoming v1alpha1.PodTemplate
+			if err := json.NewDecoder(r.Body).Decode(&incoming); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if !hasStored {
+				http.Error(w, "NotFound", http.StatusNotFound)
+				return
+			}
+			if incoming.Metadata.ResourceVersion != storedTpl.Metadata.ResourceVersion {
+				http.Error(w, "Conflict: resourceVersion mismatch", http.StatusConflict)
+				return
+			}
+			rv++
+			storedTpl.Status = incoming.Status
+			storedTpl.Metadata.ResourceVersion = fmt.Sprintf("%d", rv)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(storedTpl)
+		default:
+			http.Error(w, "unexpected route: "+r.Method+" "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "test-token", ts.Client())
+	ctx := context.Background()
+
+	if err := client.CreatePodTemplate(ctx, v1alpha1.PodTemplate{
+		Metadata: v1alpha1.ObjectMeta{Name: "tpl-rest", Namespace: "cubepod-workloads"},
+		Status: v1alpha1.PodTemplateStatus{
+			TemplateID:    "tpl-rest",
+			LatestBuildID: "bld-1",
+			BuildStatus:   "waiting",
+		},
+	}); err != nil {
+		t.Fatalf("CreatePodTemplate failed: %v", err)
+	}
+
+	snap1, err := client.GetPodTemplate(ctx, "cubepod-workloads", "tpl-rest")
+	if err != nil {
+		t.Fatalf("GetPodTemplate 1 failed: %v", err)
+	}
+	snap2, err := client.GetPodTemplate(ctx, "cubepod-workloads", "tpl-rest")
+	if err != nil {
+		t.Fatalf("GetPodTemplate 2 failed: %v", err)
+	}
+
+	// Empty ResourceVersion rejected before HTTP request.
+	noRV := *snap1
+	noRV.Metadata.ResourceVersion = ""
+	if _, err := client.UpdatePodTemplateStatusCAS(ctx, noRV); !errors.Is(err, controller.ErrCASConflict) {
+		t.Fatalf("expected ErrCASConflict for empty ResourceVersion, got %v", err)
+	}
+
+	snap1.Status.BuildStatus = "building"
+	res, err := client.UpdatePodTemplateStatusCAS(ctx, *snap1)
+	if err != nil {
+		t.Fatalf("UpdatePodTemplateStatusCAS winner failed: %v", err)
+	}
+	if res.Metadata.ResourceVersion == snap1.Metadata.ResourceVersion {
+		t.Fatalf("expected bumped ResourceVersion, got %q", res.Metadata.ResourceVersion)
+	}
+
+	snap2.Status.BuildStatus = "building"
+	if _, err := client.UpdatePodTemplateStatusCAS(ctx, *snap2); !errors.Is(err, controller.ErrCASConflict) {
+		t.Fatalf("expected ErrCASConflict for stale REST CAS, got %v", err)
+	}
+}

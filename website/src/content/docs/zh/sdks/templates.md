@@ -14,7 +14,7 @@ CubePod 通过 `PodTemplate` CRD（`cubepod.io/v1alpha1`）解析传入 `POST /s
 
 | Helm 配置项 | CLI 标志 | 默认值 | 生效行为 |
 | :--- | :--- | :--- | :--- |
-| `featureGates.e2bTemplateAPI` | `--e2b-template-api` / `--feature-gate=E2BTemplateAPI=true` | `false` | 将 `GET /templates` 从旧版 3 卡片 `{"templates":[...]}` 包装切换为标准 E2B `E2BTemplate[]` 数组，并开启 `/v2/templates`、`/v3/templates`、`/templates/aliases/{alias}`、`/templates/tags`、`PATCH` 与 `DELETE`。 |
+| `featureGates.e2bTemplateAPI` | `--e2b-template-api` / `--feature-gate=E2BTemplateAPI=true` | `true` *(v0.7.0 变更)* | 将 `GET /templates` 从旧版 3 卡片 `{"templates":[...]}` 包装切换为标准 E2B `E2BTemplate[]` 数组，并开启 `/v2/templates`、`/v3/templates`、`/templates/aliases/{alias}`、`/templates/tags`、`PATCH` 与 `DELETE`（设为 `false` 可回滚）。 |
 | `templateBuild.enabled` | `--template-build` | `false` | 开启 Kubernetes BuildKit 或本地 Docker 配方构建（支持带 `steps` 的 `POST /v2/templates/{id}/builds/{buildID}` 与 `PUT /templates/{id}/files/{hash}`）。为 `false` 时上述构建接口返回 HTTP `501`，但在 `e2bTemplateAPI` 开启时仍可通过空 `steps` 的 `fromImage` 注册已有镜像。 |
 
 ## 内置预置模板与别名

@@ -485,7 +485,7 @@ func NewReconciler(opts ...ReconcilerOption) *Reconciler {
 		defaultSandboxImage:  "ubuntu:24.04",
 		transparentEgress:    true,
 		forkMode:             "pvc-clone",
-		e2bTemplateAPI:       false,
+		e2bTemplateAPI:       true,
 		templateBuildEnabled: false,
 		imageBuilder:         NewFakeImageBuilder(),
 		contextStore:         NewMemoryContextStore(),

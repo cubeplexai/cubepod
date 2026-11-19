@@ -14,7 +14,7 @@ Template catalog and build endpoints are controlled by two independent flags on 
 
 | Helm Value | CLI Flag | Default | Effect |
 | :--- | :--- | :--- | :--- |
-| `featureGates.e2bTemplateAPI` | `--e2b-template-api` / `--feature-gate=E2BTemplateAPI=true` | `false` | Switches `GET /templates` from the legacy 3-card `{"templates":[...]}` wrapper to the E2B JSON array (`E2BTemplate[]`), and enables `/v2/templates`, `/v3/templates`, `/templates/aliases/{alias}`, `/templates/tags`, `PATCH`, and `DELETE`. |
+| `featureGates.e2bTemplateAPI` | `--e2b-template-api` / `--feature-gate=E2BTemplateAPI=true` | `true` *(Changed in v0.7.0)* | Switches `GET /templates` from the legacy 3-card `{"templates":[...]}` wrapper to the E2B JSON array (`E2BTemplate[]`), and enables `/v2/templates`, `/v3/templates`, `/templates/aliases/{alias}`, `/templates/tags`, `PATCH`, and `DELETE` (`false` rolls back). |
 | `templateBuild.enabled` | `--template-build` | `false` | Enables `BuildKit` (Kubernetes) or local Docker recipe builds (`POST /v2/templates/{id}/builds/{buildID}` with `steps` and `PUT /templates/{id}/files/{hash}`). When `false`, those endpoints return HTTP `501`, though registering an existing `fromImage` with empty `steps` still works when `e2bTemplateAPI` is enabled. |
 
 ## Built-In Seeded Templates & Aliases
