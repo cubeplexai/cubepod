@@ -120,7 +120,6 @@ export interface EndpointHost {
 
 export interface CreateEndpointOptions extends RequestOptions {
   expiresInSeconds?: number;
-  targetUrl?: string;
 }
 
 export interface PanelEndpoint {

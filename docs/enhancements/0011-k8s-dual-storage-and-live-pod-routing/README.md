@@ -47,7 +47,7 @@ To run CubePod across both bare-metal Kata + SPDK Raw Block clusters (`volumeMod
 
 ### 3.3 `pkg/gateway/server.go` & `cmd/cubepod-gateway/main.go`
 - Add `SetLivePodRouting(enabled bool)` on `gateway.Server`. When `livePodRouting` is true and `status.PodIP != ""`, `ensureRunning` and `handleCreateSandbox` set `rec.PoddURL = fmt.Sprintf("http://%s:%d", status.PodIP, rec.EnvdPort)` and wait up to 30s for `GET <PoddURL>/health` to return `200 OK`.
-- In `handlePanelProxy` / `handleCreateEndpoint`, when `rec.PoddURL != ""` and no explicit `targetUrl` override was passed, default the panel upstream to `fmt.Sprintf("http://%s:%d", status.PodIP, port)` so `/panel/{token}/` reverse-proxies directly into the Kubernetes Pod's `<port>`!
+- In `handlePanelProxy` / `handleCreateEndpoint`, resolve the panel upstream as `fmt.Sprintf("http://%s:%d", status.PodIP, port)` from sandbox status so `/panel/{token}/` reverse-proxies directly into the Kubernetes Pod's `<port>`. Client-supplied `targetUrl` / `upstreamUrl` on `POST /sandboxes/{id}/endpoints/{port}` are ignored (*Changed in v0.7.0*).
 - Update `cmd/cubepod-gateway/main.go` to accept controller flags (`--kube-api`, `--kubeconfig`, `--namespace`, `--storage-class`, `--volume-mode`, `--runtime-class`, `--podd-injector-image`, `--default-sandbox-image`, `--live-pod-routing`).
 
 ---

@@ -77,8 +77,9 @@ CubePod 在 `podd`（`crates/podd/src/interpreter.rs`）内原生集成多语言
 | `POST /sandboxes/{id}/desktop/start` | 启动显示服务与桌面会话 | 校验 `resolution` 格式（`^[0-9]{3,5}x[0-9]{3,5}x(16\|24\|32)$`），支持可选 `initialUrl`、`expiresInSeconds` 与 `transport`（`"webrtc" \| "novnc"`，*v0.6.0 新增*）；若镜像未包含桌面组件则返回 `422 desktop_not_installed`。同时提供 `/v1/sandboxes/{id}/desktop/start` 别名 |
 | `GET /sandboxes/{id}/desktop/status` | 查询桌面运行状态与各服务 URL | 同理提供 `/v1/sandboxes/{id}/desktop/status` 别名 |
 | `POST /sandboxes/{id}/desktop/stop` | 停止桌面相关服务 | 同理提供 `/v1/sandboxes/{id}/desktop/stop` 别名 |
-| `GET /sandboxes/{id}/endpoints/{port}` 与 `POST /sandboxes/{id}/endpoints/{port}` | 为沙箱内任意 TCP/WebSocket 端口生成签名访问令牌 | 令牌格式：`base64url(sandboxID:port:expUnix).hmacSha256Sig` |
-| `ANY /panel/{token}/...` | 校验 HMAC 后透明代理 HTTP、WebSocket 与 WebRTC 流量 | 剥离 `/panel/{token}` 前缀并转发至沙箱内 `PodIP:<port>` |
+| `GET /sandboxes/{id}/endpoints/{port}` | 兼容 E2B `getHost` / `get_host` 的对外主机名 | 返回 `<port>-<sandboxID>.<domain>`。行为不变。 |
+| `POST /sandboxes/{id}/endpoints/{port}` | 为沙箱端口签发 `/panel/{token}/` 签名代理令牌 | 请求体仅为 `{expiresInSeconds}`（默认 `3600`）。客户端提供的 `targetUrl` / `upstreamUrl` 会被忽略。*v0.7.0 变更。* 令牌格式：`base64url(sandboxID:port:expUnix).hmacSha256Sig` |
+| `ANY /panel/{token}/...` | 校验 HMAC 后透明代理 HTTP、WebSocket 与 WebRTC 流量 | 剥离 `/panel/{token}` 前缀，并始终转发到该沙箱自己的 `PodIP:<port>`（仅在尚无沙箱主机时才使用进程内测试映射）。*v0.7.0 变更。* |
 
 架构原理与安全细节请参阅[桌面环境与签名 Panel 代理](/zh/concepts/desktop-and-panel-proxy/)。
 
