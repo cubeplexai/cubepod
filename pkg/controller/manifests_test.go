@@ -256,17 +256,21 @@ func TestBuildKataPod_OfficialE2BVolumeMounts(t *testing.T) {
 		t.Fatal("missing sandbox container")
 	}
 	stagingPath := "/run/cubepod/volumes/" + id
-	var sawMount, sawWorkspace bool
+	finalPath := "/mnt/cpod-test-vol"
+	var sawMount, sawDirect, sawWorkspace bool
 	for _, m := range main.VolumeMounts {
 		if m.Name == pvc && m.MountPath == stagingPath {
 			sawMount = true
+		}
+		if m.Name == pvc && m.MountPath == finalPath {
+			sawDirect = true
 		}
 		if m.MountPath == "/workspace" {
 			sawWorkspace = true
 		}
 	}
-	if !sawMount || !sawWorkspace {
-		t.Fatalf("expected official staging mount %s and /workspace, got %+v", stagingPath, main.VolumeMounts)
+	if !sawMount || !sawDirect || !sawWorkspace {
+		t.Fatalf("expected official staging mount %s, final path %s, and /workspace, got %+v", stagingPath, finalPath, main.VolumeMounts)
 	}
 	wantEnv := `[{"volume_id":"` + id + `","staging_path":"` + stagingPath + `","target_path":"/mnt/cpod-test-vol"}]`
 	var sawEnv bool
