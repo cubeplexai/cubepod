@@ -126,6 +126,7 @@ func TestDesktopLifecycleAndWebSocketPanel(t *testing.T) {
 
 	reconciler := controller.NewReconciler()
 	srv := gateway.NewServer(reconciler)
+	srv.SetPanelSecret("test-desktop-panel-hmac-secret-32b")
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -348,6 +349,7 @@ func TestDesktopTransportWebRTCAndFallback(t *testing.T) {
 
 	reconciler := controller.NewReconciler()
 	srv := gateway.NewServer(reconciler)
+	srv.SetPanelSecret("test-desktop-panel-hmac-secret-32b")
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
@@ -571,6 +573,7 @@ func TestDesktopConcurrentSessions50Plus(t *testing.T) {
 
 	reconciler := controller.NewReconciler()
 	srv := gateway.NewServer(reconciler)
+	srv.SetPanelSecret("test-desktop-panel-hmac-secret-32b")
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 

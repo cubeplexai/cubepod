@@ -67,19 +67,21 @@ flowchart TB
 | `controller-deployment.yaml` | `Deployment`（`controller.replicaCount`，仅在 `templateBuild.enabled=true` 且 `contextStore.backend=local` 时锁定为 `1`；设为 `s3` 时支持多副本 HA） | 提供 `/livez` 与 `/healthz`；按 `--sync-interval`（默认 `5s`）执行调谐；注入运行时/存储/出站镜像参数、`--feature-gate`、`global.imagePullSecrets`、`egress.caSecretName`、S3 上下文存储（`--context-store-backend=s3`）及 BuildKit mTLS 参数，开启本地构建时挂载 `cubepod-template-context` PVC |
 | `gateway-state-pvc.yaml` | `PersistentVolumeClaim`（`<fullname>-gateway-state`，可选） | 仅当 `gateway.persistence.enabled: true` 且未指定 `existingClaim` 时渲染；用于持久化 Gateway `stateDir`（本地模板、文件密钥与生命周期事件/Webhook） |
 | `secrets-key-secret.yaml` *(v0.6.0 新增)* | `Secret`（`<fullname>-secrets-key`，可选） | 当内联设置 `secrets.encryptionKey` 且未设置 `secrets.existingSecret` 与 `gateway.secretsKeySecret` 时渲染 |
+| `panel-secret.yaml` *(v0.7.0 新增)* | `Secret`（`<fullname>-panel-secret`） | 存放网关面板 HMAC 密钥。当 `gateway.panelSecret` 为空时，安装阶段随机生成，并通过 `lookup` 在升级时复用。通过 `secretKeyRef` 注入为 `CUBEPOD_PANEL_SECRET` |
 | `e2b-volumes-pvc.yaml` | `PersistentVolumeClaim`（`e2bVolumes.pvcName`，`ReadWriteMany`） | 当 `e2bVolumes.rwxStorageClassName` 非空时创建，并通过 `helm.sh/resource-policy: keep` 在卸载时保留数据 |
 | `service.yaml` | `<fullname>-gateway`（`:8080`）、`<fullname>-controller`（`:8081`） | 默认均为 `ClusterIP`；切换为 `NodePort` 时支持通过 `gateway.service.nodePort` 固定端口 |
 | `buildkit.yaml` | `Deployment`（当 `buildkit.replicaCount > 1` 时切换为 `StatefulSet` + Headless `Service`）、`Service`（`:1234`）、缓存 `PVC` / `volumeClaimTemplates`、可选 `cubepod-template-context` PVC 与 `NetworkPolicy` | 仅当 `templateBuild.enabled: true` 时渲染 *(v0.7.0 变更)* |
 
 ## 生产环境核心配置示例
 
-建议通过独立的 `my-values.yaml` 覆盖默认配置，而非直接修改 Chart 文件：
+建议通过独立的 `my-values.yaml` 覆盖默认配置，而非直接修改 Chart 文件。
+
+面板 HMAC 密钥（`gateway.panelSecret`）是网关启动的必选项（*v0.7.0 变更*）。将其留空时，Chart 会在安装时随机生成一个 Kubernetes Secret，并在升级时复用同一个值。只有在需要自行指定密钥时才设置 `gateway.panelSecret`。不要轮换正在使用的密钥，否则已签发的 `/panel/{token}/` 地址以及其他副本上的校验都会失败。
 
 ```yaml
 gateway:
   replicaCount: 2
   port: 8080
-  panelSecret: "replace-with-random-hmac-secret"
   service:
     type: ClusterIP
 

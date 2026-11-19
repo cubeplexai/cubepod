@@ -156,7 +156,7 @@ Stateless gateway; rolling updates require zero downtime.
 ## Production Readiness Review Questionnaire (PRR)
 
 ### Feature Enablement and Rollback
-Panel signing key is configured via `CUBEPOD_PANEL_SECRET`.
+Panel signing key is configured via `CUBEPOD_PANEL_SECRET` and is required at gateway startup. The Helm chart generates a random Secret when `gateway.panelSecret` is omitted and reuses it on upgrade. There is no compiled-in default (*Changed in v0.7.0*).
 
 ### Monitoring Requirements
 Gateway tracks `AutoResumeCount` per sandbox and returns health status on `GET /health`.

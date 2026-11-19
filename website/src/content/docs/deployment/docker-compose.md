@@ -27,6 +27,8 @@ Start the three services from the repository root:
 docker compose -f deploy/docker-compose/docker-compose.yaml up --build
 ```
 
+If `CUBEPOD_PANEL_SECRET` is unset, the gateway entrypoint writes a random HMAC secret to `/var/lib/cubepod/state/panel-secret` on the `cubepod-state` volume and reuses it on restart (*Changed in v0.7.0*). Set `CUBEPOD_PANEL_SECRET` in the environment to supply your own value.
+
 Once the containers are healthy, verify the Gateway and Controller health endpoints:
 
 ```bash
@@ -53,7 +55,7 @@ The table below reflects the exact service definitions in `deploy/docker-compose
 
 | Service | Dockerfile Context | Published Port | Default Flags & Environment | Mounted Volumes |
 | :--- | :--- | :--- | :--- | :--- |
-| `cubepod-gateway` | `images/gateway/Dockerfile` (root `../..`) | `8080:8080` | `-addr=:8080`, `--e2b-template-api=false`, `--template-build=false`, `--state-dir=/var/lib/cubepod/state`, `--template-probe-timeout=120s`, `CUBEPOD_RUNTIME_MODE=docker-loopback`, `CUBEPOD_STATE=/var/lib/cubepod/state` | `/var/run/docker.sock:/var/run/docker.sock`, `cubepod-volumes:/var/lib/cubepod/volumes`, `cubepod-state:/var/lib/cubepod/state` |
+| `cubepod-gateway` | `images/gateway/Dockerfile` (root `../..`) | `8080:8080` | `gateway-entrypoint.sh` then `-addr=:8080`, `--e2b-template-api=false`, `--template-build=false`, `--state-dir=/var/lib/cubepod/state`, `--template-probe-timeout=120s`, `CUBEPOD_RUNTIME_MODE=docker-loopback`, `CUBEPOD_STATE=/var/lib/cubepod/state`. Generates or reuses `CUBEPOD_PANEL_SECRET` (*Changed in v0.7.0*) | `/var/run/docker.sock:/var/run/docker.sock`, `cubepod-volumes:/var/lib/cubepod/volumes`, `cubepod-state:/var/lib/cubepod/state`, `./gateway-entrypoint.sh:/usr/local/bin/gateway-entrypoint.sh:ro` |
 | `cubepod-controller` | `images/controller/Dockerfile` (root `../..`) | `8081:8081` | `-addr=:8081`, `--e2b-template-api=false`, `--template-build=false`, `--state-dir=/var/lib/cubepod/state`, `--template-probe-timeout=120s`, `CUBEPOD_STATE=/var/lib/cubepod/state` | `cubepod-state:/var/lib/cubepod/state` |
 | `cubepod-egress` | `images/egress/Dockerfile` (root `../..`) | `18080:18080` | `-addr=:18080`, `-default-allow=true` | — |
 
@@ -77,6 +79,8 @@ To test template builds or the `/v2/templates` and `/v3/templates` HTTP endpoint
 2. Restart the Compose services or run native Go/Rust binaries directly with `make build` and `make test-e2e`.
 
 ## Building & Testing Outside Compose
+
+When running `cubepod-gateway` directly, export `CUBEPOD_PANEL_SECRET` to a random value. The process refuses to start if the secret is unset (*Changed in v0.7.0*).
 
 For rapid edit-compile loops directly on the host machine, the repository `Makefile` exposes:
 

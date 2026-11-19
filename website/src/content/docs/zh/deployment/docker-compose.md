@@ -27,6 +27,8 @@ flowchart LR
 docker compose -f deploy/docker-compose/docker-compose.yaml up --build
 ```
 
+如果未设置 `CUBEPOD_PANEL_SECRET`，网关入口脚本会在 `cubepod-state` 卷上的 `/var/lib/cubepod/state/panel-secret` 写入一个随机 HMAC 密钥，并在重启时复用（*v0.7.0 变更*）。如需自行指定，请在环境变量中设置 `CUBEPOD_PANEL_SECRET`。
+
 容器就绪后，检查 Gateway 与 Controller 的健康探针：
 
 ```bash
@@ -53,7 +55,7 @@ docker compose -f deploy/docker-compose/docker-compose.yaml down -v
 
 | 服务名 | Dockerfile 构建配置 | 暴露端口 | 默认启动参数与环境变量 | 挂载卷 |
 | :--- | :--- | :--- | :--- | :--- |
-| `cubepod-gateway` | `images/gateway/Dockerfile`（构建上下文 `../..`） | `8080:8080` | `-addr=:8080`、`--e2b-template-api=false`、`--template-build=false`、`--state-dir=/var/lib/cubepod/state`、`--template-probe-timeout=120s`；环境变量 `CUBEPOD_RUNTIME_MODE=docker-loopback`、`CUBEPOD_STATE=/var/lib/cubepod/state` | `/var/run/docker.sock:/var/run/docker.sock`、`cubepod-volumes:/var/lib/cubepod/volumes`、`cubepod-state:/var/lib/cubepod/state` |
+| `cubepod-gateway` | `images/gateway/Dockerfile`（构建上下文 `../..`） | `8080:8080` | `gateway-entrypoint.sh`，随后是 `-addr=:8080`、`--e2b-template-api=false`、`--template-build=false`、`--state-dir=/var/lib/cubepod/state`、`--template-probe-timeout=120s`；环境变量 `CUBEPOD_RUNTIME_MODE=docker-loopback`、`CUBEPOD_STATE=/var/lib/cubepod/state`。会生成或复用 `CUBEPOD_PANEL_SECRET`（*v0.7.0 变更*） | `/var/run/docker.sock:/var/run/docker.sock`、`cubepod-volumes:/var/lib/cubepod/volumes`、`cubepod-state:/var/lib/cubepod/state`、`./gateway-entrypoint.sh:/usr/local/bin/gateway-entrypoint.sh:ro` |
 | `cubepod-controller` | `images/controller/Dockerfile`（构建上下文 `../..`） | `8081:8081` | `-addr=:8081`、`--e2b-template-api=false`、`--template-build=false`、`--state-dir=/var/lib/cubepod/state`、`--template-probe-timeout=120s`；环境变量 `CUBEPOD_STATE=/var/lib/cubepod/state` | `cubepod-state:/var/lib/cubepod/state` |
 | `cubepod-egress` | `images/egress/Dockerfile`（构建上下文 `../..`） | `18080:18080` | `-addr=:18080`、`-default-allow=true` | — |
 
@@ -77,6 +79,8 @@ docker compose -f deploy/docker-compose/docker-compose.yaml down -v
 2. 重启 Compose 服务，或直接使用 `make build` 与 `make test-e2e` 在宿主机运行本地测试栈。
 
 ## 脱离 Compose 进行本地编译与测试
+
+直接运行 `cubepod-gateway` 时，必须将 `CUBEPOD_PANEL_SECRET` 设置为随机值。如果该密钥为空，进程会拒绝启动（*v0.7.0 变更*）。
 
 如果需要在宿主机进行高频代码修改、编译与验证，仓库根目录 `Makefile` 提供了标准任务：
 

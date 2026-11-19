@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -33,6 +34,10 @@ type mintEndpointReq struct {
 	ExpiresInSeconds int `json:"expiresInSeconds,omitempty"`
 }
 
+// ErrPanelSecretMissing is returned when the gateway has no HMAC secret
+// for signing and verifying /panel/{token}/ URLs (Changed in v0.7.0).
+var ErrPanelSecretMissing = errors.New("CUBEPOD_PANEL_SECRET is required; refusing to start with an empty panel HMAC secret")
+
 // SetPanelSecret sets the HMAC secret used to sign and verify panel tokens.
 func (s *Server) SetPanelSecret(secret string) {
 	s.mu.Lock()
@@ -47,10 +52,23 @@ func (s *Server) getPanelSecret() []byte {
 	if len(sec) > 0 {
 		return sec
 	}
-	if env := os.Getenv("CUBEPOD_PANEL_SECRET"); env != "" {
+	if env := strings.TrimSpace(os.Getenv("CUBEPOD_PANEL_SECRET")); env != "" {
 		return []byte(env)
 	}
-	return []byte("cubepod-default-hmac-panel-secret-key-32b")
+	return nil
+}
+
+// RequirePanelSecret resolves the HMAC secret from SetPanelSecret or
+// CUBEPOD_PANEL_SECRET and returns ErrPanelSecretMissing if neither is set.
+// On success the resolved secret is pinned on the server. There is no
+// compiled-in default (Changed in v0.7.0).
+func (s *Server) RequirePanelSecret() error {
+	secret := strings.TrimSpace(string(s.getPanelSecret()))
+	if secret == "" {
+		return ErrPanelSecretMissing
+	}
+	s.SetPanelSecret(secret)
+	return nil
 }
 
 // RegisterPort registers the upstream target URL for a sandbox port.
@@ -161,6 +179,10 @@ func (s *Server) handleMintEndpointToken(w http.ResponseWriter, r *http.Request)
 
 	// Do not honor client targetUrl / upstreamUrl and do not pin a
 	// caller-supplied upstream into the in-memory endpoint map.
+	if len(s.getPanelSecret()) == 0 {
+		http.Error(w, "panel HMAC secret is not configured", http.StatusInternalServerError)
+		return
+	}
 	token, expTime := s.mintPanelToken(sandboxID, port, req.ExpiresInSeconds)
 	urlPath := fmt.Sprintf("/panel/%s/", token)
 
@@ -193,7 +215,12 @@ func (s *Server) parseAndVerifyPanelToken(token string) (*PanelTokenClaims, erro
 		return nil, fmt.Errorf("invalid token signature encoding")
 	}
 
-	mac := hmac.New(sha256.New, s.getPanelSecret())
+	sec := s.getPanelSecret()
+	if len(sec) == 0 {
+		slog.Error("panel token rejected: panel HMAC secret is not configured")
+		return nil, fmt.Errorf("panel HMAC secret is not configured")
+	}
+	mac := hmac.New(sha256.New, sec)
 	mac.Write(payloadBytes)
 	expectedSig := mac.Sum(nil)
 	if !hmac.Equal(sigBytes, expectedSig) {

@@ -349,6 +349,7 @@ func TestMetricsConcurrentRequests(t *testing.T) {
 func TestMetricsCEPAlignmentAndPanelGauge(t *testing.T) {
 	reconciler := controller.NewReconciler()
 	srv := gateway.NewServer(reconciler)
+	srv.SetPanelSecret("test-metrics-panel-hmac-secret-32b")
 	if err := srv.ConfigureE2BSecrets(gateway.E2BSecretConfig{Dir: t.TempDir()}); err != nil {
 		t.Fatalf("ConfigureE2BSecrets failed: %v", err)
 	}
