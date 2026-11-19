@@ -418,6 +418,10 @@ func (m *ControllerManager) ReconcileOnce(ctx context.Context) {
 		slog.Warn("sweep template contexts failed", "err", err)
 	}
 
+	if promoted := m.reconciler.ReconcileProvisioning(ctx, now); len(promoted) > 0 {
+		slog.Info("promoted provisioning sandboxes to running", "count", len(promoted), "names", promoted)
+	}
+
 	paused, terminated := m.reconciler.ReapIdle(ctx, now)
 	if len(paused) > 0 || len(terminated) > 0 {
 		slog.Info("reap cycle executed", "paused", len(paused), "terminated", len(terminated))

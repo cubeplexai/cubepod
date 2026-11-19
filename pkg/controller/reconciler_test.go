@@ -3349,3 +3349,115 @@ func TestReconciler_PodBoxKubeEventEmission(t *testing.T) {
 		t.Fatalf("expected 0 events when WithPodBoxEvents(false), got %d", len(silentEvs))
 	}
 }
+
+func TestReconcileProvisioning_PromotesReadyPodAndSkipsNotReady(t *testing.T) {
+	ctx := context.Background()
+	kc := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(controller.WithKubeClient(kc), controller.WithNamespace("default"))
+
+	now := time.Now().UTC()
+	pausedAt := now.Add(-5 * time.Minute)
+
+	// 1. Ready pod: should be promoted to Running with PodIP and cleared PausedAt.
+	if err := kc.UpsertPodBox(ctx, v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata:   v1alpha1.ObjectMeta{Name: "box-ready", Namespace: "default"},
+		Spec: v1alpha1.PodBoxSpec{
+			TemplateRef:  "ubuntu:24.04",
+			DesiredState: v1alpha1.DesiredStateRunning,
+		},
+		Status: v1alpha1.PodBoxStatus{
+			Phase:    v1alpha1.PodBoxPhaseProvisioning,
+			PodName:  "box-ready",
+			PausedAt: &pausedAt,
+		},
+	}); err != nil {
+		t.Fatalf("UpsertPodBox box-ready: %v", err)
+	}
+	kc.Pods["default/box-ready"] = controller.PodManifest{
+		Name:      "box-ready",
+		Namespace: "default",
+		PodIP:     "10.1.2.3",
+		NotReady:  false,
+	}
+
+	// 2. NotReady pod: should stay Provisioning.
+	if err := kc.UpsertPodBox(ctx, v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata:   v1alpha1.ObjectMeta{Name: "box-notready", Namespace: "default"},
+		Spec: v1alpha1.PodBoxSpec{
+			TemplateRef:  "ubuntu:24.04",
+			DesiredState: v1alpha1.DesiredStateRunning,
+		},
+		Status: v1alpha1.PodBoxStatus{
+			Phase:   v1alpha1.PodBoxPhaseProvisioning,
+			PodName: "box-notready",
+		},
+	}); err != nil {
+		t.Fatalf("UpsertPodBox box-notready: %v", err)
+	}
+	kc.Pods["default/box-notready"] = controller.PodManifest{
+		Name:      "box-notready",
+		Namespace: "default",
+		PodIP:     "10.1.2.4",
+		NotReady:  true,
+	}
+
+	// 3. Paused desired state: should stay Provisioning even if pod exists.
+	if err := kc.UpsertPodBox(ctx, v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata:   v1alpha1.ObjectMeta{Name: "box-paused-desired", Namespace: "default"},
+		Spec: v1alpha1.PodBoxSpec{
+			TemplateRef:  "ubuntu:24.04",
+			DesiredState: v1alpha1.DesiredStatePaused,
+		},
+		Status: v1alpha1.PodBoxStatus{
+			Phase:   v1alpha1.PodBoxPhaseProvisioning,
+			PodName: "box-paused-desired",
+		},
+	}); err != nil {
+		t.Fatalf("UpsertPodBox box-paused-desired: %v", err)
+	}
+	kc.Pods["default/box-paused-desired"] = controller.PodManifest{
+		Name:      "box-paused-desired",
+		Namespace: "default",
+		PodIP:     "10.1.2.5",
+		NotReady:  false,
+	}
+
+	if _, err := r.SyncFromKube(ctx); err != nil {
+		t.Fatalf("SyncFromKube: %v", err)
+	}
+
+	promoted := r.ReconcileProvisioning(ctx, now)
+	if len(promoted) != 1 || promoted[0] != "box-ready" {
+		t.Fatalf("promoted = %v; want [box-ready]", promoted)
+	}
+
+	gotReady, err := kc.GetPodBox(ctx, "default", "box-ready")
+	if err != nil {
+		t.Fatalf("GetPodBox box-ready: %v", err)
+	}
+	if gotReady.Status.Phase != v1alpha1.PodBoxPhaseRunning {
+		t.Fatalf("box-ready Phase = %q; want Running", gotReady.Status.Phase)
+	}
+	if gotReady.Status.PodIP != "10.1.2.3" {
+		t.Fatalf("box-ready PodIP = %q; want 10.1.2.3", gotReady.Status.PodIP)
+	}
+	if gotReady.Status.PausedAt != nil {
+		t.Fatalf("box-ready PausedAt = %v; want nil", gotReady.Status.PausedAt)
+	}
+
+	for _, name := range []string{"box-notready", "box-paused-desired"} {
+		got, err := kc.GetPodBox(ctx, "default", name)
+		if err != nil {
+			t.Fatalf("GetPodBox %s: %v", name, err)
+		}
+		if got.Status.Phase != v1alpha1.PodBoxPhaseProvisioning {
+			t.Fatalf("%s Phase = %q; want Provisioning", name, got.Status.Phase)
+		}
+	}
+}
