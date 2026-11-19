@@ -1537,6 +1537,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		if podIP != "" {
 			status.PodIP = podIP
 		}
+		if podConflictUnconfirmed && status.PodIP == "" {
+			status.Phase = v1alpha1.PodBoxPhaseProvisioning
+		} else {
+			status.Phase = v1alpha1.PodBoxPhaseRunning
+		}
 		status.PodName = podManifest.Name
 		status.LastActivityAt = &now
 		status.PausedAt = nil
@@ -2437,13 +2442,36 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 			if spec.Lifecycle.PausedTTLSeconds > 0 && status.PausedAt != nil {
 				ttlDeadline := status.PausedAt.Add(time.Duration(spec.Lifecycle.PausedTTLSeconds) * time.Second)
 				if !now.Before(ttlDeadline) {
-					if status.PodName != "" {
+					statusWithTerminated := *status
+					statusWithTerminated.Phase = v1alpha1.PodBoxPhaseTerminated
+					statusWithTerminated.PodName = ""
+					statusWithTerminated.PodIP = ""
+					statusWithTerminated.Reason = "PausedTTLExpired"
+					statusWithTerminated.Message = "Terminated due to paused TTL expiration"
+
+					if r.kubeClient != nil {
+						err := r.kubeClient.UpsertPodBox(ctx, v1alpha1.PodBox{
+							APIVersion: "cubepod.io/v1alpha1",
+							Kind:       "PodBox",
+							Metadata: v1alpha1.ObjectMeta{
+								Name:        name,
+								Namespace:   r.namespace,
+								Annotations: r.podBoxAnnotationsLocked(name, ""),
+							},
+							Spec:   spec,
+							Status: statusWithTerminated,
+						})
+						if err != nil {
+							slog.Warn("failed to persist terminated state to Kubernetes; rolling back in-memory state", "name", name, "err", err)
+							continue
+						}
+					}
+
+					if status.PodName != "" && r.kubeClient != nil {
 						_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
 					}
 					r.deleteEgressSecretsLocked(ctx, name)
-					status.Phase = v1alpha1.PodBoxPhaseTerminated
-					status.Reason = "PausedTTLExpired"
-					status.Message = "Terminated due to paused TTL expiration"
+					*status = statusWithTerminated
 					terminated = append(terminated, name)
 					r.recordPodBoxEventLocked(ctx, name, PodBoxEventReasonPausedTTLExpired, KubeEventTypeNormal,
 						"Terminated due to paused TTL expiration", now)
@@ -2458,7 +2486,8 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 }
 
 // ReconcileProvisioning advances PodBoxes stuck in Provisioning (e.g. after a transient
-// EnsurePod readiness timeout) to Running once their backing Pod is Ready with a PodIP.
+// EnsurePod readiness timeout) to Running once their backing Pod is Ready with a PodIP,
+// and re-drives Provisioning PodBoxes whose backing Pod is missing.
 func (r *Reconciler) ReconcileProvisioning(ctx context.Context, now time.Time) []string {
 	if r.kubeClient == nil {
 		return nil
@@ -2472,8 +2501,9 @@ func (r *Reconciler) ReconcileProvisioning(ctx context.Context, now time.Time) [
 
 	r.mu.RLock()
 	hasCandidates := false
-	for _, status := range r.boxes {
-		if status.Phase == v1alpha1.PodBoxPhaseProvisioning && status.PodName != "" {
+	for name, status := range r.boxes {
+		spec := r.specs[name]
+		if status.Phase == v1alpha1.PodBoxPhaseProvisioning && spec.DesiredState == v1alpha1.DesiredStateRunning {
 			hasCandidates = true
 			break
 		}
@@ -2483,6 +2513,7 @@ func (r *Reconciler) ReconcileProvisioning(ctx context.Context, now time.Time) [
 		return nil
 	}
 
+	listStartedAt := time.Now().UTC()
 	pods, err := r.kubeClient.ListPods(ctx, r.namespace, "")
 	if err != nil {
 		slog.Warn("failed to list pods while reconciling provisioning sandboxes", "err", err)
@@ -2493,20 +2524,32 @@ func (r *Reconciler) ReconcileProvisioning(ctx context.Context, now time.Time) [
 		podsByName[p.Name] = p
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
+	type missingPodCandidate struct {
+		name string
+		spec v1alpha1.PodBoxSpec
+	}
+	var missingPodCandidates []missingPodCandidate
 	var promoted []string
+
+	r.mu.Lock()
 	for name, status := range r.boxes {
 		spec := r.specs[name]
 		if status.Phase != v1alpha1.PodBoxPhaseProvisioning || spec.DesiredState != v1alpha1.DesiredStateRunning {
 			continue
 		}
+		if status.LastActivityAt != nil && status.LastActivityAt.After(listStartedAt) {
+			continue
+		}
 		if status.PodName == "" {
+			missingPodCandidates = append(missingPodCandidates, missingPodCandidate{name: name, spec: spec})
 			continue
 		}
 		pod, ok := podsByName[status.PodName]
-		if !ok || pod.NotReady || pod.PodIP == "" {
+		if !ok {
+			missingPodCandidates = append(missingPodCandidates, missingPodCandidate{name: name, spec: spec})
+			continue
+		}
+		if pod.NotReady || pod.PodIP == "" {
 			continue
 		}
 
@@ -2539,7 +2582,20 @@ func (r *Reconciler) ReconcileProvisioning(ctx context.Context, now time.Time) [
 		}
 
 		*status = statusWithRunning
+		r.recordPhaseTransitionLocked(ctx, name, v1alpha1.PodBoxPhaseProvisioning, statusWithRunning)
 		promoted = append(promoted, name)
+	}
+	r.mu.Unlock()
+
+	for _, cand := range missingPodCandidates {
+		st, err := r.Reconcile(ctx, cand.name, cand.spec)
+		if err != nil {
+			slog.Warn("failed to re-reconcile provisioning sandbox with missing pod", "name", cand.name, "err", err)
+			continue
+		}
+		if st != nil && st.Phase == v1alpha1.PodBoxPhaseRunning {
+			promoted = append(promoted, cand.name)
+		}
 	}
 
 	slices.Sort(promoted)
