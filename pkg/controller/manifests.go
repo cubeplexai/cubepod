@@ -391,7 +391,10 @@ type e2bMountEnvEntry struct {
 // applyOfficialVolumeMounts stages each official E2B volume at
 // /run/cubepod/volumes/<volumeID>, deduplicates shared PVCs in pod.Volumes,
 // and passes the staging->target mapping to podd-init via CUBEPOD_E2B_MOUNTS.
-func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest, mounts []v1alpha1.E2BVolumeMount) ([]VolumeManifest, ContainerManifest) {
+// When mountDirect is true (Filesystem volume mode with an empty runtime class),
+// the kubelet also mounts each volume at its final path so standard containers
+// do not need CAP_SYS_ADMIN or a pivot_root to expose the volume.
+func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest, mounts []v1alpha1.E2BVolumeMount, mountDirect bool) ([]VolumeManifest, ContainerManifest) {
 	if len(mounts) == 0 {
 		return volumes, main
 	}
@@ -418,6 +421,13 @@ func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest,
 			MountPath: stagingPath,
 			SubPath:   m.SubPath,
 		})
+		if mountDirect {
+			main.VolumeMounts = append(main.VolumeMounts, VolumeMount{
+				Name:      pvc,
+				MountPath: m.Path,
+				SubPath:   m.SubPath,
+			})
+		}
 		envEntries = append(envEntries, e2bMountEnvEntry{
 			VolumeID:    m.VolumeID,
 			StagingPath: stagingPath,
@@ -632,22 +642,12 @@ func BuildPodManifest(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha
 
 	// Official E2B volumes are filesystem mounts in addition to rootfs and
 	// workspace. They stay VolumeMounts when the workspace is a block device.
-	volumes, mainContainer = applyOfficialVolumeMounts(volumes, mainContainer, spec.E2BVolumeMounts)
-	// Standard containers do not pivot_root and lack CAP_SYS_ADMIN. Let the
-	// kubelet mount each volume at its final path as well as its staging path.
-	// podd-init recognizes the identical mount and only initializes ownership.
-	// Kata/block-mode workloads keep the staging + in-guest bind-mount path.
-	if strings.EqualFold(vm, "Filesystem") && rtClass == "" && ValidateOfficialVolumeMounts(spec.E2BVolumeMounts) == nil {
-		for _, m := range spec.E2BVolumeMounts {
-			pvc := m.PVCName
-			if pvc == "" {
-				pvc, _ = E2BPVCName(m.VolumeID)
-			}
-			mainContainer.VolumeMounts = append(mainContainer.VolumeMounts, VolumeMount{
-				Name: pvc, MountPath: m.Path, SubPath: m.SubPath,
-			})
-		}
-	}
+	// Standard containers do not pivot_root and lack CAP_SYS_ADMIN, so the
+	// kubelet also mounts each volume at its final path. podd-init recognizes
+	// the identical mount and only initializes ownership. Kata/block-mode
+	// workloads keep the staging + in-guest bind-mount path.
+	mountDirect := strings.EqualFold(vm, "Filesystem") && rtClass == ""
+	volumes, mainContainer = applyOfficialVolumeMounts(volumes, mainContainer, spec.E2BVolumeMounts, mountDirect)
 
 	var containers []ContainerManifest
 
