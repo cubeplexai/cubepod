@@ -232,12 +232,9 @@ class CubePod:
         port: int = 8080,
         *,
         expires_in_seconds: int = 3600,
-        target_url: str | None = None,
     ) -> PanelEndpoint:
         """Request an HMAC-SHA256 signed panel proxy URL for browser live-view or web terminal."""
         payload: dict[str, Any] = {"expiresInSeconds": expires_in_seconds}
-        if target_url is not None:
-            payload["targetUrl"] = target_url
         resp = self._request(
             "POST",
             f"/sandboxes/{sandbox_id}/endpoints/{port}",

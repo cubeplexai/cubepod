@@ -702,9 +702,6 @@ export class CubePodClient {
     if (endpointOptions.expiresInSeconds !== undefined) {
       payload.expiresInSeconds = endpointOptions.expiresInSeconds;
     }
-    if (endpointOptions.targetUrl !== undefined) {
-      payload.targetUrl = endpointOptions.targetUrl;
-    }
 
     const resp = await this._request(
       'POST',

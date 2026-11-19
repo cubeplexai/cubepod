@@ -65,8 +65,9 @@ Instead of provisioning per-sandbox Kubernetes `Ingress` objects or exposing con
    ```text
    base64url(sandboxID:port:expUnix).base64url(hmacSha256)
    ```
+   The request body only accepts `expiresInSeconds`. Client `targetUrl` / `upstreamUrl` values are ignored (*Changed in v0.7.0*). Official E2B `getHost` / `get_host` uses `GET /sandboxes/{id}/endpoints/{port}` and is unchanged.
 2. **Stateless Verification Across Replicas**: Any `cubepod-gateway` replica receiving `GET /panel/{token}/{rest...}` (or a WebSocket upgrade handshake) verifies the HMAC signature and expiration timestamp without needing central session storage.
-3. **Auto-Resume & Live Reverse Proxy**: Using `resolveSandbox`, the gateway wakes the sandbox if it is `Paused`, resolves its current `<status.podIP>:<port>`, and reverse-proxies HTTP assets and bidirectional WebSocket frames (`noVNC`, `neko` signaling, `ttyd`, HMR dev servers) directly to the MicroVM.
+3. **Auto-Resume & Live Reverse Proxy**: Using `resolveSandbox`, the gateway wakes the sandbox if it is `Paused`, always resolves its current `<status.podIP>:<port>` from sandbox status (not a client-supplied upstream), and reverse-proxies HTTP assets and bidirectional WebSocket frames (`noVNC`, `neko` signaling, `ttyd`, HMR dev servers) directly to the MicroVM (*Changed in v0.7.0*).
 
 ## 4. Production Sizing, Audio & GPU Roadmap
 

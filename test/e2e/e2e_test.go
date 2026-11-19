@@ -460,8 +460,8 @@ func TestE2E_GatewayFullStackLifecycle(t *testing.T) {
 	}
 
 	// 9. Signed Panel Reverse Proxy
+	srv.RegisterPort(sbID, 8080, mockUpstream.URL)
 	panelReqBody, _ := json.Marshal(map[string]interface{}{
-		"targetUrl":        mockUpstream.URL,
 		"expiresInSeconds": 3600,
 	})
 	panelResp, err := http.Post(ts.URL+"/sandboxes/"+sbID+"/endpoints/8080", "application/json", bytes.NewReader(panelReqBody))
@@ -527,8 +527,6 @@ func TestE2E_PythonSDKLiveHTTP(t *testing.T) {
 	reconciler := controller.NewReconciler()
 	srv := gateway.NewServer(reconciler)
 	srv.SetPanelSecret("e2e-python-sdk-live-panel-secret-32b")
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
 
 	// Start mock live in-sandbox HTTP server for panel proxy verification
 	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -541,6 +539,33 @@ func TestE2E_PythonSDKLiveHTTP(t *testing.T) {
 		}
 	}))
 	defer mockUpstream.Close()
+
+	// Inject the mock panel upstream in-process when a sandbox is created.
+	// The public mint API no longer accepts a client targetUrl.
+	inner := srv.Handler()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && (r.URL.Path == "/sandboxes" || r.URL.Path == "/v2/sandboxes") {
+			recw := httptest.NewRecorder()
+			inner.ServeHTTP(recw, r)
+			var created struct {
+				SandboxID string `json:"sandboxID"`
+			}
+			_ = json.Unmarshal(recw.Body.Bytes(), &created)
+			if created.SandboxID != "" {
+				srv.RegisterPort(created.SandboxID, 8080, mockUpstream.URL)
+			}
+			for k, vs := range recw.Header() {
+				for _, v := range vs {
+					w.Header().Add(k, v)
+				}
+			}
+			w.WriteHeader(recw.Code)
+			_, _ = w.Write(recw.Body.Bytes())
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
 
 	testScript := filepath.Join(repoRoot, "sdks/python/tests/test_e2e_live.py")
 	pythonPath := filepath.Join(repoRoot, "sdks/python")

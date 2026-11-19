@@ -110,7 +110,6 @@ async def run_live_e2e(gateway_url: str, upstream_url: str | None = None) -> Non
             sb_id,
             port=8080,
             expires_in_seconds=3600,
-            target_url=upstream_url,
         )
         assert panel.url.startswith("/panel/"), f"expected url starting with /panel/, got {panel.url}"
         assert panel.token, "panel token must not be empty"

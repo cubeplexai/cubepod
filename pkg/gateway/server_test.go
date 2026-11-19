@@ -1256,7 +1256,8 @@ func TestLivePodRoutingAndEndpointDefault(t *testing.T) {
 	mockPoddURL := "http://10.244.5.10:49983"
 	srv.SetPoddURL(rec.SandboxID, mockPoddURL)
 
-	// Mint endpoint with no targetURL override: should default targetURL to host of podd
+	// Mint must succeed without a client targetUrl, and must not stash an
+	// upstream in the in-memory endpoint map (panel resolves the sandbox host).
 	mintReq := `{"expiresInSeconds":3600}`
 	mintResp, err := http.Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/endpoints/8080", "application/json", strings.NewReader(mintReq))
 	if err != nil || mintResp.StatusCode != http.StatusOK {
@@ -1264,9 +1265,101 @@ func TestLivePodRoutingAndEndpointDefault(t *testing.T) {
 	}
 	defer mintResp.Body.Close()
 
-	registered := srv.GetRegisteredPort(rec.SandboxID, 8080)
-	if !strings.Contains(registered, ":8080") {
-		t.Fatalf("expected registered target URL for port 8080, got %q", registered)
+	if registered := srv.GetRegisteredPort(rec.SandboxID, 8080); registered != "" {
+		t.Fatalf("mint must not register an upstream, got %q", registered)
+	}
+}
+
+func TestPanelProxyIgnoresClientTargetURL(t *testing.T) {
+	sandboxHits := 0
+	attackerHits := 0
+	sandboxUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sandboxHits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("from-sandbox"))
+	}))
+	defer sandboxUpstream.Close()
+	attackerUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attackerHits++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("from-attacker"))
+	}))
+	defer attackerUpstream.Close()
+
+	sandboxURL, err := url.Parse(sandboxUpstream.URL)
+	if err != nil {
+		t.Fatalf("parse sandbox upstream: %v", err)
+	}
+	sandboxPort, err := strconv.Atoi(sandboxURL.Port())
+	if err != nil || sandboxPort <= 0 {
+		t.Fatalf("sandbox upstream port: %v %q", err, sandboxURL.Port())
+	}
+
+	reconciler := controller.NewReconciler()
+	reconciler.RegisterTemplate("desktop", v1alpha1.PodTemplateSpec{Image: "ubuntu:24.04"})
+	srv := gateway.NewServer(reconciler)
+	srv.SetPanelSecret("test-panel-ignore-target-url")
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	createResp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"desktop"}`))
+	if err != nil {
+		t.Fatalf("create sandbox failed: %v", err)
+	}
+	var rec gateway.SandboxRecord
+	_ = json.NewDecoder(createResp.Body).Decode(&rec)
+	createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated || rec.SandboxID == "" {
+		t.Fatalf("expected created sandbox, status=%d rec=%+v", createResp.StatusCode, rec)
+	}
+
+	// Sandbox host is the mock's hostname; token port matches the mock listen port
+	// so resolveSandboxHost + port reaches sandboxUpstream, not the attacker.
+	srv.SetPoddURL(rec.SandboxID, sandboxUpstream.URL)
+
+	mintBody, _ := json.Marshal(map[string]any{
+		"expiresInSeconds": 3600,
+		"targetUrl":        attackerUpstream.URL,
+		"upstreamUrl":      attackerUpstream.URL,
+	})
+	mintResp, err := http.Post(
+		ts.URL+"/sandboxes/"+rec.SandboxID+"/endpoints/"+strconv.Itoa(sandboxPort),
+		"application/json",
+		bytes.NewReader(mintBody),
+	)
+	if err != nil || mintResp.StatusCode != http.StatusOK {
+		t.Fatalf("mint failed: status=%d err=%v", mintResp.StatusCode, err)
+	}
+	var minted struct {
+		URL   string `json:"url"`
+		Token string `json:"token"`
+	}
+	_ = json.NewDecoder(mintResp.Body).Decode(&minted)
+	mintResp.Body.Close()
+	if minted.Token == "" || minted.URL == "" {
+		t.Fatalf("invalid mint result: %+v", minted)
+	}
+	if registered := srv.GetRegisteredPort(rec.SandboxID, sandboxPort); registered != "" {
+		t.Fatalf("mint must not register client targetUrl, got %q", registered)
+	}
+
+	proxyResp, err := http.Get(ts.URL + minted.URL + "probe")
+	if err != nil {
+		t.Fatalf("panel proxy request failed: %v", err)
+	}
+	body, _ := io.ReadAll(proxyResp.Body)
+	proxyResp.Body.Close()
+	if proxyResp.StatusCode != http.StatusOK {
+		t.Fatalf("panel proxy status=%d body=%s", proxyResp.StatusCode, body)
+	}
+	if string(body) != "from-sandbox" {
+		t.Fatalf("panel proxy followed client targetUrl: body=%q sandboxHits=%d attackerHits=%d", string(body), sandboxHits, attackerHits)
+	}
+	if attackerHits != 0 {
+		t.Fatalf("attacker upstream was contacted %d time(s)", attackerHits)
+	}
+	if sandboxHits == 0 {
+		t.Fatal("expected the sandbox upstream to be contacted")
 	}
 }
 

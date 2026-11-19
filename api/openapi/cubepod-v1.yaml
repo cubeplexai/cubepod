@@ -1002,7 +1002,13 @@ paths:
       tags:
         - Desktop & Panels
       summary: Mint panel token
-      description: Mint HMAC-SHA256 signed panel proxy token for interactive web/VNC/HTTP ports
+      description: >
+        Mint an HMAC-SHA256 signed panel proxy token for interactive web/VNC/HTTP
+        ports. The request body only accepts expiresInSeconds. Client-supplied
+        targetUrl or upstreamUrl values are ignored. The panel proxy always
+        resolves http://<sandbox-pod-ip>:<port> from sandbox status
+        (Changed in v0.7.0). Official E2B getHost / get_host uses GET on this
+        path and is unchanged.
       operationId: mintEndpointToken
       parameters:
         - name: sandboxID
@@ -1024,8 +1030,6 @@ paths:
                 expiresInSeconds:
                   type: integer
                   default: 3600
-                targetUrl:
-                  type: string
       responses:
         "200":
           description: Signed proxy URL and token

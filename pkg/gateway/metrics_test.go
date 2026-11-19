@@ -441,7 +441,8 @@ func TestMetricsCEPAlignmentAndPanelGauge(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	mintReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/sandboxes/"+rec.SandboxID+"/endpoints/8080", bytes.NewReader([]byte(`{"targetUrl":"`+upstream.URL+`"}`)))
+	srv.RegisterPort(rec.SandboxID, 8080, upstream.URL)
+	mintReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/sandboxes/"+rec.SandboxID+"/endpoints/8080", bytes.NewReader([]byte(`{"expiresInSeconds":3600}`)))
 	mintReq.Header.Set("Content-Type", "application/json")
 	mintResp, err := ts.Client().Do(mintReq)
 	if err != nil {

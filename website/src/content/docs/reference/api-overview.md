@@ -77,8 +77,9 @@ For desktop-enabled images (such as `cubeplex-ubuntu24-desktop`), the Gateway co
 | `POST /sandboxes/{id}/desktop/start` | Start display server & desktop session | Validates `resolution` (`^[0-9]{3,5}x[0-9]{3,5}x(16\|24\|32)$`), optional `initialUrl`, `expiresInSeconds`, and `transport` (`"webrtc" \| "novnc"`, *Added in v0.6.0*); returns `422 desktop_not_installed` if the image lacks desktop binaries. Aliased under `/v1/sandboxes/{id}/desktop/start` |
 | `GET /sandboxes/{id}/desktop/status` | Inspect desktop status (`desktopStatus`, panel URLs) | Also aliased under `/v1/sandboxes/{id}/desktop/status` |
 | `POST /sandboxes/{id}/desktop/stop` | Stop desktop services | Also aliased under `/v1/sandboxes/{id}/desktop/stop` |
-| `GET /sandboxes/{id}/endpoints/{port}` & `POST /sandboxes/{id}/endpoints/{port}` | Mint or query a signed proxy token for any sandbox TCP/WebSocket port | Token format: `base64url(sandboxID:port:expUnix).hmacSha256Sig` |
-| `ANY /panel/{token}/...` | HMAC-verified HTTP, WebSocket, and WebRTC proxy | Strips `/panel/{token}` prefix and proxies to `PodIP:<port>` inside the sandbox |
+| `GET /sandboxes/{id}/endpoints/{port}` | E2B `getHost` / `get_host` compatible public hostname | Returns `<port>-<sandboxID>.<domain>`. Unchanged. |
+| `POST /sandboxes/{id}/endpoints/{port}` | Mint a signed `/panel/{token}/` proxy token for a sandbox port | Body is `{expiresInSeconds}` (default `3600`). Client `targetUrl` / `upstreamUrl` are ignored. *Changed in v0.7.0.* Token format: `base64url(sandboxID:port:expUnix).hmacSha256Sig` |
+| `ANY /panel/{token}/...` | HMAC-verified HTTP, WebSocket, and WebRTC proxy | Strips `/panel/{token}` prefix and always proxies to the sandbox's own `PodIP:<port>` (or the in-process test mapping when no sandbox host is known). *Changed in v0.7.0.* |
 
 See [Desktop & Panel Proxy](/concepts/desktop-and-panel-proxy/) for architecture details.
 

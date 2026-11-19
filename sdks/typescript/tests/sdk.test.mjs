@@ -236,7 +236,7 @@ test('Sandbox lifecycle, resetRootfs, fork, lease, panel endpoint, and getHost(p
     assert.equal(epHost.url, 'http://8080-cpod-1.cubepod.local');
     assert.equal(epHost.port, 8080);
 
-    const panel = await reconnected.createEndpoint(8080, { expiresInSeconds: 1800, targetUrl: 'http://127.0.0.1:8080' });
+    const panel = await reconnected.createEndpoint(8080, { expiresInSeconds: 1800 });
     assert.equal(panel.url, '/panel/abc.sig/');
     assert.equal(panel.token, 'abc.sig');
     assert.equal(panel.expiresAt, '2026-11-13T10:00:00Z');

@@ -26,10 +26,11 @@ type PanelTokenClaims struct {
 	ExpUnix   int64
 }
 
+// mintEndpointReq is the public POST /sandboxes/{id}/endpoints/{port} body.
+// Client-supplied targetUrl / upstreamUrl fields are ignored; the panel
+// proxy always resolves the sandbox's own host (Changed in v0.7.0).
 type mintEndpointReq struct {
-	ExpiresInSeconds int    `json:"expiresInSeconds,omitempty"`
-	TargetURL        string `json:"targetUrl,omitempty"`
-	UpstreamURL      string `json:"upstreamUrl,omitempty"`
+	ExpiresInSeconds int `json:"expiresInSeconds,omitempty"`
 }
 
 // SetPanelSecret sets the HMAC secret used to sign and verify panel tokens.
@@ -75,6 +76,21 @@ func (s *Server) GetRegisteredPort(sandboxID string, port int) string {
 		return ports[port]
 	}
 	return ""
+}
+
+// panelUpstreamURL returns the gateway-side upstream for a sandbox port.
+// The sandbox's own host (PodIP or podd URL hostname) always wins so a
+// client cannot steer /panel/{token}/ at an arbitrary address.
+// RegisterPort is only used when no sandbox host is known, which covers
+// in-process test injection (not the public mint API).
+func (s *Server) panelUpstreamURL(rec *SandboxRecord, port int) string {
+	if rec == nil {
+		return ""
+	}
+	if host := s.resolveSandboxHost(rec); host != "" {
+		return fmt.Sprintf("http://%s:%d", host, port)
+	}
+	return s.GetRegisteredPort(rec.SandboxID, port)
 }
 
 // handleCreateEndpoint is an alias for handleMintEndpointToken.
@@ -133,8 +149,7 @@ func (s *Server) handleMintEndpointToken(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	rec, ok := s.resolveSandbox(r.Context(), sandboxID)
-	if !ok {
+	if _, ok := s.resolveSandbox(r.Context(), sandboxID); !ok {
 		http.Error(w, "sandbox not found", http.StatusNotFound)
 		return
 	}
@@ -143,19 +158,9 @@ func (s *Server) handleMintEndpointToken(w http.ResponseWriter, r *http.Request)
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 	}
-	targetURL := req.TargetURL
-	if targetURL == "" {
-		targetURL = req.UpstreamURL
-	}
-	if targetURL == "" {
-		if host := s.resolveSandboxHost(rec); host != "" {
-			targetURL = fmt.Sprintf("http://%s:%d", host, port)
-		}
-	}
-	if targetURL != "" {
-		s.RegisterPort(sandboxID, port, targetURL)
-	}
 
+	// Do not honor client targetUrl / upstreamUrl and do not pin a
+	// caller-supplied upstream into the in-memory endpoint map.
 	token, expTime := s.mintPanelToken(sandboxID, port, req.ExpiresInSeconds)
 	urlPath := fmt.Sprintf("/panel/%s/", token)
 
@@ -264,12 +269,7 @@ func (s *Server) handlePanelProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetURLStr := s.GetRegisteredPort(claims.SandboxID, claims.Port)
-	if targetURLStr == "" {
-		if host := s.resolveSandboxHost(rec); host != "" {
-			targetURLStr = fmt.Sprintf("http://%s:%d", host, claims.Port)
-		}
-	}
+	targetURLStr := s.panelUpstreamURL(rec, claims.Port)
 	if targetURLStr == "" {
 		http.Error(w, fmt.Sprintf("no upstream registered for sandbox %s port %d", claims.SandboxID, claims.Port), http.StatusBadGateway)
 		return
