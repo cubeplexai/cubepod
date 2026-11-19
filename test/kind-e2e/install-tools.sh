@@ -15,11 +15,11 @@ base=https://github.com/kubernetes-sigs/kind/releases/download/$KIND_VERSION
 curl -fsSLo kind "$base/kind-linux-$ARCH"
 curl -fsSLo kind.sha256 "$base/kind-linux-$ARCH.sha256sum"
 echo "$(awk '{print $1}' kind.sha256)  kind" | sha256sum -c -
-base=https://dl.k8s.io/release/v1.35.5/bin/linux/$ARCH
+base=https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/$ARCH
 curl -fsSLo kubectl "$base/kubectl"
 curl -fsSLo kubectl.sha256 "$base/kubectl.sha256"
 echo "$(<kubectl.sha256)  kubectl" | sha256sum -c -
-archive=helm-v3.19.0-linux-$ARCH.tar.gz
+archive=helm-$HELM_VERSION-linux-$ARCH.tar.gz
 curl -fsSLO "https://get.helm.sh/$archive"
 curl -fsSLO "https://get.helm.sh/$archive.sha256sum"
 sha256sum -c "$archive.sha256sum"
