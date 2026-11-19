@@ -16,6 +16,7 @@ import (
 
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/gateway"
+	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
 func newVolumeHarness(t *testing.T, dir string) (*gateway.Server, *httptest.Server, *controller.MemoryKubeClient) {
@@ -1151,5 +1152,310 @@ func TestE2BVolumeMountCounters(t *testing.T) {
 	}
 	if got := srv.E2BVolumeMountErrorsTotal.Load(); got != 3 {
 		t.Fatalf("E2BVolumeMountErrorsTotal = %d; want 3", got)
+	}
+}
+
+func TestE2BVolumeRotateKeyEndpointAndSandboxMountIsolation(t *testing.T) {
+	dir := t.TempDir()
+	kekProv, err := volume.NewLocalKEKProvider("gw-kek-v1", bytes.Repeat([]byte{0x5a}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem := controller.NewMemoryKubeClient()
+	rec := controller.NewReconciler(controller.WithKubeClient(mem), controller.WithNamespace("cubepod-workloads"))
+	srv := gateway.NewServer(rec)
+	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+		Dir: dir,
+		KMS: kekProv,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	oldKey := "cpod_gw_old_key"
+	newKey := "cpod_gw_new_key"
+	otherKey := "cpod_gw_other_tenant"
+
+	v1 := createVol(t, ts, oldKey, "rot-vol-1")
+	v2 := createVol(t, ts, oldKey, "rot-vol-2")
+	otherVol := createVol(t, ts, otherKey, "rot-vol-1")
+
+	// Mount v1 onto a sandbox before rotating the key.
+	sbBody, _ := json.Marshal(map[string]any{
+		"templateID":   "base",
+		"volumeMounts": []map[string]string{{"name": v1.Name, "path": "/mnt/rot"}},
+	})
+	sbResp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", oldKey, sbBody, "application/json")
+	var sb struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	readJSON(t, sbResp, &sb)
+	if sbResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create sandbox: %d", sbResp.StatusCode)
+	}
+
+	// Missing X-API-Key -> 401.
+	rNoAuth := volReq(t, http.MethodPost, ts.URL+"/volumes/rotate-key", "", []byte(`{"previousApiKey":"`+oldKey+`"}`), "application/json")
+	rNoAuth.Body.Close()
+	if rNoAuth.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on missing X-API-Key, got %d", rNoAuth.StatusCode)
+	}
+
+	// Empty or self-identical previousApiKey -> 400.
+	rBadPrev := volReq(t, http.MethodPost, ts.URL+"/volumes/rotate-key", newKey, []byte(`{"previousApiKey":""}`), "application/json")
+	rBadPrev.Body.Close()
+	if rBadPrev.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty previousApiKey, got %d", rBadPrev.StatusCode)
+	}
+	rSameKey := volReq(t, http.MethodPost, ts.URL+"/volumes/rotate-key", oldKey, []byte(`{"previousApiKey":"`+oldKey+`"}`), "application/json")
+	rSameKey.Body.Close()
+	if rSameKey.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on identical keys, got %d", rSameKey.StatusCode)
+	}
+
+	// Collision with existing tenant -> 409 Conflict.
+	rCollide := volReq(t, http.MethodPost, ts.URL+"/volumes/rotate-key", otherKey, []byte(`{"previousApiKey":"`+oldKey+`"}`), "application/json")
+	rCollide.Body.Close()
+	if rCollide.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 on target key collision, got %d", rCollide.StatusCode)
+	}
+
+	// Valid key rotation -> 200 {"rotatedVolumes": 2}.
+	rRot := volReq(t, http.MethodPost, ts.URL+"/volumes/rotate-key", newKey, []byte(`{"previousApiKey":"`+oldKey+`"}`), "application/json")
+	var rotBody struct {
+		RotatedVolumes int `json:"rotatedVolumes"`
+	}
+	readJSON(t, rRot, &rotBody)
+	if rRot.StatusCode != http.StatusOK || rotBody.RotatedVolumes != 2 {
+		t.Fatalf("rotate-key: status=%d body=%+v", rRot.StatusCode, rotBody)
+	}
+
+	// Old key must be denied (401) across GET /volumes, GET /volumes/{id}, DELETE /volumes/{id},
+	// POST /sandboxes with volumeMounts, and a second POST /volumes/rotate-key.
+	for _, check := range []struct {
+		method string
+		url    string
+		body   []byte
+	}{
+		{http.MethodGet, ts.URL + "/volumes", nil},
+		{http.MethodGet, ts.URL + "/volumes/" + v1.VolumeID, nil},
+		{http.MethodDelete, ts.URL + "/volumes/" + v2.VolumeID, nil},
+		{http.MethodPost, ts.URL + "/sandboxes", sbBody},
+		{http.MethodPost, ts.URL + "/volumes/rotate-key", []byte(`{"previousApiKey":"` + oldKey + `"}`)},
+	} {
+		keyToUse := oldKey
+		if strings.HasSuffix(check.url, "/rotate-key") {
+			keyToUse = "cpod_gw_another_fresh_key"
+		}
+		resp := volReq(t, check.method, check.url, keyToUse, check.body, "application/json")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for revoked oldKey on %s %s, got %d", check.method, check.url, resp.StatusCode)
+		}
+	}
+
+	// Other tenant remains untouched.
+	rOther := volReq(t, http.MethodGet, ts.URL+"/volumes/"+otherVol.VolumeID, otherKey, nil, "")
+	rOther.Body.Close()
+	if rOther.StatusCode != http.StatusOK {
+		t.Fatalf("other tenant GET failed: %d", rOther.StatusCode)
+	}
+
+	// Reopen gateway over same dir: newKey retains access, active sandbox mount still blocks delete (409),
+	// and deleting sandbox releases mount so DELETE /volumes/{id} succeeds (204).
+	srv2 := gateway.NewServer(rec)
+	if err := srv2.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+		Dir: dir,
+		KMS: kekProv,
+	}); err != nil {
+		t.Fatalf("reopen gateway volumes: %v", err)
+	}
+	ts2 := httptest.NewServer(srv2.Handler())
+	defer ts2.Close()
+
+	rList := volReq(t, http.MethodGet, ts2.URL+"/volumes", newKey, nil, "")
+	var listed []map[string]string
+	readJSON(t, rList, &listed)
+	if rList.StatusCode != http.StatusOK || len(listed) != 2 {
+		t.Fatalf("reopened list(newKey): status=%d listed=%+v", rList.StatusCode, listed)
+	}
+
+	rDelBusy := volReq(t, http.MethodDelete, ts2.URL+"/volumes/"+v1.VolumeID, newKey, nil, "")
+	rDelBusy.Body.Close()
+	if rDelBusy.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 deleting mounted volume under newKey, got %d", rDelBusy.StatusCode)
+	}
+
+	// Clean up sandbox on srv (releases mount on shared dir after reopen or via DELETE /sandboxes on srv2 after PodBox sync).
+	rDelSb := volReq(t, http.MethodDelete, ts.URL+"/sandboxes/"+sb.SandboxID, newKey, nil, "")
+	rDelSb.Body.Close()
+	// Reconcile srv2 with updated PodBox state and delete v1 cleanly.
+	if err := srv2.ConfigureE2BVolumes(gateway.E2BVolumeConfig{Dir: dir, KMS: kekProv}); err != nil {
+		t.Fatal(err)
+	}
+	rDelOK := volReq(t, http.MethodDelete, ts2.URL+"/volumes/"+v1.VolumeID, newKey, nil, "")
+	rDelOK.Body.Close()
+	if rDelOK.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 deleting unmounted volume under newKey, got %d", rDelOK.StatusCode)
+	}
+}
+
+func TestE2BVolumeKMSQuotaAndPrometheusMetrics(t *testing.T) {
+	// Spin up a mock external HTTP KMS server to verify Gateway + HTTPKMSProvider integration.
+	rawKEK := bytes.Repeat([]byte{0x91}, 32)
+	backingKMS, err := volume.NewLocalKEKProvider("ext-kms-gw", rawKEK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kmsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer gw-kms-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		var payload map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		switch r.URL.Path {
+		case "/wrap":
+			raw, _ := io.ReadAll(io.LimitReader(strings.NewReader(payload["plaintext"]), 4096))
+			_ = raw
+			var dec []byte
+			if b, decErr := json.Marshal(payload["plaintext"]); decErr == nil {
+				_ = json.Unmarshal(b, &dec)
+			}
+			wrapped, wErr := backingKMS.Wrap(r.Context(), dec)
+			if wErr != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"keyId": "ext-kms-gw", "ciphertext": wrapped})
+		case "/unwrap":
+			var wrapped []byte
+			if b, decErr := json.Marshal(payload["ciphertext"]); decErr == nil {
+				_ = json.Unmarshal(b, &wrapped)
+			}
+			pt, uErr := backingKMS.Unwrap(r.Context(), wrapped)
+			if uErr != nil {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"plaintext": pt})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer kmsSrv.Close()
+
+	httpKMS, err := volume.NewHTTPKMSProvider(volume.HTTPKMSConfig{
+		URL:         kmsSrv.URL,
+		BearerToken: "gw-kms-token",
+		KeyID:       "ext-kms-gw",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	mem := controller.NewMemoryKubeClient()
+	rec := controller.NewReconciler(controller.WithKubeClient(mem))
+	srv := gateway.NewServer(rec)
+	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+		Dir:                 dir,
+		MaxVolumesPerTenant: 2,
+		MaxBytesPerTenant:   50,
+		KMS:                 httpKMS,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	tenantA := "cpod_metrics_tenant_a"
+	tenantB := "cpod_metrics_tenant_b"
+
+	vA1 := createVol(t, ts, tenantA, "mvol-a1")
+	vA2 := createVol(t, ts, tenantA, "mvol-a2")
+	vB1 := createVol(t, ts, tenantB, "mvol-b1")
+
+	// Verify meta.json on disk uses envelope encryption (no plaintext token on disk).
+	metaOnDisk, err := os.ReadFile(filepath.Join(dir, vA1.VolumeID, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(metaOnDisk), vA1.Token) || !strings.Contains(string(metaOnDisk), `"kmsKeyID": "ext-kms-gw"`) {
+		t.Fatalf("expected KMS-encrypted meta.json without plaintext token, got %s", metaOnDisk)
+	}
+
+	// 3rd volume for tenantA -> 429 Too Many Requests (+1 quota rejection metric).
+	rCountCap := volReq(t, http.MethodPost, ts.URL+"/volumes", tenantA, []byte(`{"name":"mvol-a3"}`), "application/json")
+	rCountCap.Body.Close()
+	if rCountCap.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on volume count cap, got %d", rCountCap.StatusCode)
+	}
+
+	// Upload 30B to vA1 + 15B to vA2 = 45B <= 50B -> 201 Created.
+	putFile := func(vol volCreate, p, data string) int {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPut, ts.URL+"/volumecontent/"+vol.VolumeID+"/file?path="+p, strings.NewReader(data))
+		req.Header.Set("Authorization", "Bearer "+vol.Token)
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			t.Fatal(doErr)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := putFile(vA1, "/part1.txt", strings.Repeat("a", 30)); code != http.StatusCreated {
+		t.Fatalf("expected 201 for 30B upload, got %d", code)
+	}
+	if code := putFile(vA2, "/part2.txt", strings.Repeat("b", 15)); code != http.StatusCreated {
+		t.Fatalf("expected 201 for 15B upload, got %d", code)
+	}
+	// Upload 10B more (45 + 10 = 55 > 50B) -> 429 Too Many Requests (+1 quota rejection metric).
+	if code := putFile(vA2, "/overflow.txt", strings.Repeat("c", 10)); code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on tenant byte quota overflow, got %d", code)
+	}
+	// Tenant B remains unaffected and can upload 40B.
+	if code := putFile(vB1, "/ok.txt", strings.Repeat("d", 40)); code != http.StatusCreated {
+		t.Fatalf("expected 201 for isolated tenant B upload, got %d", code)
+	}
+
+	// Scrape Prometheus text /metrics and verify all 5 required metrics.
+	mResp, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	promBody, _ := io.ReadAll(mResp.Body)
+	mResp.Body.Close()
+	promText := string(promBody)
+	for _, wantSubstr := range []string{
+		"cubepod_e2b_volumes_storage_capacity_bytes ",
+		"cubepod_e2b_volumes_storage_used_bytes ",
+		"cubepod_e2b_volumes_storage_available_bytes ",
+		"cubepod_e2b_volumes_total 3\n",
+		"cubepod_e2b_volume_quota_rejections_total 2\n",
+	} {
+		if !strings.Contains(promText, wantSubstr) {
+			t.Fatalf("Prometheus /metrics missing %q in:\n%s", wantSubstr, promText)
+		}
+	}
+
+	// Also verify JSON /metrics snapshot.
+	jReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/metrics", nil)
+	jReq.Header.Set("Accept", "application/json")
+	jResp, err := http.DefaultClient.Do(jReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jMetrics map[string]any
+	readJSON(t, jResp, &jMetrics)
+	if capVal, _ := jMetrics["cubepod_e2b_volumes_storage_capacity_bytes"].(float64); capVal <= 0 {
+		t.Fatalf("expected positive storage capacity bytes in JSON metrics, got %v", jMetrics["cubepod_e2b_volumes_storage_capacity_bytes"])
+	}
+	if totVal, _ := jMetrics["cubepod_e2b_volumes_total"].(float64); int(totVal) != 3 {
+		t.Fatalf("expected cubepod_e2b_volumes_total=3, got %v", jMetrics["cubepod_e2b_volumes_total"])
+	}
+	if rejVal, _ := jMetrics["cubepod_e2b_volume_quota_rejections_total"].(float64); int(rejVal) != 2 {
+		t.Fatalf("expected cubepod_e2b_volume_quota_rejections_total=2, got %v", jMetrics["cubepod_e2b_volume_quota_rejections_total"])
 	}
 }

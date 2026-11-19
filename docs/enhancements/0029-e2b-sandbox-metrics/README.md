@@ -156,6 +156,16 @@ Adds `"e2b_bind_duration_ms": <u64>` to `/run/cubepod/init-state.json`:
 - `cubepod_sandbox_forks_total{mode,result}` (counter)
 - `cubepod_sandbox_fork_duration_seconds` (histogram)
 - `cubepod_gateway_crd_resyncs_total` (counter)
+- `cubepod_sandbox_metrics_samples_total{result="ok|error"}` (counter, Beta v0.7: background sampler health)
+- `cubepod_sandbox_{cpu_count,cpu_used_pct,memory_used_bytes,memory_total_bytes,disk_used_bytes,disk_total_bytes}{sandbox_id}` (gauges, latest sample per sandbox, Beta v0.7)
+
+#### 5. Background Sampler (Beta, `v0.7`)
+
+`Server.StartMetricsSampler(ctx, interval)` / `StopMetricsSampler()` (`pkg/gateway/sandbox_metrics.go`) tick every `--metrics-sample-interval` (env `CUBEPOD_METRICS_SAMPLE_INTERVAL`, Helm `gateway.metricsSampleInterval`, default `10s`, `0` disables). Each tick snapshots `Running` sandboxes under `s.mu.RLock()`, releases the lock, then polls `podd /metrics` (or the local fallback when no `PoddURL`) with at most 8 concurrent workers and records into the ring buffers. Paused/terminated sandboxes are skipped; errors increment `result="error"` and never block the loop.
+
+#### 6. Prometheus Rules & Grafana Dashboard (GA, `v1.0`)
+
+`deploy/monitoring/sandbox-metrics-rules.yaml` (`PrometheusRule`: `cubepod:sandbox_cpu_used_pct:avg5m`, `cubepod:sandbox_memory_utilization_ratio`, `cubepod:sandbox_disk_utilization_ratio`; alerts `CubePodSandboxHighMemoryPressure`, `CubePodSandboxDiskNearFull`, `CubePodMetricsSamplerFailing`) and `deploy/monitoring/sandbox-metrics-dashboard.json`.
 
 ### State Machine & Data Flow
 
@@ -184,13 +194,14 @@ flowchart LR
   - `podd`: Verify RFC3339 formatting, `/proc/stat` delta CPU calculation, `/proc/meminfo` & cgroup memory parsing, `statvfs` disk reporting, `GET /metrics` JSON schema, and `GET /v1/prometheus` exposition including `init-state.json` gauges.
 - **Unit Tests (Go, `-race`)**:
   - `sandbox_metrics_test.go`: Verify `GET /sandboxes/{id}/metrics` against a mock `podd` server, local fallback mode, `?start=` / `?end=` filtering (unix seconds & RFC3339), invalid range `400`, paused `autoResume=false` vs auto-resume, and `GET /sandboxes/metrics` batch filtering.
+  - `sandbox_metrics_test.go` (sampler): background ticks populate history with no HTTP polling, paused sandboxes skipped, podd errors counted without blocking, clean stop without goroutine leaks.
   - `metrics_test.go`: Verify all newly added Prometheus counters, gauges, histograms, and `cubepod_panel_active_sessions` tracking under concurrent requests with `-race`.
 
 ### Graduation Criteria
 
 - **Alpha (`v0.6`)**: `GET /sandboxes/{sandboxID}/metrics`, `GET /sandboxes/metrics`, `podd` `/metrics` & `/v1/prometheus`, `podd-init` `e2b_bind_duration_ms`, and all Gateway Prometheus metrics implemented and verified via `cargo test` and `go test -race`.
-- **Beta (`v0.7`)**: Background periodic sampler in Gateway/Controller populating ring buffers continuously for running sandboxes; live `make test-k8s-e2e` metrics assertions enabled.
-- **GA (`v1.0`)**: Production soak in CubePlex with Prometheus recording rules and alerting dashboards.
+- **Beta (`v0.7`)** *(implemented)*: Background periodic sampler in Gateway/Controller populating ring buffers continuously for running sandboxes; live `make test-k8s-e2e` metrics assertions enabled.
+- **GA (`v1.0`)**: Production soak in CubePlex with Prometheus recording rules and alerting dashboards (manifests shipped in `deploy/monitoring/`; soak pending).
 
 ### Upgrade / Downgrade Strategy
 
@@ -214,6 +225,7 @@ flowchart LR
 
 - **2026-11-16**: CEP-0029 drafted and marked `implementable` for `v0.6`.
 - **2026-11-16**: Alpha implementation completed across `podd-init`, `podd`, `cubepod-gateway`, and `api/openapi/cubepod-v1.yaml`; marked `implemented`.
+- **2026-11-17**: Beta: background sampler, live K8s E2E assertions (`TestK8sLiveE2ESandboxMetrics`), and Prometheus rules/Grafana dashboard added (#98).
 
 ---
 

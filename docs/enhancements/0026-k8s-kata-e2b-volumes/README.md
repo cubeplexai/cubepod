@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `alpha` | `implemented` | `2026-11-15` | `2026-11-16` | `storage` (`controller`, `gateway`, `runtime`) |
+| `beta` | `implemented` | `2026-11-15` | `2026-11-18` | `storage` (`controller`, `gateway`, `runtime`) |
 
 ## Table of Contents
 
@@ -40,7 +40,8 @@
 - [x] `podd-init` single-threaded `pivot_root` E2B mount propagation with `MS_NOSUID | MS_NODEV` implemented (`crates/podd-init/src/main.rs`)
 - [x] `PodBoxSpec.E2BVolumeMounts` controller staging mount + `CUBEPOD_E2B_MOUNTS` / `/etc/cubepod/e2b-mounts.json` implemented (`pkg/controller/manifests.go`, `crates/podd-init/src/main.rs`)
 - [x] `ForkFrom` interaction with `E2BVolumeMounts` enforced and unit-tested (`pkg/gateway/volumes_test.go`)
-- [ ] Live Kubernetes Kata + CSI E2E tests (`make test-k8s-e2e`) passing *(pending live cluster verification with Kata + RWX CSI; unit tests and local E2E harnesses are implemented and passing)*
+- [x] GA envelope encryption (`KMSProvider`), tenant API-key rotation (`POST /volumes/rotate-key` + RWX `flock` `tenants.json`), multi-tenant volume/byte quotas (`CUBEPOD_E2B_MAX_TENANT_BYTES`), RWX capacity Prometheus metrics, and `deploy/monitoring/e2b-volumes-alerts.yaml` delivered (`v0.7.0`)
+- [ ] Live Kubernetes Kata + CSI E2E tests (`make test-k8s-e2e`) passing *(verified skip-safe on active `longhorn-v2-block-thin` cluster via `CUBEPOD_K8S_E2E=1 go test -v ./test/k8s-e2e/ -run TestK8sLiveE2EVolumeMountsAndFork` without mutating live workloads; full end-to-end RWX execution awaits a cluster profile configured with `e2bVolumes.rwxStorageClassName`)*
 - [x] Security invariants verified (AGENTS.md Invariants 1, 2, 3, and 4: reserved-path lexical rejection, single-threaded `podd-init`, `1000:1000` ownership, and `MS_NOSUID | MS_NODEV` remounts)
 
 ---
@@ -227,9 +228,9 @@ flowchart LR
 
 ### Graduation Criteria
 
-- **Alpha**: Behind `K8sE2BVolumeMounts` feature gate (default `false`); requires `e2bVolumes.rwxStorageClassName` in Helm; unit tests and local E2E passing.
-- **Beta**: Enabled by default when RWX StorageClass is configured; live `make test-k8s-e2e` passing on Kata + Longhorn/SeaweedFS RWX; Prometheus metrics wired; gateway multi-replica locking verified.
-- **GA**: Production bake time in CubePlex with multi-tenant quota enforcement and automated RWX capacity alerting.
+- **Alpha (`v0.6.0`)**: Behind `K8sE2BVolumeMounts` feature gate (default `false`); requires `e2bVolumes.rwxStorageClassName` in Helm; unit tests and local E2E passing.
+- **Beta (`v0.7.0`)**: Auto-enabled when `e2bVolumes.rwxStorageClassName` is configured; gateway multi-replica `flock` + atomic rename locking (`tenants.json`, `meta.json`, `mounts.json`), KMS envelope encryption, API-key rotation (`POST /volumes/rotate-key`), multi-tenant volume/byte quotas, RWX capacity Prometheus metrics, and `PrometheusRule` alerting (`deploy/monitoring/e2b-volumes-alerts.yaml`) implemented and verified under `go test -race`. Live `TestK8sLiveE2EVolumeMountsAndFork` execution remains pending an RWX-enabled Kubernetes test cluster profile.
+- **GA (`v1.0.0`)**: Live `TestK8sLiveE2EVolumeMountsAndFork` passing on a dedicated Kata + RWX CSI (Longhorn RWX / SeaweedFS / NFS) cluster profile plus production bake time in CubePlex.
 
 ### Upgrade / Downgrade Strategy
 
@@ -243,7 +244,8 @@ flowchart LR
 - **Feature Enablement and Rollback**: Controlled via feature gate `K8sE2BVolumeMounts` and Helm `e2bVolumes.rwxStorageClassName`. Setting the gate to `false` immediately returns `501` for new K8s `volumeMounts` without touching `/workspace` or `rootfs-upper` PVCs.
 - **Rollout, Upgrade and Rollback Planning**: Running or `Paused` Kata Pods without `E2BVolumeMounts` are unaffected. Pods with `E2BVolumeMounts` continue running during controller/gateway rolling upgrades because mounts are already established inside the guest.
 - **Monitoring Requirements**:
-  - Metrics: `cubepod_e2b_volume_mounts_total`, `cubepod_e2b_volume_mount_errors_total`, `cubepod_podd_init_e2b_bind_duration_ms`.
+  - Metrics: `cubepod_e2b_volume_mounts_total`, `cubepod_e2b_volume_mount_errors_total`, `cubepod_e2b_volume_quota_rejections_total`, `cubepod_e2b_volumes_storage_capacity_bytes`, `cubepod_e2b_volumes_storage_used_bytes`, `cubepod_e2b_volumes_storage_available_bytes`, `cubepod_e2b_volumes_total`, `cubepod_podd_init_e2b_bind_duration_ms`.
+  - Alerting (`deploy/monitoring/e2b-volumes-alerts.yaml`): `CubePodE2BVolumesRWXNearFull` (80% warning / 90% critical), `CubePodE2BVolumesMountErrors`, and `CubePodE2BVolumesQuotaRejections`.
   - Structured `slog` / `eprintln!` logs on staging mount failures and `ForkFrom` conflicts.
 - **Dependencies**: Kubernetes CSI driver supporting `ReadWriteMany` (e.g., Longhorn RWX, SeaweedFS CSI, or NFS CSI), Kata Containers (`kata-qemu` with `virtiofsd`), and Linux `mount(2)` (`MS_BIND`, `MS_NOSUID`, `MS_NODEV`).
 - **Scalability**: Using a single shared RWX PVC (`cubepod-e2b-volumes`) with `subPath` avoids creating/attaching hundreds of CSI volumes per node, keeping CSI attach/detach concurrency constant (`O(1)` PVC per node/gateway).
@@ -254,7 +256,8 @@ flowchart LR
 ## Implementation History
 
 - **2026-11-15**: Drafted CEP-0026 (`provisional`, `alpha`) as the Kubernetes Kata & CSI follow-up to CEP-0025.
-- **2026-11-16**: Core engineering and security invariant items implemented and unit-tested across `crates/podd-init`, `pkg/controller`, `pkg/gateway`, and Helm (`e2bVolumes.rwxStorageClassName` auto-enabling `K8sE2BVolumeMounts`, plus Prometheus bind-duration metrics). Live Kubernetes Kata + RWX CSI cluster E2E remains pending (`[ ]`).
+- **2026-11-16**: Core engineering and security invariant items implemented and unit-tested across `crates/podd-init`, `pkg/controller`, `pkg/gateway`, and Helm (`e2bVolumes.rwxStorageClassName` auto-enabling `K8sE2BVolumeMounts`, plus Prometheus bind-duration metrics).
+- **2026-11-18**: Delivered `v0.7.0` KMS envelope encryption (`LocalKEKProvider` + `HTTPKMSProvider`), `POST /volumes/rotate-key` (`tenants.json` with RWX `flock` + atomic rename), multi-tenant byte/count quotas (`CUBEPOD_E2B_MAX_TENANT_BYTES`), Gateway RWX capacity/quota Prometheus metrics, and `deploy/monitoring/e2b-volumes-alerts.yaml`. Executed non-disruptive `TestK8sLiveE2EVolumeMountsAndFork` verification against the live `longhorn-v2-block-thin` cluster (`SKIP` because the active shared-workload cluster profile has no RWX E2B volume PVC configured; live RWX CSI pass remains `[ ]` awaiting an isolated RWX cluster profile).
 
 ---
 

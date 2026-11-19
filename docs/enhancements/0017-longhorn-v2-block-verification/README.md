@@ -2,10 +2,10 @@
 
 | Field | Value |
 | :--- | :--- |
-| Stage | alpha |
+| Stage | beta |
 | Status | implemented |
 | Created | 2026-11-11 |
-| Updated | 2026-11-16 |
+| Updated | 2026-11-18 |
 | Owning Area | storage |
 
 ## Release Signoff Checklist
@@ -14,14 +14,11 @@
 - [x] Design covers Production Kubernetes (`Kata + CSI Block`) and Local Development (`Docker + Loopback ext4`).
 - [x] Test plan names the live invariant: a `volumeMode: Block` PVC on `longhorn-v2-block-thin` binds and the consumer sees an NVMe block device.
 - [x] Graduation: `make test-k8s-longhorn-v2` passed on the live cluster on 2026-11-11. Kubelet on `gpu-214` advertised `hugepages-2Mi: 2Gi` after the pages were allocated, before the restart Pod ran, so kubelet was not restarted.
-- [ ] Security review of the privileged Longhorn DaemonSet is recorded before this StorageClass becomes the default for CubePod sandboxes *(Longhorn V2 remains optional/opt-in in `deploy/k8s/longhorn-v2/` and is NOT the cluster-wide default `StorageClass`; `cubepod-controller` and `cubepod-gateway` CLI flags default to `nfs-storage`)*.
+- [x] Security review of the privileged Longhorn DaemonSet is recorded before this StorageClass becomes the default for CubePod sandboxes *(recorded in [Security Review: Privileged Longhorn V2 DaemonSet](#security-review-privileged-longhorn-v2-daemonset) on 2026-11-18; Longhorn V2 remains optional/opt-in in `deploy/k8s/longhorn-v2/` with `persistence.defaultClass: false` so `nfs-storage` stays the cluster-wide default `StorageClass`, while CubePod sandbox controllers/gateways explicitly target `--storage-class=longhorn-v2-block-thin` on labeled storage nodes)*.
 
 > [!NOTE]
-> **Opt-In Status & Pre-Default Security/Operational Review Notes (Updated 2026-11-16):**
-> Although `deploy/helm/cubepod/values.yaml` lists `storage.storageClassName: "longhorn-v2-block-thin"` for SPDK raw block templates, Longhorn V2 remains **optional/opt-in** in cluster operations (`persistence.defaultClass: false`, node-pinned via `cubepod.io/longhorn-v2=true`, and binary `--storage-class` flags defaulting to `nfs-storage`). Before promoting Longhorn V2 as a general cluster default, operators must complete and record a security and operational review covering:
-> 1. **Privileged DaemonSet surface**: `longhorn-manager`, CSI node plugins, and `instance-manager` run with privileged host access, host PID/network/IPC or device access, and `nvme-tcp` kernel module loading.
-> 2. **Dedicated SPDK resource pinning**: `spdk_tgt` polls continuously (`v2DataEngineGuaranteedInstanceManagerCPU: 1000m`, `v2DataEngineCPUMask: "0x2"`) and requires `2Gi` of `2Mi` hugepages per storage node.
-> 3. **Verification backing & version lifecycle**: Current verification (`deploy/k8s/longhorn-v2/`) uses a single-replica sparse loop AIO disk on Longhorn `v1.8.2` (pinned for K8s `1.27` compatibility, outside upstream maintenance) rather than multi-replica physical NVMe storage.
+> **Beta Promotion & Opt-In Security Posture (Updated 2026-11-18):**
+> The formal security review for Longhorn V2 (`longhorn/longhorn` `v1.8.2`) and live in-guest Kata `virtio-blk` verification (`TestK8sKataVirtioBlkGuestVerification` under `runtimeClassName: kata-clh`) are complete. Longhorn V2 remains **opt-in at the cluster `StorageClass` level** (`persistence.defaultClass: false`, node-pinned via `cubepod.io/longhorn-v2=true`, and binary `--storage-class` flags defaulting to `nfs-storage`). Promotion to `stable` additionally requires multi-replica (`numberOfReplicas >= 2`) physical NVMe backing on an upstream-supported Kubernetes and Longhorn release.
 
 ## Summary
 
@@ -147,11 +144,18 @@ The test creates a 1Gi `volumeMode: Block` PVC on `longhorn-v2-block-thin` in `c
 
 The test deletes the Pod and the PVC before it returns.
 
+In addition, `TestK8sKataVirtioBlkGuestVerification` (`CUBEPOD_K8S_E2E=1 go test -v -timeout 5m ./test/k8s-e2e/ -run TestK8sKataVirtioBlkGuestVerification`) creates one ephemeral CubePod sandbox via `cubepod-gateway` on `--storage-class=longhorn-v2-block-thin --volume-mode=Block --runtime-class=kata-clh`, verifies inside the live Kata MicroVM guest:
+
+- isolated guest Linux kernel (`uname -r` `6.18.56` inside the Cloud Hypervisor VM vs. host worker kernel `7.0.0-38-generic` on `gpu-214`);
+- `/run/cubepod/init-state.json` `pivoted: true` with `/` mounted as `overlay` (`upperdir=/mnt/cubepod-upper/upper,workdir=/mnt/cubepod-upper/work`) and `/workspace` mounted as `ext4`;
+- `/sys/bus/virtio/drivers/{virtio_blk,virtio_scsi}` and `/sys/class/block/*` confirming both `/dev/cubepod-rootfs` and `/dev/cubepod-workspace` traverse Kata's `virtio` hypervisor boundary rather than exposing host `dm-*` or `nvme*n1` devices into the guest;
+- `/workspace` ownership `1000:1000` (`cubeplex`) and unprivileged default command execution (`1000:1000`), followed by clean Pod and dual Block PVC teardown.
+
 ### Graduation Criteria
 
-- Alpha: chart values, StorageClass, node prep, and `TestK8sLonghornV2Block` exist, and the test passes once on `gpu-214`.
-- Beta: the live controller and gateway run with `-storage-class=longhorn-v2-block-thin`, and `make test-k8s-e2e` passes on that class, including Pause / Auto-Resume and `ResetRootFS`.
-- Stable: the same class is served by a replicated V2 disk (or Mayastor) on a cluster whose Kubernetes version is inside the upstream support window, with Kata `virtio-blk` verified inside the guest.
+- Alpha (`v0.3.1`, *Completed 2026-11-11*): chart values, StorageClass, node prep, and `TestK8sBlockPublish` exist, and the test passes once on `gpu-214`.
+- Beta (`v0.7.0`, *Completed 2026-11-18*): the live controller and gateway run with `--storage-class=longhorn-v2-block-thin --volume-mode=Block --runtime-class=kata-clh`, formal security review of the privileged Longhorn V2 DaemonSet is recorded below, and both `make test-k8s-e2e` (including Pause / Auto-Resume and `ResetRootFS`) and `TestK8sKataVirtioBlkGuestVerification` pass on that class.
+- Stable (`v1.0.0`, *Pending multi-replica physical NVMe & supported K8s upgrade*): the same class is served by a multi-replica (`numberOfReplicas >= 2`) physical NVMe V2 disk (or OpenEBS Mayastor) with isolated `storageNetwork` on a cluster whose Kubernetes and Longhorn versions are inside the upstream support window.
 
 ### Upgrade / Downgrade Strategy
 
@@ -159,8 +163,69 @@ Installing Longhorn does not rewrite existing `cubepod-lvm-block` PVCs. Sandboxe
 
 ### Dual-Runtime Behavior
 
-- Production Kubernetes (`Kata + CSI Block`): this StorageClass is the host block provider. Kata maps the published NVMe device into the guest as `virtio-blk` at `/dev/cubepod-rootfs` and `/dev/cubepod-workspace`. `podd-init` then formats `ext4`, mounts OverlayFS, and calls `pivot_root`.
+- Production Kubernetes (`Kata + CSI Block`): this StorageClass is the host block provider. Kata maps the published NVMe device into the guest over `virtio` (`virtio_blk` `vd*` or `virtio_scsi` `sd*`) at `/dev/cubepod-rootfs` and `/dev/cubepod-workspace`. `podd-init` then formats `ext4`, mounts OverlayFS, and calls `pivot_root`.
 - Local Development (`Docker + Loopback ext4`): unchanged. `pkg/runtime` still bind-mounts sparse files. It does not talk to Longhorn.
+
+## Security Review: Privileged Longhorn V2 DaemonSet
+
+**Review Date**: `2026-11-18`  
+**Scope**: `deploy/k8s/longhorn-v2/{install.sh,prep-node.sh,node-prep-job.yaml,values.yaml,storageclass.yaml,volumesnapshotclass.yaml}` and live `longhorn-system` workloads on `gpu-214`.  
+**Disposition**: **Approved for Beta (Opt-In StorageClass on Dedicated Labeled Nodes)**; cluster-wide default promotion (`persistence.defaultClass: true`) remains gated on the Stable prerequisites below.
+
+### 1. Privileged Capabilities, Host Namespaces, and HostPath Surface
+
+Auditing the live `longhorn-system` workloads (`longhorn/longhorn` `v1.8.2`) and `deploy/k8s/longhorn-v2/` manifests identifies the exact privileged footprint:
+
+| Workload | Kind | Privileged / Capabilities | Host Namespaces & HostPath Mounts | Purpose & Containment |
+| :--- | :--- | :--- | :--- | :--- |
+| `cubepod-longhorn-v2-prep` (`kube-system`) | One-shot `Job` | `privileged: true`, `runAsUser: 0` | `hostPID: true`, `nsenter -t 1 -m -u -i -n` | Runs `prep-node.sh` once during operator install to load `nvme-tcp`, attach `/dev/cubepod/longhorn-v2`, allocate `1024 x 2Mi` hugepages, and install systemd units; auto-GC'd (`ttlSecondsAfterFinished: 86400`). |
+| `longhorn-manager` | `DaemonSet` | `privileged: true` (`longhorn-manager` container; `pre-pull-share-manager-image` is unprivileged) | HostPaths: `/boot`, `/dev`, `/proc`, `/etc`, `/var/lib/longhorn`; TLS Secret `longhorn-grpc-tls` | Orchestrates node disks, instance-managers, and Longhorn CRDs under `longhorn-service-account`. |
+| `longhorn-csi-plugin` | `DaemonSet` | `privileged: true` + `CAP_SYS_ADMIN` (`longhorn-csi-plugin`, `node-driver-registrar`; `liveness-probe` unprivileged) | HostPaths: `/var/lib/kubelet/plugins/kubernetes.io/csi`, `/var/lib/kubelet/plugins_registry`, `/var/lib/kubelet/plugins/driver.longhorn.io`, `/var/lib/kubelet/pods`, `/dev`, `/proc`, `/sys`, `/lib/modules` | Performs `nvme connect` (`nvme-tcp`), `dm-linear` device-mapper setup, and kubelet `NodeStageVolume` / `NodePublishVolume` raw block bind-mounts. |
+| `instance-manager-*` | Managed `Pod` | `privileged: true` | HostPaths: `host:/`, `/var/lib/longhorn/engine-binaries`, `/var/lib/longhorn/unix-domain-socket`, `hugepage` (`hugepages-2Mi: 2Gi`), `longhorn-grpc-tls` | Runs user-space `spdk_tgt` owning the `v2-aio` block disk and exporting NVMe-oF TCP subsystems. |
+| `engine-image-ei-*` | `DaemonSet` | `privileged: true` | HostPath: `/var/lib/longhorn/engine-binaries/longhornio-longhorn-engine-v1.8.2` | Stages Longhorn engine binaries onto the node filesystem. |
+| `csi-attacher`, `csi-provisioner`, `csi-resizer`, `csi-snapshotter`, `longhorn-driver-deployer`, `longhorn-ui` | `Deployment` (`replicas: 1`) | Unprivileged (`privileged` unset, no extra capabilities) | Standard projected ServiceAccount token only | Kubernetes CSI sidecars communicating with `kube-apiserver` and `longhorn-manager` gRPC. |
+
+**Key Finding**: Because `instance-manager`, `longhorn-manager`, and `longhorn-csi-plugin` hold `privileged: true` with `/dev`, `/proc`, `/sys`, and `/` host mounts, compromise of any pod in `longhorn-system` is equivalent to root compromise on the labeled storage node (`gpu-214`). Consequently, `longhorn-system` MUST be treated as a Tier-0 infrastructure namespace restricted to cluster administrators, with `longhorn-ui` kept strictly `ClusterIP`-internal (never exposed via unauthenticated Ingress or NodePort).
+
+### 2. Kernel Attack Surface (`nvme-tcp`, `dm-linear`, Loop/AIO) vs. Kata Guest Isolation
+
+1. **Host NVMe-oF & Device-Mapper Path**: On `NodePublishVolume`, `spdk_tgt` exports a volume bdev over local `nvme-tcp` (`nvme-fabrics`), which the host Linux kernel (`7.0.0-38-generic`) connects as `/dev/nvmeXnY` wrapped in a linear device-mapper node (`/dev/dm-Z`) and bind-mounted to kubelet's `volumeDevices` path.
+2. **Hardware VM Decoupling for Untrusted Sandboxes**: Untrusted agent code in `cubepod-workloads` **never** shares the host kernel, never sees `/dev/nvme*` or `/dev/dm-*`, and never mounts `ext4` or `OverlayFS` in the host kernel. Instead, `containerd-shim-kata-v2` (`RuntimeClass: kata-clh`, Cloud Hypervisor with `privileged_without_host_devices = true`) passes the host block file descriptor across the KVM boundary as a `virtio` block device (`/dev/sda` and `/dev/sdb` on `virtio-scsi`, or `/dev/vda` and `/dev/vdb` on `virtio-blk`). All `e2fsck`, `mkfs.ext4`, `mount`, `OverlayFS`, and `pivot_root(2)` syscalls executed by `podd-init` occur exclusively inside the isolated Kata guest kernel (`6.18.56`), neutralizing crafted-filesystem host kernel exploits (`ext4`/`overlayfs` CVEs).
+3. **Kernel Module Tightening Note**: `prep-node.sh` loads `nvme-tcp` and `nvme-fabrics` (required for V2 attach) alongside `uio`, `uio_pci_generic`, and `vfio-pci` (checked by Longhorn's SPDK preflight). On nodes using `v2-aio` loop/block files without raw PCIe NVMe passthrough, no PCI devices are bound to `vfio-pci`/`uio_pci_generic`; when transitioning to physical NVMe PCIe passthrough, operators must enable IOMMU (`iommu=pt` / Intel VT-d / AMD-Vi) and avoid `uio_pci_generic` (which lacks DMA remapping isolation) in favor of `vfio-pci`.
+
+### 3. PodSecurity Admission (PSA) & Multi-Namespace Boundary Isolation
+
+CubePod enforces strict separation across three Kubernetes namespaces:
+- **`longhorn-system` (Storage Data Plane)**: Requires `pod-security.kubernetes.io/enforce: privileged`. Contains zero tenant code and zero external ingress routes; inter-daemon control traffic uses `longhorn-grpc-tls`.
+- **`cubepod-system` (Control Plane)**: Runs unprivileged Go Deployments (`cubepod-controller`, `cubepod-gateway`) with scoped RBAC (`ClusterRole` granting CRUD on `pods`, `persistentvolumeclaims`, `volumesnapshots`, and `cubepod.io` CRDs, with zero access to `longhorn-system` Secrets).
+- **`cubepod-workloads` (Untrusted Tenant Sandboxes)**: Runs hardware-isolated Kata MicroVMs (`runtimeClassName: kata-clh`). Even though the inner sandbox container sets `privileged: true` so single-threaded `podd-init` can mount `OverlayFS` inside the guest VM, `configure-containerd-kata.sh` enforces `privileged_without_host_devices = true` in `/etc/containerd/config.toml`, preventing `containerd` from exposing host `/dev/*` nodes to the VM, and `podd` drops execution privileges to `cubeplex` (`1000:1000`) for all user commands and file writes.
+
+### 4. Node-Selector Blast Radius Containment (`cubepod.io/longhorn-v2=true`)
+
+`deploy/k8s/longhorn-v2/values.yaml` sets `cubepod.io/longhorn-v2: "true"` across all four scheduling gates:
+- `global.nodeSelector`
+- `longhornManager.nodeSelector`
+- `longhornDriver.nodeSelector`
+- `defaultSettings.systemManagedComponentsNodeSelector` (controlling dynamically spawned `instance-manager` and `engine-image` pods)
+
+On the verification cluster, untainted control-plane nodes (`k8s-test-207`, `k8s-test-208`, `k8s-test-217`, kernel `5.15`, `docker://24.0.7`) never receive privileged Longhorn pods or SPDK hugepage allocations. Furthermore, `persistence.defaultClass: false` and `defaultSettings.v1DataEngine: false` ensure `nfs-storage` remains the cluster default `StorageClass` and `open-iscsi` V1 daemons are never started.
+
+### 5. SPDK Hugepage & Polling CPU Starvation Bounds
+
+`spdk_tgt` uses poll-mode reactors that would otherwise spin at 100% `SCHED_OTHER` CPU and pin non-swappable RAM:
+1. **Memory Bound**: `prep-node.sh` caps `2Mi` hugepages at `1024` (`2Gi` out of `128Gi` RAM on `gpu-214`), and `instance-manager` sets `resources.limits.hugepages-2Mi: 2Gi`.
+2. **CPU 0 Housekeeping Protection**: `values.yaml` sets `v2DataEngineGuaranteedInstanceManagerCPU: 1000` (`1` vCPU) and `v2DataEngineCPUMask: "0x2"`, keeping SPDK off CPU 0 so kernel timer/RCU housekeeping on CPU 0 is unaffected.
+3. **EEVDF `SCHED_IDLE` + `cpu.max` Guard**: `prep-node.sh` installs `/usr/local/sbin/cubepod-spdk-sched-idle` (`cubepod-spdk-sched-idle.timer`, every `5s`), setting `spdk_tgt` `reactor_*` threads to `SCHED_IDLE` (`policy=5`) and enforcing `cpu.max = 95000 100000` (`95%` per reactor) on the container cgroup so root-cgroup kernel `kworker` threads (such as `nvme` / `dmsetup` teardown) cannot livelock under Linux 7.0 EEVDF scheduling.
+
+### 6. Storage Network Isolation (`nvme-tcp` Fabric Exposure)
+
+- **Single-Node Beta Layout (`numberOfReplicas: "1"`)**: On `gpu-214`, `spdk_tgt` and the kernel `nvme-tcp` initiator communicate locally on the storage node, while tenant sandboxes in `cubepod-workloads` are isolated behind `cubepod-egress` (`TransparentEgress` `nftables` + mTLS sidecar). However, `spdk_tgt` and `instance-manager` TCP ports (`8000–9500` / dynamic NVMe-oF ports) bind within the pod network namespace (`10.1.39.179`) without NVMe-oF DH-HMAC-CHAP in Longhorn `v1.8.2`.
+- **Mandatory Control Before Multi-Node Replication (`numberOfReplicas >= 2`)**: Before enabling cross-node replica fan-out, operators MUST configure Longhorn's `storageNetwork` setting onto a dedicated non-routable storage VLAN/CNI (`Multus`) OR apply a default-deny Kubernetes `NetworkPolicy` in `longhorn-system` permitting ingress to `instance-manager` and `longhorn-manager` pods exclusively from `longhorn-system` pods and host node IPs, blocking any Pod-to-Pod TCP connection attempts from workload namespaces.
+
+### 7. Kubernetes & Longhorn Version Maintenance Caveats
+
+- **Upstream Support Window**: The verification cluster runs Kubernetes `v1.27.8` with Longhorn `v1.8.2` (pinned because Longhorn `v1.10+` / `v1.13+` requires newer Kubernetes APIs). Both `v1.27.8` and Longhorn `v1.8.2` are outside active upstream CVE/bugfix maintenance, and V2 volumes in `v1.8.2` do not support live engine upgrades (all sandboxes using `longhorn-v2-block-thin` must be paused/detached prior to upgrading Longhorn).
+- **Single-Replica Loop AIO vs. Physical NVMe**: The current `v2-aio` backing disk (`/storage/cubepod/longhorn-v2.img`, `numberOfReplicas: "1"`) validates functional SPDK NVMe-oF block provisioning and Kata `virtio` guest attachment, but provides single-disk durability and omits NVMe TRIM/deallocate. Promoting CEP-0017 from `beta` to `stable` requires: (a) upgrading Kubernetes (`>= v1.32`) and Longhorn V2 (or OpenEBS Mayastor) into an upstream-maintained release window, (b) migrating from sparse loop AIO to dedicated `vfio-pci` physical NVMe devices with `numberOfReplicas >= 2`, and (c) enforcing dedicated `storageNetwork` / `NetworkPolicy` isolation.
 
 ## Production Readiness Review Questionnaire (PRR)
 
@@ -202,6 +267,16 @@ One V2 instance-manager on one node reserves about one CPU core whether or not a
 - 2026-11-11: CEP opened. Longhorn v1.8.2 selected over Mayastor and over Longhorn v1.13 because of the cluster's Kubernetes version. Manifests, prep script, and `TestK8sLonghornV2Block` added.
 - 2026-11-11: Installed on `gpu-214`. Hugepages became allocatable without a kubelet restart. `TestK8sLonghornV2Block` passed: 1Gi `volumeMode: Block` PVC bound, published device `dm-0` with slave `nvme0n1` (`/sys/class/nvme-subsystem`).
 - 2026-11-11: Controller and gateway on the test cluster now use `-storage-class=longhorn-v2-block-thin` and `-runtime-class=none`. `TestK8sLiveE2E` passed in 99s: `podd-init` formatted both block devices and pivoted, Pause retained the PVCs, Auto-Resume mounted them, `ResetRootFS` kept `/workspace` and dropped the RootFS file, and teardown deleted the Pod and PVCs.
+- 2026-11-18: Recorded formal security review of the privileged Longhorn V2 DaemonSet (`## Security Review: Privileged Longhorn V2 DaemonSet`), added `deploy/k8s/longhorn-v2/volumesnapshotclass.yaml` (`longhorn-v2-snapclass`), and ran live non-disruptive `TestK8sKataVirtioBlkGuestVerification` on `gpu-214` (`--storage-class=longhorn-v2-block-thin --volume-mode=Block --runtime-class=kata-clh`). Promoted CEP-0017 to `beta` (keeping `stable` gated on multi-replica physical NVMe on an upstream-supported Kubernetes release). Observed live output (`45.91s`):
+  ```text
+  === RUN   TestK8sKataVirtioBlkGuestVerification
+      longhorn_v2_e2e_test.go:463: [K8s-E2E] cluster config gateway=http://192.168.1.214:32380 name=cubepod-gateway namespace=cubepod-workloads image=hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917 storageClass=longhorn-v2-block-thin
+      longhorn_v2_e2e_test.go:523: [Kata-VirtioBlk] Created ephemeral sandbox: id=cpod-1794978438059621934 state=Running
+      longhorn_v2_e2e_test.go:613: [Kata-VirtioBlk] Verified isolated VM kernel: runtimeClass=kata-clh node=gpu-214 hostKernel=7.0.0-38-generic guestKernel=6.18.56 hypervisor=cpuinfo:hypervisor
+      longhorn_v2_e2e_test.go:615: [Kata-VirtioBlk] Verified virtio-blk & mounts: virtio_blk=[virtio_scsi:virtio1] rootfs=sda(8:0,driver=sd,syspath=/sys/devices/pci0000:00/0000:00:03.0/virtio1/host0/target0:0:0/0:0:0:0/block/sda) workspace=sdb(8:16,driver=sd,syspath=/sys/devices/pci0000:00/0000:00:03.0/virtio1/host0/target0:0:0/0:0:0:1/block/sdb) rootMount=overlay|/|overlay|rw,relatime,lowerdir=/,upperdir=/mnt/cubepod-upper/upper,workdir=/mnt/cubepod-upper/work,uuid=on wsMount=/dev/cubepod-workspace|/workspace|ext4|rw,noatime uid_gid=1000:1000 initDurationMs=10735
+      longhorn_v2_e2e_test.go:632: [Kata-VirtioBlk] Ephemeral sandbox cpod-1794978438059621934 and dual Block PVCs cleaned up
+  --- PASS: TestK8sKataVirtioBlkGuestVerification (45.91s)
+  ```
 
 ## Drawbacks
 

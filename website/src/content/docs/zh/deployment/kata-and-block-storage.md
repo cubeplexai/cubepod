@@ -87,6 +87,15 @@ bash deploy/k8s/longhorn-v2/install.sh
 | `allowVolumeExpansion` | `true` |
 | `volumeBindingMode` | `Immediate` |
 
+3. **面向 CoW `fork` 的 CSI `VolumeSnapshotClass`（`volumesnapshotclass.yaml`）** *(v0.7.0 新增。)*：
+   - 当集群已安装 Kubernetes `VolumeSnapshot` CRD（`snapshot.storage.k8s.io/v1`）及外部 `snapshot-controller` 控制器时，`install.sh` 会自动应用 `deploy/k8s/longhorn-v2/volumesnapshotclass.yaml`（`longhorn-v2-snapclass`、`driver: driver.longhorn.io`、`deletionPolicy: Delete`、`parameters.type: snap`，无需外部备份存储即可创建集群内 SPDK 快照）。
+   - 在 `cubepod-controller` 上配置 `--fork-mode=snapshot --volume-snapshot-class=longhorn-v2-snapclass` 即可启用快照模式 CoW 克隆（默认模式为 `--fork-mode=pvc-clone`）。
+
+4. **特权 DaemonSet 安全边界说明** *(v0.7.0 新增。)*：
+   - **命名空间与节点爆炸半径收敛**：Longhorn V2 组件（`longhorn-manager`、`longhorn-csi-plugin`、`instance-manager`、`engine-image-*`）需要 `privileged: true` 权限（`longhorn-system` 需配置 `pod-security.kubernetes.io/enforce: privileged`）。`values.yaml` 将所有 Longhorn 组件严格绑定至 `cubepod.io/longhorn-v2=true` 节点并设置 `persistence.defaultClass: false`，防止未加污点的控制面节点或普通计算节点运行特权存储容器。
+   - **客户机内核硬件隔离**：`cubepod-workloads` 中的不受信任沙箱进程不会直接接触宿主机的 `spdk_tgt` 或 `nvme-tcp` 套接字；`containerd-shim-kata-v2` 将宿主机 NVMe 块设备跨硬件虚拟化边界映射为 `virtio-blk` 设备（`/dev/vda`、`/dev/vdb`），由独立的 Kata 客户机内核完成 `ext4` 与 `OverlayFS` 挂载。
+   - **多副本存储网络隔离**：在跨多台物理 NVMe 节点启用 `numberOfReplicas >= 2` 时，应将 Longhorn `storageNetwork` 隔离至专用存储 VLAN/CNI 网络，或通过 Kubernetes `NetworkPolicy` / 宿主机防火墙将 `nvme-tcp` 与 `instance-manager` 端口严格限制在 `cubepod.io/longhorn-v2=true` 节点之间。完整安全评审记录请参阅 [CEP-0017](/ceps/0017-longhorn-v2-block-verification/#security-review-privileged-longhorn-v2-daemonset)。
+
 ### 方案 B：OpenEBS LVM-LocalPV（裸 NVMe 卷组）
 
 如果您的节点拥有独立裸 NVMe 磁盘且倾向于简洁的本地 LVM 管理方式，可使用 OpenEBS LVM-LocalPV：
@@ -118,6 +127,12 @@ make test-k8s-block   # 等价别名：make test-k8s-longhorn-v2
 
 # 完整 Kubernetes 集群端到端测试套件
 make test-k8s-e2e
+
+# 非破坏性 Kata 客户机内 virtio-blk + OverlayFS + 1000:1000 权限校验（v0.7.0 新增）
+CUBEPOD_K8S_E2E=1 go test -v -timeout 5m ./test/k8s-e2e/ -run TestK8sKataVirtioBlkGuestVerification
+
+# 多小时 / 多天并发 E2B 协议与交互式 PTY 稳定性浸泡测试（v0.7.0 新增）
+CUBEPOD_SOAK_DURATION=24h CUBEPOD_SOAK_CONCURRENCY=8 make test-soak
 ```
 
 ### 基准测试与目标 SLO

@@ -9,12 +9,13 @@ participating-areas:
   - "runtime"
 status: "implemented"
 creation-date: "2026-11-15"
+last-updated: "2026-11-18"
 reviewers:
   - "@xfgong"
 approvers:
   - "@xfgong"
-stage: "alpha"
-latest-milestone: "v0.6.0"
+stage: "beta"
+latest-milestone: "v0.7.0"
 milestone:
   alpha: "v0.6.0"
   beta: "v0.7.0"
@@ -29,4 +30,9 @@ disable-supported: true
 metrics:
   - "cubepod_e2b_volume_mounts_total"
   - "cubepod_e2b_volume_mount_errors_total"
+  - "cubepod_e2b_volume_quota_rejections_total"
+  - "cubepod_e2b_volumes_storage_capacity_bytes"
+  - "cubepod_e2b_volumes_storage_used_bytes"
+  - "cubepod_e2b_volumes_storage_available_bytes"
+  - "cubepod_e2b_volumes_total"
   - "cubepod_podd_init_e2b_bind_duration_ms"

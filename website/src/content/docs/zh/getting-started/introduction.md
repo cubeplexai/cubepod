@@ -23,7 +23,7 @@ CubePod 彻底消除了这一取舍：直接在 **Kata Containers MicroVM** 中�
 | 能力维度 | 普通容器 | 瞬态 MicroVM | CubePod |
 | :--- | :--- | :--- | :--- |
 | **计算隔离层** | 共享宿主机 Linux 内核 | 硬件 VM（`Firecracker` / `QEMU`） | 硬件 VM（`Kata QEMU` / `Cloud Hypervisor`）+ 本地 Docker Loopback |
-| **OS RootFS 持久化** | 临时可写层 | 临时 Scratch 层 | **持久化 `OverlayFS` `upperdir`**（`<box>-rootfs-pvc`） |
+| **OS RootFS 持久化** | 临时可写层 | 临时 Scratch 层（或随 VM 快照保存） | **持久化 `OverlayFS` `upperdir`**（`<box>-rootfs-pvc`） |
 | **Workspace 持久化** | 可选 PVC 挂载 | 可选或随停止丢失 | **解耦的独立持久卷**（`<box>-workspace-pvc`） |
 | **RootFS 重置 / 系统升级** | 重建整套容器 | 重新打包镜像 | 单调递增 `rootfsGeneration` 替换——**`/workspace` 保持完好** |
 | **冷启动延迟** | ~1–3 秒 | ~150 毫秒 | **`< 50 ms`**（基于预挂载 `PodWarmPool` 原子 CAS 认领） |

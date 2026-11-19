@@ -111,7 +111,9 @@ As a security engineer, if untrusted code connects via TLS with `SNI=api.github.
 
 - **Loop Prevention in Shared Network Namespace**: In Kubernetes (including Kata MicroVMs, where all containers inside a Pod share the Guest VM network namespace), `nftables` `OUTPUT` rules match `meta skuid != 65532` (`cubepod-egress` UID). The `sandbox` container runs infrastructure hooks as `0` and workloads as `1000` (never `65532`), guaranteeing zero routing loops without requiring custom `fwmark` kernel modules.
 - **MITM CA Private Key Isolation**: `mitm-ca.key` is mounted exclusively in the `egress` container (`/etc/cubepod/certs/mitm-ca.key`, `0400`). Only the public certificate `mitm-ca.crt` is visible inside the `sandbox` container. Even root (`uid=0`) inside the `sandbox` container cannot read another container's mount namespace.
-- **ALPN Negotiation**: For Selective MITM, `cubepod-egress` advertises `NextProtos: []string{"http/1.1"}` on the client-facing TLS listener so `curl`, Go `net/http`, Python `httpx`, and Node `undici` negotiate HTTP/1.1 cleanly without HTTP/2 frame multiplexing complexity in Alpha.
+- **ALPN Negotiation**: For Selective MITM, `cubepod-egress` advertises `NextProtos: []string{"h2", "http/1.1"}` on the client-facing TLS listener (Stable, `v0.7.0`; Alpha/Beta advertised only `http/1.1`). The negotiated protocol is recorded in `cubepod_egress_mitm_alpn_total{proto="h2|http/1.1"}`.
+  - **`h2`**: the TLS connection is served with `golang.org/x/net/http2` (`http2.Server.ServeConn`). Every stream runs the same checks as HTTP/1.1 through one shared helper (`prepareMITMRequest`): `:authority` must equal the TLS SNI and any absolute-form scheme/host must match (otherwise `421` and a `cubepod_egress_blocked_hosts_total` increment), then `HeaderTransforms` are applied and `cpodref_`/`cbxref_` placeholders are exchanged over per-sandbox mTLS. An exchange failure returns `403` and the request is never forwarded, so unswapped placeholders and real secrets never cross the wrong boundary. Hop-by-hop headers are stripped, upstream failures return `502`, and response bodies are flushed after every read so SSE/streaming responses are not buffered. Many streams multiplex over a single client TLS connection.
+  - **`http/1.1` (or no ALPN)**: the original keep-alive loop is retained. The upstream leg uses `ForceAttemptHTTP2` and may itself negotiate `h2` with the origin; responses to HTTP/1.1 clients are always framed as HTTP/1.1.
 
 ### Risks and Mitigations
 
@@ -194,7 +196,7 @@ flowchart TD
 
 - **Alpha (`v0.5.0`)**: Selective HTTPS MITM, transparent TLS/HTTP listeners, DNS filter, `egress-init.sh` `nftables` wrapper, and `cubepod-controller` Secret issuance merged and covered by unit + E2E tests behind `TransparentEgress`.
 - **Beta (`v0.6.0`)**: Enabled by default on `PodTemplate` with `Egress.Enabled=true`; Prometheus metrics (`cubepod_egress_*`) exported; verified against live CubePlex `:8443` exchange endpoint.
-- **Stable (`v1.0.0`)**: HTTP/2 ALPN support on MITM connections and production bake in CubePlex multi-tenant clusters.
+- **Stable (`v0.7.0`)**: HTTP/2 (`h2`) ALPN support on selective MITM connections (CONNECT and transparent TLS) with `http/1.1` fallback, identical SNI/`:authority`, `HeaderTransforms`, and placeholder-exchange invariants, covered by `pkg/egress/mitm_alpn_test.go` (including 20 multiplexed streams under `-race`, domain-fronting `421`, unauthorized placeholder `403`, and streaming flush), plus the `cubepod_egress_mitm_alpn_total` metric.
 
 ### Upgrade / Downgrade Strategy
 
@@ -228,6 +230,8 @@ flowchart TD
 ## Implementation History
 
 - `2026-11-13`: Initial CEP drafted and marked `implementable` for `v0.5.0`.
+- `2026-11-16`: Beta (`v0.6.0`) shipped: default-on egress, Prometheus metrics, HA secret exchange.
+- `2026-11-18`: Stable (`v0.7.0`): HTTP/2 (`h2`) ALPN support for selective MITM (#101).
 
 ---
 

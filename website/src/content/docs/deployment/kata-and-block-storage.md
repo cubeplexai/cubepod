@@ -87,6 +87,15 @@ What `prep-node.sh` and `install.sh` configure:
 | `allowVolumeExpansion` | `true` |
 | `volumeBindingMode` | `Immediate` |
 
+3. **CSI `VolumeSnapshotClass` for CoW `fork` (`volumesnapshotclass.yaml`)** *(Added in v0.7.0.)*:
+   - When the Kubernetes `VolumeSnapshot` CRDs (`snapshot.storage.k8s.io/v1`) and external `snapshot-controller` are installed on the cluster, `install.sh` applies `deploy/k8s/longhorn-v2/volumesnapshotclass.yaml` (`longhorn-v2-snapclass`, `driver: driver.longhorn.io`, `deletionPolicy: Delete`, `parameters.type: snap` for in-cluster SPDK snapshots without requiring an external backup target).
+   - Enable snapshot-mode CoW forking on `cubepod-controller` with `--fork-mode=snapshot --volume-snapshot-class=longhorn-v2-snapclass` (otherwise CubePod defaults to `--fork-mode=pvc-clone`).
+
+4. **Privileged DaemonSet Security Posture** *(Added in v0.7.0.)*:
+   - **Namespace & Node Blast Radius**: Longhorn V2 components (`longhorn-manager`, `longhorn-csi-plugin`, `instance-manager`, `engine-image-*`) require `privileged: true` (`pod-security.kubernetes.io/enforce: privileged` on `longhorn-system`). `values.yaml` pins every Longhorn workload to `cubepod.io/longhorn-v2=true` and sets `persistence.defaultClass: false` so untainted control-plane or general compute nodes never run privileged storage pods.
+   - **Guest Kernel Isolation**: Untrusted sandbox workloads in `cubepod-workloads` never access `spdk_tgt` or `nvme-tcp` sockets directly; `containerd-shim-kata-v2` passes the host NVMe block node across the VM boundary as `virtio-blk` (`/dev/vda`, `/dev/vdb`) mounted inside an isolated Kata guest kernel.
+   - **Multi-Node Storage Network**: When scaling `numberOfReplicas >= 2` across multiple physical NVMe hosts, isolate Longhorn `storageNetwork` onto a dedicated storage VLAN/CNI or apply Kubernetes `NetworkPolicy` / host firewall rules restricting `nvme-tcp` and `instance-manager` ports exclusively to `cubepod.io/longhorn-v2=true` nodes. See [CEP-0017](/ceps/0017-longhorn-v2-block-verification/#security-review-privileged-longhorn-v2-daemonset) for the full security review.
+
 ### Option B: OpenEBS LVM-LocalPV (Bare NVMe Volume Group)
 
 If your nodes have a dedicated local NVMe device and you prefer local LVM thin/thick provisioning without SPDK:
@@ -118,6 +127,12 @@ make test-k8s-block   # alias: make test-k8s-longhorn-v2
 
 # Full live Kubernetes E2E suite
 make test-k8s-e2e
+
+# Non-disruptive in-guest Kata virtio-blk + OverlayFS + 1000:1000 verification (Added in v0.7.0)
+CUBEPOD_K8S_E2E=1 go test -v -timeout 5m ./test/k8s-e2e/ -run TestK8sKataVirtioBlkGuestVerification
+
+# Multi-hour / multi-day concurrent E2B + interactive PTY soak suite (Added in v0.7.0)
+CUBEPOD_SOAK_DURATION=24h CUBEPOD_SOAK_CONCURRENCY=8 make test-soak
 ```
 
 ### Benchmark Suite & Target SLOs

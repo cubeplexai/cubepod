@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -492,4 +494,184 @@ func (s *Server) handleBatchSandboxMetrics(w http.ResponseWriter, r *http.Reques
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"sandboxes": sandboxesMap,
 	})
+}
+
+const maxMetricsSamplerWorkers = 8
+
+func (st *sandboxMetricsStore) latestAll() map[string]SandboxMetric {
+	st.mu.RLock()
+	defer st.mu.RUnlock()
+	out := make(map[string]SandboxMetric, len(st.rings))
+	for id, ring := range st.rings {
+		if m, ok := ring.latest(); ok {
+			out[id] = m
+		}
+	}
+	return out
+}
+
+func (st *sandboxMetricsStore) prune(keep func(id string) bool) {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	for id := range st.rings {
+		if !keep(id) {
+			delete(st.rings, id)
+		}
+	}
+}
+
+func (s *Server) writeSandboxMetricsSamplerProm(buf *bytes.Buffer) {
+	m := s.Metrics()
+	fmt.Fprintf(buf, "# HELP cubepod_sandbox_metrics_samples_total Background sandbox metrics sampler results\n")
+	fmt.Fprintf(buf, "# TYPE cubepod_sandbox_metrics_samples_total counter\n")
+	fmt.Fprintf(buf, "cubepod_sandbox_metrics_samples_total{result=\"ok\"} %d\n", m.SandboxMetricsSamplesOK.Load())
+	fmt.Fprintf(buf, "cubepod_sandbox_metrics_samples_total{result=\"error\"} %d\n", m.SandboxMetricsSamplesError.Load())
+
+	// Only emit gauges for currently Running sandboxes so frozen samples of
+	// paused sandboxes cannot keep alerts firing.
+	latest := m.sandboxMetricsStore().latestAll()
+	ids := make([]string, 0, len(latest))
+	s.mu.RLock()
+	for id := range latest {
+		if rec, ok := s.sandboxes[id]; ok && rec != nil && strings.EqualFold(rec.State, "Running") {
+			ids = append(ids, id)
+		}
+	}
+	s.mu.RUnlock()
+	sort.Strings(ids)
+	gauges := []struct {
+		name, help string
+		val        func(SandboxMetric) float64
+	}{
+		{"cubepod_sandbox_cpu_count", "Latest sampled CPU count per sandbox", func(x SandboxMetric) float64 { return float64(x.CPUCount) }},
+		{"cubepod_sandbox_cpu_used_pct", "Latest sampled CPU utilization percent per sandbox", func(x SandboxMetric) float64 { return x.CPUUsedPct }},
+		{"cubepod_sandbox_memory_used_bytes", "Latest sampled memory used bytes per sandbox", func(x SandboxMetric) float64 { return float64(x.MemUsed) }},
+		{"cubepod_sandbox_memory_total_bytes", "Latest sampled memory limit bytes per sandbox", func(x SandboxMetric) float64 { return float64(x.MemTotal) }},
+		{"cubepod_sandbox_disk_used_bytes", "Latest sampled workspace disk used bytes per sandbox", func(x SandboxMetric) float64 { return float64(x.DiskUsed) }},
+		{"cubepod_sandbox_disk_total_bytes", "Latest sampled workspace disk total bytes per sandbox", func(x SandboxMetric) float64 { return float64(x.DiskTotal) }},
+	}
+	for _, g := range gauges {
+		fmt.Fprintf(buf, "# HELP %s %s\n# TYPE %s gauge\n", g.name, g.help, g.name)
+		for _, id := range ids {
+			fmt.Fprintf(buf, "%s{sandbox_id=%q} %g\n", g.name, id, g.val(latest[id]))
+		}
+	}
+}
+
+// StartMetricsSampler launches a background loop that samples every running
+// sandbox each interval and records into the per-sandbox ring buffers.
+// interval <= 0 disables it. Calling it again replaces the previous sampler.
+func (s *Server) StartMetricsSampler(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.StopMetricsSampler()
+	s.samplerMu.Lock()
+	defer s.samplerMu.Unlock()
+	sctx, cancel := context.WithCancel(ctx)
+	s.samplerCancel = cancel
+	s.samplerWG.Add(1)
+	go func() {
+		defer s.samplerWG.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-sctx.Done():
+				return
+			case <-ticker.C:
+				s.sampleMetricsOnce(sctx)
+			}
+		}
+	}()
+}
+
+// StopMetricsSampler stops the background sampler and waits for it to exit.
+func (s *Server) StopMetricsSampler() {
+	s.samplerMu.Lock()
+	defer s.samplerMu.Unlock()
+	if s.samplerCancel != nil {
+		s.samplerCancel()
+		s.samplerCancel = nil
+	}
+	s.samplerWG.Wait()
+}
+
+// sampleMetricsOnce polls all running sandboxes with bounded concurrency.
+// s.mu is never held across network I/O.
+func (s *Server) sampleMetricsOnce(ctx context.Context) {
+	type target struct {
+		id  string
+		rec *SandboxRecord
+	}
+	s.mu.RLock()
+	targets := make([]target, 0, len(s.sandboxes))
+	for id, rec := range s.sandboxes {
+		if rec != nil && strings.EqualFold(rec.State, "Running") {
+			targets = append(targets, target{id: id, rec: rec})
+		}
+	}
+	s.mu.RUnlock()
+
+	m := s.Metrics()
+	store := m.sandboxMetricsStore()
+	// Drop rings of sandboxes that no longer exist.
+	store.prune(func(id string) bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		_, ok := s.sandboxes[id]
+		return ok
+	})
+	if len(targets) == 0 {
+		return
+	}
+	sem := make(chan struct{}, maxMetricsSamplerWorkers)
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(t target) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					m.SandboxMetricsSamplesError.Add(1)
+				}
+			}()
+			s.mu.RLock()
+			poddURL := t.rec.PoddURL
+			s.mu.RUnlock()
+			var sample SandboxMetric
+			if poddURL != "" {
+				var err error
+				sample, err = s.fetchPoddMetric(ctx, poddURL)
+				if err != nil {
+					if ctx.Err() == nil {
+						m.SandboxMetricsSamplesError.Add(1)
+					}
+					return
+				}
+			} else {
+				sample = s.sampleLocalSandboxMetric(t.rec)
+			}
+			// The sandbox may have been deleted/paused while polling; do not
+			// resurrect its ring (and gauge series) in that case.
+			s.mu.RLock()
+			cur, exists := s.sandboxes[t.id]
+			stillRunning := exists && cur == t.rec && strings.EqualFold(cur.State, "Running")
+			s.mu.RUnlock()
+			if !stillRunning {
+				return
+			}
+			store.record(t.id, sample)
+			m.SandboxMetricsSamplesOK.Add(1)
+		}(t)
+	}
+	wg.Wait()
 }

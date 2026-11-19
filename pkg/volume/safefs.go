@@ -356,3 +356,67 @@ func removeBeneath(rootFD int, rel string) (isDir bool, err error) {
 	}
 	return false, nil
 }
+
+// sumDataRootBytes computes the total size of regular files inside dataDir
+// using O_NOFOLLOW dirfd traversal (ignoring symlinks and deduplicating hardlinks).
+func sumDataRootBytes(dataDir string) (int64, error) {
+	root, err := openDataRoot(dataDir)
+	if err != nil {
+		if errors.Is(err, ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	defer root.Close()
+	seen := map[[2]uint64]struct{}{}
+	return sumDirBytesFD(root, seen)
+}
+
+func sumDirBytesFD(dir *os.File, seen map[[2]uint64]struct{}) (int64, error) {
+	names, err := readDirNames(dir)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, name := range names {
+		if name == "." || name == ".." {
+			continue
+		}
+		var st unix.Stat_t
+		if err := unix.Fstatat(int(dir.Fd()), name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			return 0, mapUnixErr(err)
+		}
+		switch st.Mode & unix.S_IFMT {
+		case unix.S_IFREG:
+			if st.Nlink > 1 {
+				inoKey := [2]uint64{uint64(st.Dev), st.Ino}
+				if _, dup := seen[inoKey]; dup {
+					continue
+				}
+				seen[inoKey] = struct{}{}
+			}
+			if st.Size > 0 {
+				total += st.Size
+			}
+		case unix.S_IFDIR:
+			subFD, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			if err != nil {
+				if errors.Is(err, unix.ENOENT) {
+					continue
+				}
+				return 0, mapUnixErr(err)
+			}
+			subDir := os.NewFile(uintptr(subFD), name)
+			subBytes, subErr := sumDirBytesFD(subDir, seen)
+			_ = subDir.Close()
+			if subErr != nil {
+				return 0, subErr
+			}
+			total += subBytes
+		}
+	}
+	return total, nil
+}

@@ -180,6 +180,28 @@ templateBuild:
 
 SDK 与 CLI 构建工作流请参阅[模板目录与构建](/zh/sdks/templates/)。
 
+## 沙箱指标采样与监控
+
+*v0.7.0 新增。*
+
+`cubepod-gateway` 会在后台定期轮询每个 `Running` 沙箱的 `podd /metrics`，持续填充 `GET /sandboxes/{sandboxID}/metrics` 背后的每沙箱环形缓冲区，即使无人查询也能保留历史。已暂停或已终止的沙箱会被跳过。
+
+```yaml
+gateway:
+  metricsSampleInterval: "10s"   # Go duration；"0" 表示关闭（参数 --metrics-sample-interval，环境变量 CUBEPOD_METRICS_SAMPLE_INTERVAL）
+```
+
+网关 `/metrics` 会暴露 `cubepod_sandbox_metrics_samples_total{result="ok|error"}` 以及带 `sandbox_id` 标签的每沙箱指标（`cubepod_sandbox_cpu_used_pct`、`cubepod_sandbox_memory_used_bytes`、`cubepod_sandbox_memory_total_bytes`、`cubepod_sandbox_disk_used_bytes`、`cubepod_sandbox_disk_total_bytes`、`cubepod_sandbox_cpu_count`）。
+
+`deploy/monitoring/` 提供开箱即用的 Prometheus Operator 规则与 Grafana 仪表盘：
+
+```bash
+kubectl apply -f deploy/monitoring/sandbox-metrics-rules.yaml
+# 在 Grafana 中导入 deploy/monitoring/sandbox-metrics-dashboard.json
+```
+
+规则会记录 `cubepod:sandbox_cpu_used_pct:avg5m`、`cubepod:sandbox_memory_utilization_ratio`、`cubepod:sandbox_disk_utilization_ratio`，并提供 `CubePodSandboxHighMemoryPressure`、`CubePodSandboxDiskNearFull`、`CubePodMetricsSamplerFailing` 告警。
+
 ## 验证部署状态
 
 确认控制面 Pod、CRD 及健康探针均处于正常状态：

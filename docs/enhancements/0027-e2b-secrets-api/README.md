@@ -303,7 +303,7 @@ sequenceDiagram
   - [x] `KubeSecretBackend` enabled for multi-replica K8s gateways with Helm chart RBAC (`secrets.backend: "k8s"`), `CUBEPOD_SECRETS_KEY` Secret management, and HA Vault re-hydration.
   - [x] Python & TypeScript SDK helpers (`Secret` / `AsyncSecret`, `Secret.fill`) verified against live gateway.
 - **Stable (`v1.0`)**:
-  - [ ] Secret store operation latency histograms and Prometheus alerting rules for secret exchange errors and store latency (tracked in [#103](https://github.com/cubeplexai/cubepod/issues/103)).
+  - [x] Per-operation latency histograms `cubepod_secrets_operation_duration_seconds{operation}` and `PrometheusRule` alerts (`CubePodSecretStoreHighErrorRate`, `CubePodSecretStoreHighLatency`, `CubePodSecretExchangeErrors`) in `deploy/monitoring/watcher-secret-alerts.yaml` (*Added in v0.7.0*, [#103](https://github.com/cubeplexai/cubepod/issues/103)).
   - [ ] Production bake time in CubePlex.
 
 ### Upgrade / Downgrade Strategy

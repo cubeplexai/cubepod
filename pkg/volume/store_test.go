@@ -1,9 +1,16 @@
 package volume
 
 import (
+	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +21,7 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
@@ -531,5 +539,521 @@ func TestStore_NotePVC_SharedRWX(t *testing.T) {
 	}
 	if got.PVCName != "cubepod-e2b-volumes" || got.PVCNamespace != "cubepod-system" {
 		t.Fatalf("unexpected persisted PVC metadata: %+v", got)
+	}
+}
+
+func newMockKMSServer(t *testing.T, expectedBearer, expectedKeyID string, useTLS bool) *httptest.Server {
+	t.Helper()
+	kek := bytes.Repeat([]byte{0x42}, 32)
+	local, err := NewLocalKEKProvider(expectedKeyID, kek)
+	if err != nil {
+		t.Fatalf("NewLocalKEKProvider: %v", err)
+	}
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if expectedBearer != "" && r.Header.Get("Authorization") != "Bearer "+expectedBearer {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/wrap":
+			var req kmsWrapRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.KeyID != expectedKeyID {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			pt, err := base64.StdEncoding.DecodeString(req.Plaintext)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			wrapped, err := local.Wrap(r.Context(), pt)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(kmsWrapResponse{
+				KeyID:      expectedKeyID,
+				Ciphertext: base64.StdEncoding.EncodeToString(wrapped),
+			})
+		case "/unwrap":
+			var req kmsUnwrapRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.KeyID != expectedKeyID {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			ct, err := base64.StdEncoding.DecodeString(req.Ciphertext)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			pt, err := local.Unwrap(r.Context(), ct)
+			if err != nil {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(kmsUnwrapResponse{
+				Plaintext: base64.StdEncoding.EncodeToString(pt),
+			})
+		case "/redirect/wrap":
+			http.Redirect(w, r, "https://attacker.invalid/leak", http.StatusFound)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	var srv *httptest.Server
+	if useTLS {
+		srv = httptest.NewTLSServer(handler)
+	} else {
+		srv = httptest.NewServer(handler)
+	}
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestKMS_LocalKEKAndHTTPKMSWrapUnwrapAndRedaction(t *testing.T) {
+	rawHex := hex.EncodeToString(bytes.Repeat([]byte{0xab}, 32))
+	rawB64 := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0xcd}, 32))
+
+	if _, err := ParseKEK("not-a-valid-secret-kek-material"); err == nil || strings.Contains(err.Error(), "not-a-valid-secret-kek-material") {
+		t.Fatalf("expected redacted ParseKEK error, got %v", err)
+	}
+
+	pHex, err := NewLocalKEKProviderFromString("", rawHex)
+	if err != nil {
+		t.Fatalf("NewLocalKEKProviderFromString hex: %v", err)
+	}
+	pB64, err := NewLocalKEKProviderFromString("kek-v2", rawB64)
+	if err != nil {
+		t.Fatalf("NewLocalKEKProviderFromString b64: %v", err)
+	}
+	if strings.Contains(fmt.Sprintf("%v %#v", pHex, pHex), rawHex) {
+		t.Fatal("LocalKEKProvider leaked raw KEK in string output")
+	}
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logBuf, nil))
+	logger.Info("kms check", "local", pHex)
+	if strings.Contains(logBuf.String(), rawHex) {
+		t.Fatal("LocalKEKProvider leaked KEK in slog output")
+	}
+
+	wrapped, err := pHex.Wrap(context.Background(), []byte("32-byte-dek-material-placeholder"))
+	if err != nil {
+		t.Fatalf("LocalKEK Wrap: %v", err)
+	}
+	unwrapped, err := pHex.Unwrap(context.Background(), wrapped)
+	if err != nil || string(unwrapped) != "32-byte-dek-material-placeholder" {
+		t.Fatalf("LocalKEK Unwrap: err=%v got=%q", err, unwrapped)
+	}
+	if _, err := pB64.Unwrap(context.Background(), wrapped); err == nil {
+		t.Fatal("expected unwrap with wrong KEK to fail")
+	}
+
+	// Non-loopback plaintext HTTP must be rejected by default.
+	if _, err := NewHTTPKMSProvider(HTTPKMSConfig{URL: "http://kms.example.com/v1"}); err == nil {
+		t.Fatal("expected error for non-loopback http:// KMS URL")
+	}
+
+	// HTTPS TLS mock KMS server with bearer auth + TLS verification + redaction.
+	const bearerSecret = "kms-super-secret-bearer-token"
+	tlsSrv := newMockKMSServer(t, bearerSecret, "ext-key-1", true)
+	pool := x509.NewCertPool()
+	pool.AddCert(tlsSrv.Certificate())
+
+	httpKMS, err := NewHTTPKMSProvider(HTTPKMSConfig{
+		URL:         tlsSrv.URL,
+		BearerToken: bearerSecret,
+		KeyID:       "ext-key-1",
+		Timeout:     3 * time.Second,
+		TLSConfig:   &tls.Config{RootCAs: pool},
+	})
+	if err != nil {
+		t.Fatalf("NewHTTPKMSProvider TLS: %v", err)
+	}
+	logger.Info("http kms check", "remote", httpKMS)
+	if strings.Contains(fmt.Sprintf("%v %#v %s", httpKMS, httpKMS, logBuf.String()), bearerSecret) {
+		t.Fatal("HTTPKMSProvider leaked bearer token")
+	}
+
+	extWrapped, err := httpKMS.Wrap(context.Background(), bytes.Repeat([]byte{0x11}, 32))
+	if err != nil {
+		t.Fatalf("HTTPKMS Wrap: %v", err)
+	}
+	extPlain, err := httpKMS.Unwrap(context.Background(), extWrapped)
+	if err != nil || !bytes.Equal(extPlain, bytes.Repeat([]byte{0x11}, 32)) {
+		t.Fatalf("HTTPKMS Unwrap: err=%v got=%x", err, extPlain)
+	}
+
+	// Wrong bearer token must fail without leaking bearer token in error.
+	badAuthKMS, err := NewHTTPKMSProvider(HTTPKMSConfig{
+		URL:         tlsSrv.URL,
+		BearerToken: "wrong-secret-token",
+		KeyID:       "ext-key-1",
+		TLSConfig:   &tls.Config{RootCAs: pool},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := badAuthKMS.Wrap(context.Background(), bytes.Repeat([]byte{0x11}, 32)); err == nil || strings.Contains(err.Error(), "wrong-secret-token") {
+		t.Fatalf("expected redacted auth failure, got %v", err)
+	}
+
+	// Redirect responses must be refused so Authorization headers never follow redirects.
+	redirKMS, err := NewHTTPKMSProvider(HTTPKMSConfig{
+		URL:         tlsSrv.URL + "/redirect",
+		BearerToken: bearerSecret,
+		KeyID:       "ext-key-1",
+		TLSConfig:   &tls.Config{RootCAs: pool},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := redirKMS.Wrap(context.Background(), bytes.Repeat([]byte{0x11}, 32)); err == nil {
+		t.Fatal("expected redirect response to be rejected")
+	}
+}
+
+func TestStore_KMSEnvelopeEncryptionAndLegacyPlaintextMigration(t *testing.T) {
+	dir := t.TempDir()
+	key := "cpod_test_kms_tenant"
+
+	// 1. Legacy store (no KMS): meta.json stores plaintext "token".
+	legacyStore, err := Open(dir, Config{})
+	if err != nil {
+		t.Fatalf("open legacy store: %v", err)
+	}
+	legacyVol, err := legacyStore.Create(key, "legacy-vol")
+	if err != nil {
+		t.Fatalf("create legacy-vol: %v", err)
+	}
+	legacyMetaBytes, err := os.ReadFile(filepath.Join(dir, legacyVol.VolumeID, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(legacyMetaBytes), legacyVol.Token) || strings.Contains(string(legacyMetaBytes), "encryptedToken") {
+		t.Fatalf("expected legacy plaintext meta.json, got %s", legacyMetaBytes)
+	}
+
+	// 2. Reopen with LocalKEKProvider: legacy record is migrated on disk to envelope encryption,
+	// while in-memory Get and Authenticate preserve 100% token compatibility.
+	kekProv, err := NewLocalKEKProvider("kek-primary", bytes.Repeat([]byte{0x77}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	kmsStore, err := Open(dir, Config{KMS: kekProv})
+	if err != nil {
+		t.Fatalf("reopen with LocalKEKProvider: %v", err)
+	}
+	migratedMetaBytes, err := os.ReadFile(filepath.Join(dir, legacyVol.VolumeID, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(migratedMetaBytes), legacyVol.Token) {
+		t.Fatalf("plaintext token still present in migrated meta.json: %s", migratedMetaBytes)
+	}
+	var diskMigrated Volume
+	if err := json.Unmarshal(migratedMetaBytes, &diskMigrated); err != nil {
+		t.Fatal(err)
+	}
+	if diskMigrated.Token != "" || diskMigrated.EncryptedToken == "" || diskMigrated.KMSKeyID != "kek-primary" {
+		t.Fatalf("unexpected migrated disk meta: %+v", diskMigrated)
+	}
+	gotLegacy, err := kmsStore.Get(key, legacyVol.VolumeID)
+	if err != nil || gotLegacy.Token != legacyVol.Token {
+		t.Fatalf("Get migrated legacy volume: err=%v got=%+v", err, gotLegacy)
+	}
+	if _, err := kmsStore.Authenticate(legacyVol.VolumeID, legacyVol.Token); err != nil {
+		t.Fatalf("Authenticate migrated legacy token failed: %v", err)
+	}
+
+	// 3. Create new volume with mock HTTPKMSProvider on a fresh store dir and verify AAD binding.
+	httpDir := t.TempDir()
+	mockSrv := newMockKMSServer(t, "tok-http-kms", "vault-key-v1", false)
+	httpProv, err := NewHTTPKMSProvider(HTTPKMSConfig{
+		URL:         mockSrv.URL,
+		BearerToken: "tok-http-kms",
+		KeyID:       "vault-key-v1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpStore, err := Open(httpDir, Config{KMS: httpProv})
+	if err != nil {
+		t.Fatalf("open with HTTPKMSProvider: %v", err)
+	}
+	v1, err := httpStore.Create(key, "kms-vol-1")
+	if err != nil {
+		t.Fatalf("create kms-vol-1: %v", err)
+	}
+	v2, err := httpStore.Create(key, "kms-vol-2")
+	if err != nil {
+		t.Fatalf("create kms-vol-2: %v", err)
+	}
+	v1DiskBytes, err := os.ReadFile(filepath.Join(httpDir, v1.VolumeID, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(v1DiskBytes), v1.Token) {
+		t.Fatalf("new KMS volume leaked plaintext token on disk: %s", v1DiskBytes)
+	}
+
+	// Reopening with HTTPKMSProvider unwraps tokens cleanly.
+	httpStoreReopened, err := Open(httpDir, Config{KMS: httpProv})
+	if err != nil {
+		t.Fatalf("reopen HTTPKMS store: %v", err)
+	}
+	if _, err := httpStoreReopened.Authenticate(v1.VolumeID, v1.Token); err != nil {
+		t.Fatalf("Authenticate after HTTPKMS reopen: %v", err)
+	}
+
+	// Reopening an encrypted store WITHOUT KMS must fail rather than silently dropping volumes.
+	if _, err := Open(httpDir, Config{}); err == nil {
+		t.Fatal("expected Open without KMS on encrypted store to fail")
+	}
+
+	// Transplanting v1's encryptedToken into v2's volumeID must fail GCM AAD authentication.
+	var v1Disk Volume
+	_ = json.Unmarshal(v1DiskBytes, &v1Disk)
+	if _, err := openVolumeToken(context.Background(), httpProv, v2.VolumeID, v1Disk.EncryptedToken); err == nil {
+		t.Fatal("expected cross-volume encryptedToken transplant to fail AAD check")
+	}
+}
+
+func TestStore_RotateAPIKey_MigrationRevocationMountsAndRWX(t *testing.T) {
+	dir := t.TempDir()
+	kekProv, err := NewLocalKEKProvider("rot-kek", bytes.Repeat([]byte{0x33}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	st1, err := Open(dir, Config{KMS: kekProv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Second open store over the same RWX directory simulates a peer Gateway HA replica.
+	st2, err := Open(dir, Config{KMS: kekProv})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldKey := "cpod_old_api_key"
+	newKey := "cpod_new_api_key"
+	thirdKey := "cpod_third_api_key"
+	otherTenantKey := "cpod_unrelated_tenant_key"
+
+	v1, err := st1.Create(oldKey, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := st1.Create(oldKey, "beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherVol, err := st1.Create(otherTenantKey, "alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st1.WriteFile(v1.VolumeID, "/dataset.txt", strings.NewReader("payload-1"), WriteOpts{}); err != nil {
+		t.Fatal(err)
+	}
+
+	planned, err := st1.LookupMounts(oldKey, []MountRequest{{Name: "alpha", Path: "/mnt/alpha"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st1.CommitMounts("sb-rot-1", oldKey, planned); err != nil {
+		t.Fatal(err)
+	}
+	// Reload st2 so it sees initial volumes before rotation.
+	st2, err = Open(dir, Config{KMS: kekProv})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Validation & collision checks.
+	if _, err := st1.RotateAPIKey("", newKey); !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("empty oldKey: got %v, want ErrInvalidKey", err)
+	}
+	if _, err := st1.RotateAPIKey(oldKey, ""); !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("empty newKey: got %v, want ErrInvalidKey", err)
+	}
+	if _, err := st1.RotateAPIKey(oldKey, oldKey); !errors.Is(err, ErrInvalidKey) {
+		t.Fatalf("identical keys: got %v, want ErrInvalidKey", err)
+	}
+	if _, err := st1.RotateAPIKey(oldKey, otherTenantKey); !errors.Is(err, ErrConflict) {
+		t.Fatalf("collision into otherTenantKey: got %v, want ErrConflict", err)
+	}
+
+	// Execute key rotation on st1.
+	rotated, err := st1.RotateAPIKey(oldKey, newKey)
+	if err != nil || rotated != 2 {
+		t.Fatalf("RotateAPIKey: rotated=%d err=%v", rotated, err)
+	}
+	if modeOf(t, filepath.Join(dir, "tenants.json"))&0o077 != 0 {
+		t.Fatalf("tenants.json permissions too broad: %#o", modeOf(t, filepath.Join(dir, "tenants.json")))
+	}
+
+	// Old key must be strictly denied across all management and mount APIs on BOTH st1 and live peer st2.
+	for idx, s := range []*Store{st1, st2} {
+		if _, err := s.List(oldKey); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("store[%d] List(oldKey): got %v, want ErrUnauthorized", idx, err)
+		}
+		if _, err := s.Get(oldKey, v1.VolumeID); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("store[%d] Get(oldKey): got %v, want ErrUnauthorized", idx, err)
+		}
+		if _, err := s.Delete(oldKey, v2.VolumeID); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("store[%d] Delete(oldKey): got %v, want ErrUnauthorized", idx, err)
+		}
+		if _, err := s.Create(oldKey, "gamma"); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("store[%d] Create(oldKey): got %v, want ErrUnauthorized", idx, err)
+		}
+		if _, err := s.LookupMounts(oldKey, []MountRequest{{Name: "alpha", Path: "/mnt/a"}}); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("store[%d] LookupMounts(oldKey): got %v, want ErrUnauthorized", idx, err)
+		}
+		if _, err := s.RotateAPIKey(oldKey, thirdKey); !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("store[%d] RotateAPIKey(revoked oldKey): got %v, want ErrUnauthorized", idx, err)
+		}
+
+		listed, err := s.List(newKey)
+		if err != nil || len(listed) != 2 {
+			t.Fatalf("store[%d] List(newKey): len=%d err=%v", idx, len(listed), err)
+		}
+		gotV1, err := s.Get(newKey, v1.VolumeID)
+		if err != nil || gotV1.Token != v1.Token {
+			t.Fatalf("store[%d] Get(newKey, v1): err=%v got=%+v", idx, err, gotV1)
+		}
+	}
+
+	// Unrelated tenant must be completely untouched.
+	gotOther, err := st1.Get(otherTenantKey, otherVol.VolumeID)
+	if err != nil || gotOther.VolumeID != otherVol.VolumeID {
+		t.Fatalf("other tenant affected by rotation: err=%v got=%+v", err, gotOther)
+	}
+
+	// Reopen from disk: verify persistence of rotation + active mount protection + mount cleanup.
+	reopened, err := Open(dir, Config{KMS: kekProv})
+	if err != nil {
+		t.Fatalf("reopen after RotateAPIKey: %v", err)
+	}
+	if _, err := reopened.Get(oldKey, v1.VolumeID); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("reopened Get(oldKey): got %v, want ErrUnauthorized", err)
+	}
+	if specs := reopened.MountsForSandbox("sb-rot-1"); len(specs) != 1 || specs[0].VolumeID != v1.VolumeID {
+		t.Fatalf("expected active mount preserved across rotation + reopen, got %+v", specs)
+	}
+	if _, err := reopened.Delete(newKey, v1.VolumeID); !errors.Is(err, ErrInUse) {
+		t.Fatalf("expected ErrInUse before mount cleanup, got %v", err)
+	}
+	reopened.UnmountSandbox("sb-rot-1")
+	if _, err := reopened.Delete(newKey, v1.VolumeID); err != nil {
+		t.Fatalf("expected Delete(newKey, v1) to succeed after mount cleanup: %v", err)
+	}
+
+	// Chained rotation (newKey -> thirdKey) and rejection of rotating back onto revoked oldKey.
+	if _, err := reopened.RotateAPIKey(newKey, oldKey); !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected ErrConflict rotating onto previously revoked key, got %v", err)
+	}
+	rot2, err := reopened.RotateAPIKey(newKey, thirdKey)
+	if err != nil || rot2 != 1 {
+		t.Fatalf("second RotateAPIKey: rot=%d err=%v", rot2, err)
+	}
+	if _, err := reopened.List(newKey); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("expected newKey revoked after second rotation, got %v", err)
+	}
+	gotV2, err := reopened.Get(thirdKey, v2.VolumeID)
+	if err != nil || gotV2.VolumeID != v2.VolumeID {
+		t.Fatalf("expected thirdKey to own v2: err=%v got=%+v", err, gotV2)
+	}
+}
+
+func TestStore_MultiTenantByteQuotaOverwriteAndCapacityStats(t *testing.T) {
+	dir := t.TempDir()
+	st, err := Open(dir, Config{
+		MaxVolumesPerTenant: 3,
+		MaxBytesPerTenant:   100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tenantA := "cpod_quota_tenant_a"
+	tenantB := "cpod_quota_tenant_b"
+
+	vA1, err := st.Create(tenantA, "vol-a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vA2, err := st.Create(tenantA, "vol-a2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vB1, err := st.Create(tenantB, "vol-b1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Tenant A writes 60 + 35 = 95 bytes across two volumes.
+	if _, err := st.WriteFile(vA1.VolumeID, "/f1.bin", strings.NewReader(strings.Repeat("a", 60)), WriteOpts{}); err != nil {
+		t.Fatalf("write 60B: %v", err)
+	}
+	if _, err := st.WriteFile(vA2.VolumeID, "/f2.bin", strings.NewReader(strings.Repeat("b", 35)), WriteOpts{}); err != nil {
+		t.Fatalf("write 35B: %v", err)
+	}
+
+	// Adding 10B (total 105 > 100) must fail with ErrLimitExceeded and leave no partial file.
+	if _, err := st.WriteFile(vA2.VolumeID, "/f3.bin", strings.NewReader(strings.Repeat("c", 10)), WriteOpts{}); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("expected ErrLimitExceeded on 105B total, got %v", err)
+	}
+	if _, err := st.Stat(vA2.VolumeID, "/f3.bin"); !errors.Is(err, ErrNotExist) {
+		t.Fatalf("rejected quota upload should not exist, got %v", err)
+	}
+
+	// Overwriting 60B /f1.bin with 65B brings total to 95 - 60 + 65 = 100 <= 100 -> must succeed!
+	if _, err := st.WriteFile(vA1.VolumeID, "/f1.bin", strings.NewReader(strings.Repeat("z", 65)), WriteOpts{}); err != nil {
+		t.Fatalf("overwrite within 100B quota failed: %v", err)
+	}
+
+	// Tenant B is isolated and can write its own 90 bytes unaffected by Tenant A being at 100%.
+	if _, err := st.WriteFile(vB1.VolumeID, "/b.bin", strings.NewReader(strings.Repeat("q", 90)), WriteOpts{}); err != nil {
+		t.Fatalf("tenant B isolated write failed: %v", err)
+	}
+
+	// Removing files frees Tenant A's quota; verify concurrent writes under -race never exceed 100B.
+	if err := st.Remove(vA1.VolumeID, "/f1.bin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Remove(vA2.VolumeID, "/f2.bin"); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			targetVol := vA1.VolumeID
+			if idx%2 == 1 {
+				targetVol = vA2.VolumeID
+			}
+			_, _ = st.WriteFile(targetVol, fmt.Sprintf("/race-%d.bin", idx), strings.NewReader(strings.Repeat("x", 40)), WriteOpts{})
+		}(i)
+	}
+	wg.Wait()
+
+	usedA, err := st.tenantUsedBytes(rawKeyHash(tenantA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usedA > 100 || usedA != 80 {
+		t.Fatalf("expected concurrent writes capped at 80B (2x40B <= 100B), got %d", usedA)
+	}
+
+	cs, err := st.CapacityStats()
+	if err != nil {
+		t.Fatalf("CapacityStats: %v", err)
+	}
+	if cs.CapacityBytes == 0 || cs.AvailableBytes > cs.CapacityBytes || cs.VolumesTotal != 3 {
+		t.Fatalf("unexpected CapacityStats: %+v", cs)
 	}
 }

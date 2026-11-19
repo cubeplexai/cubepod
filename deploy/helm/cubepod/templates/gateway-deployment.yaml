@@ -56,6 +56,7 @@ spec:
             {{- end }}
             - "--e2b-template-api={{ include "cubepod.boolDefaultTrue" $fg.e2bTemplateAPI }}"
             - "--feature-gate={{ include "cubepod.featureGatesCSV" . }}"
+            - "--metrics-sample-interval={{ .Values.gateway.metricsSampleInterval | default "10s" }}"
             - "--template-build={{ .Values.templateBuild.enabled }}"
             - "--template-probe-timeout={{ .Values.templateBuild.probeTimeout }}"
             - "--controller-url=http://{{ include "cubepod.fullname" . }}-controller:{{ .Values.controller.healthzPort }}"

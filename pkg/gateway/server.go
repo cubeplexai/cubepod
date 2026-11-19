@@ -308,43 +308,47 @@ func (w *lockedWriter) Write(p []byte) (n int, err error) {
 
 // Server serves the CubePod Control Plane and Panel Proxy routes.
 type Server struct {
-	reconciler                *controller.Reconciler
-	mu                        sync.RWMutex
-	sandboxMu                 sync.Mutex
-	sandboxLocks              map[string]*sandboxOpLock
-	sandboxes                 map[string]*SandboxRecord
-	commands                  map[string]*commandEntry
-	watchers                  map[string]*dirWatcher
-	endpoints                 map[string]map[int]string
-	workspaceBaseDir          string
-	panelSecret               []byte
-	vault                     *egress.Vault
-	ca                        *egress.CA
-	strictEgressMTLS          bool
-	livePodRouting            bool
-	metrics                   *Metrics
-	e2bTemplateAPI            bool
-	templateBuild             bool
-	controllerURL             string
-	probeTimeout              time.Duration
-	httpClient                *http.Client
-	e2b                       atomic.Pointer[volume.Store]
-	secrets                   atomic.Pointer[secret.Store]
-	events                    atomic.Pointer[events.Manager]
-	e2bDir                    string
-	e2bCfg                    volume.Config
-	e2bMaxFileBytes           int64
-	e2bK8sMounts              bool
-	e2bSharedPVC              string
-	runtime                   runtime.Backend
-	featureGates              FeatureGates
-	syncMu                    sync.Mutex
-	syncInterval              time.Duration
-	syncCancel                context.CancelFunc
-	syncWG                    sync.WaitGroup
-	crdResyncsTotal           atomic.Uint64
-	E2BVolumeMountsTotal      atomic.Uint64
-	E2BVolumeMountErrorsTotal atomic.Uint64
+	reconciler                    *controller.Reconciler
+	mu                            sync.RWMutex
+	sandboxMu                     sync.Mutex
+	sandboxLocks                  map[string]*sandboxOpLock
+	sandboxes                     map[string]*SandboxRecord
+	commands                      map[string]*commandEntry
+	watchers                      map[string]*dirWatcher
+	endpoints                     map[string]map[int]string
+	workspaceBaseDir              string
+	panelSecret                   []byte
+	vault                         *egress.Vault
+	ca                            *egress.CA
+	strictEgressMTLS              bool
+	livePodRouting                bool
+	metrics                       *Metrics
+	e2bTemplateAPI                bool
+	templateBuild                 bool
+	controllerURL                 string
+	probeTimeout                  time.Duration
+	httpClient                    *http.Client
+	e2b                           atomic.Pointer[volume.Store]
+	secrets                       atomic.Pointer[secret.Store]
+	events                        atomic.Pointer[events.Manager]
+	e2bDir                        string
+	e2bCfg                        volume.Config
+	e2bMaxFileBytes               int64
+	e2bK8sMounts                  bool
+	e2bSharedPVC                  string
+	runtime                       runtime.Backend
+	featureGates                  FeatureGates
+	syncMu                        sync.Mutex
+	samplerMu                     sync.Mutex
+	samplerCancel                 context.CancelFunc
+	samplerWG                     sync.WaitGroup
+	syncInterval                  time.Duration
+	syncCancel                    context.CancelFunc
+	syncWG                        sync.WaitGroup
+	crdResyncsTotal               atomic.Uint64
+	E2BVolumeMountsTotal          atomic.Uint64
+	E2BVolumeMountErrorsTotal     atomic.Uint64
+	E2BVolumeQuotaRejectionsTotal atomic.Uint64
 }
 
 // SetRuntime installs a product execution backend used during sandbox create,
@@ -607,6 +611,7 @@ func (s *Server) registerCommonRoutes(mux *http.ServeMux) {
 
 	// Official E2B 2.64.0 Volume management (API key) and content (volume token).
 	mux.HandleFunc("POST /volumes", s.handleCreateVolume)
+	mux.HandleFunc("POST /volumes/rotate-key", s.handleRotateVolumeKey)
 	mux.HandleFunc("GET /volumes", s.handleListVolumes)
 	mux.HandleFunc("GET /volumes/{volumeID}", s.handleGetVolume)
 	mux.HandleFunc("DELETE /volumes/{volumeID}", s.handleDeleteVolume)

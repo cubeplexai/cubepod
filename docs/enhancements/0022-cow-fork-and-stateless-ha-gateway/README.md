@@ -8,7 +8,7 @@
 | **Participating Areas** | `gateway`, `storage`, `runtime` |
 | **Authors** | @cubepod-maintainers |
 | **Created** | 2026-11-13 |
-| **Last Updated** | 2026-11-16 |
+| **Last Updated** | 2026-11-18 |
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
@@ -140,12 +140,17 @@ flowchart TD
   - `TestStatelessGatewayMultiReplicaFailover`: Instantiates **two independent `gateway.Server` instances** (`gw1`, `gw2`) backed by a shared `KubeClient`: creates sandbox, runs background command, and mints `/panel/{token}/` on `gw1`, then queries sandbox, streams logs with `?cursor=`, and proxies `/panel/{token}/` through `gw2` without prior state sharing!
 - **Integration / E2E Tests**:
   - Docker loopback `fork` E2E verifying isolated mutations between parent and child after fork.
+  - `TestStatelessGatewayRollingHandoverUnderLoad` (`test/k8s-e2e/rolling_update_test.go`): Launches multiple `gateway.Server` replicas sharing `MemoryKubeClient` and a stateful mock `podd` behind a dynamic round-robin reverse proxy while rolling and gracefully draining replicas across two complete replica generations (`gen0 -> gen1 -> gen2`) under continuous concurrent sandbox create/exec/file/panel traffic, asserting `0` failed requests (`StatelessGatewayHA`).
+  - `TestK8sLiveGatewayRollingUpdateZeroDowntime` (`test/k8s-e2e/rolling_update_test.go`): Live multi-replica rolling restart test gated behind `CUBEPOD_K8S_DISRUPTIVE=1` (requires `gateway.replicaCount >= 2` and `PodDisruptionBudget`).
+  - `TestK8sLiveE2EVolumeSnapshotFork` (`test/k8s-e2e/k8s_e2e_test.go`) + `deploy/k8s/longhorn-v2/volumesnapshotclass.yaml` (`longhorn-v2-snapclass`, `driver.longhorn.io`, `deletionPolicy: Delete`, `parameters.type: snap`): Live CSI `VolumeSnapshot` CoW fork verification gated on `CUBEPOD_VOLUME_SNAPSHOT_CLASS`.
 
 ### Graduation Criteria
 
-- **Alpha (`v0.5.0`)**: Multi-gen `ForkFrom`, Docker sparse reflink fork, bounded `quiesce`/`thaw`, and stateless `gw1`->`gw2` failover merged and tested.
-- **Beta (`v0.6.0`)**: Helm chart defaults `gateway.replicas: 2` with PodDisruptionBudget; CSI `VolumeSnapshot` mode implemented with unit tests and K8s E2E test harness (`live Longhorn V2 SPDK CSI snapshot verification ongoing`).
-- **Stable (`v1.0.0`)**: Zero-downtime Gateway rolling updates verified under continuous load in CubePlex.
+- **Alpha (`v0.5.0`)** *(Completed)*: Multi-gen `ForkFrom`, Docker sparse reflink fork, bounded `quiesce`/`thaw`, and stateless `gw1`->`gw2` failover merged and tested.
+- **Beta (`v0.6.0`)** *(Completed)*: Helm chart defaults `gateway.replicas: 2` with `PodDisruptionBudget`; CSI `VolumeSnapshot` mode and `deploy/k8s/longhorn-v2/volumesnapshotclass.yaml` (`longhorn-v2-snapclass`) added; `TestStatelessGatewayRollingHandoverUnderLoad` verified under `go test -race` with `0` failed requests across multi-generation rolling drains.
+- **Stable (`v1.0.0`)** *(Pending live cluster prerequisites)*:
+  - Live `TestK8sLiveE2EVolumeSnapshotFork` execution against Longhorn V2 SPDK CSI (pending installation of the cluster-wide Kubernetes `snapshot-controller` controller and configuring `--fork-mode=snapshot --volume-snapshot-class=longhorn-v2-snapclass` on `cubepod-controller`).
+  - Live multi-replica zero-downtime `cubepod-gateway` rolling updates (`CUBEPOD_K8S_DISRUPTIVE=1` with `gateway.replicaCount >= 2`) verified under continuous production load in CubePlex.
 
 ### Upgrade / Downgrade Strategy
 
@@ -179,6 +184,7 @@ flowchart TD
 ## Implementation History
 
 - `2026-11-13`: Initial CEP drafted and marked `implementable` for `v0.5.0`.
+- `2026-11-18`: Added `deploy/k8s/longhorn-v2/volumesnapshotclass.yaml` (`longhorn-v2-snapclass`, `driver.longhorn.io`, `parameters.type: snap`) and `test/k8s-e2e/rolling_update_test.go` (`TestStatelessGatewayRollingHandoverUnderLoad` passing under `go test -race` with 0 failed requests across 2 rolling waves, plus `CUBEPOD_K8S_DISRUPTIVE=1`-gated `TestK8sLiveGatewayRollingUpdateZeroDowntime`). Live `VolumeSnapshot` fork run remains pending cluster `snapshot-controller` deployment and `--fork-mode=snapshot` controller rollout.
 
 ---
 

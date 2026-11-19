@@ -123,6 +123,9 @@ helm upgrade --install longhorn longhorn/longhorn \
   --timeout 15m
 
 kubectl apply -f "$ROOT/storageclass.yaml"
+if kubectl get crd volumesnapshotclasses.snapshot.storage.k8s.io >/dev/null 2>&1; then
+  kubectl apply -f "$ROOT/volumesnapshotclass.yaml"
+fi
 
 echo "waiting for Longhorn node object $NODE"
 for _ in $(seq 1 60); do

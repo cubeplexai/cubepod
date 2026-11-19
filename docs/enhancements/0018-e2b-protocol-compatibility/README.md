@@ -8,7 +8,7 @@
 | **Participating Areas** | `runtime`, `sdk` |
 | **Authors** | @cubepod-maintainers |
 | **Created** | 2026-11-11 |
-| **Last Updated** | 2026-11-17 |
+| **Last Updated** | 2026-11-18 |
 
 <!-- toc -->
 - [Release Signoff Checklist](#release-signoff-checklist)
@@ -461,6 +461,10 @@ def test_code_interpreter_execution():
   - Trigger `pause`, verify scale-to-zero.
   - Issue subsequent E2B SDK command, verify transparent Auto-Resume and state preservation.
 
+#### 9.4 Concurrent E2B & Interactive PTY Soak Harness (`test/k8s-e2e/soak_test.go`)
+- **`TestSoakRunnerShortVerification`**: Runs in `< 3s` under `go test -race ./test/k8s-e2e/...`, driving concurrent E2B sandbox creation/refresh/detail/delete, filesystem `PUT/GET/LIST/DELETE`, command execution, and interactive PTY `Start`/`SendInput`/`Update`/`Connect`/`SendSignal` cycles while verifying sandbox-hour accounting (`ComputeSandboxHours`), zero leaked sandboxes or goroutines, and structured JSON + Markdown report output.
+- **`TestK8sLiveSoakE2BAndPTY` (`make test-soak`)**: Strictly gated on `CUBEPOD_K8S_SOAK=1` with configurable `CUBEPOD_SOAK_DURATION`, `CUBEPOD_SOAK_CONCURRENCY`, `CUBEPOD_SOAK_TARGET_HOURS`, and `CUBEPOD_SOAK_OUT` for multi-day (`> 10,000` sandbox-hour) production soak runs.
+
 ---
 
 ### 10. Graduation Criteria
@@ -474,7 +478,8 @@ def test_code_interpreter_execution():
   - [x] Zero-Trust Egress secret binding transparently integrated with E2B `envVars`.
 - **GA / Stable (`v1.0.0`)**:
   - [x] Complete conformance test suite with upstream E2B Python and TypeScript SDKs integrated into GitHub Actions CI (`make test-e2b-compat`, `make test-e2b-compat-ts` in `.github/workflows/ci.yml`).
-  - [ ] Production bake time in CubePlex agent platform across > 10,000 sandbox hours (tracked in [#104](https://github.com/cubeplexai/cubepod/issues/104)).
+  - [x] Automated concurrent E2B + PTY soak harness (`test/k8s-e2e/soak_test.go`, `make test-soak`) with sandbox-hour accounting, leak detection, and JSON/Markdown reporting.
+  - [ ] Production bake time in CubePlex agent platform across > 10,000 sandbox hours (e.g., `CUBEPOD_SOAK_CONCURRENCY=150 CUBEPOD_SOAK_DURATION=72h CUBEPOD_SOAK_TARGET_HOURS=10000 make test-soak` — pending multi-day wall-clock execution; tracked in [#104](https://github.com/cubeplexai/cubepod/issues/104)).
 
 ---
 
@@ -510,6 +515,7 @@ def test_code_interpreter_execution():
 - **2026-11-11**: Initial CEP-0018 proposal drafted and designated `implementable`.
 - **2026-11-15**: Official E2B 2.64.0 Volume API and `volumeMounts` specified separately in [CEP-0025](../0025-e2b-volumes/README.md).
 - **2026-11-17**: Promoted to `implemented` (`beta`). Completed Beta deliverables: `e2b-code-interpreter` matplotlib capture, subdomain ingress routing (`{port}-{sandboxID}`), and zero-trust secret binding for E2B `envVars`. Conformance test suites (`make test-e2b-compat`, `make test-e2b-compat-ts`) integrated into GitHub Actions CI (`.github/workflows/ci.yml`); long-term >10,000 sandbox-hour soak tracked in [#104](https://github.com/cubeplexai/cubepod/issues/104).
+- **2026-11-18**: Added concurrent E2B + interactive PTY soak harness (`test/k8s-e2e/soak_test.go`, `make test-soak`) with `< 3s` `-race` leak/accounting verification (`TestSoakRunnerShortVerification`) and live multi-day soak runner (`TestK8sLiveSoakE2BAndPTY`); multi-day `> 10,000` sandbox-hour production soak execution remains pending extended runtime ([#104](https://github.com/cubeplexai/cubepod/issues/104)).
 
 ---
 

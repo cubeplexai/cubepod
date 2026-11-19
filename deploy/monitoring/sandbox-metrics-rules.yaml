@@ -1,0 +1,54 @@
+# Prometheus Operator rules for CubePod sandbox metrics (CEP-0029, GA).
+# Requires the gateway background sampler (--metrics-sample-interval, v0.7.0+)
+# and a scrape job/ServiceMonitor for the cubepod-gateway /metrics endpoint.
+# Apply with `kubectl apply -n <namespace>` where your Prometheus Operator selects rules.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cubepod-sandbox-metrics
+  labels:
+    app.kubernetes.io/name: cubepod
+    app.kubernetes.io/component: monitoring
+spec:
+  groups:
+    - name: cubepod.sandbox-metrics.rules
+      interval: 30s
+      rules:
+        - record: cubepod:sandbox_cpu_used_pct:avg5m
+          expr: avg_over_time(cubepod_sandbox_cpu_used_pct[5m])
+        - record: cubepod:sandbox_memory_utilization_ratio
+          expr: |
+            cubepod_sandbox_memory_used_bytes
+              / on(sandbox_id, namespace, pod, instance) cubepod_sandbox_memory_total_bytes > 0
+        - record: cubepod:sandbox_disk_utilization_ratio
+          expr: |
+            cubepod_sandbox_disk_used_bytes
+              / on(sandbox_id, namespace, pod, instance) cubepod_sandbox_disk_total_bytes > 0
+    - name: cubepod.sandbox-metrics.alerts
+      rules:
+        - alert: CubePodSandboxHighMemoryPressure
+          expr: cubepod:sandbox_memory_utilization_ratio > 0.9
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sandbox {{ $labels.sandbox_id }} memory above 90%"
+            description: "Sandbox {{ $labels.sandbox_id }} has used more than 90% of its memory limit for 10 minutes."
+        - alert: CubePodSandboxDiskNearFull
+          expr: cubepod:sandbox_disk_utilization_ratio > 0.9
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sandbox {{ $labels.sandbox_id }} workspace disk above 90%"
+            description: "Sandbox {{ $labels.sandbox_id }} workspace disk usage has exceeded 90% for 15 minutes."
+        - alert: CubePodMetricsSamplerFailing
+          expr: |
+            sum by (namespace, pod) (rate(cubepod_sandbox_metrics_samples_total{result="error"}[5m]))
+              / clamp_min(sum by (namespace, pod) (rate(cubepod_sandbox_metrics_samples_total[5m])), 1e-9) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "CubePod gateway metrics sampler failing on {{ $labels.pod }}"
+            description: "More than 50% of background sandbox metric samples have errored for 10 minutes."
