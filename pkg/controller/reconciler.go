@@ -2457,6 +2457,95 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 	return paused, terminated
 }
 
+// ReconcileProvisioning advances PodBoxes stuck in Provisioning (e.g. after a transient
+// EnsurePod readiness timeout) to Running once their backing Pod is Ready with a PodIP.
+func (r *Reconciler) ReconcileProvisioning(ctx context.Context, now time.Time) []string {
+	if r.kubeClient == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	r.mu.RLock()
+	hasCandidates := false
+	for _, status := range r.boxes {
+		if status.Phase == v1alpha1.PodBoxPhaseProvisioning && status.PodName != "" {
+			hasCandidates = true
+			break
+		}
+	}
+	r.mu.RUnlock()
+	if !hasCandidates {
+		return nil
+	}
+
+	pods, err := r.kubeClient.ListPods(ctx, r.namespace, "")
+	if err != nil {
+		slog.Warn("failed to list pods while reconciling provisioning sandboxes", "err", err)
+		return nil
+	}
+	podsByName := make(map[string]PodManifest, len(pods))
+	for _, p := range pods {
+		podsByName[p.Name] = p
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var promoted []string
+	for name, status := range r.boxes {
+		spec := r.specs[name]
+		if status.Phase != v1alpha1.PodBoxPhaseProvisioning || spec.DesiredState != v1alpha1.DesiredStateRunning {
+			continue
+		}
+		if status.PodName == "" {
+			continue
+		}
+		pod, ok := podsByName[status.PodName]
+		if !ok || pod.NotReady || pod.PodIP == "" {
+			continue
+		}
+
+		statusWithRunning := *status
+		statusWithRunning.Phase = v1alpha1.PodBoxPhaseRunning
+		statusWithRunning.PodIP = pod.PodIP
+		statusWithRunning.PausedAt = nil
+		statusWithRunning.LastActivityAt = &now
+		if statusWithRunning.Reason == "" {
+			statusWithRunning.Reason = "Provisioned"
+		}
+		if statusWithRunning.Message == "" {
+			statusWithRunning.Message = "Sandbox pod is ready"
+		}
+
+		err := r.kubeClient.UpsertPodBox(ctx, v1alpha1.PodBox{
+			APIVersion: "cubepod.io/v1alpha1",
+			Kind:       "PodBox",
+			Metadata: v1alpha1.ObjectMeta{
+				Name:        name,
+				Namespace:   r.namespace,
+				Annotations: r.podBoxAnnotationsLocked(name, ""),
+			},
+			Spec:   spec,
+			Status: statusWithRunning,
+		})
+		if err != nil {
+			slog.Warn("failed to persist running state for provisioning sandbox", "name", name, "err", err)
+			continue
+		}
+
+		*status = statusWithRunning
+		promoted = append(promoted, name)
+	}
+
+	slices.Sort(promoted)
+	return promoted
+}
+
 // ActiveSandboxesCount returns the number of Running sandboxes.
 func (r *Reconciler) ActiveSandboxesCount() int {
 	r.mu.RLock()
