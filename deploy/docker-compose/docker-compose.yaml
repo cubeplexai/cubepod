@@ -5,8 +5,8 @@ services:
       dockerfile: images/gateway/Dockerfile
     ports:
       - "8080:8080"
+    entrypoint: ["/bin/sh", "/usr/local/bin/gateway-entrypoint.sh"]
     command:
-      - "/usr/local/bin/cubepod-gateway"
       - "-addr=:8080"
       - "--e2b-template-api=false"
       - "--template-build=false"
@@ -19,6 +19,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - cubepod-volumes:/var/lib/cubepod/volumes
       - cubepod-state:/var/lib/cubepod/state
+      - ./gateway-entrypoint.sh:/usr/local/bin/gateway-entrypoint.sh:ro
 
   cubepod-controller:
     build:

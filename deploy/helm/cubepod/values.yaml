@@ -57,6 +57,11 @@ gateway:
     type: "ClusterIP"
     port: 8080
     nodePort: null
+  # HMAC secret used to sign /panel/{token}/ URLs. Required at gateway startup.
+  # When empty, the chart generates a random Secret on install and reuses it
+  # on upgrade. Do not rotate an in-use secret or existing panel tokens and
+  # multi-replica verification will break. Set this to supply your own value.
+  # Changed in v0.7.0.
   panelSecret: ""
   resources:
     requests:

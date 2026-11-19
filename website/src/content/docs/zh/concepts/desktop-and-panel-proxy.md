@@ -66,7 +66,7 @@ CubePod 无需为每个沙箱动态创建 Kubernetes `Ingress`，即可通过短
    base64url(sandboxID:port:expUnix).base64url(hmacSha256)
    ```
    请求体仅接受 `expiresInSeconds`。客户端提供的 `targetUrl` / `upstreamUrl` 会被忽略（*v0.7.0 变更*）。官方 E2B `getHost` / `get_host` 走的是 `GET /sandboxes/{id}/endpoints/{port}`，行为不变。
-2. **多副本无状态校验**：任意 `cubepod-gateway` 副本收到 `GET /panel/{token}/{rest...}`（或 WebSocket 握手请求）时，均可本地完成 HMAC 签名与过期时间验证，不依赖集中式 Session 存储。
+2. **多副本无状态校验**：任意 `cubepod-gateway` 副本收到 `GET /panel/{token}/{rest...}`（或 WebSocket 握手请求）时，均可本地完成 HMAC 签名与过期时间验证，不依赖集中式 Session 存储。令牌使用 `CUBEPOD_PANEL_SECRET` 签名，该密钥是网关启动的必选项。当 `gateway.panelSecret` 省略时，Helm Chart 会随机生成 Secret 并在升级时复用；不再使用编译进二进制的默认密钥（*v0.7.0 变更*）。
 3. **自动唤醒与透明反代**：网关通过 `resolveSandbox` 自动唤醒可能处于 `Paused` 状态的沙箱，始终根据沙箱状态解析当前 `<status.podIP>:<port>`（不使用调用方提供的上游地址），并将 HTTP 资源与双向 WebSocket 帧（`noVNC`、`neko` 信令、`ttyd`、前端热更新 HMR 等）直接反向代理至目标 MicroVM（*v0.7.0 变更*）。
 
 ## 4. 50+ 并发桌面资源评估、音频与 GPU 演进路线

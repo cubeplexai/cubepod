@@ -1235,6 +1235,7 @@ func TestTemplateRoutesAndOpenAPI(t *testing.T) {
 func TestLivePodRoutingAndEndpointDefault(t *testing.T) {
 	reconciler := controller.NewReconciler()
 	srv := gateway.NewServer(reconciler)
+	srv.SetPanelSecret("test-live-pod-routing-panel-secret")
 	srv.SetLivePodRouting(true)
 	if !srv.LivePodRouting() {
 		t.Fatalf("expected livePodRouting to be true")
@@ -2001,6 +2002,7 @@ func TestStatelessGatewayMultiReplicaFailover(t *testing.T) {
 	rec1 := controller.NewReconciler(controller.WithKubeClient(sharedMemKube))
 	gw1 := gateway.NewServer(rec1)
 	gw1.SetLivePodRouting(true)
+	gw1.SetPanelSecret("test-ha-panel-hmac-secret-32bytes!!")
 	ts1 := httptest.NewServer(gw1.Handler())
 	defer ts1.Close()
 
@@ -2008,6 +2010,7 @@ func TestStatelessGatewayMultiReplicaFailover(t *testing.T) {
 	rec2 := controller.NewReconciler(controller.WithKubeClient(sharedMemKube))
 	gw2 := gateway.NewServer(rec2)
 	gw2.SetLivePodRouting(true)
+	gw2.SetPanelSecret("test-ha-panel-hmac-secret-32bytes!!")
 	ts2 := httptest.NewServer(gw2.Handler())
 	defer ts2.Close()
 

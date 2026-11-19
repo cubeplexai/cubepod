@@ -83,10 +83,11 @@ spec:
             {{- end }}
           {{- if $hasEnv }}
           env:
-            {{- if .Values.gateway.panelSecret }}
             - name: CUBEPOD_PANEL_SECRET
-              value: {{ .Values.gateway.panelSecret | quote }}
-            {{- end }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "cubepod.panelSecretName" . }}
+                  key: panel-secret
             {{- if $stateDir }}
             - name: CUBEPOD_STATE
               value: {{ $stateDir | quote }}

@@ -67,19 +67,21 @@ flowchart TB
 | `controller-deployment.yaml` | `Deployment` (`controller.replicaCount`; forced to `1` only when `templateBuild.enabled=true` and `contextStore.backend=local`) | Serves `/livez` and `/healthz`; reconciles on `--sync-interval` (`5s`); wires runtime/storage/egress flags, `--feature-gate`, `global.imagePullSecrets`, `egress.caSecretName`, S3 context store (`--context-store-backend=s3`), BuildKit mTLS (`--buildkit-*-cert`), or mounts `cubepod-template-context` PVC for `local` builds |
 | `gateway-state-pvc.yaml` | `PersistentVolumeClaim` (`<fullname>-gateway-state`, optional) | Rendered when `gateway.persistence.enabled: true` and `existingClaim` is empty; persists Gateway `stateDir` (templates, file secrets, events/webhooks) |
 | `secrets-key-secret.yaml` *(Added in v0.6.0)* | `Secret` (`<fullname>-secrets-key`, optional) | Rendered when `secrets.encryptionKey` is set inline without `secrets.existingSecret` or `gateway.secretsKeySecret` |
+| `panel-secret.yaml` *(Added in v0.7.0)* | `Secret` (`<fullname>-panel-secret`) | Holds the gateway panel HMAC key. Generated randomly on install when `gateway.panelSecret` is empty, then reused on upgrade via `lookup`. Injected as `CUBEPOD_PANEL_SECRET` through `secretKeyRef` |
 | `e2b-volumes-pvc.yaml` | `PersistentVolumeClaim` (`e2bVolumes.pvcName`, `ReadWriteMany`) | Rendered when `e2bVolumes.rwxStorageClassName` is non-empty; kept on uninstall via `helm.sh/resource-policy: keep` |
 | `service.yaml` | `<fullname>-gateway` (`:8080`), `<fullname>-controller` (`:8081`) | Both default to `ClusterIP`; `gateway.service.nodePort` supported when switching to `NodePort` |
 | `buildkit.yaml` | `Deployment` (or `StatefulSet` + headless `Service` when `buildkit.replicaCount > 1`), `Service` (`:1234`), cache `PVC` / `volumeClaimTemplates`, optional `cubepod-template-context` PVC, `NetworkPolicy` | Rendered only when `templateBuild.enabled: true` *(Changed in v0.7.0)* |
 
 ## Core Production Values
 
-Override defaults in a custom `my-values.yaml` file rather than editing the chart directly:
+Override defaults in a custom `my-values.yaml` file rather than editing the chart directly.
+
+The panel HMAC secret (`gateway.panelSecret`) is required at gateway startup (*Changed in v0.7.0*). Leave it empty to let the chart generate a random Kubernetes Secret on install and reuse that same value on upgrade. Set `gateway.panelSecret` only if you want to supply your own value. Do not rotate an in-use secret: existing `/panel/{token}/` URLs and other replicas will fail verification.
 
 ```yaml
 gateway:
   replicaCount: 2
   port: 8080
-  panelSecret: "replace-with-random-hmac-secret"
   service:
     type: ClusterIP
 

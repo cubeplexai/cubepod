@@ -341,6 +341,11 @@ func main() {
 		}
 	}
 
+	if err := gw.RequirePanelSecret(); err != nil {
+		slog.Error("panel HMAC secret is not configured", "err", err)
+		os.Exit(1)
+	}
+
 	httpSrv := &http.Server{
 		Addr:    *addr,
 		Handler: gw.Handler(),

@@ -318,3 +318,10 @@ Effective Kubernetes Secret name for CUBEPOD_SECRETS_KEY
 {{- printf "%s-secrets-key" (include "cubepod.fullname" .) -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Name of the Kubernetes Secret that holds CUBEPOD_PANEL_SECRET
+*/}}
+{{- define "cubepod.panelSecretName" -}}
+{{- printf "%s-panel-secret" (include "cubepod.fullname" .) -}}
+{{- end }}
