@@ -252,7 +252,11 @@ export default defineConfig({
               translations: { 'zh-CN': 'Kubernetes 与 Helm 生产部署' },
               slug: 'deployment/kubernetes-helm',
             },
-            { label: 'Reproducible kind E2E', slug: 'deployment/kind-e2e' },
+            {
+              label: 'Reproducible kind E2E',
+              translations: { 'zh-CN': '可复现的 kind E2E 测试' },
+              slug: 'deployment/kind-e2e',
+            },
             {
               label: 'Kata MicroVM & Block CSI',
               translations: { 'zh-CN': 'Kata 微虚拟机与块存储 CSI' },
