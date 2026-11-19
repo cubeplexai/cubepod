@@ -1824,13 +1824,13 @@ func (r *Reconciler) GetPodTemplate(nameOrID string) (*v1alpha1.PodTemplate, boo
 	defer r.mu.RUnlock()
 	for _, obj := range r.templateObjects {
 		if obj.Status.TemplateID == nameOrID || obj.Metadata.Name == nameOrID || slices.Contains(obj.Spec.Names, nameOrID) {
-			cp := *obj
+			cp := clonePodTemplate(obj)
 			return &cp, true
 		}
 	}
 	if objName, ok := r.templateIndex[nameOrID]; ok {
 		if obj, exists := r.templateObjects[objName]; exists {
-			cp := *obj
+			cp := clonePodTemplate(obj)
 			return &cp, true
 		}
 	}
@@ -1940,7 +1940,7 @@ func (r *Reconciler) AssignTemplateTags(ctx context.Context, nameOrID string, ta
 	r.templates[tpl.Metadata.Name] = tpl.Spec
 	r.persistLocalTemplateLocked(tpl)
 
-	cp := *tpl
+	cp := clonePodTemplate(tpl)
 	return &cp, nil
 }
 
@@ -1991,7 +1991,7 @@ func (r *Reconciler) DeleteTemplateTags(ctx context.Context, nameOrID string, ta
 	r.templates[tpl.Metadata.Name] = tpl.Spec
 	r.persistLocalTemplateLocked(tpl)
 
-	cp := *tpl
+	cp := clonePodTemplate(tpl)
 	return &cp, nil
 }
 
