@@ -35,7 +35,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-3-0t64 libxtst6 libxcvt0 pulseaudio \
     libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 \
     gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
     gstreamer1.0-x gstreamer1.0-pulseaudio \
     libopus0 libvpx9 \
     && rm -rf /var/lib/apt/lists/* \
@@ -46,20 +45,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && mkdir -p /opt/cubepod/desktop/ms-playwright \
     && playwright install chromium \
     && playwright install-deps chromium \
-    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/* \
     # Expose stable symlink to Playwright Chromium binary
     && CHROME_BIN="$(find /opt/cubepod/desktop/ms-playwright -path '*/chromium-*/chrome-linux*/chrome' -type f | head -n 1)" \
     && test -n "$CHROME_BIN" \
     && ln -sf "$CHROME_BIN" /opt/cubepod/desktop/chromium-bin \
     && chmod -R a+rX /opt/cubepod/desktop/ms-playwright \
-    # Ensure UID/GID 1000 is cleanly assigned to unprivileged user `cubeplex`
-    && if id -u 1000 >/dev/null 2>&1; then userdel -r "$(id -nu 1000)"; fi \
-    && if getent group 1000 >/dev/null 2>&1; then groupdel "$(getent group 1000 | cut -d: -f1)"; fi \
-    && groupadd -g 1000 cubeplex \
-    && useradd -m -u 1000 -g 1000 -s /bin/bash cubeplex \
-    && usermod -aG audio,video cubeplex \
-    && mkdir -p /workspace /home/cubeplex/.config/chromium /run/cubepod/desktop /tmp/.X11-unix \
-    && chown -R 1000:1000 /workspace /home/cubeplex /run/cubepod/desktop \
+    # Use existing UID/GID 1000 user (e.g. `ubuntu` in ubuntu:24.04) or create `sandbox` if absent
+    && TARGET_USER="$(id -nu 1000 2>/dev/null || true)" \
+    && if [ -z "$TARGET_USER" ]; then \
+         groupadd -g 1000 sandbox \
+         && useradd -m -u 1000 -g 1000 -s /bin/bash sandbox \
+         && TARGET_USER=sandbox; \
+       fi \
+    && TARGET_HOME="$(getent passwd 1000 | cut -d: -f6)" \
+    && usermod -aG audio,video "$TARGET_USER" \
+    && mkdir -p /workspace "${TARGET_HOME}/.config/chromium" /run/cubepod/desktop /tmp/.X11-unix \
+    && chown -R 1000:1000 /workspace "${TARGET_HOME}" /run/cubepod/desktop \
     && chmod 1777 /tmp/.X11-unix
 
 COPY --from=neko /usr/bin/neko /usr/local/bin/neko
