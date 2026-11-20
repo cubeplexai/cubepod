@@ -52,6 +52,23 @@ func newMockCRDServer() (*mockCRDServer, *httptest.Server) {
 		if strings.HasPrefix(path, "/api/v1/namespaces/") {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			if strings.Contains(path, "/pods") {
+				if r.Method == http.MethodGet && strings.HasSuffix(path, "/pods") {
+					_ = json.NewEncoder(w).Encode(map[string]any{"items": []any{}})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"metadata": map[string]any{"name": "mock-pod"},
+					"status": map[string]any{
+						"phase": "Running",
+						"podIP": "10.244.0.10",
+						"conditions": []map[string]any{
+							{"type": "Ready", "status": "True"},
+						},
+					},
+				})
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "Success"})
 			return
 		}
