@@ -3766,4 +3766,67 @@ func TestMarkFailed_SyncsMemoryClearsLeaseAndBlocksResurrection(t *testing.T) {
 	if stAfter.Phase != v1alpha1.PodBoxPhaseFailed {
 		t.Fatalf("Phase after Reconcile = %q; want Failed", stAfter.Phase)
 	}
+
+	// Explicit Pause on a leased Running box must also clear LeaseExpiresAt.
+	if _, err := r.Reconcile(ctx, "box-pause-lease", spec); err != nil {
+		t.Fatalf("Reconcile(box-pause-lease): %v", err)
+	}
+	if err := r.AcquireLease("box-pause-lease", time.Now().UTC().Add(10*time.Minute)); err != nil {
+		t.Fatalf("AcquireLease(box-pause-lease): %v", err)
+	}
+	if _, err := r.Pause(ctx, "box-pause-lease"); err != nil {
+		t.Fatalf("Pause(box-pause-lease): %v", err)
+	}
+	pausedSpec, ok := r.GetBoxSpec("box-pause-lease")
+	if !ok || pausedSpec.Lifecycle.LeaseExpiresAt != nil {
+		t.Fatalf("expected LeaseExpiresAt cleared on Pause, got %+v", pausedSpec.Lifecycle.LeaseExpiresAt)
+	}
+
+	// MarkFailed cache-miss fallback persists both Phase=Failed and cleared LeaseExpiresAt.
+	exp := time.Now().UTC().Add(10 * time.Minute)
+	if err := kc.UpsertPodBox(ctx, v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata:   v1alpha1.ObjectMeta{Name: "box-fallback-fail", Namespace: "default"},
+		Spec: v1alpha1.PodBoxSpec{
+			TemplateRef:  "ubuntu:24.04",
+			DesiredState: v1alpha1.DesiredStateRunning,
+			Lifecycle:    v1alpha1.LifecyclePolicy{LeaseExpiresAt: &exp},
+		},
+		Status: v1alpha1.PodBoxStatus{Phase: v1alpha1.PodBoxPhaseRunning},
+	}); err != nil {
+		t.Fatalf("UpsertPodBox(box-fallback-fail): %v", err)
+	}
+	rFresh := controller.NewReconciler(controller.WithKubeClient(kc), controller.WithNamespace("default"))
+	if err := rFresh.MarkFailed(ctx, "box-fallback-fail", "ProbeTimeout", ""); err != nil {
+		t.Fatalf("MarkFailed fallback: %v", err)
+	}
+	fbBox, err := kc.GetPodBox(ctx, "default", "box-fallback-fail")
+	if err != nil {
+		t.Fatalf("GetPodBox(box-fallback-fail): %v", err)
+	}
+	if fbBox.Status.Phase != v1alpha1.PodBoxPhaseFailed || fbBox.Spec.Lifecycle.LeaseExpiresAt != nil {
+		t.Fatalf("fallback box = %+v; want Failed with nil LeaseExpiresAt", fbBox)
+	}
+
+	// MarkFailed must not overwrite Terminated.
+	if err := kc.UpsertPodBox(ctx, v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata:   v1alpha1.ObjectMeta{Name: "box-term-no-fail", Namespace: "default"},
+		Spec:       v1alpha1.PodBoxSpec{TemplateRef: "ubuntu:24.04", DesiredState: v1alpha1.DesiredStatePaused},
+		Status:     v1alpha1.PodBoxStatus{Phase: v1alpha1.PodBoxPhaseTerminated},
+	}); err != nil {
+		t.Fatalf("UpsertPodBox(box-term-no-fail): %v", err)
+	}
+	if err := rFresh.MarkFailed(ctx, "box-term-no-fail", "ProbeTimeout", ""); err != nil {
+		t.Fatalf("MarkFailed on Terminated: %v", err)
+	}
+	termBox, err := kc.GetPodBox(ctx, "default", "box-term-no-fail")
+	if err != nil {
+		t.Fatalf("GetPodBox(box-term-no-fail): %v", err)
+	}
+	if termBox.Status.Phase != v1alpha1.PodBoxPhaseTerminated {
+		t.Fatalf("Terminated box phase = %q; want Terminated", termBox.Status.Phase)
+	}
 }
