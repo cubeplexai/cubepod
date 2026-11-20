@@ -983,6 +983,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 			}
 
 			var claimedBy string
+			entryNotReady := podIP == ""
 			// When EnsurePod returns 409 (pod already exists), check its label:
 			// if it's already claimed, do NOT add it as an unclaimed standby entry!
 			if is409 {
@@ -1006,7 +1007,12 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 					slog.Info("pod already exists and is claimed, skipping standby adoption", "pod", dummyStatus.PodName)
 					continue
 				}
-				// If false: copy labels and claimed-by
+				// If false: copy labels, claimed-by, PodIP and NotReady
+				if foundPod.PodIP != "" {
+					podIP = foundPod.PodIP
+					dummyStatus.PodIP = podIP
+				}
+				entryNotReady = foundPod.NotReady || podIP == ""
 				if foundPod.Labels != nil {
 					for k, v := range foundPod.Labels {
 						podManifest.Labels[k] = v
@@ -1021,6 +1027,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				TemplateRef:      spec.TemplateRef,
 				PodName:          dummyStatus.PodName,
 				PodIP:            podIP,
+				NotReady:         entryNotReady,
 				RootfsPVCName:    rootfsPVC.Name,
 				WorkspacePVCName: wsPVC.Name,
 				Image:            tpl.Image,
@@ -1055,7 +1062,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 
 	var finalAvail int32
 	for _, entry := range pool.entries {
-		if !entry.Claimed && !entry.NotReady {
+		if !entry.Claimed && !entry.NotReady && entry.PodIP != "" {
 			finalAvail++
 		}
 	}
@@ -1135,7 +1142,7 @@ func (r *Reconciler) claimWarmPodLocked(ctx context.Context, poolName string, bo
 	}
 
 	for _, entry := range pool.entries {
-		if !entry.Claimed && !entry.NotReady {
+		if !entry.Claimed && !entry.NotReady && entry.PodIP != "" {
 			if entry.Image != "" && expectedImage != "" && entry.Image != expectedImage {
 				continue
 			}
@@ -1184,7 +1191,7 @@ func (r *Reconciler) GetWarmPoolStatus(poolName string) (*v1alpha1.PodWarmPoolSt
 
 	var avail int32
 	for _, entry := range pool.entries {
-		if !entry.Claimed && !entry.NotReady {
+		if !entry.Claimed && !entry.NotReady && entry.PodIP != "" {
 			avail++
 		}
 	}

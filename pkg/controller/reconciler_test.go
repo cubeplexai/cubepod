@@ -3640,3 +3640,58 @@ func TestReconcile_TerminatedCannotBeResurrected(t *testing.T) {
 		t.Fatalf("Phase after Reconcile(Running) = %q; want Terminated", st2.Phase)
 	}
 }
+
+type noIPWarmPodKubeClient struct {
+	*controller.MemoryKubeClient
+	returnIP string
+}
+
+func (c *noIPWarmPodKubeClient) EnsurePod(ctx context.Context, pod controller.PodManifest) (string, error) {
+	_, err := c.MemoryKubeClient.EnsurePod(ctx, pod)
+	return c.returnIP, err
+}
+
+func TestWarmPool_DoesNotClaimEntryWithoutPodIP(t *testing.T) {
+	ctx := context.Background()
+	mem := controller.NewMemoryKubeClient()
+	kc := &noIPWarmPodKubeClient{MemoryKubeClient: mem, returnIP: ""}
+	r := controller.NewReconciler(controller.WithKubeClient(kc), controller.WithNamespace("default"))
+
+	poolSpec := v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "ubuntu:24.04",
+		Replicas:    1,
+	}
+	st, err := r.ReconcileWarmPool(ctx, "no-ip-pool", poolSpec)
+	if err != nil {
+		t.Fatalf("ReconcileWarmPool: %v", err)
+	}
+	if st.ReadyReplicas != 0 || st.AvailableReplicas != 0 {
+		t.Fatalf("expected 0 ready/available replicas when PodIP is empty, got %+v", st)
+	}
+
+	entries := r.GetWarmPoolEntries("no-ip-pool")
+	if len(entries) != 1 || !entries[0].NotReady || entries[0].PodIP != "" {
+		t.Fatalf("expected 1 unready entry without PodIP, got %+v", entries)
+	}
+
+	if _, err := r.ClaimWarmPod(ctx, "no-ip-pool", "box-should-not-claim"); err == nil {
+		t.Fatalf("expected ClaimWarmPod to fail when standby entry has no PodIP")
+	}
+
+	// Simulate pod becoming ready with PodIP and SyncFromKube observing it.
+	p := mem.Pods["default/"+entries[0].PodName]
+	p.PodIP = "10.244.0.77"
+	p.NotReady = false
+	mem.Pods["default/"+entries[0].PodName] = p
+	if _, err := r.SyncFromKube(ctx); err != nil {
+		t.Fatalf("SyncFromKube: %v", err)
+	}
+
+	claimed, err := r.ClaimWarmPod(ctx, "no-ip-pool", "box-claimed-after-ready")
+	if err != nil {
+		t.Fatalf("ClaimWarmPod after ready failed: %v", err)
+	}
+	if claimed.PodIP != "10.244.0.77" {
+		t.Fatalf("claimed PodIP = %q; want 10.244.0.77", claimed.PodIP)
+	}
+}
