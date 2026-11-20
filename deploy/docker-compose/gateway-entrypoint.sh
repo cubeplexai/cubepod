@@ -12,4 +12,12 @@ if [ -z "${CUBEPOD_PANEL_SECRET}" ]; then
   CUBEPOD_PANEL_SECRET="$(cat "${secret_file}")"
   export CUBEPOD_PANEL_SECRET
 fi
-exec /usr/local/bin/cubepod-gateway "$@"
+
+# Compose overlays may still pass the binary as command[0], from before this
+# entrypoint existed. Go's flag parser stops at the first non-flag, so a
+# duplicated path would drop --e2b-template-api=false and other options.
+gateway="/usr/local/bin/cubepod-gateway"
+if [ "${1}" = "${gateway}" ] || [ "${1##*/}" = "cubepod-gateway" ]; then
+  exec "$@"
+fi
+exec "${gateway}" "$@"
