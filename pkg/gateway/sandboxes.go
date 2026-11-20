@@ -1212,6 +1212,20 @@ func (s *Server) handleRefreshSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	if rec.State == string(v1alpha1.PodBoxPhaseTerminated) {
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "sandbox is terminated")
+		return
+	}
+	if s.reconciler != nil {
+		if box, ok := s.reconciler.GetBox(id); ok && box != nil && box.Phase == v1alpha1.PodBoxPhaseTerminated {
+			rec.State = string(box.Phase)
+			rec.Reason = box.Reason
+			s.mu.Unlock()
+			writeError(w, http.StatusConflict, "sandbox is terminated")
+			return
+		}
+	}
 	rec.TimeoutSeconds = secs
 	now := time.Now().UTC()
 	rec.LastActivityAt = &now
@@ -1245,6 +1259,20 @@ func (s *Server) handleSetTimeout(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	if rec.State == string(v1alpha1.PodBoxPhaseTerminated) {
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "sandbox is terminated")
+		return
+	}
+	if s.reconciler != nil {
+		if box, ok := s.reconciler.GetBox(id); ok && box != nil && box.Phase == v1alpha1.PodBoxPhaseTerminated {
+			rec.State = string(box.Phase)
+			rec.Reason = box.Reason
+			s.mu.Unlock()
+			writeError(w, http.StatusConflict, "sandbox is terminated")
+			return
+		}
+	}
 	rec.TimeoutSeconds = secs
 	s.recordActivity(rec)
 	wireRec := cloneSandboxRecord(rec)
@@ -1285,12 +1313,40 @@ func (s *Server) handleAcquireLease(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	state := rec.State
+	if s.reconciler != nil {
+		if box, ok := s.reconciler.GetBox(id); ok && box != nil && box.Phase != "" {
+			if box.Phase == v1alpha1.PodBoxPhaseTerminated || box.Phase == v1alpha1.PodBoxPhaseFailed || box.Phase == v1alpha1.PodBoxPhasePaused {
+				rec.State = string(box.Phase)
+				rec.Reason = box.Reason
+				state = rec.State
+			}
+		}
+	}
+	switch state {
+	case string(v1alpha1.PodBoxPhaseTerminated):
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "sandbox is terminated")
+		return
+	case string(v1alpha1.PodBoxPhaseFailed):
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "sandbox is failed")
+		return
+	case string(v1alpha1.PodBoxPhasePaused):
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "sandbox is paused")
+		return
+	}
 	rec.LeaseSeconds = secs
 	exp := time.Now().UTC().Add(time.Duration(secs) * time.Second)
 	rec.LeaseExpiresAt = &exp
 	s.recordActivity(rec)
 	wireRec := cloneSandboxRecord(rec)
 	s.mu.Unlock()
+
+	if s.reconciler != nil {
+		_ = s.reconciler.AcquireLease(id, exp)
+	}
 
 	s.emitSandboxEvent(wireRec.OwnerTenantHash, events.EventUpdated, wireRec, &events.EventData{
 		Reason: "LeaseAcquired",

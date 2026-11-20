@@ -3146,3 +3146,86 @@ func TestGateway_TerminatedSandboxRejectsConnectPauseAndReset(t *testing.T) {
 		}
 	}
 }
+
+func TestGateway_LeasePropagatesToReconcilerAndRejectsInactiveStates(t *testing.T) {
+	kc := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(controller.WithKubeClient(kc))
+	srv := gateway.NewServer(r)
+	srv.SetLivePodRouting(true)
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"base"}`))
+	if err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	var sbx gateway.SandboxRecord
+	if err := json.NewDecoder(resp.Body).Decode(&sbx); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// 1. Acquiring a lease on a Running sandbox succeeds and propagates LeaseExpiresAt to Reconciler.
+	lResp, err := http.Post(ts.URL+"/sandboxes/"+sbx.SandboxID+"/lease", "application/json", strings.NewReader(`{"leaseSeconds":120}`))
+	if err != nil {
+		t.Fatalf("lease request failed: %v", err)
+	}
+	_ = lResp.Body.Close()
+	if lResp.StatusCode != http.StatusOK {
+		t.Fatalf("lease on Running sandbox: status=%d; want 200", lResp.StatusCode)
+	}
+	spec, ok := r.GetBoxSpec(sbx.SandboxID)
+	if !ok || spec.Lifecycle.LeaseExpiresAt == nil {
+		t.Fatalf("expected LeaseExpiresAt propagated to Reconciler spec, got ok=%v spec=%+v", ok, spec)
+	}
+
+	// 2. Pause sandbox -> lease must be rejected with 409.
+	pResp, err := http.Post(ts.URL+"/sandboxes/"+sbx.SandboxID+"/pause", "application/json", nil)
+	if err != nil {
+		t.Fatalf("pause sandbox: %v", err)
+	}
+	_ = pResp.Body.Close()
+	lPaused, err := http.Post(ts.URL+"/sandboxes/"+sbx.SandboxID+"/lease", "application/json", strings.NewReader(`{"leaseSeconds":60}`))
+	if err != nil {
+		t.Fatalf("lease on Paused sandbox failed: %v", err)
+	}
+	_ = lPaused.Body.Close()
+	if lPaused.StatusCode != http.StatusConflict {
+		t.Fatalf("lease on Paused sandbox: status=%d; want 409", lPaused.StatusCode)
+	}
+
+	// 3. Mark Terminated -> lease, timeout, and refreshes must all return 409.
+	box, err := kc.GetPodBox(context.Background(), "cubepod-workloads", sbx.SandboxID)
+	if err != nil {
+		t.Fatalf("GetPodBox: %v", err)
+	}
+	box.Status.Phase = v1alpha1.PodBoxPhaseTerminated
+	box.Status.Reason = "PausedTTLExpired"
+	if err := kc.UpsertPodBox(context.Background(), *box); err != nil {
+		t.Fatalf("UpsertPodBox: %v", err)
+	}
+	if _, err := r.SyncFromKube(context.Background()); err != nil {
+		t.Fatalf("SyncFromKube: %v", err)
+	}
+	srv.SyncPodBoxesOnce(context.Background())
+
+	for _, tc := range []struct {
+		name string
+		path string
+		body string
+	}{
+		{name: "lease", path: "/sandboxes/" + sbx.SandboxID + "/lease", body: `{"leaseSeconds":60}`},
+		{name: "timeout", path: "/sandboxes/" + sbx.SandboxID + "/timeout", body: `{"timeout":300}`},
+		{name: "refreshes", path: "/sandboxes/" + sbx.SandboxID + "/refreshes", body: `{"duration":300}`},
+	} {
+		r2, err := http.Post(ts.URL+tc.path, "application/json", strings.NewReader(tc.body))
+		if err != nil {
+			t.Fatalf("%s request failed: %v", tc.name, err)
+		}
+		_ = r2.Body.Close()
+		if r2.StatusCode != http.StatusConflict {
+			t.Fatalf("%s on Terminated sandbox: status=%d; want 409", tc.name, r2.StatusCode)
+		}
+	}
+}
