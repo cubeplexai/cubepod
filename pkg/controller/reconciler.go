@@ -1490,6 +1490,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			}
 		}
 		r.deleteEgressSecretsLocked(ctx, name)
+		spec.Lifecycle.LeaseExpiresAt = nil
 		status.Phase = v1alpha1.PodBoxPhasePaused
 		status.PodName = ""
 		status.PodIP = ""
@@ -2077,12 +2078,15 @@ func (r *Reconciler) MarkFailed(ctx context.Context, name, reason, message strin
 
 	status, ok := r.boxes[name]
 	spec, hasSpec := r.specs[name]
-	if hasSpec {
-		spec.Lifecycle.LeaseExpiresAt = nil
-		r.specs[name] = spec
-	}
 
 	if ok && status != nil {
+		if status.Phase == v1alpha1.PodBoxPhaseTerminated {
+			return nil
+		}
+		if hasSpec {
+			spec.Lifecycle.LeaseExpiresAt = nil
+			r.specs[name] = spec
+		}
 		prevPhase := status.Phase
 		status.Phase = v1alpha1.PodBoxPhaseFailed
 		if reason != "" {
@@ -2106,11 +2110,18 @@ func (r *Reconciler) MarkFailed(ctx context.Context, name, reason, message strin
 				Spec:   spec,
 				Status: cp,
 			}
-			_ = r.kubeClient.UpsertPodBox(ctx, box)
+			if err := r.kubeClient.UpsertPodBox(ctx, box); err != nil {
+				slog.Warn("failed to persist failed state to Kubernetes", "name", name, "err", err)
+				return err
+			}
 		}
 		return nil
 	}
 
+	if hasSpec {
+		spec.Lifecycle.LeaseExpiresAt = nil
+		r.specs[name] = spec
+	}
 	if r.kubeClient == nil {
 		return fmt.Errorf("podbox %s not found", name)
 	}
@@ -2121,6 +2132,9 @@ func (r *Reconciler) MarkFailed(ctx context.Context, name, reason, message strin
 		}
 		return fmt.Errorf("podbox %s not found", name)
 	}
+	if box.Status.Phase == v1alpha1.PodBoxPhaseTerminated {
+		return nil
+	}
 	box.Spec.Lifecycle.LeaseExpiresAt = nil
 	box.Status.Phase = v1alpha1.PodBoxPhaseFailed
 	if reason != "" {
@@ -2129,12 +2143,8 @@ func (r *Reconciler) MarkFailed(ctx context.Context, name, reason, message strin
 	if message != "" {
 		box.Status.Message = message
 	}
-	type podBoxStatusUpdater interface {
-		UpdatePodBoxStatus(context.Context, v1alpha1.PodBox) error
-	}
-	if u, ok := r.kubeClient.(podBoxStatusUpdater); ok {
-		return u.UpdatePodBoxStatus(ctx, *box)
-	}
+	// Use UpsertPodBox rather than UpdatePodBoxStatus so both Spec.Lifecycle.LeaseExpiresAt=nil
+	// and Status.Phase=Failed are persisted to the Kubernetes APIServer.
 	return r.kubeClient.UpsertPodBox(ctx, *box)
 }
 
