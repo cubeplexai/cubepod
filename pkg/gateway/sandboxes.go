@@ -1029,6 +1029,11 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "sandbox is terminated")
 		return
 	}
+	if rec.State == string(v1alpha1.PodBoxPhaseFailed) {
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "sandbox is failed")
+		return
+	}
 	poddURL := rec.PoddURL
 	templateID := rec.TemplateID
 	rootfsGen := rec.RootfsGeneration
@@ -1065,13 +1070,17 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if status.Phase == v1alpha1.PodBoxPhaseTerminated {
+	if status.Phase == v1alpha1.PodBoxPhaseTerminated || status.Phase == v1alpha1.PodBoxPhaseFailed {
 		s.mu.Lock()
 		rec.State = string(status.Phase)
 		rec.Reason = status.Reason
 		rec.explicitlyPaused = false
 		s.mu.Unlock()
-		writeError(w, http.StatusConflict, "sandbox is terminated")
+		if status.Phase == v1alpha1.PodBoxPhaseFailed {
+			writeError(w, http.StatusConflict, "sandbox is failed")
+		} else {
+			writeError(w, http.StatusConflict, "sandbox is terminated")
+		}
 		return
 	}
 	s.pauseRuntimeSandbox(r.Context(), id)
@@ -1112,6 +1121,11 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "sandbox is terminated")
 		return
 	}
+	if rec.State == string(v1alpha1.PodBoxPhaseFailed) {
+		s.mu.RUnlock()
+		writeError(w, http.StatusConflict, "sandbox is failed")
+		return
+	}
 	wasPaused := rec.State == "Paused" || rec.State == string(v1alpha1.PodBoxPhasePaused)
 	recCopy := cloneSandboxRecord(rec)
 	liveRouting := s.livePodRouting
@@ -1130,12 +1144,16 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if status.Phase == v1alpha1.PodBoxPhaseTerminated {
+	if status.Phase == v1alpha1.PodBoxPhaseTerminated || status.Phase == v1alpha1.PodBoxPhaseFailed {
 		s.mu.Lock()
 		rec.State = string(status.Phase)
 		rec.Reason = status.Reason
 		s.mu.Unlock()
-		writeError(w, http.StatusConflict, "sandbox is terminated")
+		if status.Phase == v1alpha1.PodBoxPhaseFailed {
+			writeError(w, http.StatusConflict, "sandbox is failed")
+		} else {
+			writeError(w, http.StatusConflict, "sandbox is terminated")
+		}
 		return
 	}
 
@@ -1807,30 +1825,10 @@ func (s *Server) waitForTemplateReadyCmd(ctx context.Context, poddURL, readyCmd 
 }
 
 func (s *Server) markPodBoxFailed(ctx context.Context, boxName, reason string) {
-	if s.reconciler == nil || s.reconciler.KubeClient() == nil {
+	if s.reconciler == nil {
 		return
 	}
-	kc := s.reconciler.KubeClient()
-	boxes, err := kc.ListPodBoxes(ctx, "")
-	if err != nil {
-		return
-	}
-	for _, box := range boxes {
-		if box.Metadata.Name != boxName {
-			continue
-		}
-		box.Status.Phase = v1alpha1.PodBoxPhaseFailed
-		box.Status.Reason = reason
-		type podBoxStatusUpdater interface {
-			UpdatePodBoxStatus(context.Context, v1alpha1.PodBox) error
-		}
-		if u, ok := kc.(podBoxStatusUpdater); ok {
-			_ = u.UpdatePodBoxStatus(ctx, box)
-			return
-		}
-		_ = kc.UpsertPodBox(ctx, box)
-		return
-	}
+	_ = s.reconciler.MarkFailed(ctx, boxName, reason, "")
 }
 
 func (s *Server) copyResolvedImageAnnotation(ctx context.Context, parentID, childID string) {

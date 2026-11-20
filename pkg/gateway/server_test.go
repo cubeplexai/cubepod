@@ -3229,3 +3229,46 @@ func TestGateway_LeasePropagatesToReconcilerAndRejectsInactiveStates(t *testing.
 		}
 	}
 }
+
+func TestGateway_FailedSandboxSyncsReconcilerAndRejectsConnectAndPause(t *testing.T) {
+	kc := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(controller.WithKubeClient(kc))
+	srv := gateway.NewServer(r)
+	srv.SetLivePodRouting(true)
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"base"}`))
+	if err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	var sbx gateway.SandboxRecord
+	if err := json.NewDecoder(resp.Body).Decode(&sbx); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if err := r.AcquireLease(sbx.SandboxID, time.Now().UTC().Add(10*time.Minute)); err != nil {
+		t.Fatalf("AcquireLease: %v", err)
+	}
+	if err := r.MarkFailed(context.Background(), sbx.SandboxID, "TemplateReadyProbeTimedOut", ""); err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+	srv.SyncPodBoxesOnce(context.Background())
+
+	for _, path := range []string{
+		"/sandboxes/" + sbx.SandboxID + "/connect",
+		"/sandboxes/" + sbx.SandboxID + "/pause",
+	} {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+path, nil)
+		r2, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s failed: %v", path, err)
+		}
+		_ = r2.Body.Close()
+		if r2.StatusCode != http.StatusConflict {
+			t.Fatalf("POST %s on Failed sandbox: status=%d; want 409", path, r2.StatusCode)
+		}
+	}
+}

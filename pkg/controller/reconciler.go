@@ -1218,7 +1218,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	var prevPhase v1alpha1.PodBoxPhase
 	if exists && status != nil {
 		prevPhase = status.Phase
-		if status.Phase == v1alpha1.PodBoxPhaseTerminated {
+		if status.Phase == v1alpha1.PodBoxPhaseTerminated ||
+			(status.Phase == v1alpha1.PodBoxPhaseFailed && spec.RootfsGeneration <= status.ObservedRootfsGen) {
 			cp := *status
 			return &cp, nil
 		}
@@ -2064,6 +2065,79 @@ func (r *Reconciler) Pause(ctx context.Context, name string) (*v1alpha1.PodBoxSt
 	return status, nil
 }
 
+// MarkFailed transitions a PodBox to Failed in both Reconciler memory and Kubernetes,
+// clearing any active lease so Failed sandboxes never retain an active lease.
+func (r *Reconciler) MarkFailed(ctx context.Context, name, reason, message string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	status, ok := r.boxes[name]
+	spec, hasSpec := r.specs[name]
+	if hasSpec {
+		spec.Lifecycle.LeaseExpiresAt = nil
+		r.specs[name] = spec
+	}
+
+	if ok && status != nil {
+		prevPhase := status.Phase
+		status.Phase = v1alpha1.PodBoxPhaseFailed
+		if reason != "" {
+			status.Reason = reason
+		}
+		if message != "" {
+			status.Message = message
+		}
+		cp := *status
+		r.recordPhaseTransitionLocked(ctx, name, prevPhase, cp)
+		if r.kubeClient != nil {
+			anns := r.podBoxAnnotationsLocked(name, "")
+			box := v1alpha1.PodBox{
+				APIVersion: "cubepod.io/v1alpha1",
+				Kind:       "PodBox",
+				Metadata: v1alpha1.ObjectMeta{
+					Name:        name,
+					Namespace:   r.namespace,
+					Annotations: anns,
+				},
+				Spec:   spec,
+				Status: cp,
+			}
+			_ = r.kubeClient.UpsertPodBox(ctx, box)
+		}
+		return nil
+	}
+
+	if r.kubeClient == nil {
+		return fmt.Errorf("podbox %s not found", name)
+	}
+	box, err := r.kubeClient.GetPodBox(ctx, r.namespace, name)
+	if err != nil || box == nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("podbox %s not found", name)
+	}
+	box.Spec.Lifecycle.LeaseExpiresAt = nil
+	box.Status.Phase = v1alpha1.PodBoxPhaseFailed
+	if reason != "" {
+		box.Status.Reason = reason
+	}
+	if message != "" {
+		box.Status.Message = message
+	}
+	type podBoxStatusUpdater interface {
+		UpdatePodBoxStatus(context.Context, v1alpha1.PodBox) error
+	}
+	if u, ok := r.kubeClient.(podBoxStatusUpdater); ok {
+		return u.UpdatePodBoxStatus(ctx, *box)
+	}
+	return r.kubeClient.UpsertPodBox(ctx, *box)
+}
+
 // DeleteBox terminates a PodBox compute Pod and optionally deletes its underlying PVCs.
 func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes bool) error {
 	r.mu.Lock()
@@ -2756,6 +2830,11 @@ func (r *Reconciler) SetPausedAt(name string, t time.Time) error {
 func (r *Reconciler) AcquireLease(name string, expiresAt time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if box, ok := r.boxes[name]; ok && box != nil {
+		if box.Phase == v1alpha1.PodBoxPhaseFailed || box.Phase == v1alpha1.PodBoxPhaseTerminated || box.Phase == v1alpha1.PodBoxPhasePaused {
+			return fmt.Errorf("cannot acquire lease for podbox %q in phase %s", name, box.Phase)
+		}
+	}
 	spec, ok := r.specs[name]
 	if !ok {
 		return fmt.Errorf("podbox %q not found", name)
