@@ -15,6 +15,8 @@ RUN apk add --no-cache ca-certificates tzdata
 
 COPY --from=builder /bin/cubepod-gateway /usr/local/bin/cubepod-gateway
 
+COPY deploy/docker-compose/gateway-entrypoint.sh /usr/local/bin/gateway-entrypoint.sh
+
 EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/cubepod-gateway"]

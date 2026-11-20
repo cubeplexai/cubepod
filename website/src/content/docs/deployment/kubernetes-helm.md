@@ -78,6 +78,8 @@ Override defaults in a custom `my-values.yaml` file rather than editing the char
 
 The panel HMAC secret (`gateway.panelSecret`) is required at gateway startup (*Changed in v0.7.0*). Leave it empty to let the chart generate a random Kubernetes Secret on install and reuse that same value on upgrade. Set `gateway.panelSecret` only if you want to supply your own value. Do not rotate an in-use secret: existing `/panel/{token}/` URLs and other replicas will fail verification.
 
+*Changed in v0.7.0*: For GitOps / Argo CD / offline `helm template`, set `gateway.existingPanelSecret` to an operator-managed Secret in the release namespace with key `panel-secret`. It takes precedence over `gateway.panelSecret` and disables chart Secret creation. Offline rendering cannot use `lookup`, so leaving both values empty generates a different key on each render; automatic generation/reuse is intended for online Helm install/upgrade. Explicit `gateway.panelSecret` changes trigger a pod-template checksum rollout; the generated/lookup path adds no random rollout annotation. After rotating an external Secret, run `kubectl rollout restart deployment/<fullname>-gateway` because environment variables are read only at startup. Rotating any key invalidates old panel tokens; coordinate rotations across replicas.
+
 ```yaml
 gateway:
   replicaCount: 2
@@ -237,3 +239,5 @@ curl -fsS http://localhost:8080/health
 
 - Prepare worker nodes for Kata Containers and raw block storage in [Kata Containers & Block Storage](/deployment/kata-and-block-storage/).
 - Inspect every Helm value in [Helm Values Reference](/reference/helm-values/) and CRD field in [CRD Reference](/reference/crds/).
+
+*Changed in v0.7.0*: Both environment and in-process secret settings trim surrounding whitespace and reject the old public default and `replace-with-random-hmac-secret` placeholder. Empty/invalid keys cannot mint tokens, including desktop URLs. No new minimum key length is imposed; use a cryptographically random secret.

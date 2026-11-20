@@ -14,6 +14,10 @@ spec:
       app.kubernetes.io/component: gateway
   template:
     metadata:
+      {{- if and .Values.gateway.panelSecret (not .Values.gateway.existingPanelSecret) }}
+      annotations:
+        checksum/panel-secret: {{ .Values.gateway.panelSecret | trim | sha256sum | quote }}
+      {{- end }}
       labels:
         {{- include "cubepod.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: gateway

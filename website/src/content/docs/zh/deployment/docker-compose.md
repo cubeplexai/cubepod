@@ -55,7 +55,7 @@ docker compose -f deploy/docker-compose/docker-compose.yaml down -v
 
 | 服务名 | Dockerfile 构建配置 | 暴露端口 | 默认启动参数与环境变量 | 挂载卷 |
 | :--- | :--- | :--- | :--- | :--- |
-| `cubepod-gateway` | `images/gateway/Dockerfile`（构建上下文 `../..`） | `8080:8080` | `gateway-entrypoint.sh`，随后是 `-addr=:8080`、`--e2b-template-api=false`、`--template-build=false`、`--state-dir=/var/lib/cubepod/state`、`--template-probe-timeout=120s`；环境变量 `CUBEPOD_RUNTIME_MODE=docker-loopback`、`CUBEPOD_STATE=/var/lib/cubepod/state`。会生成或复用 `CUBEPOD_PANEL_SECRET`（*v0.7.0 变更*） | `/var/run/docker.sock:/var/run/docker.sock`、`cubepod-volumes:/var/lib/cubepod/volumes`、`cubepod-state:/var/lib/cubepod/state`、`./gateway-entrypoint.sh:/usr/local/bin/gateway-entrypoint.sh:ro` |
+| `cubepod-gateway` | `images/gateway/Dockerfile`（构建上下文 `../..`） | `8080:8080` | `gateway-entrypoint.sh`，随后是 `-addr=:8080`、`--e2b-template-api=false`、`--template-build=false`、`--state-dir=/var/lib/cubepod/state`、`--template-probe-timeout=120s`；环境变量 `CUBEPOD_RUNTIME_MODE=docker-loopback`、`CUBEPOD_STATE=/var/lib/cubepod/state`。会生成或复用 `CUBEPOD_PANEL_SECRET`（*v0.7.0 变更*） | `/var/run/docker.sock:/var/run/docker.sock`、`cubepod-volumes:/var/lib/cubepod/volumes`、`cubepod-state:/var/lib/cubepod/state` |
 | `cubepod-controller` | `images/controller/Dockerfile`（构建上下文 `../..`） | `8081:8081` | `-addr=:8081`、`--e2b-template-api=false`、`--template-build=false`、`--state-dir=/var/lib/cubepod/state`、`--template-probe-timeout=120s`；环境变量 `CUBEPOD_STATE=/var/lib/cubepod/state` | `cubepod-state:/var/lib/cubepod/state` |
 | `cubepod-egress` | `images/egress/Dockerfile`（构建上下文 `../..`） | `18080:18080` | `-addr=:18080`、`-default-allow=true` | — |
 
@@ -106,3 +106,5 @@ make test-e2e
 - 使用 Helm 部署到 Kubernetes 集群：[Kubernetes 与 Helm 部署](/zh/deployment/kubernetes-helm/)
 - 准备 Kata Containers 与 CSI 裸块存储：[Kata Containers 与块存储配置](/zh/deployment/kata-and-block-storage/)
 - 接入各语言客户端：[Python SDK](/zh/sdks/python/)、[TypeScript SDK](/zh/sdks/typescript/) 与 [Go SDK 与 CLI](/zh/sdks/go-and-cli/)
+
+*v0.7.0 变更*：入口脚本打包进网关镜像，不再依赖宿主机相对路径挂载。生成密钥时使用 `umask 077`、原子发布且不覆写已有文件；并发启动复用先发布的密钥。已有空文件时启动失败，不静默轮换。

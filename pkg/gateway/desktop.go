@@ -223,6 +223,11 @@ func (s *Server) runDesktopCtl(ctx context.Context, rec *SandboxRecord, cmdStr s
 
 // handleDesktopStart handles POST /sandboxes/{sandboxID}/desktop/start.
 func (s *Server) handleDesktopStart(w http.ResponseWriter, r *http.Request) {
+	if err := validatePanelSecret(s.getPanelSecret()); err != nil {
+		http.Error(w, "panel HMAC secret is not configured or is invalid", http.StatusInternalServerError)
+		return
+	}
+
 	sandboxID := r.PathValue("sandboxID")
 	rec, ok := s.resolveSandbox(r.Context(), sandboxID)
 	if !ok {
@@ -319,12 +324,28 @@ func (s *Server) handleDesktopStart(w http.ResponseWriter, r *http.Request) {
 	if expiresIn <= 0 {
 		expiresIn = 3600
 	}
-	tokDesktop, expTime := s.mintPanelToken(sandboxID, ctlStatus.Ports.Desktop, expiresIn)
-	tokTerminal, _ := s.mintPanelToken(sandboxID, ctlStatus.Ports.Terminal, expiresIn)
-	tokCDP, _ := s.mintPanelToken(sandboxID, ctlStatus.Ports.CDP, expiresIn)
+	tokDesktop, expTime, err := s.mintPanelToken(sandboxID, ctlStatus.Ports.Desktop, expiresIn)
+	if err != nil {
+		http.Error(w, "failed to mint desktop panel token", http.StatusInternalServerError)
+		return
+	}
+	tokTerminal, _, err := s.mintPanelToken(sandboxID, ctlStatus.Ports.Terminal, expiresIn)
+	if err != nil {
+		http.Error(w, "failed to mint desktop panel token", http.StatusInternalServerError)
+		return
+	}
+	tokCDP, _, err := s.mintPanelToken(sandboxID, ctlStatus.Ports.CDP, expiresIn)
+	if err != nil {
+		http.Error(w, "failed to mint desktop panel token", http.StatusInternalServerError)
+		return
+	}
 	var webrtcURL string
 	if transportUsed == "webrtc" && webrtcPort > 0 {
-		tokWebRTC, _ := s.mintPanelToken(sandboxID, webrtcPort, expiresIn)
+		tokWebRTC, _, err := s.mintPanelToken(sandboxID, webrtcPort, expiresIn)
+		if err != nil {
+			http.Error(w, "failed to mint desktop panel token", http.StatusInternalServerError)
+			return
+		}
 		webrtcURL = fmt.Sprintf("/panel/%s/", tokWebRTC)
 	}
 

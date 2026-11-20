@@ -4,7 +4,6 @@ services:
     build: !reset null
     image: ${E2E_CONTROL_IMAGE:?}
     command: !override
-      - /usr/local/bin/cubepod-gateway
       - -addr=:8080
       - --live-pod-routing=false
       - --e2b-template-api=false

@@ -3,3 +3,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY cubepod-gateway cubepod-controller cubepod-egress /usr/local/bin/
 # Infrastructure image only; user images remain free of runtime binaries.
 COPY podd podd-init /opt/cubepod/dist/
+
+COPY gateway-entrypoint.sh /usr/local/bin/gateway-entrypoint.sh

@@ -113,6 +113,11 @@ jobs:
       - name: Helm Template Verification
         run: helm template cubepod-ci deploy/helm/cubepod
 
+      - name: Panel secret chart and entrypoint regressions
+        run: |
+          python3 deploy/helm/test_panel_secret.py -v
+          python3 deploy/docker-compose/test_entrypoint.py -v
+
   e2e-suite:
     name: Full E2E Integration Suite
     runs-on: ubuntu-latest
