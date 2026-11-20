@@ -983,6 +983,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 			}
 
 			var claimedBy string
+			entryNotReady := podIP == ""
 			// When EnsurePod returns 409 (pod already exists), check its label:
 			// if it's already claimed, do NOT add it as an unclaimed standby entry!
 			if is409 {
@@ -1006,7 +1007,12 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 					slog.Info("pod already exists and is claimed, skipping standby adoption", "pod", dummyStatus.PodName)
 					continue
 				}
-				// If false: copy labels and claimed-by
+				// If false: copy labels, claimed-by, PodIP and NotReady
+				if foundPod.PodIP != "" {
+					podIP = foundPod.PodIP
+					dummyStatus.PodIP = podIP
+				}
+				entryNotReady = foundPod.NotReady || podIP == ""
 				if foundPod.Labels != nil {
 					for k, v := range foundPod.Labels {
 						podManifest.Labels[k] = v
@@ -1021,6 +1027,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 				TemplateRef:      spec.TemplateRef,
 				PodName:          dummyStatus.PodName,
 				PodIP:            podIP,
+				NotReady:         entryNotReady,
 				RootfsPVCName:    rootfsPVC.Name,
 				WorkspacePVCName: wsPVC.Name,
 				Image:            tpl.Image,
@@ -1055,7 +1062,7 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 
 	var finalAvail int32
 	for _, entry := range pool.entries {
-		if !entry.Claimed && !entry.NotReady {
+		if !entry.Claimed && !entry.NotReady && entry.PodIP != "" {
 			finalAvail++
 		}
 	}
@@ -1135,7 +1142,7 @@ func (r *Reconciler) claimWarmPodLocked(ctx context.Context, poolName string, bo
 	}
 
 	for _, entry := range pool.entries {
-		if !entry.Claimed && !entry.NotReady {
+		if !entry.Claimed && !entry.NotReady && entry.PodIP != "" {
 			if entry.Image != "" && expectedImage != "" && entry.Image != expectedImage {
 				continue
 			}
@@ -1184,7 +1191,7 @@ func (r *Reconciler) GetWarmPoolStatus(poolName string) (*v1alpha1.PodWarmPoolSt
 
 	var avail int32
 	for _, entry := range pool.entries {
-		if !entry.Claimed && !entry.NotReady {
+		if !entry.Claimed && !entry.NotReady && entry.PodIP != "" {
 			avail++
 		}
 	}
@@ -1211,6 +1218,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	var prevPhase v1alpha1.PodBoxPhase
 	if exists && status != nil {
 		prevPhase = status.Phase
+		if status.Phase == v1alpha1.PodBoxPhaseTerminated ||
+			(status.Phase == v1alpha1.PodBoxPhaseFailed && spec.RootfsGeneration <= status.ObservedRootfsGen) {
+			cp := *status
+			return &cp, nil
+		}
 	}
 
 	isFork := !exists && spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != ""
@@ -1478,6 +1490,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			}
 		}
 		r.deleteEgressSecretsLocked(ctx, name)
+		spec.Lifecycle.LeaseExpiresAt = nil
 		status.Phase = v1alpha1.PodBoxPhasePaused
 		status.PodName = ""
 		status.PodIP = ""
@@ -1536,6 +1549,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		}
 		if podIP != "" {
 			status.PodIP = podIP
+		}
+		if podConflictUnconfirmed && status.PodIP == "" {
+			status.Phase = v1alpha1.PodBoxPhaseProvisioning
+		} else {
+			status.Phase = v1alpha1.PodBoxPhaseRunning
 		}
 		status.PodName = podManifest.Name
 		status.LastActivityAt = &now
@@ -2048,6 +2066,88 @@ func (r *Reconciler) Pause(ctx context.Context, name string) (*v1alpha1.PodBoxSt
 	return status, nil
 }
 
+// MarkFailed transitions a PodBox to Failed in both Reconciler memory and Kubernetes,
+// clearing any active lease so Failed sandboxes never retain an active lease.
+func (r *Reconciler) MarkFailed(ctx context.Context, name, reason, message string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	status, ok := r.boxes[name]
+	spec, hasSpec := r.specs[name]
+
+	if ok && status != nil {
+		if status.Phase == v1alpha1.PodBoxPhaseTerminated {
+			return nil
+		}
+		if hasSpec {
+			spec.Lifecycle.LeaseExpiresAt = nil
+			r.specs[name] = spec
+		}
+		prevPhase := status.Phase
+		status.Phase = v1alpha1.PodBoxPhaseFailed
+		if reason != "" {
+			status.Reason = reason
+		}
+		if message != "" {
+			status.Message = message
+		}
+		cp := *status
+		r.recordPhaseTransitionLocked(ctx, name, prevPhase, cp)
+		if r.kubeClient != nil {
+			anns := r.podBoxAnnotationsLocked(name, "")
+			box := v1alpha1.PodBox{
+				APIVersion: "cubepod.io/v1alpha1",
+				Kind:       "PodBox",
+				Metadata: v1alpha1.ObjectMeta{
+					Name:        name,
+					Namespace:   r.namespace,
+					Annotations: anns,
+				},
+				Spec:   spec,
+				Status: cp,
+			}
+			if err := r.kubeClient.UpsertPodBox(ctx, box); err != nil {
+				slog.Warn("failed to persist failed state to Kubernetes", "name", name, "err", err)
+				return err
+			}
+		}
+		return nil
+	}
+
+	if hasSpec {
+		spec.Lifecycle.LeaseExpiresAt = nil
+		r.specs[name] = spec
+	}
+	if r.kubeClient == nil {
+		return fmt.Errorf("podbox %s not found", name)
+	}
+	box, err := r.kubeClient.GetPodBox(ctx, r.namespace, name)
+	if err != nil || box == nil {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("podbox %s not found", name)
+	}
+	if box.Status.Phase == v1alpha1.PodBoxPhaseTerminated {
+		return nil
+	}
+	box.Spec.Lifecycle.LeaseExpiresAt = nil
+	box.Status.Phase = v1alpha1.PodBoxPhaseFailed
+	if reason != "" {
+		box.Status.Reason = reason
+	}
+	if message != "" {
+		box.Status.Message = message
+	}
+	// Use UpsertPodBox rather than UpdatePodBoxStatus so both Spec.Lifecycle.LeaseExpiresAt=nil
+	// and Status.Phase=Failed are persisted to the Kubernetes APIServer.
+	return r.kubeClient.UpsertPodBox(ctx, *box)
+}
+
 // DeleteBox terminates a PodBox compute Pod and optionally deletes its underlying PVCs.
 func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes bool) error {
 	r.mu.Lock()
@@ -2237,10 +2337,10 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 				if entry, ok := existingEntries[pod.Name]; ok {
 					entry.Claimed = claimed
 					entry.ClaimedBy = claimedBy
-					entry.NotReady = pod.NotReady
 					if pod.PodIP != "" {
 						entry.PodIP = pod.PodIP
 					}
+					entry.NotReady = pod.NotReady || entry.PodIP == ""
 					if entry.PodManifest.Labels == nil {
 						entry.PodManifest.Labels = make(map[string]string)
 					}
@@ -2269,7 +2369,7 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 						TemplateRef:      tplRef,
 						PodName:          pod.Name,
 						PodIP:            pod.PodIP,
-						NotReady:         pod.NotReady,
+						NotReady:         pod.NotReady || pod.PodIP == "",
 						RootfsPVCName:    entryID + "-rootfs-pvc",
 						WorkspacePVCName: entryID + "-workspace-pvc",
 						Claimed:          claimed,
@@ -2346,7 +2446,7 @@ func (r *Reconciler) FindAvailableWarmPool(templateRef string) string {
 	for name, pool := range r.warmPools {
 		if pool.spec.TemplateRef == templateRef {
 			for _, entry := range pool.entries {
-				if !entry.Claimed && !entry.NotReady {
+				if !entry.Claimed && !entry.NotReady && entry.PodIP != "" {
 					return name
 				}
 			}
@@ -2437,13 +2537,36 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 			if spec.Lifecycle.PausedTTLSeconds > 0 && status.PausedAt != nil {
 				ttlDeadline := status.PausedAt.Add(time.Duration(spec.Lifecycle.PausedTTLSeconds) * time.Second)
 				if !now.Before(ttlDeadline) {
-					if status.PodName != "" {
+					statusWithTerminated := *status
+					statusWithTerminated.Phase = v1alpha1.PodBoxPhaseTerminated
+					statusWithTerminated.PodName = ""
+					statusWithTerminated.PodIP = ""
+					statusWithTerminated.Reason = "PausedTTLExpired"
+					statusWithTerminated.Message = "Terminated due to paused TTL expiration"
+
+					if r.kubeClient != nil {
+						err := r.kubeClient.UpsertPodBox(ctx, v1alpha1.PodBox{
+							APIVersion: "cubepod.io/v1alpha1",
+							Kind:       "PodBox",
+							Metadata: v1alpha1.ObjectMeta{
+								Name:        name,
+								Namespace:   r.namespace,
+								Annotations: r.podBoxAnnotationsLocked(name, ""),
+							},
+							Spec:   spec,
+							Status: statusWithTerminated,
+						})
+						if err != nil {
+							slog.Warn("failed to persist terminated state to Kubernetes; rolling back in-memory state", "name", name, "err", err)
+							continue
+						}
+					}
+
+					if status.PodName != "" && r.kubeClient != nil {
 						_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
 					}
 					r.deleteEgressSecretsLocked(ctx, name)
-					status.Phase = v1alpha1.PodBoxPhaseTerminated
-					status.Reason = "PausedTTLExpired"
-					status.Message = "Terminated due to paused TTL expiration"
+					*status = statusWithTerminated
 					terminated = append(terminated, name)
 					r.recordPodBoxEventLocked(ctx, name, PodBoxEventReasonPausedTTLExpired, KubeEventTypeNormal,
 						"Terminated due to paused TTL expiration", now)
@@ -2455,6 +2578,123 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 	slices.Sort(paused)
 	slices.Sort(terminated)
 	return paused, terminated
+}
+
+// ReconcileProvisioning advances PodBoxes stuck in Provisioning (e.g. after a transient
+// EnsurePod readiness timeout) to Running once their backing Pod is Ready with a PodIP,
+// and re-drives Provisioning PodBoxes whose backing Pod is missing.
+func (r *Reconciler) ReconcileProvisioning(ctx context.Context, now time.Time) []string {
+	if r.kubeClient == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	r.mu.RLock()
+	hasCandidates := false
+	for name, status := range r.boxes {
+		spec := r.specs[name]
+		if status.Phase == v1alpha1.PodBoxPhaseProvisioning && spec.DesiredState == v1alpha1.DesiredStateRunning {
+			hasCandidates = true
+			break
+		}
+	}
+	r.mu.RUnlock()
+	if !hasCandidates {
+		return nil
+	}
+
+	listStartedAt := time.Now().UTC()
+	pods, err := r.kubeClient.ListPods(ctx, r.namespace, "")
+	if err != nil {
+		slog.Warn("failed to list pods while reconciling provisioning sandboxes", "err", err)
+		return nil
+	}
+	podsByName := make(map[string]PodManifest, len(pods))
+	for _, p := range pods {
+		podsByName[p.Name] = p
+	}
+
+	type missingPodCandidate struct {
+		name string
+		spec v1alpha1.PodBoxSpec
+	}
+	var missingPodCandidates []missingPodCandidate
+	var promoted []string
+
+	r.mu.Lock()
+	for name, status := range r.boxes {
+		spec := r.specs[name]
+		if status.Phase != v1alpha1.PodBoxPhaseProvisioning || spec.DesiredState != v1alpha1.DesiredStateRunning {
+			continue
+		}
+		if status.LastActivityAt != nil && status.LastActivityAt.After(listStartedAt) {
+			continue
+		}
+		if status.PodName == "" {
+			missingPodCandidates = append(missingPodCandidates, missingPodCandidate{name: name, spec: spec})
+			continue
+		}
+		pod, ok := podsByName[status.PodName]
+		if !ok {
+			missingPodCandidates = append(missingPodCandidates, missingPodCandidate{name: name, spec: spec})
+			continue
+		}
+		if pod.NotReady || pod.PodIP == "" {
+			continue
+		}
+
+		statusWithRunning := *status
+		statusWithRunning.Phase = v1alpha1.PodBoxPhaseRunning
+		statusWithRunning.PodIP = pod.PodIP
+		statusWithRunning.PausedAt = nil
+		statusWithRunning.LastActivityAt = &now
+		if statusWithRunning.Reason == "" {
+			statusWithRunning.Reason = "Provisioned"
+		}
+		if statusWithRunning.Message == "" {
+			statusWithRunning.Message = "Sandbox pod is ready"
+		}
+
+		err := r.kubeClient.UpsertPodBox(ctx, v1alpha1.PodBox{
+			APIVersion: "cubepod.io/v1alpha1",
+			Kind:       "PodBox",
+			Metadata: v1alpha1.ObjectMeta{
+				Name:        name,
+				Namespace:   r.namespace,
+				Annotations: r.podBoxAnnotationsLocked(name, ""),
+			},
+			Spec:   spec,
+			Status: statusWithRunning,
+		})
+		if err != nil {
+			slog.Warn("failed to persist running state for provisioning sandbox", "name", name, "err", err)
+			continue
+		}
+
+		*status = statusWithRunning
+		r.recordPhaseTransitionLocked(ctx, name, v1alpha1.PodBoxPhaseProvisioning, statusWithRunning)
+		promoted = append(promoted, name)
+	}
+	r.mu.Unlock()
+
+	for _, cand := range missingPodCandidates {
+		st, err := r.Reconcile(ctx, cand.name, cand.spec)
+		if err != nil {
+			slog.Warn("failed to re-reconcile provisioning sandbox with missing pod", "name", cand.name, "err", err)
+			continue
+		}
+		if st != nil && st.Phase == v1alpha1.PodBoxPhaseRunning {
+			promoted = append(promoted, cand.name)
+		}
+	}
+
+	slices.Sort(promoted)
+	return promoted
 }
 
 // ActiveSandboxesCount returns the number of Running sandboxes.
@@ -2490,7 +2730,7 @@ func (r *Reconciler) WarmPoolReadyCount() int {
 	total := 0
 	for _, pool := range r.warmPools {
 		for _, entry := range pool.entries {
-			if !entry.Claimed && !entry.NotReady {
+			if !entry.Claimed && !entry.NotReady && entry.PodIP != "" {
 				total++
 			}
 		}
@@ -2600,6 +2840,11 @@ func (r *Reconciler) SetPausedAt(name string, t time.Time) error {
 func (r *Reconciler) AcquireLease(name string, expiresAt time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if box, ok := r.boxes[name]; ok && box != nil {
+		if box.Phase == v1alpha1.PodBoxPhaseFailed || box.Phase == v1alpha1.PodBoxPhaseTerminated || box.Phase == v1alpha1.PodBoxPhasePaused {
+			return fmt.Errorf("cannot acquire lease for podbox %q in phase %s", name, box.Phase)
+		}
+	}
 	spec, ok := r.specs[name]
 	if !ok {
 		return fmt.Errorf("podbox %q not found", name)

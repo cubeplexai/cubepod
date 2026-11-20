@@ -311,6 +311,9 @@ func main() {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("CUBEPOD_RUNTIME")), "docker") {
 		cfg := runtime.DockerConfig{
 			DockerHost:          os.Getenv("DOCKER_HOST"),
+			BinDir:              os.Getenv("CUBEPOD_DOCKER_BIN_DIR"),
+			BaseDir:             os.Getenv("CUBEPOD_DOCKER_BASE_DIR"),
+			HostBaseDir:         os.Getenv("CUBEPOD_DOCKER_HOST_BASE_DIR"),
 			Network:             os.Getenv("CUBEPOD_DOCKER_NETWORK"),
 			DefaultImage:        os.Getenv("CUBEPOD_DOCKER_IMAGE"),
 			ContainerNamePrefix: os.Getenv("CUBEPOD_DOCKER_CONTAINER_PREFIX"),

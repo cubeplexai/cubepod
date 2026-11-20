@@ -64,3 +64,5 @@ deploy/k8s/local/
 
 # Isolated kind E2E build, credentials, and evidence
 .kind-e2e/
+
+.compose-e2e/
