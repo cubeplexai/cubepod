@@ -3717,3 +3717,53 @@ func TestWarmPool_DoesNotClaimEntryWithoutPodIP(t *testing.T) {
 		t.Fatalf("claimed PodIP = %q; want 10.244.0.77", claimed.PodIP)
 	}
 }
+
+func TestMarkFailed_SyncsMemoryClearsLeaseAndBlocksResurrection(t *testing.T) {
+	ctx := context.Background()
+	kc := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(controller.WithKubeClient(kc), controller.WithNamespace("default"))
+
+	spec := v1alpha1.PodBoxSpec{
+		TemplateRef:  "ubuntu:24.04",
+		DesiredState: v1alpha1.DesiredStateRunning,
+	}
+	if _, err := r.Reconcile(ctx, "box-fail-lease", spec); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if err := r.AcquireLease("box-fail-lease", time.Now().UTC().Add(10*time.Minute)); err != nil {
+		t.Fatalf("AcquireLease: %v", err)
+	}
+
+	if err := r.MarkFailed(ctx, "box-fail-lease", "TemplateReadyProbeTimedOut", "ready cmd timed out"); err != nil {
+		t.Fatalf("MarkFailed: %v", err)
+	}
+
+	memBox, ok := r.GetBox("box-fail-lease")
+	if !ok || memBox.Phase != v1alpha1.PodBoxPhaseFailed || memBox.Reason != "TemplateReadyProbeTimedOut" {
+		t.Fatalf("memBox = %+v; want Phase=Failed", memBox)
+	}
+	memSpec, ok := r.GetBoxSpec("box-fail-lease")
+	if !ok || memSpec.Lifecycle.LeaseExpiresAt != nil {
+		t.Fatalf("expected LeaseExpiresAt cleared on Failed box, got %+v", memSpec.Lifecycle.LeaseExpiresAt)
+	}
+	if err := r.AcquireLease("box-fail-lease", time.Now().UTC().Add(time.Minute)); err == nil {
+		t.Fatalf("expected AcquireLease on Failed box to fail")
+	}
+
+	kBox, err := kc.GetPodBox(ctx, "default", "box-fail-lease")
+	if err != nil {
+		t.Fatalf("GetPodBox: %v", err)
+	}
+	if kBox.Status.Phase != v1alpha1.PodBoxPhaseFailed || kBox.Spec.Lifecycle.LeaseExpiresAt != nil {
+		t.Fatalf("kBox = %+v; want Failed with nil LeaseExpiresAt", kBox)
+	}
+
+	// Reconciling without a RootfsGeneration bump must preserve Failed.
+	stAfter, err := r.Reconcile(ctx, "box-fail-lease", spec)
+	if err != nil {
+		t.Fatalf("Reconcile on Failed: %v", err)
+	}
+	if stAfter.Phase != v1alpha1.PodBoxPhaseFailed {
+		t.Fatalf("Phase after Reconcile = %q; want Failed", stAfter.Phase)
+	}
+}
