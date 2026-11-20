@@ -3082,3 +3082,67 @@ func TestUnifiedFeatureGatesAndDisabling(t *testing.T) {
 		t.Fatalf("expected 501 for subdomain CreateWatcher when E2BFilesystemWatch=false with live poddURL, got %d", subResp.StatusCode)
 	}
 }
+
+func TestGateway_TerminatedSandboxRejectsConnectPauseAndReset(t *testing.T) {
+	kc := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(controller.WithKubeClient(kc))
+	srv := gateway.NewServer(r)
+	srv.SetLivePodRouting(true)
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	resp, err := http.Post(ts.URL+"/sandboxes", "application/json", strings.NewReader(`{"templateID":"base"}`))
+	if err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	var sbx gateway.SandboxRecord
+	if err := json.NewDecoder(resp.Body).Decode(&sbx); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// Pause, expire PausedTTL, and sync so Gateway sees Terminated.
+	pResp, err := http.Post(ts.URL+"/sandboxes/"+sbx.SandboxID+"/pause", "application/json", nil)
+	if err != nil {
+		t.Fatalf("pause sandbox: %v", err)
+	}
+	_ = pResp.Body.Close()
+	if err := r.SetPausedAt(sbx.SandboxID, time.Now().UTC().Add(-2*time.Hour)); err != nil {
+		t.Fatalf("SetPausedAt: %v", err)
+	}
+	// Inject PausedTTLSeconds into K8s & Reconciler by updating spec via ReapIdle on a TTL-configured sandbox,
+	// or directly mark Terminated via ReapIdle after creating with timeout/ttl. Simpler: upsert Terminated PodBox and sync.
+	box, err := kc.GetPodBox(context.Background(), "cubepod-workloads", sbx.SandboxID)
+	if err != nil {
+		t.Fatalf("GetPodBox: %v", err)
+	}
+	box.Status.Phase = v1alpha1.PodBoxPhaseTerminated
+	box.Status.Reason = "PausedTTLExpired"
+	if err := kc.UpsertPodBox(context.Background(), *box); err != nil {
+		t.Fatalf("UpsertPodBox: %v", err)
+	}
+	if _, err := r.SyncFromKube(context.Background()); err != nil {
+		t.Fatalf("SyncFromKube: %v", err)
+	}
+	srv.SyncPodBoxesOnce(context.Background())
+
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{name: "connect", path: "/sandboxes/" + sbx.SandboxID + "/connect"},
+		{name: "pause", path: "/sandboxes/" + sbx.SandboxID + "/pause"},
+		{name: "reset-rootfs", path: "/sandboxes/" + sbx.SandboxID + "/reset-rootfs"},
+	} {
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+tc.path, nil)
+		r2, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s request failed: %v", tc.name, err)
+		}
+		_ = r2.Body.Close()
+		if r2.StatusCode != http.StatusConflict {
+			t.Fatalf("%s on Terminated sandbox: status=%d; want 409", tc.name, r2.StatusCode)
+		}
+	}
+}

@@ -1211,6 +1211,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	var prevPhase v1alpha1.PodBoxPhase
 	if exists && status != nil {
 		prevPhase = status.Phase
+		if status.Phase == v1alpha1.PodBoxPhaseTerminated {
+			cp := *status
+			return &cp, nil
+		}
 	}
 
 	isFork := !exists && spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != ""

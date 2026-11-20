@@ -1024,6 +1024,11 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
+	if rec.State == string(v1alpha1.PodBoxPhaseTerminated) {
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "sandbox is terminated")
+		return
+	}
 	poddURL := rec.PoddURL
 	templateID := rec.TemplateID
 	rootfsGen := rec.RootfsGeneration
@@ -1060,6 +1065,15 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if status.Phase == v1alpha1.PodBoxPhaseTerminated {
+		s.mu.Lock()
+		rec.State = string(status.Phase)
+		rec.Reason = status.Reason
+		rec.explicitlyPaused = false
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "sandbox is terminated")
+		return
+	}
 	s.pauseRuntimeSandbox(r.Context(), id)
 
 	s.mu.Lock()
@@ -1093,6 +1107,11 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.RLock()
+	if rec.State == string(v1alpha1.PodBoxPhaseTerminated) {
+		s.mu.RUnlock()
+		writeError(w, http.StatusConflict, "sandbox is terminated")
+		return
+	}
 	wasPaused := rec.State == "Paused" || rec.State == string(v1alpha1.PodBoxPhasePaused)
 	recCopy := cloneSandboxRecord(rec)
 	liveRouting := s.livePodRouting
@@ -1109,6 +1128,14 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if status.Phase == v1alpha1.PodBoxPhaseTerminated {
+		s.mu.Lock()
+		rec.State = string(status.Phase)
+		rec.Reason = status.Reason
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "sandbox is terminated")
 		return
 	}
 
@@ -1284,6 +1311,11 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.RLock()
+	if rec.State == string(v1alpha1.PodBoxPhaseTerminated) {
+		s.mu.RUnlock()
+		writeError(w, http.StatusConflict, "sandbox is terminated")
+		return
+	}
 	wasPaused := rec.State == "Paused" || rec.State == string(v1alpha1.PodBoxPhasePaused)
 	recCopy := cloneSandboxRecord(rec)
 	recCopy.RootfsGeneration++
@@ -1300,6 +1332,14 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if status.Phase == v1alpha1.PodBoxPhaseTerminated {
+		s.mu.Lock()
+		rec.State = string(status.Phase)
+		rec.Reason = status.Reason
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "sandbox is terminated")
 		return
 	}
 	if liveRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
@@ -1568,6 +1608,10 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 	defer unlock()
 
 	s.mu.Lock()
+	if rec.State == string(v1alpha1.PodBoxPhaseTerminated) {
+		s.mu.Unlock()
+		return fmt.Errorf("sandbox %s is terminated", rec.SandboxID)
+	}
 	s.recordActivity(rec)
 	recCopy := cloneSandboxRecord(rec)
 	liveRouting := s.livePodRouting
@@ -1586,6 +1630,13 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 		status, err := s.reconciler.Reconcile(ctx, recCopy.SandboxID, spec)
 		if err != nil {
 			return err
+		}
+		if status.Phase == v1alpha1.PodBoxPhaseTerminated {
+			s.mu.Lock()
+			rec.State = string(status.Phase)
+			rec.Reason = status.Reason
+			s.mu.Unlock()
+			return fmt.Errorf("sandbox %s is terminated", recCopy.SandboxID)
 		}
 		if liveRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
 			recCopy.PoddURL = formatPoddURL(status.PodIP, recCopy.EnvdPort)

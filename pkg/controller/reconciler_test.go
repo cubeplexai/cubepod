@@ -3593,3 +3593,50 @@ func TestReconcileProvisioning_RedrivesMissingPodAndEmptyPodName(t *testing.T) {
 		}
 	}
 }
+
+func TestReconcile_TerminatedCannotBeResurrected(t *testing.T) {
+	ctx := context.Background()
+	kc := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(controller.WithKubeClient(kc), controller.WithNamespace("default"))
+
+	spec := v1alpha1.PodBoxSpec{
+		TemplateRef:  "ubuntu:24.04",
+		DesiredState: v1alpha1.DesiredStateRunning,
+		Lifecycle: v1alpha1.LifecyclePolicy{
+			PausedTTLSeconds: 60,
+		},
+	}
+	if _, err := r.Reconcile(ctx, "box-term-guard", spec); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, err := r.Pause(ctx, "box-term-guard"); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+	if err := r.SetPausedAt("box-term-guard", time.Now().UTC().Add(-5*time.Minute)); err != nil {
+		t.Fatalf("SetPausedAt: %v", err)
+	}
+
+	_, terminated := r.ReapIdle(ctx, time.Now().UTC())
+	if len(terminated) != 1 || terminated[0] != "box-term-guard" {
+		t.Fatalf("terminated = %v; want [box-term-guard]", terminated)
+	}
+
+	// Re-reconciling with DesiredStatePaused or DesiredStateRunning must NOT resurrect Terminated.
+	pausedSpec := spec
+	pausedSpec.DesiredState = v1alpha1.DesiredStatePaused
+	st1, err := r.Reconcile(ctx, "box-term-guard", pausedSpec)
+	if err != nil {
+		t.Fatalf("Reconcile(Paused) on Terminated: %v", err)
+	}
+	if st1.Phase != v1alpha1.PodBoxPhaseTerminated {
+		t.Fatalf("Phase after Reconcile(Paused) = %q; want Terminated", st1.Phase)
+	}
+
+	st2, err := r.Reconcile(ctx, "box-term-guard", spec)
+	if err != nil {
+		t.Fatalf("Reconcile(Running) on Terminated: %v", err)
+	}
+	if st2.Phase != v1alpha1.PodBoxPhaseTerminated {
+		t.Fatalf("Phase after Reconcile(Running) = %q; want Terminated", st2.Phase)
+	}
+}
