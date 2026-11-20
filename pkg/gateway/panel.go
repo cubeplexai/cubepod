@@ -38,11 +38,25 @@ type mintEndpointReq struct {
 // for signing and verifying /panel/{token}/ URLs (Changed in v0.7.0).
 var ErrPanelSecretMissing = errors.New("CUBEPOD_PANEL_SECRET is required; refusing to start with an empty panel HMAC secret")
 
+// ErrPanelSecretInvalid rejects known public placeholders, without imposing
+// a new minimum length on existing operator-supplied secrets.
+var ErrPanelSecretInvalid = errors.New("panel HMAC secret must not be a known default or placeholder")
+
+func validatePanelSecret(secret []byte) error {
+	switch string(secret) {
+	case "":
+		return ErrPanelSecretMissing
+	case "replace-with-random-hmac-secret", "cubepod-default-hmac-panel-secret-key-32b":
+		return ErrPanelSecretInvalid
+	}
+	return nil
+}
+
 // SetPanelSecret sets the HMAC secret used to sign and verify panel tokens.
 func (s *Server) SetPanelSecret(secret string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.panelSecret = []byte(secret)
+	s.panelSecret = []byte(strings.TrimSpace(secret))
 }
 
 func (s *Server) getPanelSecret() []byte {
@@ -59,13 +73,14 @@ func (s *Server) getPanelSecret() []byte {
 }
 
 // RequirePanelSecret resolves the HMAC secret from SetPanelSecret or
-// CUBEPOD_PANEL_SECRET and returns ErrPanelSecretMissing if neither is set.
+// CUBEPOD_PANEL_SECRET, returning ErrPanelSecretMissing if neither is set
+// or ErrPanelSecretInvalid for known public defaults/placeholders.
 // On success the resolved secret is pinned on the server. There is no
 // compiled-in default (Changed in v0.7.0).
 func (s *Server) RequirePanelSecret() error {
 	secret := strings.TrimSpace(string(s.getPanelSecret()))
-	if secret == "" {
-		return ErrPanelSecretMissing
+	if err := validatePanelSecret([]byte(secret)); err != nil {
+		return err
 	}
 	s.SetPanelSecret(secret)
 	return nil
@@ -116,7 +131,11 @@ func (s *Server) handleCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	s.handleMintEndpointToken(w, r)
 }
 
-func (s *Server) mintPanelToken(sandboxID string, port int, expiresInSeconds int) (string, time.Time) {
+func (s *Server) mintPanelToken(sandboxID string, port int, expiresInSeconds int) (string, time.Time, error) {
+	sec := s.getPanelSecret()
+	if err := validatePanelSecret(sec); err != nil {
+		return "", time.Time{}, err
+	}
 	if expiresInSeconds == 0 {
 		expiresInSeconds = 3600
 	}
@@ -124,13 +143,13 @@ func (s *Server) mintPanelToken(sandboxID string, port int, expiresInSeconds int
 	expUnix := expTime.Unix()
 
 	payload := fmt.Sprintf("%s:%d:%d", sandboxID, port, expUnix)
-	mac := hmac.New(sha256.New, s.getPanelSecret())
+	mac := hmac.New(sha256.New, sec)
 	mac.Write([]byte(payload))
 	sig := mac.Sum(nil)
 
 	payloadB64 := base64.RawURLEncoding.EncodeToString([]byte(payload))
 	sigB64 := base64.RawURLEncoding.EncodeToString(sig)
-	return payloadB64 + "." + sigB64, expTime
+	return payloadB64 + "." + sigB64, expTime, nil
 }
 
 func (s *Server) resolveSandboxHost(rec *SandboxRecord) string {
@@ -179,11 +198,12 @@ func (s *Server) handleMintEndpointToken(w http.ResponseWriter, r *http.Request)
 
 	// Do not honor client targetUrl / upstreamUrl and do not pin a
 	// caller-supplied upstream into the in-memory endpoint map.
-	if len(s.getPanelSecret()) == 0 {
-		http.Error(w, "panel HMAC secret is not configured", http.StatusInternalServerError)
+	token, expTime, err := s.mintPanelToken(sandboxID, port, req.ExpiresInSeconds)
+	if err != nil {
+		http.Error(w, "panel HMAC secret is not configured or is invalid", http.StatusInternalServerError)
 		return
 	}
-	token, expTime := s.mintPanelToken(sandboxID, port, req.ExpiresInSeconds)
+
 	urlPath := fmt.Sprintf("/panel/%s/", token)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -216,7 +236,7 @@ func (s *Server) parseAndVerifyPanelToken(token string) (*PanelTokenClaims, erro
 	}
 
 	sec := s.getPanelSecret()
-	if len(sec) == 0 {
+	if err := validatePanelSecret(sec); err != nil {
 		slog.Error("panel token rejected: panel HMAC secret is not configured")
 		return nil, fmt.Errorf("panel HMAC secret is not configured")
 	}

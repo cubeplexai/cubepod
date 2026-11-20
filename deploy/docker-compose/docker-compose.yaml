@@ -13,13 +13,13 @@ services:
       - "--state-dir=/var/lib/cubepod/state"
       - "--template-probe-timeout=120s"
     environment:
+      - CUBEPOD_PANEL_SECRET=${CUBEPOD_PANEL_SECRET:-}
       - CUBEPOD_RUNTIME_MODE=docker-loopback
       - CUBEPOD_STATE=/var/lib/cubepod/state
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - cubepod-volumes:/var/lib/cubepod/volumes
       - cubepod-state:/var/lib/cubepod/state
-      - ./gateway-entrypoint.sh:/usr/local/bin/gateway-entrypoint.sh:ro
 
   cubepod-controller:
     build:

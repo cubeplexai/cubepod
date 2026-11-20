@@ -55,7 +55,7 @@ The table below reflects the exact service definitions in `deploy/docker-compose
 
 | Service | Dockerfile Context | Published Port | Default Flags & Environment | Mounted Volumes |
 | :--- | :--- | :--- | :--- | :--- |
-| `cubepod-gateway` | `images/gateway/Dockerfile` (root `../..`) | `8080:8080` | `gateway-entrypoint.sh` then `-addr=:8080`, `--e2b-template-api=false`, `--template-build=false`, `--state-dir=/var/lib/cubepod/state`, `--template-probe-timeout=120s`, `CUBEPOD_RUNTIME_MODE=docker-loopback`, `CUBEPOD_STATE=/var/lib/cubepod/state`. Generates or reuses `CUBEPOD_PANEL_SECRET` (*Changed in v0.7.0*) | `/var/run/docker.sock:/var/run/docker.sock`, `cubepod-volumes:/var/lib/cubepod/volumes`, `cubepod-state:/var/lib/cubepod/state`, `./gateway-entrypoint.sh:/usr/local/bin/gateway-entrypoint.sh:ro` |
+| `cubepod-gateway` | `images/gateway/Dockerfile` (root `../..`) | `8080:8080` | `gateway-entrypoint.sh` then `-addr=:8080`, `--e2b-template-api=false`, `--template-build=false`, `--state-dir=/var/lib/cubepod/state`, `--template-probe-timeout=120s`, `CUBEPOD_RUNTIME_MODE=docker-loopback`, `CUBEPOD_STATE=/var/lib/cubepod/state`. Generates or reuses `CUBEPOD_PANEL_SECRET` (*Changed in v0.7.0*) | `/var/run/docker.sock:/var/run/docker.sock`, `cubepod-volumes:/var/lib/cubepod/volumes`, `cubepod-state:/var/lib/cubepod/state` |
 | `cubepod-controller` | `images/controller/Dockerfile` (root `../..`) | `8081:8081` | `-addr=:8081`, `--e2b-template-api=false`, `--template-build=false`, `--state-dir=/var/lib/cubepod/state`, `--template-probe-timeout=120s`, `CUBEPOD_STATE=/var/lib/cubepod/state` | `cubepod-state:/var/lib/cubepod/state` |
 | `cubepod-egress` | `images/egress/Dockerfile` (root `../..`) | `18080:18080` | `-addr=:18080`, `-default-allow=true` | — |
 
@@ -130,3 +130,5 @@ raw-block storage. The test uses unique project/volume/network names and an
 automatically allocated loopback port. It removes only its own resources,
 leaving existing Compose stacks and kind clusters intact. Failure diagnostics
 and both SDK reports are retained under `.compose-e2e/PROJECT/artifacts/`.
+
+*Changed in v0.7.0*: The entrypoint is copied into the gateway image (not bind-mounted). It uses `umask 077` and atomic, no-overwrite publication of the generated secret; concurrent starts reuse the winning value. Existing empty files cause startup failure rather than silent rotation.

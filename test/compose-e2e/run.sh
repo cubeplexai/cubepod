@@ -87,6 +87,7 @@ BUILD="$STATE/build"; mkdir -p "$BUILD"
  done
  timeout 600s cargo build --locked --release -p podd -p podd-init
  cp "${CARGO_TARGET_DIR:-target}/release/podd" "${CARGO_TARGET_DIR:-target}/release/podd-init" "$BUILD/")
+cp "$ROOT/deploy/docker-compose/gateway-entrypoint.sh" "$BUILD/"
 timeout 600s docker build -f "$HERE/Dockerfile" -t "$E2E_CONTROL_IMAGE" "$BUILD"
 timeout 600s docker build -f "$ROOT/test/kind-e2e/Dockerfile" --target sandbox -t "$E2E_SANDBOX_IMAGE" "$BUILD"
 for suffix in runtime-bin sandbox-data volumes; do

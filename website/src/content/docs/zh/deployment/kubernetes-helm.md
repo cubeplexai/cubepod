@@ -78,6 +78,8 @@ flowchart TB
 
 面板 HMAC 密钥（`gateway.panelSecret`）是网关启动的必选项（*v0.7.0 变更*）。将其留空时，Chart 会在安装时随机生成一个 Kubernetes Secret，并在升级时复用同一个值。只有在需要自行指定密钥时才设置 `gateway.panelSecret`。不要轮换正在使用的密钥，否则已签发的 `/panel/{token}/` 地址以及其他副本上的校验都会失败。
 
+*v0.7.0 变更*：GitOps / Argo CD / 离线 `helm template` 请设置 `gateway.existingPanelSecret`，指向 release 命名空间内、包含 `panel-secret` 键的外部 Secret。此选项优先于 `gateway.panelSecret`，并跳过 Chart 创建 Secret。离线渲染无法使用 `lookup`，两项均为空时每次渲染都会生成不同密钥；自动生成和复用适用于在线 Helm install/upgrade。显式修改 `gateway.panelSecret` 会通过稳定 checksum 触发滚动重启，自动生成/lookup 路径不添加随机 rollout annotation。外管 Secret 轮换后需执行 `kubectl rollout restart deployment/<fullname>-gateway`，因为环境变量只在进程启动时读取。轮换会使旧 panel token 失效，需协调所有副本。
+
 ```yaml
 gateway:
   replicaCount: 2
@@ -237,3 +239,5 @@ curl -fsS http://localhost:8080/health
 
 - 按照 [Kata Containers 与块存储配置](/zh/deployment/kata-and-block-storage/) 准备计算节点的虚拟化运行时与裸块 CSI 驱动。
 - 查阅 [Helm Values 参考](/zh/reference/helm-values/)与 [Kubernetes CRD 参考](/zh/reference/crds/)了解完整参数说明。
+
+*v0.7.0 变更*：环境变量和进程内密钥设置均会去除两端空白，并拒绝旧的公开默认密钥与 `replace-with-random-hmac-secret` 占位符。空或无效密钥不能签发 token（包括桌面地址）。本次不强制新的最短长度，仍应使用加密安全的随机密钥。

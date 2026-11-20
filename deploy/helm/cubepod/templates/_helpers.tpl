@@ -323,5 +323,9 @@ Effective Kubernetes Secret name for CUBEPOD_SECRETS_KEY
 Name of the Kubernetes Secret that holds CUBEPOD_PANEL_SECRET
 */}}
 {{- define "cubepod.panelSecretName" -}}
+{{- if .Values.gateway.existingPanelSecret -}}
+{{- .Values.gateway.existingPanelSecret -}}
+{{- else -}}
 {{- printf "%s-panel-secret" (include "cubepod.fullname" .) -}}
+{{- end -}}
 {{- end }}
