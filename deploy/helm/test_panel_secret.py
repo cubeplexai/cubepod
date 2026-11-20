@@ -68,7 +68,20 @@ class PanelSecretChartTests(unittest.TestCase):
                     "/api": {"kind": "APIVersions", "apiVersion": "v1", "versions": ["v1"]},
                     "/apis": {"kind": "APIGroupList", "apiVersion": "v1", "groups": []},
                     "/api/v1": {"kind": "APIResourceList", "groupVersion": "v1", "resources": [{"name": "secrets", "singularName": "secret", "namespaced": True, "kind": "Secret", "verbs": ["get", "list"]}]},
-                    "/api/v1/namespaces/default/secrets/panel-test-cubepod-panel-secret": {"kind": "Secret", "apiVersion": "v1", "metadata": {"name": "panel-test-cubepod-panel-secret", "namespace": "default"}, "data": {"panel-secret": existing}},
+                    "/api/v1/namespaces/default/secrets/panel-test-cubepod-panel-secret": {
+                    "kind": "Secret",
+                    "apiVersion": "v1",
+                    "metadata": {
+                        "name": "panel-test-cubepod-panel-secret",
+                        "namespace": "default",
+                        "labels": {"app.kubernetes.io/managed-by": "Helm"},
+                        "annotations": {
+                            "meta.helm.sh/release-name": "panel-test",
+                            "meta.helm.sh/release-namespace": "default",
+                        },
+                    },
+                    "data": {"panel-secret": existing},
+                },
                 }
                 response = responses.get(path)
                 self.send_response(200 if response is not None else 404)
@@ -88,7 +101,27 @@ class PanelSecretChartTests(unittest.TestCase):
                 kubeconfig = Path(tmp) / "config"
                 kubeconfig.write_text(json.dumps({"apiVersion": "v1", "kind": "Config", "clusters": [{"name": "fixture", "cluster": {"server": "http://127.0.0.1:"+str(server.server_port)}}], "contexts": [{"name": "fixture", "context": {"cluster": "fixture", "user": "fixture"}}], "current-context": "fixture", "users": [{"name": "fixture", "user": {}}]}))
                 kubeconfig.chmod(0o600)
-                result = subprocess.check_output(["helm", "template", "panel-test", str(fixture), "--dry-run=server", "--kubeconfig", str(kubeconfig)], text=True, timeout=20)
+                # Helm 4 --dry-run=server also downloads the cluster OpenAPI
+                # schema; this fixture only serves lookup. Skip schema validation
+                # so the test exercises Secret reuse without a full apiserver.
+                rendered = subprocess.run(
+                    [
+                        "helm",
+                        "template",
+                        "panel-test",
+                        str(fixture),
+                        "--dry-run=server",
+                        "--disable-openapi-validation",
+                        "--kubeconfig",
+                        str(kubeconfig),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                )
+                if rendered.returncode != 0:
+                    self.fail(rendered.stderr or rendered.stdout)
+                result = rendered.stdout
                 self.assertEqual(generated_secret(result), b"persisted-online-test-key")
                 self.assertTrue(any("/secrets/panel-test-cubepod-panel-secret" in p for p in seen))
         finally:
