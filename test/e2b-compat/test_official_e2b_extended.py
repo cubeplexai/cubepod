@@ -48,6 +48,8 @@ def direct_gateway_url() -> Generator[str, None, None]:
     env["KUBECONFIG"] = os.path.join(temp_dir, "nonexistent-kubeconfig")
     env.pop("KUBERNETES_SERVICE_HOST", None)
     env.pop("KUBERNETES_SERVICE_PORT", None)
+    if not env.get("CUBEPOD_PANEL_SECRET"):
+        env["CUBEPOD_PANEL_SECRET"] = "cubepod-test-panel-secret"
 
     proc = subprocess.Popen(
         [
