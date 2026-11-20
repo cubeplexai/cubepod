@@ -836,6 +836,9 @@ class LiveGateway:
         gw_env["KUBECONFIG"] = os.path.join(self.temp_dir, "nonexistent-kubeconfig")
         gw_env.pop("KUBERNETES_SERVICE_HOST", None)
         gw_env.pop("KUBERNETES_SERVICE_PORT", None)
+        # Gateway refuses to start without a panel HMAC secret (Helm/Compose generate one).
+        if not gw_env.get("CUBEPOD_PANEL_SECRET"):
+            gw_env["CUBEPOD_PANEL_SECRET"] = "cubepod-test-panel-secret"
         self.go_proc = subprocess.Popen(
             cmd,
             env=gw_env,
