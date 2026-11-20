@@ -2029,9 +2029,10 @@ func (r *Reconciler) retireUnclaimedWarmEntriesForTemplateLocked(tplName, newRea
 					_ = r.kubeClient.DeletePod(context.Background(), r.namespace, entry.PodName)
 					_ = r.kubeClient.DeletePVC(context.Background(), r.namespace, entry.RootfsPVCName)
 					_ = r.kubeClient.DeletePVC(context.Background(), r.namespace, entry.WorkspacePVCName)
+					r.deleteEgressSecretsLocked(context.Background(), entry.ID)
 					continue
 				}
-				if !entry.Claimed {
+				if !entry.Claimed && !entry.NotReady && entry.PodIP != "" {
 					avail++
 				}
 				kept = append(kept, entry)

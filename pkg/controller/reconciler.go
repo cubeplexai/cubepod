@@ -2253,10 +2253,10 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 				if entry, ok := existingEntries[pod.Name]; ok {
 					entry.Claimed = claimed
 					entry.ClaimedBy = claimedBy
-					entry.NotReady = pod.NotReady
 					if pod.PodIP != "" {
 						entry.PodIP = pod.PodIP
 					}
+					entry.NotReady = pod.NotReady || entry.PodIP == ""
 					if entry.PodManifest.Labels == nil {
 						entry.PodManifest.Labels = make(map[string]string)
 					}
@@ -2285,7 +2285,7 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 						TemplateRef:      tplRef,
 						PodName:          pod.Name,
 						PodIP:            pod.PodIP,
-						NotReady:         pod.NotReady,
+						NotReady:         pod.NotReady || pod.PodIP == "",
 						RootfsPVCName:    entryID + "-rootfs-pvc",
 						WorkspacePVCName: entryID + "-workspace-pvc",
 						Claimed:          claimed,
@@ -2362,7 +2362,7 @@ func (r *Reconciler) FindAvailableWarmPool(templateRef string) string {
 	for name, pool := range r.warmPools {
 		if pool.spec.TemplateRef == templateRef {
 			for _, entry := range pool.entries {
-				if !entry.Claimed && !entry.NotReady {
+				if !entry.Claimed && !entry.NotReady && entry.PodIP != "" {
 					return name
 				}
 			}
@@ -2646,7 +2646,7 @@ func (r *Reconciler) WarmPoolReadyCount() int {
 	total := 0
 	for _, pool := range r.warmPools {
 		for _, entry := range pool.entries {
-			if !entry.Claimed && !entry.NotReady {
+			if !entry.Claimed && !entry.NotReady && entry.PodIP != "" {
 				total++
 			}
 		}

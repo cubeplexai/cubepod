@@ -3673,6 +3673,28 @@ func TestWarmPool_DoesNotClaimEntryWithoutPodIP(t *testing.T) {
 	if len(entries) != 1 || !entries[0].NotReady || entries[0].PodIP != "" {
 		t.Fatalf("expected 1 unready entry without PodIP, got %+v", entries)
 	}
+	if poolName := r.FindAvailableWarmPool("ubuntu:24.04"); poolName != "" {
+		t.Fatalf("expected FindAvailableWarmPool to return empty when entry has no PodIP, got %q", poolName)
+	}
+	if readyCnt := r.WarmPoolReadyCount(); readyCnt != 0 {
+		t.Fatalf("expected WarmPoolReadyCount=0 when entry has no PodIP, got %d", readyCnt)
+	}
+
+	// SyncFromKube with empty PodIP must keep NotReady=true and ready count=0.
+	delete(mem.IPs, "default/"+entries[0].PodName)
+	pEmpty := mem.Pods["default/"+entries[0].PodName]
+	pEmpty.PodIP = ""
+	pEmpty.NotReady = false
+	mem.Pods["default/"+entries[0].PodName] = pEmpty
+	if _, err := r.SyncFromKube(ctx); err != nil {
+		t.Fatalf("SyncFromKube(empty IP): %v", err)
+	}
+	if readyCnt := r.WarmPoolReadyCount(); readyCnt != 0 {
+		t.Fatalf("expected WarmPoolReadyCount=0 after SyncFromKube with empty PodIP, got %d", readyCnt)
+	}
+	if poolName := r.FindAvailableWarmPool("ubuntu:24.04"); poolName != "" {
+		t.Fatalf("expected FindAvailableWarmPool empty after SyncFromKube with empty PodIP, got %q", poolName)
+	}
 
 	if _, err := r.ClaimWarmPod(ctx, "no-ip-pool", "box-should-not-claim"); err == nil {
 		t.Fatalf("expected ClaimWarmPod to fail when standby entry has no PodIP")
