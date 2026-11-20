@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && pip install --no-cache-dir --break-system-packages \
        ipykernel matplotlib pandas numpy \
-    && useradd -m -u 1000 -s /bin/bash cubeplex \
-    && mkdir -p /workspace && chown 1000:1000 /workspace
+    && mkdir -p /workspace && chown 1000:1000 /workspace \
+    && rm -rf /root/.cache /tmp/*
 
 WORKDIR /workspace

@@ -278,6 +278,12 @@ jobs:
           - image: cubepod-egress
             dockerfile: images/egress/Dockerfile
             context: .
+          - image: cubepod-sandbox-base
+            dockerfile: images/sandbox-base/Dockerfile
+            context: .
+          - image: cubepod-desktop
+            dockerfile: images/desktop/Dockerfile
+            context: .
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -350,7 +356,7 @@ jobs:
           manifest="release-manifest-${RELEASE_TAG}.yaml"
           printf 'release: %s\nsource_commit: %s\nimages:\n' "$RELEASE_TAG" "$source_commit" > "$manifest"
 
-          for target in podd controller gateway egress; do
+          for target in podd controller gateway egress sandbox-base desktop; do
             ref="ghcr.io/${IMAGE_OWNER}/cubepod-${target}:${RELEASE_TAG}"
             digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
             [[ "$digest" == sha256:* ]]

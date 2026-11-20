@@ -26,7 +26,6 @@ DEFAULT_URL="${CUBEPOD_INITIAL_URL:-about:blank}"
 NOVNC_DIR="${CUBEPOD_NOVNC_DIR:-/usr/share/novnc}"
 NEKO_STATIC="${CUBEPOD_NEKO_STATIC:-/opt/cubepod/desktop/neko-www}"
 NEKO_ICELITE="${CUBEPOD_NEKO_ICELITE:-1}"
-PROFILE_DIR="${CUBEPOD_BROWSER_PROFILE_DIR:-/home/cubeplex/.config/chromium}"
 WORKDIR="${CUBEPOD_WORKDIR:-/workspace}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,14 +53,21 @@ XDG_RUNTIME_DIR_PATH="${RUN_DIR}/xdg"
 DROP_PRIV=0
 TARGET_UID=""
 TARGET_GID=""
-TARGET_HOME="${HOME:-/home/cubeplex}"
-if [ "$(id -u)" -eq 0 ] && id cubeplex >/dev/null 2>&1; then
-  DROP_PRIV=1
-  TARGET_UID="$(id -u cubeplex)"
-  TARGET_GID="$(id -g cubeplex)"
-  TARGET_HOME="$(getent passwd cubeplex | cut -d: -f6)"
-  TARGET_HOME="${TARGET_HOME:-/home/cubeplex}"
+TARGET_USER=""
+TARGET_HOME="${HOME:-/tmp}"
+if [ "$(id -u)" -eq 0 ]; then
+  PW_ENTRY="$(getent passwd 1000 2>/dev/null || true)"
+  if [ -n "$PW_ENTRY" ]; then
+    DROP_PRIV=1
+    TARGET_USER="$(printf '%s' "$PW_ENTRY" | cut -d: -f1)"
+    TARGET_UID="$(printf '%s' "$PW_ENTRY" | cut -d: -f3)"
+    TARGET_GID="$(printf '%s' "$PW_ENTRY" | cut -d: -f4)"
+    TARGET_HOME="$(printf '%s' "$PW_ENTRY" | cut -d: -f6)"
+    TARGET_HOME="${TARGET_HOME:-/home/${TARGET_USER}}"
+  fi
 fi
+
+PROFILE_DIR="${CUBEPOD_BROWSER_PROFILE_DIR:-${TARGET_HOME}/.config/chromium}"
 
 prepare_dirs() {
   mkdir -p "$RUN_DIR" "$XDG_RUNTIME_DIR_PATH" "$PROFILE_DIR"
@@ -216,8 +222,8 @@ cleanup_stale_chromium_locks() {
   if pgrep -f -- "[u]ser-data-dir=${PROFILE_DIR}" >/dev/null 2>&1; then
     return 0
   fi
-  if [ "$PROFILE_DIR" = "/home/cubeplex/.config/chromium" ] && id cubeplex >/dev/null 2>&1; then
-    if pgrep -u "$(id -u cubeplex)" -x "chrome|chromium|chromium-browser" >/dev/null 2>&1; then
+  if [ "$PROFILE_DIR" = "${TARGET_HOME}/.config/chromium" ] && [ -n "$TARGET_UID" ]; then
+    if pgrep -u "$TARGET_UID" -x "chrome|chromium|chromium-browser" >/dev/null 2>&1; then
       return 0
     fi
   fi
@@ -247,15 +253,15 @@ spawn_daemon() {
     if [ "$DROP_PRIV" = "1" ]; then
       if command -v setpriv >/dev/null 2>&1; then
         exec setpriv --reuid="$TARGET_UID" --regid="$TARGET_GID" --init-groups -- \
-          env HOME="$TARGET_HOME" USER=cubeplex LOGNAME=cubeplex \
+          env HOME="$TARGET_HOME" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
           DISPLAY="$DISPLAY_NUM" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR_PATH" "$@"
       elif command -v runuser >/dev/null 2>&1; then
-        exec runuser -u cubeplex -- \
-          env HOME="$TARGET_HOME" USER=cubeplex LOGNAME=cubeplex \
+        exec runuser -u "$TARGET_USER" -- \
+          env HOME="$TARGET_HOME" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
           DISPLAY="$DISPLAY_NUM" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR_PATH" "$@"
       else
-        exec su -s /bin/bash cubeplex -c 'exec env "$@"' -- _ \
-          HOME="$TARGET_HOME" USER=cubeplex LOGNAME=cubeplex \
+        exec su -s /bin/bash "$TARGET_USER" -c 'exec env "$@"' -- _ \
+          HOME="$TARGET_HOME" USER="$TARGET_USER" LOGNAME="$TARGET_USER" \
           DISPLAY="$DISPLAY_NUM" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR_PATH" "$@"
       fi
     else
