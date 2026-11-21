@@ -52,7 +52,7 @@ Default cubepod-egress sidecar image
 {{- define "cubepod.egressImage" -}}
 {{- $egress := .Values.egress | default dict -}}
 {{- $img := $egress.image | default dict -}}
-{{- printf "%s/%s:%s" ($img.registry | default "ghcr.io") ($img.repository | default "cubeplexai/cubepod-egress") ($img.tag | default "v0.7.0") -}}
+{{- printf "%s/%s:%s" ($img.registry | default "ghcr.io") ($img.repository | default "cubeplexai/cubepod-egress") ($img.tag | default "v0.7.1") -}}
 {{- end }}
 
 {{/*

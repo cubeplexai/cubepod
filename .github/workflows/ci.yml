@@ -194,3 +194,30 @@ jobs:
 
       - name: Run Official E2B TypeScript SDK Compatibility Suite
         run: make test-e2b-compat-ts
+
+  sandbox-images-ci:
+    name: Build Sandbox & Desktop Images (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cubepod-sandbox-base
+            dockerfile: images/sandbox-base/Dockerfile
+          - name: cubepod-desktop
+            dockerfile: images/desktop/Dockerfile
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
