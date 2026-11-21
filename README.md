@@ -25,10 +25,10 @@ CubePod solves these challenges with **Dual-Volume CSI Raw Block persistence**, 
 
 | Capability / Dimension | Upstream E2B Cloud / Standard Sandboxes | CubePod Open-Source Platform |
 | :--- | :--- | :--- |
-| **System Persistence** | Ephemeral RootFS; only `/workspace` persists (or none); system packages lost on sleep | **Full RootFS + Workspace Dual Persistence**; `apt`/`pip`/`npm` modifications survive indefinitely |
-| **Storage Architecture** | Ephemeral container overlay or slow shared NFS | **Dual CSI Raw Block PVCs** (`volumeMode: Block` $\to$ `virtio-blk` $\to$ Guest `ext4`) with native NVMe-oF speed |
-| **RootFS & Workspace Lifecycle** | Coupled (resetting workspace resets OS, or vice versa) | **Fully Decoupled**: increment `rootfsGeneration` to re-image OS while preserving `/workspace` intact |
-| **Hibernation & Resumption** | Heavy container snapshot export or cold VM restart | **Zero-Export Suspend** (`fsfreeze`, delete Pod $\to$ 0 CPU/RAM) & **~1s Cross-Node Mount Resume** |
+| **Persistence Model** | **VM pause snapshots** (E2B) or **ephemeral overlay** (containers; `/workspace` only) | **Dual-Volume CSI Raw Block Persistence** (`RootFS` + `/workspace` persisted on block storage) |
+| **Storage Architecture** | Snapshot-coupled rootfs/state (optional E2B Volumes) or slow shared NFS | **Dual CSI Raw Block PVCs** (`volumeMode: Block` $\to$ `virtio-blk` $\to$ Guest `ext4`) with native NVMe-oF speed |
+| **RootFS & Workspace Lifecycle** | Coupled in VM snapshots or full reset on container rebuild | **Fully Decoupled**: increment `rootfsGeneration` to re-image OS while preserving `/workspace` intact |
+| **Hibernation & Resumption** | Export/restore VM memory & disk snapshots or cold VM restart | **Zero-Export Suspend** (`fsfreeze`, delete Pod $\to$ 0 CPU/RAM) & **~1s Cross-Node Mount Resume** |
 | **MicroVM Cold Start** | Standard VM boot latency (several seconds) | **Pre-Attached WarmPool (`PodWarmPool`)**: blank pre-formatted ext4 MicroVMs claimed in **< 50ms** |
 | **Sandbox Forking** | Not supported / full volume copy | **< 1s Copy-on-Write Fork**: instantaneous sub-agent cloning via CSI block snapshots |
 | **Isolation Boundary** | Shared-kernel containers or cloud black-box | **Hardware-Isolated Kata MicroVM** (dedicated Guest Linux Kernel per sandbox) |

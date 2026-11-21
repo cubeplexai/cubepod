@@ -25,10 +25,10 @@ CubePod 通过**双卷 CSI 裸块设备持久化（Dual-Volume CSI Raw Block）*
 
 | 能力 / 维度 | 上游 E2B Cloud / 标准沙箱 | CubePod 开源平台 |
 | :--- | :--- | :--- |
-| **系统持久化** | 临时 RootFS；仅 `/workspace` 持久化（或无持久化）；休眠后系统软件包丢失 | **全量 RootFS + Workspace 双重持久化**；`apt`/`pip`/`npm` 修改永久保留 |
-| **存储架构** | 临时容器 Overlay 或低速共享 NFS | **双 CSI 裸块 PVC**（`volumeMode: Block` $\to$ `virtio-blk` $\to$ Guest `ext4`），具备原生 NVMe-oF 速度 |
-| **RootFS 与 Workspace 生命周期** | 相互耦合（重置工作区会重置系统，反之亦然） | **完全解耦**：递增 `rootfsGeneration` 即可重装系统镜像，同时完整保留 `/workspace` |
-| **休眠与恢复** | 沉重的容器快照导出或冷重启 VM | **零导出挂起**（`fsfreeze`，删除 Pod $\to$ 0 CPU/内存）与 **~1 秒跨节点挂载恢复** |
+| **持久化方式** | **VM Pause 快照**（E2B）或**临时 Overlay**（标准容器，仅持久化 `/workspace`） | **双卷 CSI 裸块持久化**（`RootFS` 与 `/workspace` 独立持久化在块存储上） |
+| **存储架构** | 快照耦合 RootFS 与状态（可选挂 E2B Volumes）或低速共享 NFS | **双 CSI 裸块 PVC**（`volumeMode: Block` $\to$ `virtio-blk` $\to$ Guest `ext4`），具备原生 NVMe-oF 速度 |
+| **RootFS 与 Workspace 生命周期** | 绑定于同一 VM 快照或随容器重建整体重置 | **完全解耦**：递增 `rootfsGeneration` 即可重装系统镜像，同时完整保留 `/workspace` |
+| **休眠与恢复** | 导出/恢复 VM 内存与磁盘快照或冷重启 VM | **零导出挂起**（`fsfreeze`，删除 Pod $\to$ 0 CPU/内存）与 **~1 秒跨节点挂载恢复** |
 | **MicroVM 冷启动** | 标准 VM 启动延迟（数秒） | **预挂载 WarmPool（`PodWarmPool`）**：已预格式化 ext4 的空白 MicroVM 在 **< 50ms** 内认领 |
 | **沙箱分叉（Fork）** | 不支持 / 全量卷拷贝 | **< 1 秒写时复制（CoW）Fork**：通过 CSI 块快照实现瞬时子 Agent 克隆 |
 | **隔离边界** | 共享内核容器或云端黑盒 | **硬件级隔离 Kata MicroVM**（每个沙箱独占 Guest Linux 内核） |
