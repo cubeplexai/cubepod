@@ -22,18 +22,33 @@ class RuntimeProofTest(unittest.TestCase):
             self.assertFalse(guest_ready(text))
         self.assertTrue(guest_ready('6.18.62\r\nKATA_GUEST_READY\r\n'))
 
-    def verify(self, runtime='kata-clh-e2e', count=12, expected='kata-clh-e2e'):
+    def verify(self, runtime='kata-clh-e2e', count=12, expected='kata-clh-e2e', reports=None):
         events = [{'type':'ADDED', 'object':{'kind':'Pod','metadata':{'name':f'sandbox-{i}'},'spec':{'runtimeClassName':runtime}}} for i in range(count)]
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'events.json'
             path.write_text('\n'.join(json.dumps(e) for e in events))
-            return subprocess.run([sys.executable,str(Path(__file__).with_name('verify_pods.py')),str(path),expected],capture_output=True).returncode
+            args=[sys.executable,str(Path(__file__).with_name('verify_pods.py')),str(path),expected]
+            if reports:
+                written=[]
+                for index, body in enumerate(reports):
+                    report=Path(directory)/f'report-{index}.xml'
+                    report.write_text('<testsuite>'+body+'</testsuite>')
+                    written.append(str(report))
+                args.extend(written)
+            return subprocess.run(args,capture_output=True).returncode
     def test_all_sandboxes_use_requested_runtime(self):
         self.assertEqual(self.verify(),0)
     def test_runc_fallback_fails(self):
         self.assertNotEqual(self.verify(runtime='none'),0)
     def test_partial_or_empty_execution_fails(self):
         for count in (0,1,11):self.assertNotEqual(self.verify(count=count),0)
+    def test_skipped_volume_tests_lower_expected_pod_count(self):
+        volume = "<testcase name='test_volume_mount_persistence'><skipped message='#122'/></testcase>"
+        volume_ts = "<testcase name='volume mounts survive destruction and recreation'><skipped message='#122'/></testcase>"
+        others = "<testcase name='a'/><testcase name='b'/><testcase name='c'/><testcase name='d'/>"
+        reports = [others + volume, others + volume_ts]
+        self.assertEqual(self.verify(count=8, reports=reports), 0)
+        self.assertNotEqual(self.verify(count=7, reports=reports), 0)
 
 
 

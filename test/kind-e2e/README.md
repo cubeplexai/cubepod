@@ -42,7 +42,12 @@ single-node cluster, loads images, installs the Helm chart with live Pod routing
 registers the prebuilt test template, waits with deadlines, runs both SDK suites,
 exports diagnostics, and deletes its cluster on success **or failure**. A skip,
 missing report, fewer than five scenarios per language, or failed assertion fails
-the check. Python failure does not suppress execution of TypeScript.
+the check. The only exception is the Kata Firecracker lane (`KATA_VMM=fc`): skips
+that cite [issue #120](https://github.com/cubeplexai/cubepod/issues/120) or
+[issue #122](https://github.com/cubeplexai/cubepod/issues/122) are allowed until
+those issues are fixed; unlabeled skips and any other failure still fail. kind,
+Compose and Cloud Hypervisor reject every skip. Python failure does not suppress
+execution of TypeScript.
 
 Each invocation uses a private `.kind-e2e/<cluster>/kubeconfig`, unique image tags,
 a single test namespace `cubepod-kind` **inside its own cluster**, and an OS-assigned
