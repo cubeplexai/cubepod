@@ -27,7 +27,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/cubepod/desktop/ms-playwright
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Core utilities
     bash ca-certificates curl e2fsprogs util-linux iproute2 git procps socat \
-    python3 python3-pip python3-venv \
+    python3 python3-pip python3-venv libatomic1 \
     # X11, window manager, VNC, noVNC/websockify, terminal, and fonts
     xvfb openbox x11vnc novnc websockify dbus-x11 xauth ttyd \
     fonts-liberation fonts-noto-cjk \
