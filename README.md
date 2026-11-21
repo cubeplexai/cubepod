@@ -25,7 +25,7 @@ CubePod solves these challenges with **Dual-Volume CSI Raw Block persistence**, 
 
 | Capability / Dimension | Upstream E2B Cloud / Standard Sandboxes | CubePod Open-Source Platform |
 | :--- | :--- | :--- |
-| **Persistence Model** | **VM pause snapshots** (E2B) or **ephemeral overlay** (containers; `/workspace` only) | **Dual-Volume CSI Raw Block Persistence** (`RootFS` + `/workspace` persisted on block storage) |
+| **Persistence Model** | **VM pause snapshots** (E2B) or **ephemeral overlay** (containers; `/workspace` only) | **Block-Backed Persistent RootFS + Independent `/workspace` Volume** |
 | **Storage Architecture** | Snapshot-coupled rootfs/state (optional E2B Volumes) or slow shared NFS | **Dual CSI Raw Block PVCs** (`volumeMode: Block` $\to$ `virtio-blk` $\to$ Guest `ext4`) with native NVMe-oF speed |
 | **RootFS & Workspace Lifecycle** | Coupled in VM snapshots or full reset on container rebuild | **Fully Decoupled**: increment `rootfsGeneration` to re-image OS while preserving `/workspace` intact |
 | **Hibernation & Resumption** | Export/restore VM memory & disk snapshots or cold VM restart | **Zero-Export Suspend** (`fsfreeze`, delete Pod $\to$ 0 CPU/RAM) & **~1s Cross-Node Mount Resume** |
