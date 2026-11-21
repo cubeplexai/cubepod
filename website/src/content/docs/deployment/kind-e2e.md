@@ -3,7 +3,7 @@ title: Reproducible kind E2E
 description: Run the real CubePod Helm deployment and official E2B Python and TypeScript SDKs in an isolated local Kubernetes cluster.
 ---
 
-Added after v0.6.0 (unreleased).
+Added in v0.7.0.
 
 From a source checkout on Linux with Docker, Go, Rust, Python and Node installed:
 
@@ -36,7 +36,7 @@ manual dispatch, with bounded execution and downloadable reports and diagnostics
 
 ## Independent Kata Firecracker and Cloud Hypervisor lanes
 
-Added after v0.6.0. The runc baseline stays non-KVM. Two additional independently
+Added in v0.7.0. The runc baseline stays non-KVM. Two additional independently
 reported checks run the same complete official dual-SDK scenarios with real Kata:
 
 ```sh

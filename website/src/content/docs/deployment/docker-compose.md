@@ -109,7 +109,7 @@ make test-e2e
 
 ## Reproducible dual-SDK E2E
 
-Added after v0.6.0. From a Linux x86_64 checkout, run:
+Added in v0.7.0. From a Linux x86_64 checkout, run:
 
 ```sh
 make test-compose-e2e
