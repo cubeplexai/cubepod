@@ -165,7 +165,7 @@ test_sdks() {
   if [[ -n ${KATA_VMM:-} ]]; then kata_watch_sdks; fi
   STATE="$STATE" ARTIFACTS="$ARTIFACTS" bash "$HERE/run-sdks.sh" || sdk=$?
   if [[ -n ${KATA_VMM:-} ]]; then kata_verify_sdks || sdk=1; fi
-  # Never turn a missing report, skip, or unexpectedly empty suite into green.
+  # Never turn a missing report, unlabeled skip, or unexpectedly empty suite into green.
   local deleted=0
   k wait --for=delete pods -n "$NS" -l pod.cubeplex.ai/box --timeout=60s >"$ARTIFACTS/sandbox-cleanup.txt" 2>&1 || deleted=$?
   echo "SDK exit code=$sdk; sandbox deletion=$deleted"
@@ -179,6 +179,7 @@ if [[ -f "$STATE/kata-owned" ]]; then
   KATA_VMM=$stored_vmm
 fi
 if [[ -n ${KATA_VMM:-} ]]; then
+  export KATA_VMM
   source "$ROOT/test/kata-e2e/hooks.sh"
 fi
 case "${1:-run}" in

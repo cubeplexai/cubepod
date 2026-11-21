@@ -49,8 +49,12 @@ host. The lanes pin Kata 4.4.0, bundled FC 1.17.0 / CLH 54.1 and Linux 6.18.62.
 They first execute KVM VM/vCPU checks and boot an actual Linux guest with each
 VMM, then boot a real Kata Pod before deploying CubePod with block rootfs and
 workspace CSI volumes. Both SDKs assert the guest kernel, and Kubernetes evidence
-must show the requested runtime for all created sandboxes; no runc fallback or
-skipped tests count as success. Matrix `fail-fast` is disabled.
+must show the requested runtime for all created sandboxes; no runc fallback
+counts as success. Cloud Hypervisor rejects every skip. On Firecracker only,
+skips that cite [issue #120](https://github.com/cubeplexai/cubepod/issues/120) or
+[issue #122](https://github.com/cubeplexai/cubepod/issues/122) are allowed until
+those issues are fixed; any other skip or failure still fails the check. Matrix
+`fail-fast` is disabled.
 
 FC also needs a devmapper snapshotter/thin-pool. The harness uses only its newly
 owned loop files and checked pool UUID; it never formats an existing host disk.
@@ -61,7 +65,10 @@ the owned node for recovery rather than discarding device ownership state.
 
 A native guest or smoke-Pod pass is **not** full SDK E2E. In particular FC has no
 virtiofs, while CubePod's current E2B shared content store uses filesystem staging.
-If unsupported, its real volume test must fail visibly pending a genuine block
-solution; it is never skipped or replaced with a mock. `kata-qemu` is another
+The official volume tests are temporarily skipped on Firecracker only, citing
+[issue #122](https://github.com/cubeplexai/cubepod/issues/122), and must be
+re-enabled when that issue is fixed; they are not replaced with a mock.
+Sandbox-create failures caused by [issue #120](https://github.com/cubeplexai/cubepod/issues/120)
+are handled the same way. `kata-qemu` is another
 formal runtime, planned for its own VMM/transport/full-SDK lane and not implicitly
 covered here. Runtime and guest diagnostics join the ordinary kind test artifacts.

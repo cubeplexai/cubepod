@@ -144,7 +144,7 @@ kata_stop_watch() {
 }
 kata_verify_sdks() {
   kata_stop_watch
-  python3 "$KATA_HERE/verify_pods.py" "$ARTIFACTS/sdk-pods-watch.json" "kata-$KATA_VMM-e2e"
+  python3 "$KATA_HERE/verify_pods.py" "$ARTIFACTS/sdk-pods-watch.json" "kata-$KATA_VMM-e2e" "$ARTIFACTS/python.xml" "$ARTIFACTS/typescript.xml"
 }
 kata_collect() {
   kata_stop_watch
