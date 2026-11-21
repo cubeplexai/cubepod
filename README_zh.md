@@ -1,10 +1,12 @@
+![CubePod](website/public/og-banner.png)
+
 # CubePod
 
 **面向 AI Agent 的持久化可写 RootFS MicroVM 执行平台**
 
 [English](README.md) · [中文文档](https://cubepod.dev/zh/) · [交互式 API 参考](https://cubepod.dev/api/) · [`llms.txt`](https://cubepod.dev/llms.txt)
 
-CubePod 是一个专为长生命周期、高自主性 AI Agent 设计的开源云原生执行平台。**作为开源 CubePlex Agent 技术栈的核心组件**，CubePod 为 [**CubePlex**](https://github.com/cubeplexai/cubeplex)（团队 Agent 工作区）和 [**CubeLoop**](https://github.com/cubeplexai/cubeloop)（异步 Agent 运行时）提供持久化硬件隔离执行层，兼具秒级休眠/唤醒与全系统级持久化能力。
+CubePod 是一个专为长生命周期、高自主性 AI Agent 设计的开源云原生执行平台，具备**原生兼容 E2B** 与**原生 Kubernetes Runtime 调度**能力。**作为开源 CubePlex Agent 技术栈的核心组件**，CubePod 为 [**CubePlex**](https://github.com/cubeplexai/cubeplex)（团队 Agent 工作区）和 [**CubeLoop**](https://github.com/cubeplexai/cubeloop)（异步 Agent 运行时）提供持久化硬件隔离执行层，兼具秒级休眠/唤醒与全系统级持久化能力。
 
 ---
 
