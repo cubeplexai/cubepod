@@ -25,7 +25,7 @@ CubePod 通过**双卷 CSI 裸块设备持久化（Dual-Volume CSI Raw Block）*
 
 | 能力 / 维度 | 上游 E2B Cloud / 标准沙箱 | CubePod 开源平台 |
 | :--- | :--- | :--- |
-| **持久化方式** | **VM Pause 快照**（E2B）或**临时 Overlay**（标准容器，仅持久化 `/workspace`） | **双卷 CSI 裸块持久化**（`RootFS` 与 `/workspace` 独立持久化在块存储上） |
+| **持久化方式** | **VM Pause 快照**（E2B）或**临时 Overlay**（标准容器，仅持久化 `/workspace`） | **块存储级 RootFS 持久化 + 独立 `/workspace` 卷** |
 | **存储架构** | 快照耦合 RootFS 与状态（可选挂 E2B Volumes）或低速共享 NFS | **双 CSI 裸块 PVC**（`volumeMode: Block` $\to$ `virtio-blk` $\to$ Guest `ext4`），具备原生 NVMe-oF 速度 |
 | **RootFS 与 Workspace 生命周期** | 绑定于同一 VM 快照或随容器重建整体重置 | **完全解耦**：递增 `rootfsGeneration` 即可重装系统镜像，同时完整保留 `/workspace` |
 | **休眠与恢复** | 导出/恢复 VM 内存与磁盘快照或冷重启 VM | **零导出挂起**（`fsfreeze`，删除 Pod $\to$ 0 CPU/内存）与 **~1 秒跨节点挂载恢复** |
