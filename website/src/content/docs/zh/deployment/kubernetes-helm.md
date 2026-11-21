@@ -3,7 +3,7 @@ title: Kubernetes 与 Helm 部署
 description: 使用 Helm Chart 在 Kubernetes 集群中部署 CubePod Operator、Gateway、Egress 代理、CRDs 及可选的无特权 BuildKit 构建服务。
 ---
 
-在 Kubernetes 环境中，CubePod 通过位于 `deploy/helm/cubepod/` 的 Helm Chart（`cubepod`，`version: 0.6.0`，`appVersion: "0.6.0"`）进行统一打包交付，涵盖 `PodBox`、`PodTemplate`、`PodWarmPool`、`SandboxWebhook` 四类 CRD、RBAC 权限、工作负载命名空间、Control Plane Gateway、Kubernetes Controller 以及可选的无特权 BuildKit 模板构建流水线。
+在 Kubernetes 环境中，CubePod 通过位于 `deploy/helm/cubepod/` 的 Helm Chart（`cubepod`，`version: 0.7.0`，`appVersion: "0.7.0"`）进行统一打包交付，涵盖 `PodBox`、`PodTemplate`、`PodWarmPool`、`SandboxWebhook` 四类 CRD、RBAC 权限、工作负载命名空间、Control Plane Gateway、Kubernetes Controller 以及可选的无特权 BuildKit 模板构建流水线。
 
 由 `deploy/helm/cubepod/values.yaml` 自动生成的完整字段说明，请参阅 [Helm Values 参考](/zh/reference/helm-values/)与 [Kubernetes CRD 参考](/zh/reference/crds/)。
 
@@ -18,7 +18,7 @@ description: 使用 Helm Chart 在 Kubernetes 集群中部署 CubePod Operator�
 
 ```bash
 helm install cubepod oci://ghcr.io/cubeplexai/charts/cubepod \
-  --version 0.6.0 \
+  --version 0.7.0 \
   --namespace cubepod-system \
   --create-namespace
 ```
@@ -90,7 +90,7 @@ gateway:
 runtime:
   runtimeClassName: kata-qemu
   defaultTemplate: cubeplex-ubuntu24-desktop
-  poddInjectorImage: ghcr.io/cubeplexai/cubepod-podd:v0.6.0
+  poddInjectorImage: ghcr.io/cubeplexai/cubepod-podd:v0.7.0
   defaultSandboxImage: ghcr.io/cubeplexai/cubeplex-sandbox:v0.4.0
 
 storage:
@@ -108,7 +108,7 @@ egress:
   image:
     registry: "ghcr.io"
     repository: "cubeplexai/cubepod-egress"
-    tag: "v0.6.0"
+    tag: "v0.7.0"
   port: 18080
   exchangeUrl: "https://cubeplex-backend.cubeplex.svc:8443/api/v1/internal/egress/exchange"
 ```
@@ -124,7 +124,7 @@ helm upgrade --install cubepod ./deploy/helm/cubepod \
 
 ### 关键运行时与存储默认配置
 
-- **运行时注入（`runtime.poddInjectorImage`）**：默认为 `ghcr.io/cubeplexai/cubepod-podd:v0.6.0`。每个沙箱 Pod 都会通过 `initContainer` 将 `podd-init` 与 `podd` 拷贝至共享 `emptyDir`（`/opt/cubepod/bin`），从而保持基础业务镜像纯净。
+- **运行时注入（`runtime.poddInjectorImage`）**：默认为 `ghcr.io/cubeplexai/cubepod-podd:v0.7.0`。每个沙箱 Pod 都会通过 `initContainer` 将 `podd-init` 与 `podd` 拷贝至共享 `emptyDir`（`/opt/cubepod/bin`），从而保持基础业务镜像纯净。
 - **私有仓库凭证（`global.imagePullSecrets`、`runtime.templatePullSecret`）**：自 `v0.5.2` 起支持，统一为控制面 Pod（`controller`、`gateway`、`buildkit`）与工作负载沙箱 Pod 注入镜像拉取凭证（即使关闭 `templateBuild.enabled` 也生效）。
 - **Egress CA 与状态持久化（`egress.caSecretName`、`gateway.persistence`）**：自 `v0.5.2` 起支持，可挂载持久化根 CA Secret 至控制面，并为 Gateway 持久化 `stateDir`（`CUBEPOD_STATE`）以保存模板目录、E2B Secrets 与生命周期事件/Webhook 状态。
 - **双裸块 PVC（`storage.*`）**：默认 `storageClassName: longhorn-v2-block-thin`、`volumeMode: Block`、`rootfsSize: "10Gi"`、`workspaceSize: "20Gi"`。
