@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1770,6 +1771,62 @@ func (m *mockFailingSyncKubeClient) ListPodBoxes(ctx context.Context, ns string)
 		return nil, fmt.Errorf("injected ListPodBoxes failure")
 	}
 	return m.MemoryKubeClient.ListPodBoxes(ctx, ns)
+}
+
+type failEnsurePodKubeClient struct {
+	*controller.MemoryKubeClient
+	err error
+}
+
+func (f *failEnsurePodKubeClient) EnsurePod(ctx context.Context, pod controller.PodManifest) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.MemoryKubeClient.EnsurePod(ctx, pod)
+}
+
+func TestGateway_CreateSandbox_ReconcileError_ReturnsJSONError(t *testing.T) {
+	cause := errors.New("timed out waiting for pod cubepod-kind/cpod-test to reach Running phase")
+	mockKube := &failEnsurePodKubeClient{
+		MemoryKubeClient: controller.NewMemoryKubeClient(),
+		err:              cause,
+	}
+	reconciler := controller.NewReconciler(
+		controller.WithKubeClient(mockKube),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	for _, path := range []string{"/sandboxes", "/v2/sandboxes"} {
+		resp, err := http.Post(ts.URL+path, "application/json", strings.NewReader(`{"templateID":"cubeplex-ubuntu24-desktop"}`))
+		if err != nil {
+			t.Fatalf("POST %s failed: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusInternalServerError {
+			t.Fatalf("POST %s: expected 500, got %d body=%s", path, resp.StatusCode, body)
+		}
+		ct := resp.Header.Get("Content-Type")
+		if !strings.HasPrefix(ct, "application/json") {
+			t.Fatalf("POST %s: expected application/json, got %q body=%s", path, ct, body)
+		}
+		var payload struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("POST %s: official SDK requires JSON error body, decode failed: %v body=%s", path, err, body)
+		}
+		if payload.Code != http.StatusInternalServerError {
+			t.Fatalf("POST %s: expected code %d, got %d", path, http.StatusInternalServerError, payload.Code)
+		}
+		if !strings.Contains(payload.Message, cause.Error()) {
+			t.Fatalf("POST %s: expected message to contain %q, got %q", path, cause.Error(), payload.Message)
+		}
+	}
 }
 
 func TestGateway_CreateSandbox_WarmPoolClaimFail_SyncFromKubeError_FallsBackToColdStart(t *testing.T) {

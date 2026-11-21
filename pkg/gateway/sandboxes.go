@@ -853,7 +853,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "template not found")
 			return
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -864,7 +864,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	workspaceDir := s.workspaceDirForSandbox(id, volumeKey)
 	if err := os.MkdirAll(workspaceDir, 0755); err != nil {
 		s.rollbackCreatedSandbox(r.Context(), id)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1002,7 +1002,7 @@ func (s *Server) handleGetSandbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("sandboxID")
 	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		http.Error(w, "sandbox not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "sandbox not found")
 		return
 	}
 	s.mu.RLock()
@@ -1020,7 +1020,7 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 
 	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		http.Error(w, "sandbox not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "sandbox not found")
 		return
 	}
 	s.mu.Lock()
@@ -1067,7 +1067,7 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		rec.explicitlyPaused = false
 		s.mu.Unlock()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if status.Phase == v1alpha1.PodBoxPhaseTerminated || status.Phase == v1alpha1.PodBoxPhaseFailed {
@@ -1112,7 +1112,7 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 
 	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		http.Error(w, "sandbox not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "sandbox not found")
 		return
 	}
 	s.mu.RLock()
@@ -1141,7 +1141,7 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 	}, id)
 	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if status.Phase == v1alpha1.PodBoxPhaseTerminated || status.Phase == v1alpha1.PodBoxPhaseFailed {
@@ -1169,7 +1169,7 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 			rec.lastEmittedLifecycleState = events.EventResumed
 		}
 		s.mu.Unlock()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1225,7 +1225,7 @@ func (s *Server) handleRefreshSandbox(w http.ResponseWriter, r *http.Request) {
 
 	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		http.Error(w, "sandbox not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "sandbox not found")
 		return
 	}
 
@@ -1272,7 +1272,7 @@ func (s *Server) handleSetTimeout(w http.ResponseWriter, r *http.Request) {
 
 	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		http.Error(w, "sandbox not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "sandbox not found")
 		return
 	}
 
@@ -1326,7 +1326,7 @@ func (s *Server) handleAcquireLease(w http.ResponseWriter, r *http.Request) {
 
 	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		http.Error(w, "sandbox not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "sandbox not found")
 		return
 	}
 
@@ -1381,7 +1381,7 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 
 	rec, ok := s.resolveSandbox(r.Context(), id)
 	if !ok {
-		http.Error(w, "sandbox not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "sandbox not found")
 		return
 	}
 	s.mu.RLock()
@@ -1405,7 +1405,7 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 	}, id)
 	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if status.Phase == v1alpha1.PodBoxPhaseTerminated {
@@ -1429,7 +1429,7 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 			rec.lastEmittedLifecycleState = events.EventResumed
 		}
 		s.mu.Unlock()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1460,7 +1460,7 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 
 	parent, ok := s.resolveSandbox(r.Context(), parentID)
 	if !ok {
-		http.Error(w, "parent sandbox not found", http.StatusNotFound)
+		writeError(w, http.StatusNotFound, "parent sandbox not found")
 		return
 	}
 
@@ -1499,7 +1499,7 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	status, err := s.reconciler.Reconcile(r.Context(), childID, spec)
 	if err != nil {
 		s.releaseSandboxVolumeMounts(childID)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -1551,7 +1551,7 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			if err2 := s.startRuntimeSandbox(r.Context(), child, "", nil); err2 != nil {
 				s.rollbackCreatedSandbox(r.Context(), childID)
-				http.Error(w, err2.Error(), http.StatusInternalServerError)
+				writeError(w, http.StatusInternalServerError, err2.Error())
 				return
 			}
 		} else if info != nil && info.PoddURL != "" {
