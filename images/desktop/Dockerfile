@@ -39,7 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libopus0 libvpx9 \
     && rm -rf /var/lib/apt/lists/* \
     # Python scientific/code-interpreter + Playwright browser automation packages
-    && pip install --no-cache-dir --break-system-packages \
+    && pip install --no-cache-dir --break-system-packages --ignore-installed \
        ipykernel matplotlib pandas numpy playwright \
     # Install Playwright Chromium & OS shared library dependencies (non-snap)
     && mkdir -p /opt/cubepod/desktop/ms-playwright \
