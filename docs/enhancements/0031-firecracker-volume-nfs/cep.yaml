@@ -8,9 +8,9 @@ participating-areas:
   - "runtime"
   - "egress"
   - "gateway"
-status: "implementable"
+status: "provisional"
 creation-date: "2026-11-22"
-last-updated: "2026-11-22"
+last-updated: "2026-11-23"
 reviewers:
   - "@xfgong"
 approvers:
