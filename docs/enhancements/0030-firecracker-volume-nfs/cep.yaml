@@ -1,0 +1,37 @@
+title: "Firecracker NFS Transport for Official E2B Volumes"
+cep-number: "0030"
+authors:
+  - "@gammakfinn"
+owning-area: "storage"
+participating-areas:
+  - "controller"
+  - "runtime"
+  - "egress"
+  - "gateway"
+status: "implementable"
+creation-date: "2026-11-22"
+last-updated: "2026-11-22"
+reviewers:
+  - "@xfgong"
+approvers:
+  - "@xfgong"
+stage: "alpha"
+latest-milestone: "v0.8.0"
+milestone:
+  alpha: "v0.8.0"
+  beta: "v0.8.0"
+  stable: "v1.0.0"
+feature-gates:
+  - name: "FirecrackerVolumeNFS"
+    components:
+      - "podd-init"
+      - "cubepod-controller"
+      - "cubepod-volume-nfs"
+      - "cubepod-egress"
+disable-supported: true
+metrics:
+  - "cubepod_volume_nfs_mounts_total"
+  - "cubepod_volume_nfs_mount_errors_total"
+  - "cubepod_volume_nfs_export_denials_total"
+  - "cubepod_volume_nfs_rpc_duration_seconds"
+  - "cubepod_volume_nfs_leases_active"
