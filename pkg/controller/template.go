@@ -1955,14 +1955,21 @@ func (r *Reconciler) AssignTemplateTags(ctx context.Context, nameOrID string, ta
 		return nil, fmt.Errorf("%w: %s", ErrTemplateNotFound, nameOrID)
 	}
 
-	primary := primaryNameOfTemplate(tpl)
+	if r.kubeClient != nil {
+		if fresh, err := r.kubeClient.GetPodTemplate(ctx, r.namespace, tpl.Metadata.Name); err == nil && fresh != nil {
+			*tpl = clonePodTemplate(fresh)
+		}
+	}
+
+	updated := clonePodTemplate(tpl)
+	primary := primaryNameOfTemplate(&updated)
 	var normalized []string
 	for _, raw := range tags {
 		entry := normalizeTemplateTagEntry(primary, raw)
 		if entry == "" {
 			continue
 		}
-		if existing, exists := r.templateIndex[entry]; exists && existing != tpl.Metadata.Name {
+		if existing, exists := r.templateIndex[entry]; exists && existing != updated.Metadata.Name {
 			return nil, fmt.Errorf("%w: tag %q already claimed by %q", ErrTemplateConflict, entry, existing)
 		}
 		if !slices.Contains(normalized, entry) {
@@ -1971,18 +1978,22 @@ func (r *Reconciler) AssignTemplateTags(ctx context.Context, nameOrID string, ta
 	}
 
 	for _, entry := range normalized {
-		if !slices.Contains(tpl.Spec.Names, entry) {
-			tpl.Spec.Names = append(tpl.Spec.Names, entry)
+		if !slices.Contains(updated.Spec.Names, entry) {
+			updated.Spec.Names = append(updated.Spec.Names, entry)
 		}
 	}
-	tpl.Status.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	updated.Status.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 
-	if err := r.kubeClient.UpdatePodTemplate(ctx, *tpl); err != nil {
+	if err := r.kubeClient.UpdatePodTemplate(ctx, updated); err != nil {
 		return nil, err
 	}
-	if err := r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl); err != nil {
+	if err := r.kubeClient.UpdatePodTemplateStatus(ctx, updated); err != nil {
 		return nil, err
 	}
+	if fresh, err := r.kubeClient.GetPodTemplate(ctx, r.namespace, updated.Metadata.Name); err == nil && fresh != nil {
+		updated.Metadata.ResourceVersion = fresh.Metadata.ResourceVersion
+	}
+	*tpl = updated
 	_ = r.indexTemplateLocked(tpl)
 	r.templates[tpl.Metadata.Name] = tpl.Spec
 	r.persistLocalTemplateLocked(tpl)
@@ -2004,7 +2015,14 @@ func (r *Reconciler) DeleteTemplateTags(ctx context.Context, nameOrID string, ta
 		return nil, fmt.Errorf("%w: %s", ErrTemplateNotFound, nameOrID)
 	}
 
-	primary := primaryNameOfTemplate(tpl)
+	if r.kubeClient != nil {
+		if fresh, err := r.kubeClient.GetPodTemplate(ctx, r.namespace, tpl.Metadata.Name); err == nil && fresh != nil {
+			*tpl = clonePodTemplate(fresh)
+		}
+	}
+
+	updated := clonePodTemplate(tpl)
+	primary := primaryNameOfTemplate(&updated)
 	toRemove := make(map[string]struct{}, len(tags))
 	for _, raw := range tags {
 		entry := normalizeTemplateTagEntry(primary, raw)
@@ -2014,29 +2032,37 @@ func (r *Reconciler) DeleteTemplateTags(ctx context.Context, nameOrID string, ta
 		toRemove[entry] = struct{}{}
 	}
 
-	kept := make([]string, 0, len(tpl.Spec.Names))
-	for _, existing := range tpl.Spec.Names {
+	kept := make([]string, 0, len(updated.Spec.Names))
+	var removed []string
+	for _, existing := range updated.Spec.Names {
 		if existing == primary {
 			kept = append(kept, existing)
 			continue
 		}
 		if _, rm := toRemove[existing]; rm {
-			if mapped, ok := r.templateIndex[existing]; ok && mapped == tpl.Metadata.Name {
-				delete(r.templateIndex, existing)
-			}
+			removed = append(removed, existing)
 			continue
 		}
 		kept = append(kept, existing)
 	}
-	tpl.Spec.Names = kept
-	tpl.Status.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	updated.Spec.Names = kept
+	updated.Status.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 
-	if err := r.kubeClient.UpdatePodTemplate(ctx, *tpl); err != nil {
+	if err := r.kubeClient.UpdatePodTemplate(ctx, updated); err != nil {
 		return nil, err
 	}
-	if err := r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl); err != nil {
+	if err := r.kubeClient.UpdatePodTemplateStatus(ctx, updated); err != nil {
 		return nil, err
 	}
+	if fresh, err := r.kubeClient.GetPodTemplate(ctx, r.namespace, updated.Metadata.Name); err == nil && fresh != nil {
+		updated.Metadata.ResourceVersion = fresh.Metadata.ResourceVersion
+	}
+	for _, entry := range removed {
+		if mapped, ok := r.templateIndex[entry]; ok && mapped == updated.Metadata.Name {
+			delete(r.templateIndex, entry)
+		}
+	}
+	*tpl = updated
 	_ = r.indexTemplateLocked(tpl)
 	r.templates[tpl.Metadata.Name] = tpl.Spec
 	r.persistLocalTemplateLocked(tpl)

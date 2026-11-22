@@ -2220,7 +2220,7 @@ func TestPodTemplate_SubresourceStatusPersistenceAndBuildStart(t *testing.T) {
 	// Seed a legacy PodTemplate with empty .Status (simulating pre-0.7.0 CRs in cluster).
 	if err := sharedKube.CreatePodTemplate(ctx, v1alpha1.PodTemplate{
 		Metadata: v1alpha1.ObjectMeta{Name: "cubeplex-ubuntu24-desktop", Namespace: "cubepod-workloads"},
-		Spec:     v1alpha1.PodTemplateSpec{Image: "hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917"},
+		Spec:     v1alpha1.PodTemplateSpec{Image: "registry.example.com/custom/cubeplex-sandbox:v1"},
 	}); err != nil {
 		t.Fatalf("seed legacy PodTemplate failed: %v", err)
 	}
@@ -2245,7 +2245,7 @@ func TestPodTemplate_SubresourceStatusPersistenceAndBuildStart(t *testing.T) {
 		byName[item.Metadata.Name] = item
 	}
 	if legacy := byName["cubeplex-ubuntu24-desktop"]; legacy.Status.BuildStatus != v1alpha1.BuildStatusReady ||
-		legacy.Status.ReadyImage != "hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917" {
+		legacy.Status.ReadyImage != "registry.example.com/custom/cubeplex-sandbox:v1" {
 		t.Fatalf("expected legacy seeded template status backfilled preserving Spec.Image, got %+v", legacy.Status)
 	}
 	if deb := byName["debian-12"]; deb.Status.TemplateID != "tpl_debian-12" || deb.Status.BuildStatus != v1alpha1.BuildStatusReady {
@@ -2279,5 +2279,26 @@ func TestPodTemplate_SubresourceStatusPersistenceAndBuildStart(t *testing.T) {
 	tpl, ok := ctrlReconciler.GetPodTemplate(resp.TemplateID)
 	if !ok || tpl.Status.BuildStatus != v1alpha1.BuildStatusReady {
 		t.Fatalf("expected template ready after StartBuild, ok=%v tpl=%+v", ok, tpl)
+	}
+
+	// Gateway still holds a stale pre-build cache; tag mutations must refresh from Kube
+	// so they do not clobber controller-written .Status (BuildStatus/ReadyImage) or Spec.Image.
+	tagged, err := gwReconciler.AssignTemplateTags(ctx, resp.TemplateID, []string{"v1"})
+	if err != nil {
+		t.Fatalf("AssignTemplateTags on stale gateway failed: %v", err)
+	}
+	if tagged.Status.BuildStatus != v1alpha1.BuildStatusReady || tagged.Status.ReadyImage != tpl.Status.ReadyImage || tagged.Spec.Image != tpl.Spec.Image {
+		t.Fatalf("AssignTemplateTags clobbered controller state: got status=%+v spec.image=%q want readyImage=%q", tagged.Status, tagged.Spec.Image, tpl.Status.ReadyImage)
+	}
+	untagged, err := gwReconciler.DeleteTemplateTags(ctx, resp.TemplateID, []string{"v1"})
+	if err != nil {
+		t.Fatalf("DeleteTemplateTags on stale gateway failed: %v", err)
+	}
+	if untagged.Status.BuildStatus != v1alpha1.BuildStatusReady || untagged.Status.ReadyImage != tpl.Status.ReadyImage || untagged.Spec.Image != tpl.Spec.Image {
+		t.Fatalf("DeleteTemplateTags clobbered controller state: got status=%+v spec.image=%q want readyImage=%q", untagged.Status, untagged.Spec.Image, tpl.Status.ReadyImage)
+	}
+	stored, err := sharedKube.GetPodTemplate(ctx, "cubepod-workloads", tpl.Metadata.Name)
+	if err != nil || stored.Status.BuildStatus != v1alpha1.BuildStatusReady || stored.Status.ReadyImage != tpl.Status.ReadyImage {
+		t.Fatalf("stored PodTemplate status clobbered after tag mutations: err=%v stored=%+v", err, stored)
 	}
 }
