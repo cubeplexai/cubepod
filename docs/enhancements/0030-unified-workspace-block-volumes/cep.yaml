@@ -1,0 +1,34 @@
+title: "Unified Workspace Block Volume Lifecycle Management via /volumes API"
+cep-number: "0030"
+authors:
+  - "@xfgong"
+owning-area: "storage"
+participating-areas:
+  - "gateway"
+  - "controller"
+  - "runtime"
+  - "sdk"
+status: "provisional"
+creation-date: "2026-11-21"
+last-updated: "2026-11-21"
+reviewers:
+  - "@xfgong"
+approvers:
+  - "@xfgong"
+stage: "alpha"
+latest-milestone: "v0.8.0"
+milestone:
+  alpha: "v0.8.0"
+  beta: "v0.9.0"
+  stable: "v1.0.0"
+feature-gates:
+  - name: "BlockWorkspaceVolumes"
+    components:
+      - "cubepod-gateway"
+      - "cubepod-controller"
+      - "pkg/volume"
+      - "pkg/runtime"
+disable-supported: true
+metrics:
+  - "cubepod_block_volumes_total"
+  - "cubepod_block_volume_attach_conflicts_total"
