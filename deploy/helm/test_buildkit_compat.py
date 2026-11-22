@@ -6,7 +6,7 @@ import unittest
 CHART = Path(__file__).parent / "cubepod"
 
 
-def render_buildkit(kube_version=None, replicas=1):
+def render_buildkit(kube_version=None, replicas=1, extra_sets=()):
     args = [
         "helm",
         "template",
@@ -21,6 +21,8 @@ def render_buildkit(kube_version=None, replicas=1):
     ]
     if kube_version:
         args += ["--kube-version", kube_version]
+    for s in extra_sets:
+        args += ["--set", s]
     return subprocess.check_output(args, text=True)
 
 
@@ -54,6 +56,18 @@ class BuildKitCompatChartTests(unittest.TestCase):
                     rendered,
                     f"unexpected beta AppArmor annotation for KubeVersion {kube_ver} replicas={replicas}",
                 )
+
+    def test_storage_class_and_fsgroup_wiring(self):
+        for replicas in (1, 2):
+            rendered = render_buildkit(
+                replicas=replicas,
+                extra_sets=(
+                    "templateBuild.buildkit.cacheStorageClassName=longhorn",
+                    "templateBuild.contextStore.storageClassName=longhorn",
+                ),
+            )
+            self.assertIn("fsGroup: 1000", rendered)
+            self.assertIn('storageClassName: "longhorn"', rendered)
 
 
 if __name__ == "__main__":

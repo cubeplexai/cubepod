@@ -2190,3 +2190,94 @@ func TestGetPodTemplateConcurrentBuildStatus(t *testing.T) {
 		t.Fatal("mutating DeleteTemplateTags copy leaked into the live template Names slice")
 	}
 }
+
+// statusSubresourceKubeClient simulates real Kubernetes CRD subresources.status={},
+// where CreatePodTemplate and UpdatePodTemplate silently discard .Status fields
+// unless UpdatePodTemplateStatus / UpdatePodTemplateStatusCAS is explicitly called.
+type statusSubresourceKubeClient struct {
+	*controller.MemoryKubeClient
+}
+
+func (c *statusSubresourceKubeClient) CreatePodTemplate(ctx context.Context, tpl v1alpha1.PodTemplate) error {
+	tpl.Status = v1alpha1.PodTemplateStatus{}
+	return c.MemoryKubeClient.CreatePodTemplate(ctx, tpl)
+}
+
+func (c *statusSubresourceKubeClient) UpdatePodTemplate(ctx context.Context, tpl v1alpha1.PodTemplate) error {
+	existing, err := c.MemoryKubeClient.GetPodTemplate(ctx, tpl.Metadata.Namespace, tpl.Metadata.Name)
+	if err == nil && existing != nil {
+		tpl.Status = existing.Status
+	} else {
+		tpl.Status = v1alpha1.PodTemplateStatus{}
+	}
+	return c.MemoryKubeClient.UpdatePodTemplate(ctx, tpl)
+}
+
+func TestPodTemplate_SubresourceStatusPersistenceAndBuildStart(t *testing.T) {
+	ctx := context.Background()
+	sharedKube := &statusSubresourceKubeClient{MemoryKubeClient: controller.NewMemoryKubeClient()}
+
+	// Seed a legacy PodTemplate with empty .Status (simulating pre-0.7.0 CRs in cluster).
+	if err := sharedKube.CreatePodTemplate(ctx, v1alpha1.PodTemplate{
+		Metadata: v1alpha1.ObjectMeta{Name: "cubeplex-ubuntu24-desktop", Namespace: "cubepod-workloads"},
+		Spec:     v1alpha1.PodTemplateSpec{Image: "hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917"},
+	}); err != nil {
+		t.Fatalf("seed legacy PodTemplate failed: %v", err)
+	}
+
+	gwReconciler := controller.NewReconciler(
+		controller.WithKubeClient(sharedKube),
+		controller.WithNamespace("cubepod-workloads"),
+		controller.WithE2BTemplateAPI(true),
+		controller.WithTemplateBuildEnabled(true),
+	)
+	if err := gwReconciler.EnsureSeededTemplates(ctx); err != nil {
+		t.Fatalf("EnsureSeededTemplates failed: %v", err)
+	}
+
+	// Verify both newly created seeded templates and the legacy empty-status CR got /status persisted.
+	listed, err := sharedKube.ListPodTemplates(ctx, "cubepod-workloads")
+	if err != nil {
+		t.Fatalf("ListPodTemplates failed: %v", err)
+	}
+	byName := make(map[string]v1alpha1.PodTemplate, len(listed))
+	for _, item := range listed {
+		byName[item.Metadata.Name] = item
+	}
+	if legacy := byName["cubeplex-ubuntu24-desktop"]; legacy.Status.BuildStatus != v1alpha1.BuildStatusReady ||
+		legacy.Status.ReadyImage != "hub.sensedeal.vip/library/cubeplex-sandbox:0.8.0-260917" {
+		t.Fatalf("expected legacy seeded template status backfilled preserving Spec.Image, got %+v", legacy.Status)
+	}
+	if deb := byName["debian-12"]; deb.Status.TemplateID != "tpl_debian-12" || deb.Status.BuildStatus != v1alpha1.BuildStatusReady {
+		t.Fatalf("expected newly seeded debian-12 status persisted, got %+v", deb.Status)
+	}
+
+	// Gateway creates a new template; separate Controller must discover its TemplateID & BuildID via Kube API.
+	resp, err := gwReconciler.CreateTemplate(ctx, controller.CreateTemplateRequest{Name: "subres-build"}, "")
+	if err != nil {
+		t.Fatalf("CreateTemplate failed: %v", err)
+	}
+
+	fakeBuilder := controller.NewFakeImageBuilder()
+	ctrlReconciler := controller.NewReconciler(
+		controller.WithKubeClient(sharedKube),
+		controller.WithNamespace("cubepod-workloads"),
+		controller.WithE2BTemplateAPI(true),
+		controller.WithTemplateBuildEnabled(true),
+		controller.WithImageBuilder(fakeBuilder),
+	)
+	if err := ctrlReconciler.SyncTemplatesFromKube(ctx); err != nil {
+		t.Fatalf("SyncTemplatesFromKube failed: %v", err)
+	}
+
+	if err := ctrlReconciler.StartBuild(ctx, resp.TemplateID, resp.BuildID, controller.StartBuildRequest{
+		FromImage: "alpine:3.20",
+		Steps:     []controller.BuildStep{{Type: "RUN", Args: []string{"echo ok"}}},
+	}); err != nil {
+		t.Fatalf("StartBuild on separate controller failed after CreateTemplate: %v", err)
+	}
+	tpl, ok := ctrlReconciler.GetPodTemplate(resp.TemplateID)
+	if !ok || tpl.Status.BuildStatus != v1alpha1.BuildStatusReady {
+		t.Fatalf("expected template ready after StartBuild, ok=%v tpl=%+v", ok, tpl)
+	}
+}

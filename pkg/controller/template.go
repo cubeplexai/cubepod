@@ -405,6 +405,25 @@ var seededTemplates = []seededDef{
 	},
 }
 
+// createPodTemplateWithStatus creates a PodTemplate CR and persists its /status
+// subresource separately, since Kubernetes strips .status on POST when
+// subresources.status is enabled. It also refreshes Metadata.ResourceVersion.
+func createPodTemplateWithStatus(ctx context.Context, kc KubeClient, ns string, tpl *v1alpha1.PodTemplate) error {
+	if kc == nil || tpl == nil {
+		return nil
+	}
+	if err := kc.CreatePodTemplate(ctx, *tpl); err != nil {
+		return err
+	}
+	if err := kc.UpdatePodTemplateStatus(ctx, *tpl); err != nil {
+		return err
+	}
+	if fresh, err := kc.GetPodTemplate(ctx, ns, tpl.Metadata.Name); err == nil && fresh != nil {
+		tpl.Metadata.ResourceVersion = fresh.Metadata.ResourceVersion
+	}
+	return nil
+}
+
 // EnsureSeededTemplates ensures the three default PodTemplates are present if absent.
 // It indexes them and does not overwrite existing objects.
 func (r *Reconciler) EnsureSeededTemplates(ctx context.Context) error {
@@ -423,59 +442,77 @@ func (r *Reconciler) EnsureSeededTemplates(ctx context.Context) error {
 	}
 
 	for _, s := range seededTemplates {
-		if _, exists := r.templateObjects[s.name]; !exists {
-			var egressCfg v1alpha1.EgressConfig
-			if r.defaultEgressEnabled {
-				egressCfg = v1alpha1.EgressConfig{
-					Enabled:     true,
-					Image:       r.defaultEgressImage,
-					ExchangeURL: r.defaultEgressExchangeURL,
+		if existing, exists := r.templateObjects[s.name]; exists {
+			if existing.Status.TemplateID == "" && existing.Status.BuildStatus == "" && existing.Status.ReadyImage == "" {
+				readyImg := existing.Spec.Image
+				if readyImg == "" {
+					readyImg = s.image
 				}
-			}
-			tpl := v1alpha1.PodTemplate{
-				APIVersion: "cubepod.io/v1alpha1",
-				Kind:       "PodTemplate",
-				Metadata: v1alpha1.ObjectMeta{
-					Name:      s.name,
-					Namespace: r.namespace,
-				},
-				Spec: v1alpha1.PodTemplateSpec{
-					Egress:           egressCfg,
-					RuntimeClassName: r.defaultRuntimeClass,
-					Image:            s.image,
-					PoddImage:        r.poddInjectorImage,
-					Names:            s.names,
-					CPUCount:         s.cpu,
-					MemoryMB:         s.mem,
-					DiskSizeMB:       10240,
-					Resources: v1alpha1.ResourceRequirements{
-						CPURequest:    "1",
-						CPULimit:      fmt.Sprintf("%d", s.cpu),
-						MemoryRequest: "2Gi",
-						MemoryLimit:   fmt.Sprintf("%dMi", s.mem),
-					},
-					Storage: v1alpha1.StorageSpec{
-						StorageClassName: r.defaultStorageClass,
-						RootfsSize:       s.rootfsSize,
-						WorkspaceSize:    s.wsSize,
-					},
-				},
-				Status: v1alpha1.PodTemplateStatus{
+				existing.Status = v1alpha1.PodTemplateStatus{
 					TemplateID:    "tpl_" + Slugify(s.name),
 					ReadyBuildID:  "bld_seeded",
-					ReadyImage:    s.image,
+					ReadyImage:    readyImg,
 					LatestBuildID: "bld_seeded",
 					BuildStatus:   v1alpha1.BuildStatusReady,
-				},
+				}
+				if r.kubeClient != nil {
+					_ = r.kubeClient.UpdatePodTemplateStatus(ctx, *existing)
+				}
+				_ = r.indexTemplateLocked(existing)
 			}
-
-			if r.kubeClient != nil {
-				_ = r.kubeClient.CreatePodTemplate(ctx, tpl)
-			}
-			r.templateObjects[s.name] = &tpl
-			_ = r.indexTemplateLocked(&tpl)
-			r.templates[s.name] = tpl.Spec
+			continue
 		}
+		var egressCfg v1alpha1.EgressConfig
+		if r.defaultEgressEnabled {
+			egressCfg = v1alpha1.EgressConfig{
+				Enabled:     true,
+				Image:       r.defaultEgressImage,
+				ExchangeURL: r.defaultEgressExchangeURL,
+			}
+		}
+		tpl := v1alpha1.PodTemplate{
+			APIVersion: "cubepod.io/v1alpha1",
+			Kind:       "PodTemplate",
+			Metadata: v1alpha1.ObjectMeta{
+				Name:      s.name,
+				Namespace: r.namespace,
+			},
+			Spec: v1alpha1.PodTemplateSpec{
+				Egress:           egressCfg,
+				RuntimeClassName: r.defaultRuntimeClass,
+				Image:            s.image,
+				PoddImage:        r.poddInjectorImage,
+				Names:            s.names,
+				CPUCount:         s.cpu,
+				MemoryMB:         s.mem,
+				DiskSizeMB:       10240,
+				Resources: v1alpha1.ResourceRequirements{
+					CPURequest:    "1",
+					CPULimit:      fmt.Sprintf("%d", s.cpu),
+					MemoryRequest: "2Gi",
+					MemoryLimit:   fmt.Sprintf("%dMi", s.mem),
+				},
+				Storage: v1alpha1.StorageSpec{
+					StorageClassName: r.defaultStorageClass,
+					RootfsSize:       s.rootfsSize,
+					WorkspaceSize:    s.wsSize,
+				},
+			},
+			Status: v1alpha1.PodTemplateStatus{
+				TemplateID:    "tpl_" + Slugify(s.name),
+				ReadyBuildID:  "bld_seeded",
+				ReadyImage:    s.image,
+				LatestBuildID: "bld_seeded",
+				BuildStatus:   v1alpha1.BuildStatusReady,
+			},
+		}
+
+		if r.kubeClient != nil {
+			_ = createPodTemplateWithStatus(ctx, r.kubeClient, r.namespace, &tpl)
+		}
+		r.templateObjects[s.name] = &tpl
+		_ = r.indexTemplateLocked(&tpl)
+		r.templates[s.name] = tpl.Spec
 	}
 	return nil
 }
@@ -841,7 +878,7 @@ func (r *Reconciler) loadLocalTemplates(ctx context.Context) error {
 			continue
 		}
 		if r.kubeClient != nil {
-			if err := r.kubeClient.CreatePodTemplate(ctx, tpl); err != nil {
+			if err := createPodTemplateWithStatus(ctx, r.kubeClient, r.namespace, &tpl); err != nil {
 				_ = r.kubeClient.UpdatePodTemplate(ctx, tpl)
 				_ = r.kubeClient.UpdatePodTemplateStatus(ctx, tpl)
 			}
@@ -1088,6 +1125,13 @@ func (r *Reconciler) CreateTemplate(ctx context.Context, req CreateTemplateReque
 
 	if err := r.kubeClient.CreatePodTemplate(ctx, tpl); err != nil {
 		return nil, err
+	}
+	if err := r.kubeClient.UpdatePodTemplateStatus(ctx, tpl); err != nil {
+		_ = r.kubeClient.DeletePodTemplate(ctx, r.namespace, tpl.Metadata.Name)
+		return nil, err
+	}
+	if fresh, getErr := r.kubeClient.GetPodTemplate(ctx, r.namespace, tpl.Metadata.Name); getErr == nil && fresh != nil {
+		tpl.Metadata.ResourceVersion = fresh.Metadata.ResourceVersion
 	}
 
 	r.templateObjects[slug] = &tpl
@@ -1936,6 +1980,9 @@ func (r *Reconciler) AssignTemplateTags(ctx context.Context, nameOrID string, ta
 	if err := r.kubeClient.UpdatePodTemplate(ctx, *tpl); err != nil {
 		return nil, err
 	}
+	if err := r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl); err != nil {
+		return nil, err
+	}
 	_ = r.indexTemplateLocked(tpl)
 	r.templates[tpl.Metadata.Name] = tpl.Spec
 	r.persistLocalTemplateLocked(tpl)
@@ -1985,6 +2032,9 @@ func (r *Reconciler) DeleteTemplateTags(ctx context.Context, nameOrID string, ta
 	tpl.Status.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 
 	if err := r.kubeClient.UpdatePodTemplate(ctx, *tpl); err != nil {
+		return nil, err
+	}
+	if err := r.kubeClient.UpdatePodTemplateStatus(ctx, *tpl); err != nil {
 		return nil, err
 	}
 	_ = r.indexTemplateLocked(tpl)
