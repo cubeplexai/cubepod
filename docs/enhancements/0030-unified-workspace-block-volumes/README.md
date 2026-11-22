@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `alpha` | `provisional` | `2026-11-21` | `2026-11-21` | `storage` (`gateway`, `controller`, `runtime`, `sdk`) |
+| `alpha` | `provisional` | `2026-11-21` | `2026-11-22` | `storage` (`gateway`, `controller`, `runtime`, `sdk`) |
 
 Tracking Issue: [#146](https://github.com/cubeplexai/cubepod/issues/146) (Milestone `0.8.0`)
 
@@ -36,7 +36,7 @@ Tracking Issue: [#146](https://github.com/cubeplexai/cubepod/issues/146) (Milest
 
 - [x] Enhancement design documented in `docs/enhancements/0030-unified-workspace-block-volumes/`
 - [ ] `POST /volumes` (`type: "shared" | "block"`) and volume metadata extension (`sizeBytes`, `legacyVolumeKey`, PVC binding) specified in OpenAPI (`api/openapi/cubepod-v1.yaml`) and implemented in `pkg/volume` + `pkg/gateway`
-- [ ] `PodBoxSpec.WorkspaceVolume` (and `KubeClient.GetPVC` / `KubeClient.ListPVCs`) implemented in `api/v1alpha1` & `pkg/controller` without coupling `/workspace` to `/rootfs-upper` (AGENTS.md Invariant 1)
+- [ ] `PodBoxSpec.WorkspaceVolume` (and `KubeClient.GetPVC` / `KubeClient.ListPVCs` / atomic PVC attach-lease CAS) implemented in `api/v1alpha1` & `pkg/controller` without coupling `/workspace` to `/rootfs-upper` (AGENTS.md Invariant 1)
 - [ ] Single-writer exclusivity (`409 Conflict` when attached to a non-Terminated PodBox) & CSI `VolumeSnapshot` CoW Fork behavior verified
 - [ ] Legacy `/workspace` data migration implemented & verified: zero-copy in-place adoption (active `PodBox` auto-adoption + `cubepod volume migrate-legacy` CLI/Job + optional CSI `VolumeSnapshot` clone) with pre/post-upgrade data integrity checks
 - [ ] Anonymous `/workspace` WarmPool claim (`< 50ms`) preserved unchanged
@@ -78,7 +78,7 @@ At the same time, `/workspace` **cannot** simply be collapsed into the RWX `/vol
 
 ### Non-Goals
 
-1. **Gateway `/volumecontent/{id}/...` for `type: "block"` volumes**: Offline HTTP file read/write via `cubepod-gateway` remains exclusive to `type: "shared"` RWX volumes. Gateway MUST return `400 Bad Request` / `422 Unprocessable Entity` (or `501 Not Implemented`) when `/volumecontent` is called on a `type: "block"` volume; file I/O on a block workspace uses the running sandbox's `/files` API.
+1. **Gateway `/volumecontent/{id}/...` for `type: "block"` volumes**: Offline HTTP file read/write via `cubepod-gateway` remains exclusive to `type: "shared"` RWX volumes. Gateway MUST return `400 Bad Request` (via `writeContentError`, where the OpenAPI `Error.code` field is the string `"400"`) when `/volumecontent` is called on a `type: "block"` volume; file I/O on a block workspace uses the running sandbox's `/files` API.
 2. **Mounting `type: "block"` volumes at arbitrary paths (e.g. `/mnt/data`) in Alpha**: Alpha restricts `type: "block"` mounts strictly to `path: "/workspace"` (replacing the anonymous sandbox `workspace-pvc` on that `PodBox`). Arbitrary multi-block device mounting is deferred.
 3. **Converting anonymous `PodWarmPool` sandboxes to RWX**: Ephemeral sandboxes keep per-sandbox block `workspace-pvc`s.
 
@@ -96,10 +96,11 @@ At the same time, `/workspace` **cannot** simply be collapsed into the RWX `/vol
 
 - **Dual-Runtime Behavior**:
   - **Production Kubernetes (`Kata + CSI Block`)**:
-    - Creating a `type: "block"` volume via `POST /volumes` records metadata in `pkg/volume.Store` (`type: "block"`, deterministic `pvcName: "vol-<volumeID>"`) and provisions a `ReadWriteOnce` `volumeMode: Block` `PersistentVolumeClaim` (`vol-<volumeID>`) via `controller.KubeClient().EnsurePVC` using the configured block `StorageClass`.
-    - When `POST /sandboxes` requests `volumeMounts: [{name, path: "/workspace"}]` backed by a `type: "block"` volume, Gateway validates single-writer exclusivity, attaches the existing `vol-<volumeID>` claim as the Pod's `workspace-volume` (`VolumeDevices -> /dev/cubepod-workspace`) instead of allocating a fresh `<boxName>-workspace-pvc`, and skips `PodWarmPool` claiming.
+    - Creating a `type: "block"` volume via `POST /volumes` records metadata in `pkg/volume.Store` (`type: "block"`, deterministic `pvcName: "vol-<volumeID>"`) and synchronously provisions a `ReadWriteOnce` `volumeMode: Block` `PersistentVolumeClaim` (`vol-<volumeID>`) via `controller.KubeClient().EnsurePVC` using the configured block `StorageClass`. If `EnsurePVC` fails, Gateway MUST roll back the `pkg/volume.Store` record and return an error (never returning `201 Created` with a dangling metadata record).
+    - **No RWX dependency for block volumes**: `isKubeVolumeMountsUnsupported()` MUST be split by volume type so clusters without `SharedPVCName` (single-tenant or pure-block CSI clusters with no RWX StorageClass) still allow `type: "block"` `/volumes` CRUD and `/workspace` mounts, while gating only `type: "shared"` mounts on `SharedPVCName`.
+    - When `POST /sandboxes` requests `volumeMounts: [{name, path: "/workspace"}]` backed by a `type: "block"` volume, Gateway validates single-writer exclusivity (via K8s atomic PVC attach-lease CAS + `volume.Store`), attaches the existing `vol-<volumeID>` (or adopted legacy PVC) claim as the Pod's `workspace-volume` (`VolumeDevices -> /dev/cubepod-workspace`) instead of allocating a fresh `<boxName>-workspace-pvc`, and skips `PodWarmPool` claiming.
     - `podd-init` requires **zero changes** for the block path: it already formats/fscks `/dev/cubepod-workspace` (`ensure_ext4`) and mounts it at `<merged>/workspace` while keeping `rootfs-upper` strictly isolated (AGENTS.md Invariant 1).
-    - On `DELETE /sandboxes/{id}`: `cubepod-controller` deletes the Pod and ephemeral `rootfs-pvc`, and **preserves** `vol-<volumeID>` (just like `VolumeKey` today, except lifecycle deletion is explicitly controlled by `DELETE /volumes/{id}`).
+    - On `DELETE /sandboxes/{id}` (including `?deleteVolumes=true`): `cubepod-controller` (`Reconciler.DeleteBox`) deletes the Pod and ephemeral `rootfs-pvc`, and **always preserves** managed block workspace PVCs (both canonical `vol-<volumeID>` and in-place adopted legacy PVCs); lifecycle deletion is exclusively controlled by `DELETE /volumes/{id}`. Local Docker mode similarly skips `os.RemoveAll` on managed block volume directories during sandbox deletion.
   - **Local Development (`Docker + Loopback ext4`)**:
     - Creating a `type: "block"` volume allocates a sparse `ext4` image file `<volumesDir>/<volumeID>/workspace.img` (or loopback device / isolated host workspace dir when running host-loopback Docker), formatted on first sandbox attach.
     - Mounting at `/workspace` attaches `<volumeID>` exclusively to at most one running sandbox (enforcing single-writer `409 Conflict` parity with K8s RWO).
@@ -111,11 +112,11 @@ At the same time, `/workspace` **cannot** simply be collapsed into the RWX `/vol
 
 | Risk | Impact | Mitigation |
 | :--- | :--- | :--- |
-| Concurrent attachment of a `type: "block"` RWO PVC to two sandboxes | K8s `Multi-Attach error` stalling Pod startup or ext4 corruption | `pkg/volume.Store` checks active mounts under tenant/global lock AND Gateway checks active `PodBox` CRs referencing `vol-<volumeID>` before `Reconcile`; any active attachment returns `409 Conflict` immediately. |
-| Controller mistakenly deletes `vol-<volumeID>` on `DELETE /sandboxes/{id}` | Permanent loss of user `/workspace` data | `reconciler.deletePodBoxLocked` checks whether `WorkspacePVCName` is a managed persistent volume (`vol-*` / `WorkspaceVolume` set) and skips PVC deletion unless invoked by `DELETE /volumes/{id}`. |
-| `ForkFrom` reuses parent's RWO `vol-<volumeID>` instead of cloning | CSI multi-attach deadlock + shared corruption | For `ForkFrom`, `BuildBlockPVCsWithOptions` still uses `WorkspaceSnapshotName` / `DataSourcePVC` pointing to `vol-<volumeID>` to create an **ephemeral per-fork** `<childID>-workspace-pvc` (or detached snapshot clone); the child does NOT inherit `vol-<volumeID>` ownership in `mounts.json`. |
+| Concurrent attachment of a `type: "block"` RWO PVC to two sandboxes (including across HA Gateway replicas without shared RWX) | K8s `Multi-Attach error` stalling Pod startup or ext4 corruption | Local/single-replica mode enforces uniqueness under `pkg/volume.Store` lock; Kubernetes HA mode acquires an atomic K8s API lease before `UpsertPodBox` via `resourceVersion`-guarded CAS on the target PVC's `metadata.annotations["cubepod.io/attached-sandbox"]` (or a K8s `coordination.k8s.io/v1` `Lease`), eliminating `ListPodBoxes` -> `UpsertPodBox` TOCTOU races even on pure-block clusters with no RWX filesystem. Contention returns `409 Conflict` immediately. |
+| Controller mistakenly deletes a managed block PVC on `DELETE /sandboxes/{id}` (including `?deleteVolumes=true` or after controller restart when `!hasSpec`) | Permanent loss of user `/workspace` data | `Reconciler.DeleteBox` MUST never delete a PVC when `spec.WorkspaceVolume != nil`, even if `deleteVolumes == true`. When `!hasSpec` (cache miss after restart), `DeleteBox` MUST fall back to `GetPodBox` and/or inspect the target PVC's `app.kubernetes.io/managed-by=cubepod-volumes` label (covering both `vol-*` and Mode 1 in-place adopted `<sanitized>-workspace-pvc` claims) before ever calling `DeletePVC`. |
+| `ForkFrom` reuses parent's RWO `vol-<volumeID>` or inherits parent's block mount lease | CSI multi-attach deadlock + shared corruption | For `ForkFrom`, `BuildBlockPVCsWithOptions` still uses `WorkspaceSnapshotName` / `DataSourcePVC` pointing to the parent's `WorkspacePVCName` to create an **ephemeral per-fork** `<childID>-workspace-pvc`; `volume.Store.CopyMounts` (called by `copySandboxVolumeMounts`) MUST copy only `type: "shared"` mounts and skip `type: "block"` so the child does NOT inherit `vol-<volumeID>` ownership in `mounts.json` or PVC attach leases. |
 | Unclean Pod kill leaves dirty ext4 journal on `vol-<volumeID>` | Mount failure on next sandbox attach | `podd-init` already runs `e2fsck -p` via `ensure_ext4` prior to mounting `/dev/cubepod-workspace` cleanly before `pivot_root(2)`. |
-| User attempts `/volumecontent/{id}/...` against `type: "block"` volume | Confusion or unintended host mount exposure | Volume metadata explicitly stores `type`; `/volumecontent/*` handlers reject `type == "block"` upfront with `400 Bad Request` (`"content API is only supported for shared volumes"`). |
+| User attempts `/volumecontent/{id}/...` against `type: "block"` volume | Confusion or unintended host mount exposure | Volume metadata explicitly stores `type`; `/volumecontent/*` handlers reject `type == "block"` upfront with `400 Bad Request` (`writeContentError`, JSON `code: "400"`, `"content API is only supported for shared volumes"`). |
 
 ---
 
@@ -134,17 +135,21 @@ At the same time, `/workspace` **cannot** simply be collapsed into the RWX `/vol
   }
   ```
   - `type` (optional, enum `["shared", "block"]`, default `"shared"`):
-    - `"shared"`: RWX shared filesystem volume (existing E2B 2.64.0 behavior, `/volumecontent` supported).
-    - `"block"`: Exclusive RWO block volume (`size` defaults to template/cluster default `20Gi`, capped by tenant quota). `token` may be omitted or issued only for schema compatibility while `/volumecontent` rejects `type == "block"`.
+    - `"shared"`: RWX shared filesystem volume (existing E2B 2.64.0 behavior, `/volumecontent` supported). Specifying `size` on `type: "shared"` returns `400 Bad Request`.
+    - `"block"`: Exclusive RWO block volume (`size` defaults to template/cluster default `20Gi`; must be a valid positive Kubernetes resource quantity within cluster min/max bounds, e.g. `1Gi`..`1Ti`, otherwise `400 Bad Request`). On Kubernetes, `EnsurePVC` runs synchronously during `POST /volumes`; provisioning failure rolls back the `volume.Store` record and returns an error. For tenant byte quotas, `type: "block"` volumes account their declared `sizeBytes` against `MaxBytesPerTenant` (alongside `shared` file bytes) at creation time. `token` may be omitted or issued only for schema compatibility while `/volumecontent` rejects `type == "block"` with `400 Bad Request`.
 - **`GET /volumes` & `GET /volumes/{volumeID}`**:
   Include `"type": "shared" | "block"` and optional `"size": "20Gi"` in responses (backwards-compatible additive JSON fields).
+- **`DELETE /volumes/{volumeID}`**:
+  - Rejects with `409 Conflict` if mounted in `mounts.json`, if the target PVC carries a live `cubepod.io/attached-sandbox` lease, or if any non-`Terminated` `PodBox` references the volume in `spec.VolumeMounts` or `spec.WorkspaceVolume` (`box.Status.Phase == Terminated` is ignored).
+  - `deleteVolumePVC` MUST NOT hard-require `pvcName == "vol-" + volumeID` for `type: "block"` volumes (so Mode 1 in-place adopted `<sanitized>-workspace-pvc` claims do not leak). Instead, for `type: "block"`, it verifies `pvcName != sharedPVC` AND verifies via `GetPVC` that the PVC carries `labels["cubepod.io/volume-id"] == volumeID` and `labels["app.kubernetes.io/managed-by"] == "cubepod-volumes"` before calling `DeletePVC`.
 - **`POST /sandboxes`** (`volumeMounts` semantics):
   - Existing validation in `api/v1alpha1.ValidVolumeContainerPath` reserves `/workspace` for `type: "shared"` volumes.
   - When a requested mount references a `type: "block"` volume:
     - `path` MUST equal `"/workspace"` (`400 Bad Request` otherwise).
     - At most one `type: "block"` volume may be mounted per sandbox (`400 Bad Request` otherwise).
-    - If already attached to any sandbox in `mounts.json` or an active `PodBox` CR, return `409 Conflict`.
-    - Coexists seamlessly with `type: "shared"` mounts on other paths (e.g. `/mnt/datasets`).
+    - Specifying both `extension.volumeKey` and a `type: "block"` mount at `/workspace` in the same request returns `400 Bad Request`.
+    - If already attached to any sandbox in `mounts.json`, an active (non-`Terminated`) `PodBox` CR, or the PVC's atomic `cubepod.io/attached-sandbox` lease, return `409 Conflict`.
+    - Coexists seamlessly with `type: "shared"` mounts on other paths (e.g. `/mnt/datasets`), and works on pure-block clusters without `SharedPVCName`.
   - `extension.volumeKey` remains supported as legacy/implicit shorthand during `v0.8.x` (with deprecation notice in `v0.8.0` docs if `BlockWorkspaceVolumes` is promoted).
 
 #### 2. CRD (`api/v1alpha1/types.go`, `deploy/helm/cubepod/crds/cubepod.io_podboxes.yaml`)
@@ -167,8 +172,8 @@ type PodBoxSpec struct {
 
 - When `spec.WorkspaceVolume != nil`:
   - `WorkspacePVCName` returns `spec.WorkspaceVolume.PVCName` (`vol-<volumeID>`).
-  - `reconciler.ensurePodBoxPVCs` ensures/verifies `vol-<volumeID>` exists (`EnsurePVC` is idempotent) and NEVER deletes `vol-<volumeID>` on `DeletePodBox` or failed cold-create rollback.
-  - `spec.VolumeMounts` continues to hold only `type: "shared"` RWX mounts (non-`/workspace`), preserving the clean separation between `VolumeDevices` and `VolumeMounts`.
+  - `reconciler.ensurePodBoxPVCs` ensures/verifies the referenced PVC (`vol-<volumeID>` or adopted legacy PVC) exists (`EnsurePVC` is idempotent), and `Reconciler.DeleteBox` / failed cold-create rollback NEVER delete it (even when `deleteVolumes=true`).
+  - `spec.VolumeMounts` continues to hold only `type: "shared"` RWX mounts (non-`/workspace`), preserving the clean separation between `VolumeDevices` and `VolumeMounts`. On `POST /sandboxes/{id}/fork`, `copySandboxVolumeMounts` (`volume.Store.CopyMounts`) copies only `type: "shared"` mounts and skips `type: "block"`.
 
 ### State Machine & Data Flow
 
@@ -199,7 +204,7 @@ Production and staging clusters currently running `v0.7.x` (and earlier `0.x` re
    - Persistent `/workspace` PVCs named `<SanitizeVolumeKey(volumeKey)>-workspace-pvc`.
    - The `PodBox` CR carries `annotations["cubepod.io/volume-key"]` and `annotations["cubepod.io/owner-tenant"]` (`pkg/gateway/sandboxes.go`).
 3. **Retained Orphaned Legacy `VolumeKey` PVCs (Sandbox Already Deleted in `<= v0.7.x`)**:
-   - When a sandbox created with `volumeKey` was deleted prior to `v0.8.0`, `reconciler.deletePodBoxLocked` intentionally retained `<sanitized>-workspace-pvc` even though the `PodBox` CR was deleted.
+   - When a sandbox created with `volumeKey` was deleted prior to `v0.8.0`, `Reconciler.DeleteBox` intentionally retained `<sanitized>-workspace-pvc` even though the `PodBox` CR was deleted.
    - Only the Kubernetes `PersistentVolumeClaim` (`pod.cubeplex.ai/vol-type=workspace`) remains; `owner-tenant` is absent on the PVC itself because pre-`v0.8.0` `BuildBlockPVCsWithOptions` did not copy tenant annotations onto the PVC.
 4. **Local Development (`Docker + Loopback ext4`)**:
    - Existing directories or sparse images under `<workspaceBaseDir>` associated with prior sandboxes / `volumeKey` workloads.
@@ -225,7 +230,8 @@ Because `pkg/volume.Store` (`meta.json`) and `PodBoxSpec.WorkspaceVolume.PVCName
    - **Lazy Claim Compatibility for Legacy `extension.volumeKey` Callers**:
      - During `v0.8.0`, if a client calls `POST /sandboxes` with `extension.volumeKey = K` and that volume was not yet pre-migrated:
        - Gateway checks whether PVC `<SanitizeVolumeKey(K)>-workspace-pvc` already exists via `KubeClient.GetPVC`.
-       - Because knowledge of the exact raw string `K` (which maps deterministically via `SanitizeVolumeKey`) served as the caller credential in `<= v0.7.x`, if the PVC exists and has no active owner `PodBox` belonging to a *different* `owner-tenant`, Gateway adopts it under the caller's tenant on attach and populates `PodBoxSpec.WorkspaceVolume`! If an active `PodBox` with a *different* `cubepod.io/owner-tenant` owns that PVC, Gateway rejects the request with `409 Conflict` / `403 Forbidden`.
+       - Because knowledge of the exact raw string `K` (which maps deterministically via `SanitizeVolumeKey`) served as the caller credential in `<= v0.7.x`, if the PVC exists and has no active owner `PodBox` belonging to a *different* `owner-tenant`, Gateway adopts it under the caller's tenant on attach (patching `cubepod.io/volume-id` and `app.kubernetes.io/managed-by=cubepod-volumes` labels onto the PVC) and populates `PodBoxSpec.WorkspaceVolume`. If an active `PodBox` with a *different* `cubepod.io/owner-tenant` owns that PVC, Gateway rejects the request with `409 Conflict` / `403 Forbidden`.
+       - **Multi-tenant security note**: For already-deleted sandboxes whose legacy `volumeKey` was a predictable string (e.g. `"default"` or `"workspace"`), lazy claiming is first-come-first-served. Multi-tenant clusters SHOULD run `cubepod volume migrate-legacy --owner-map` before opening `v0.8.0` traffic and may disable lazy claiming of unmigrated PVCs via `--allow-lazy-legacy-volume-claim=false` (Helm `volumes.allowLazyLegacyClaim`).
 
 2. **Mode 2 — Optional CSI Snapshot Clone Migration (`--clone-to-canonical`)**:
    - Available in `cubepod volume migrate-legacy --clone-to-canonical` when an operator wants canonical `vol-<volumeID>` PVC names and independent backup before retiring legacy PVCs.
@@ -233,20 +239,21 @@ Because `pkg/volume.Store` (`meta.json`) and `PodBoxSpec.WorkspaceVolume.PVCName
 
 ### Boundary Conditions & Failure Recovery
 
-- **Gateway Crash Between `CommitMounts` and `UpsertPodBox`**:
-  On startup, `pkg/gateway` reconciles `mounts.json` against active `PodBox` CRs (`ReconcileMounts`), releasing orphaned block volume leases so the volume does not stay stuck in `409 Conflict`.
+- **Gateway Crash Between `CommitMounts` / PVC Lease Acquisition and `UpsertPodBox`**:
+  On startup (and periodic resync), `pkg/gateway` reconciles `mounts.json` and stale PVC `cubepod.io/attached-sandbox` annotations against active (non-`Terminated`) `PodBox` CRs (`ReconcileMounts`), releasing orphaned block volume leases so the volume does not stay stuck in `409 Conflict`.
 - **Two Concurrent `POST /sandboxes` Requests Claiming the Same `block` Volume**:
-  `Store.LookupAndCommitBlockMount` (or `CommitMounts` checking `type == "block"` uniqueness atomically under lock + `tenants.json` / `.store.lock` `flock` in multi-replica HA mode) guarantees at most one caller succeeds; the loser receives `409 Conflict`.
+  - In local / single-replica mode, `Store.CommitMounts` checks `type == "block"` uniqueness atomically under the store mutex + `.store.lock` `flock`.
+  - In Kubernetes multi-replica HA mode (including pure-block clusters without a shared RWX filesystem), Gateway acquires an atomic K8s API lease on the target PVC (`metadata.annotations["cubepod.io/attached-sandbox"] = sandboxID` via `resourceVersion` CAS update, or a `coordination.k8s.io/v1` `Lease`) before calling `UpsertPodBox`, eliminating the `ListPodBoxes` -> `UpsertPodBox` TOCTOU window. Exactly one caller succeeds; the loser receives `409 Conflict`. If `UpsertPodBox` subsequently fails, Gateway releases the PVC lease and `mounts.json` entry before returning an error.
 - **`VolumeMode: Filesystem` Fallback Clusters**:
   When template/cluster `volumeMode` is `Filesystem` (e.g. Kind E2E without raw block CSI), `vol-<volumeID>` is created with `volumeMode: Filesystem` (`AccessModes: ["ReadWriteOnce"]`) and mounted at `/workspace` instead of `VolumeDevices`, preserving identical single-writer API semantics.
 
 ### Test Plan
 
 - **Unit Tests (Go, `-race`)**:
-  - `pkg/volume/store_test.go`: Creating `type: "block"` volumes, tenant byte/size quota checks, rejection of concurrent block mounts (`ErrInUse` -> `409`), and cleanup after unmount.
+  - `pkg/volume/store_test.go`: Creating `type: "block"` volumes, declared `sizeBytes` tenant quota checks, rejection of concurrent block mounts (`ErrInUse` -> `409`), `CopyMounts` skipping `type: "block"` while preserving `type: "shared"`, and cleanup after unmount.
   - `pkg/controller/manifests_test.go`: `BuildBlockPVCsWithOptions` and `BuildPodManifest` with `spec.WorkspaceVolume` (`vol-<id>` mapped to `/dev/cubepod-workspace`, no `<boxName>-workspace-pvc` leak, CSI snapshot fork pointing to `vol-<id>`).
-  - `pkg/controller/reconciler_test.go`: State-machine verification ensuring `DeletePodBox` and rollback do NOT delete `vol-<id>`, and `ForkFrom` creates a separate cloned PVC for the child without inheriting `WorkspaceVolume`.
-  - `pkg/gateway/volumes_test.go`: Full API tests for `POST /volumes` (`type: "block"`), `/volumecontent` rejection (`400`), `POST /sandboxes` mounting at `/workspace`, non-`/workspace` path rejection for block volumes, `409` concurrent mount rejection, `DELETE /volumes/{id}` `409` while mounted -> `204` after sandbox delete, `POST /sandboxes/{id}/fork` independence, and legacy `/workspace` PVC auto-adoption / lazy `volumeKey` bridging / cross-tenant guard.
+  - `pkg/controller/reconciler_test.go`: State-machine verification ensuring `DeleteBox` (including `deleteVolumes=true` and `!hasSpec` cache-miss fallback) and rollback do NOT delete `vol-<id>` or adopted managed legacy PVCs, and `ForkFrom` creates a separate cloned PVC for the child without inheriting `WorkspaceVolume`.
+  - `pkg/gateway/volumes_test.go`: Full API tests for `POST /volumes` (`type: "block"`, `size` validation, `EnsurePVC` failure rollback, pure-block cluster without `SharedPVCName`), `/volumecontent` rejection (`400` string code), `POST /sandboxes` mounting at `/workspace`, non-`/workspace` path and `volumeKey`+`volumeMounts` conflict rejection (`400`), `409` concurrent mount rejection (including K8s PVC CAS contention), `DELETE /volumes/{id}` `409` while mounted (ignoring `Terminated` `PodBox`es) -> `204` after sandbox delete (including label-verified deletion of Mode 1 adopted legacy PVCs), `POST /sandboxes/{id}/fork` independence, and legacy `/workspace` PVC auto-adoption / lazy `volumeKey` bridging / cross-tenant guard.
   - `cmd/cubepod/` migration CLI tests: Idempotent `cubepod volume migrate-legacy` execution against Memory/fake K8s PVCs and local workspace directories, `--owner-map` resolution, and `--clone-to-canonical` snapshot flow.
 - **State Machine Verification (`AGENTS.md`)**:
   - Run `/statechart` (TLA+/TLC model check) covering `Available -> Attached -> Paused (Pod deleted, volume leased) -> Running -> Detached -> Deleted` and `ForkFrom` snapshot clone invariants before implementation PRs merge.
@@ -294,6 +301,7 @@ Because `pkg/volume.Store` (`meta.json`) and `PodBoxSpec.WorkspaceVolume.PVCName
 ## Implementation History
 
 - **2026-11-21**: Drafted CEP-0030 (`provisional`, `alpha`) targeting `v0.8.0` alongside GitHub Issue [#146](https://github.com/cubeplexai/cubepod/issues/146).
+- **2026-11-22**: Addressed PR #147 review findings: hardened `Reconciler.DeleteBox` (`deleteVolumes=true` & `!hasSpec` protection), specified K8s atomic PVC attach-lease CAS for pure-block HA clusters, aligned `deleteVolumePVC` for Mode 1 adopted PVCs, clarified `EnsurePVC` rollback, `CopyMounts` block filtering, `size` quota/validation rules, and multi-tenant lazy claim guardrails.
 
 ---
 

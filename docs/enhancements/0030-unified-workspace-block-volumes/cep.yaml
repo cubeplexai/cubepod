@@ -10,7 +10,7 @@ participating-areas:
   - "sdk"
 status: "provisional"
 creation-date: "2026-11-21"
-last-updated: "2026-11-21"
+last-updated: "2026-11-22"
 reviewers:
   - "@xfgong"
 approvers:
@@ -26,8 +26,6 @@ feature-gates:
     components:
       - "cubepod-gateway"
       - "cubepod-controller"
-      - "pkg/volume"
-      - "pkg/runtime"
 disable-supported: true
 metrics:
   - "cubepod_block_volumes_total"
