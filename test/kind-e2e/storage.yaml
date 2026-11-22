@@ -10,12 +10,12 @@ spec:
   persistentVolumeReclaimPolicy: Delete
   storageClassName: ""
   hostPath: {path: /var/local/cubepod-kind-volumes, type: DirectoryOrCreate}
-  claimRef: {namespace: cubepod-kind, name: cubepod-e2b-volumes}
+  claimRef: {namespace: cubepod-kind, name: cubepod-volumes}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: cubepod-e2b-volumes
+  name: cubepod-volumes
   namespace: cubepod-kind
 spec:
   accessModes: [ReadWriteMany]

@@ -59,7 +59,7 @@ impl SandboxMetric {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct InitMetrics {
     pub duration_ms: u64,
-    pub e2b_bind_duration_ms: u64,
+    pub volume_bind_duration_ms: u64,
 }
 
 pub fn read_init_metrics(path: &Path) -> InitMetrics {
@@ -71,8 +71,8 @@ pub fn read_init_metrics(path: &Path) -> InitMetrics {
     };
     InitMetrics {
         duration_ms: val.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
-        e2b_bind_duration_ms: val
-            .get("e2b_bind_duration_ms")
+        volume_bind_duration_ms: val
+            .get("volume_bind_duration_ms")
             .and_then(|v| v.as_u64())
             .unwrap_or(0),
     }
@@ -451,9 +451,9 @@ pub fn render_prometheus_metrics_with_watch(
             "# HELP cubepod_podd_init_duration_milliseconds Duration of podd-init setup in milliseconds\n",
             "# TYPE cubepod_podd_init_duration_milliseconds gauge\n",
             "cubepod_podd_init_duration_milliseconds {}\n",
-            "# HELP cubepod_podd_init_e2b_bind_duration_ms Duration of podd-init E2B volume bind mounts in milliseconds\n",
-            "# TYPE cubepod_podd_init_e2b_bind_duration_ms gauge\n",
-            "cubepod_podd_init_e2b_bind_duration_ms {}\n",
+            "# HELP cubepod_podd_init_volume_bind_duration_ms Duration of podd-init volume bind mounts in milliseconds\n",
+            "# TYPE cubepod_podd_init_volume_bind_duration_ms gauge\n",
+            "cubepod_podd_init_volume_bind_duration_ms {}\n",
             "# HELP cubepod_podd_cpu_used_percent Current guest CPU utilization percentage\n",
             "# TYPE cubepod_podd_cpu_used_percent gauge\n",
             "cubepod_podd_cpu_used_percent {:.2}\n",
@@ -472,7 +472,7 @@ pub fn render_prometheus_metrics_with_watch(
         ),
         active_processes,
         init.duration_ms,
-        init.e2b_bind_duration_ms,
+        init.volume_bind_duration_ms,
         sample.cpu_used_pct,
         sample.mem_used,
         sample.mem_total,
@@ -651,7 +651,7 @@ SReclaimable:     500000 kB
         let present = temp_file("present");
         fs::write(
             &present,
-            r#"{"pivoted":true,"duration_ms":85,"e2b_bind_duration_ms":12}"#,
+            r#"{"pivoted":true,"duration_ms":85,"volume_bind_duration_ms":12}"#,
         )
         .unwrap();
         let parsed = read_init_metrics(&present);
@@ -660,7 +660,7 @@ SReclaimable:     500000 kB
             parsed,
             InitMetrics {
                 duration_ms: 85,
-                e2b_bind_duration_ms: 12,
+                volume_bind_duration_ms: 12,
             }
         );
     }
@@ -686,13 +686,13 @@ SReclaimable:     500000 kB
             3,
             InitMetrics {
                 duration_ms: 42,
-                e2b_bind_duration_ms: 7,
+                volume_bind_duration_ms: 7,
             },
             &sample,
         );
         assert!(prom.contains("cubepod_podd_active_processes 3\n"));
         assert!(prom.contains("cubepod_podd_init_duration_milliseconds 42\n"));
-        assert!(prom.contains("cubepod_podd_init_e2b_bind_duration_ms 7\n"));
+        assert!(prom.contains("cubepod_podd_init_volume_bind_duration_ms 7\n"));
         assert!(prom.contains("cubepod_podd_watchers_active 0\n"));
     }
 

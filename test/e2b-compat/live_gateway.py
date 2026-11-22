@@ -831,7 +831,7 @@ class LiveGateway:
         gw_env["TMPDIR"] = self.temp_dir
         gw_env["CUBEPOD_WORKSPACE_DIR"] = self.temp_dir
         gw_env["CUBEPOD_STATE"] = self.temp_dir
-        gw_env["CUBEPOD_E2B_VOLUMES_DIR"] = os.path.join(self.temp_dir, "volumes")
+        gw_env["CUBEPOD_VOLUMES_DIR"] = os.path.join(self.temp_dir, "volumes")
         gw_env["CUBEPOD_SECRETS_DIR"] = os.path.join(self.temp_dir, "secrets")
         gw_env["KUBECONFIG"] = os.path.join(self.temp_dir, "nonexistent-kubeconfig")
         gw_env.pop("KUBERNETES_SERVICE_HOST", None)

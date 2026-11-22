@@ -27,8 +27,8 @@ spec:
       {{- $pullSecretsCSV := include "cubepod.imagePullSecretsCSV" . }}
       {{- $tplPullSecret := include "cubepod.effectiveTemplatePullSecret" . }}
       {{- $stateDir := include "cubepod.effectiveGatewayStateDir" . }}
-      {{- $e2bVolumesActive := eq (include "cubepod.e2bVolumesActive" .) "true" }}
-      {{- $k8sE2BMounts := eq (include "cubepod.k8sE2BVolumeMountsEnabled" .) "true" }}
+      {{- $volumesActive := eq (include "cubepod.volumesActive" .) "true" }}
+      {{- $k8sVolumeMounts := eq (include "cubepod.k8sVolumeMountsEnabled" .) "true" }}
       {{- $secretsCfg := .Values.secrets | default dict }}
       {{- $fg := .Values.featureGates | default dict }}
       {{- $secretsEnabled := and (eq (include "cubepod.boolDefaultTrue" $secretsCfg.enabled) "true") (eq (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) "true") }}
@@ -40,7 +40,7 @@ spec:
       {{- $ctxBackend := include "cubepod.contextStoreBackend" . }}
       {{- $s3Env := include "cubepod.s3ContextEnv" . }}
       {{- $hasEnv := true }}
-      {{- $hasVolumes := or $e2bVolumesActive .Values.egress.caSecretName .Values.gateway.persistence.enabled }}
+      {{- $hasVolumes := or $volumesActive .Values.egress.caSecretName .Values.gateway.persistence.enabled }}
       containers:
         - name: gateway
           image: "{{ .Values.gateway.image.registry }}/{{ .Values.gateway.image.repository }}:{{ .Values.gateway.image.tag }}"
@@ -140,13 +140,13 @@ spec:
                   key: key
             {{- end }}
             {{- end }}
-            {{- if $e2bVolumesActive }}
-            - name: CUBEPOD_E2B_VOLUME_DIR
-              value: "/var/lib/cubepod/e2b-volumes"
-            - name: CUBEPOD_K8S_E2B_VOLUME_MOUNTS
-              value: {{ ternary "1" "0" $k8sE2BMounts | quote }}
-            - name: CUBEPOD_E2B_SHARED_PVC
-              value: {{ .Values.e2bVolumes.pvcName | quote }}
+            {{- if $volumesActive }}
+            - name: CUBEPOD_VOLUMES_DIR
+              value: "/var/lib/cubepod/volumes"
+            - name: CUBEPOD_K8S_VOLUME_MOUNTS
+              value: {{ ternary "1" "0" $k8sVolumeMounts | quote }}
+            - name: CUBEPOD_VOLUMES_SHARED_PVC
+              value: {{ .Values.volumes.pvcName | quote }}
             {{- end }}
             {{- if $s3Env }}
             {{- $s3Env | nindent 12 }}
@@ -159,9 +159,9 @@ spec:
             - name: gateway-state
               mountPath: {{ $stateDir | quote }}
             {{- end }}
-            {{- if $e2bVolumesActive }}
-            - name: e2b-volumes
-              mountPath: /var/lib/cubepod/e2b-volumes
+            {{- if $volumesActive }}
+            - name: volumes
+              mountPath: /var/lib/cubepod/volumes
             {{- end }}
             {{- include "cubepod.egressCAVolumeMount" . | nindent 12 }}
           {{- end }}
@@ -190,10 +190,10 @@ spec:
           persistentVolumeClaim:
             claimName: {{ default (printf "%s-gateway-state" (include "cubepod.fullname" .)) .Values.gateway.persistence.existingClaim | quote }}
         {{- end }}
-        {{- if $e2bVolumesActive }}
-        - name: e2b-volumes
+        {{- if $volumesActive }}
+        - name: volumes
           persistentVolumeClaim:
-            claimName: {{ .Values.e2bVolumes.pvcName | quote }}
+            claimName: {{ .Values.volumes.pvcName | quote }}
         {{- end }}
         {{- include "cubepod.egressCAVolume" . | nindent 8 }}
       {{- end }}

@@ -123,20 +123,20 @@ pub struct InitState {
     pub workspace_device: String,
     pub workspace_action: VolumeAction,
     pub duration_ms: u64,
-    pub e2b_bind_duration_ms: u64,
+    pub volume_bind_duration_ms: u64,
 }
 
 impl InitState {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\n  \"pivoted\": {},\n  \"rootfs_device\": \"{}\",\n  \"rootfs_action\": \"{}\",\n  \"workspace_device\": \"{}\",\n  \"workspace_action\": \"{}\",\n  \"duration_ms\": {},\n  \"e2b_bind_duration_ms\": {}\n}}\n",
+            "{{\n  \"pivoted\": {},\n  \"rootfs_device\": \"{}\",\n  \"rootfs_action\": \"{}\",\n  \"workspace_device\": \"{}\",\n  \"workspace_action\": \"{}\",\n  \"duration_ms\": {},\n  \"volume_bind_duration_ms\": {}\n}}\n",
             self.pivoted,
             self.rootfs_device,
             self.rootfs_action.as_str(),
             self.workspace_device,
             self.workspace_action.as_str(),
             self.duration_ms,
-            self.e2b_bind_duration_ms
+            self.volume_bind_duration_ms
         )
     }
 
@@ -244,7 +244,7 @@ pub fn ensure_ext4(device: &Path, label: &str) -> Result<VolumeAction, String> {
 pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
     let start = Instant::now();
     let ws_str = cfg.workspace_dir.to_string_lossy();
-    let e2b_mounts = load_e2b_mounts(&ws_str)?;
+    let volume_mounts = load_volume_mounts(&ws_str)?;
 
     if cfg.skip_pivot || !cfg.rootfs_device.exists() {
         if cfg.skip_pivot {
@@ -258,17 +258,17 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         let _ = fs::create_dir_all(&cfg.workspace_dir);
         let _ = chown_path(&cfg.workspace_dir, cfg.default_uid, cfg.default_gid);
         let _ = fs::set_permissions(&cfg.workspace_dir, fs::Permissions::from_mode(0o777));
-        let mut e2b_bind_duration_ms = 0u64;
-        if !e2b_mounts.is_empty() {
+        let mut volume_bind_duration_ms = 0u64;
+        if !volume_mounts.is_empty() {
             let bind_start = Instant::now();
-            mount_e2b_volumes(
-                &e2b_mounts,
+            mount_volumes(
+                &volume_mounts,
                 Path::new("/"),
                 cfg.default_uid,
                 cfg.default_gid,
                 true,
             )?;
-            e2b_bind_duration_ms = bind_start.elapsed().as_millis() as u64;
+            volume_bind_duration_ms = bind_start.elapsed().as_millis() as u64;
         }
         let state = InitState {
             pivoted: false,
@@ -277,7 +277,7 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
             workspace_device: cfg.workspace_device.to_string_lossy().to_string(),
             workspace_action: VolumeAction::Skipped,
             duration_ms: start.elapsed().as_millis() as u64,
-            e2b_bind_duration_ms,
+            volume_bind_duration_ms,
         };
         if let Err(e) = state.write_to_file(&cfg.init_state_path) {
             eprintln!(
@@ -409,24 +409,24 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         }
     }
 
-    let mut e2b_bind_duration_ms = 0u64;
-    if !e2b_mounts.is_empty() {
+    let mut volume_bind_duration_ms = 0u64;
+    if !volume_mounts.is_empty() {
         let bind_start = Instant::now();
-        mount_e2b_volumes(
-            &e2b_mounts,
+        mount_volumes(
+            &volume_mounts,
             &cfg.merged_root_path,
             cfg.default_uid,
             cfg.default_gid,
             false,
         )?;
-        for m in &e2b_mounts {
+        for m in &volume_mounts {
             unmount_lazy_ignore_missing(
                 &cfg.merged_root_path
                     .join("run/cubepod/volumes")
                     .join(&m.volume_id),
             );
         }
-        e2b_bind_duration_ms = bind_start.elapsed().as_millis() as u64;
+        volume_bind_duration_ms = bind_start.elapsed().as_millis() as u64;
     }
 
     // 6. Perform pivot_root(2) into the merged root.
@@ -455,7 +455,7 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         workspace_device: cfg.workspace_device.to_string_lossy().to_string(),
         workspace_action,
         duration_ms: start.elapsed().as_millis() as u64,
-        e2b_bind_duration_ms,
+        volume_bind_duration_ms,
     };
     if let Err(e) = state.write_to_file(&cfg.init_state_path) {
         eprintln!(
@@ -621,9 +621,9 @@ fn unmount_lazy_ignore_missing(target: &Path) {
     }
 }
 
-const E2B_MOUNTS_ENV: &str = "CUBEPOD_E2B_MOUNTS";
-const E2B_MOUNTS_FILE: &str = "/etc/cubepod/e2b-mounts.json";
-const E2B_RESERVED_PATHS: &[&str] = &[
+const VOLUME_MOUNTS_ENV: &str = "CUBEPOD_VOLUME_MOUNTS";
+const VOLUME_MOUNTS_FILE: &str = "/etc/cubepod/volume-mounts.json";
+const VOLUME_RESERVED_PATHS: &[&str] = &[
     "/rootfs-upper",
     "/opt/cubepod",
     "/mnt/cubepod",
@@ -642,29 +642,29 @@ const E2B_RESERVED_PATHS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct E2BMountSpec {
+pub struct VolumeMountSpec {
     pub volume_id: String,
     pub staging_path: String,
     pub target_path: String,
 }
 
-fn load_e2b_mounts(workspace_dir: &str) -> Result<Vec<E2BMountSpec>, String> {
-    let env_val = env::var(E2B_MOUNTS_ENV).ok();
-    load_e2b_mounts_from(
+fn load_volume_mounts(workspace_dir: &str) -> Result<Vec<VolumeMountSpec>, String> {
+    let env_val = env::var(VOLUME_MOUNTS_ENV).ok();
+    load_volume_mounts_from(
         env_val.as_deref(),
-        Path::new(E2B_MOUNTS_FILE),
+        Path::new(VOLUME_MOUNTS_FILE),
         workspace_dir,
     )
 }
 
-fn load_e2b_mounts_from(
+fn load_volume_mounts_from(
     env_val: Option<&str>,
     file_path: &Path,
     workspace_dir: &str,
-) -> Result<Vec<E2BMountSpec>, String> {
+) -> Result<Vec<VolumeMountSpec>, String> {
     if let Some(raw) = env_val {
         if !raw.trim().is_empty() {
-            return parse_and_validate_e2b_mounts(raw, workspace_dir);
+            return parse_and_validate_volume_mounts(raw, workspace_dir);
         }
     }
     if file_path.exists() {
@@ -673,24 +673,24 @@ fn load_e2b_mounts_from(
         if raw.trim().is_empty() {
             return Ok(Vec::new());
         }
-        return parse_and_validate_e2b_mounts(&raw, workspace_dir);
+        return parse_and_validate_volume_mounts(&raw, workspace_dir);
     }
     Ok(Vec::new())
 }
 
-pub fn parse_and_validate_e2b_mounts(
+pub fn parse_and_validate_volume_mounts(
     raw: &str,
     workspace_dir: &str,
-) -> Result<Vec<E2BMountSpec>, String> {
+) -> Result<Vec<VolumeMountSpec>, String> {
     let items = JsonParser::new(raw).parse_root_array()?;
     let norm_workspace = normalize_abs_path(workspace_dir, "workspace_dir")?;
 
     let mut seen_targets = HashSet::new();
-    let mut specs: Vec<E2BMountSpec> = Vec::with_capacity(items.len());
+    let mut specs: Vec<VolumeMountSpec> = Vec::with_capacity(items.len());
 
     for (idx, item) in items.into_iter().enumerate() {
         let JsonValue::Object(fields) = item else {
-            return Err(format!("e2b mount entry {idx} must be a JSON object"));
+            return Err(format!("volume mount entry {idx} must be a JSON object"));
         };
 
         let mut volume_id: Option<String> = None;
@@ -713,22 +713,22 @@ pub fn parse_and_validate_e2b_mounts(
         }
 
         let volume_id =
-            volume_id.ok_or_else(|| format!("e2b mount entry {idx} missing volume_id"))?;
+            volume_id.ok_or_else(|| format!("volume mount entry {idx} missing volume_id"))?;
         let staging_path =
-            staging_path.ok_or_else(|| format!("e2b mount entry {idx} missing staging_path"))?;
+            staging_path.ok_or_else(|| format!("volume mount entry {idx} missing staging_path"))?;
         let target_path =
-            target_path.ok_or_else(|| format!("e2b mount entry {idx} missing target_path"))?;
+            target_path.ok_or_else(|| format!("volume mount entry {idx} missing target_path"))?;
 
         if !is_valid_volume_id(&volume_id) {
             return Err(format!(
-                "e2b mount entry {idx} has invalid volume_id {volume_id:?}: must be 32 lowercase hex chars"
+                "volume mount entry {idx} has invalid volume_id {volume_id:?}: must be 32 lowercase hex chars"
             ));
         }
 
         let expected_staging = format!("/run/cubepod/volumes/{volume_id}");
         if staging_path != expected_staging {
             return Err(format!(
-                "e2b mount entry {idx} has invalid staging_path {staging_path:?}: expected {expected_staging:?}"
+                "volume mount entry {idx} has invalid staging_path {staging_path:?}: expected {expected_staging:?}"
             ));
         }
 
@@ -736,30 +736,32 @@ pub fn parse_and_validate_e2b_mounts(
 
         if paths_overlap(&norm_target, &norm_workspace) {
             return Err(format!(
-                "e2b mount target_path {norm_target:?} overlaps workspace_dir {norm_workspace:?}"
+                "volume mount target_path {norm_target:?} overlaps workspace_dir {norm_workspace:?}"
             ));
         }
-        for reserved in E2B_RESERVED_PATHS {
+        for reserved in VOLUME_RESERVED_PATHS {
             if paths_overlap(&norm_target, reserved) {
                 return Err(format!(
-                    "e2b mount target_path {norm_target:?} overlaps reserved path {reserved:?}"
+                    "volume mount target_path {norm_target:?} overlaps reserved path {reserved:?}"
                 ));
             }
         }
         for prev in &specs {
             if prev.target_path == norm_target {
-                return Err(format!("duplicate e2b mount target_path {norm_target:?}"));
+                return Err(format!(
+                    "duplicate volume mount target_path {norm_target:?}"
+                ));
             }
             if paths_overlap(&norm_target, &prev.target_path) {
                 return Err(format!(
-                    "e2b mount target_path {norm_target:?} overlaps mount {:?}",
+                    "volume mount target_path {norm_target:?} overlaps mount {:?}",
                     prev.target_path
                 ));
             }
         }
         seen_targets.insert(norm_target.clone());
 
-        specs.push(E2BMountSpec {
+        specs.push(VolumeMountSpec {
             volume_id,
             staging_path,
             target_path: norm_target,
@@ -769,8 +771,8 @@ pub fn parse_and_validate_e2b_mounts(
     Ok(specs)
 }
 
-pub fn mount_e2b_volumes(
-    mounts: &[E2BMountSpec],
+pub fn mount_volumes(
+    mounts: &[VolumeMountSpec],
     root: &Path,
     default_uid: u32,
     default_gid: u32,
@@ -780,13 +782,14 @@ pub fn mount_e2b_volumes(
         let src_path = Path::new(&mount.staging_path);
         if !src_path.is_dir() {
             return Err(format!(
-                "e2b volume {} staging path {} does not exist or is not a directory",
+                "volume {} staging path {} does not exist or is not a directory",
                 mount.volume_id, mount.staging_path
             ));
         }
 
         let dst = root.join(mount.target_path.trim_start_matches('/'));
-        fs::create_dir_all(&dst).map_err(|e| format!("mkdir e2b target {}: {e}", dst.display()))?;
+        fs::create_dir_all(&dst)
+            .map_err(|e| format!("mkdir volume target {}: {e}", dst.display()))?;
         chown_path(&dst, default_uid, default_gid)?;
 
         // With no pivot, Kubernetes can mount the same PVC/subPath at both
@@ -794,8 +797,8 @@ pub fn mount_e2b_volumes(
         // intentionally has no CAP_SYS_ADMIN. Pivoted roots still use the
         // bind/remount path below, including its nosuid/nodev hardening.
         use std::os::unix::fs::MetadataExt;
-        let src_meta = fs::metadata(src_path).map_err(|e| format!("stat e2b source: {e}"))?;
-        let dst_meta = fs::metadata(&dst).map_err(|e| format!("stat e2b target: {e}"))?;
+        let src_meta = fs::metadata(src_path).map_err(|e| format!("stat volume source: {e}"))?;
+        let dst_meta = fs::metadata(&dst).map_err(|e| format!("stat volume target: {e}"))?;
         if no_pivot && src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino() {
             continue;
         }
@@ -849,7 +852,7 @@ fn expect_json_string(val: JsonValue, idx: usize, field: &str) -> Result<String,
     match val {
         JsonValue::String(s) => Ok(s),
         _ => Err(format!(
-            "e2b mount entry {idx} field {field} must be a string"
+            "volume mount entry {idx} field {field} must be a string"
         )),
     }
 }
@@ -1237,7 +1240,7 @@ mod tests {
         assert!(content.contains("\"rootfs_action\": \"skipped\""));
         assert!(content.contains("\"workspace_action\": \"skipped\""));
         assert!(content.contains("\"duration_ms\":"));
-        assert!(content.contains("\"e2b_bind_duration_ms\":"));
+        assert!(content.contains("\"volume_bind_duration_ms\":"));
     }
 
     #[test]
@@ -1295,7 +1298,7 @@ mod tests {
             workspace_device: "/dev/cubepod-workspace".to_string(),
             workspace_action: VolumeAction::Skipped,
             duration_ms: 128,
-            e2b_bind_duration_ms: 5,
+            volume_bind_duration_ms: 5,
         };
 
         state.write_to_file(&state_path).expect("write init state");
@@ -1308,7 +1311,7 @@ mod tests {
         assert!(content.contains("\"workspace_device\": \"/dev/cubepod-workspace\""));
         assert!(content.contains("\"workspace_action\": \"skipped\""));
         assert!(content.contains("\"duration_ms\": 128"));
-        assert!(content.contains("\"e2b_bind_duration_ms\": 5"));
+        assert!(content.contains("\"volume_bind_duration_ms\": 5"));
     }
 
     #[test]
@@ -1333,11 +1336,11 @@ mod tests {
             workspace_device: "/dev/cubepod-workspace".to_string(),
             workspace_action: VolumeAction::Mounted,
             duration_ms: 42,
-            e2b_bind_duration_ms: 7,
+            volume_bind_duration_ms: 7,
         };
 
         let json = state.to_json();
-        let expected = "{\n  \"pivoted\": true,\n  \"rootfs_device\": \"/dev/cubepod-rootfs\",\n  \"rootfs_action\": \"mounted\",\n  \"workspace_device\": \"/dev/cubepod-workspace\",\n  \"workspace_action\": \"mounted\",\n  \"duration_ms\": 42,\n  \"e2b_bind_duration_ms\": 7\n}\n";
+        let expected = "{\n  \"pivoted\": true,\n  \"rootfs_device\": \"/dev/cubepod-rootfs\",\n  \"rootfs_action\": \"mounted\",\n  \"workspace_device\": \"/dev/cubepod-workspace\",\n  \"workspace_action\": \"mounted\",\n  \"duration_ms\": 42,\n  \"volume_bind_duration_ms\": 7\n}\n";
         assert_eq!(json, expected);
     }
 
@@ -1373,7 +1376,7 @@ mod tests {
     }
 
     #[test]
-    fn e2b_mounts_valid_parsing_and_normalization() {
+    fn volume_mounts_valid_parsing_and_normalization() {
         let vid1 = "0123456789abcdef0123456789abcdef";
         let vid2 = "fedcba9876543210fedcba9876543210";
         let raw = format!(
@@ -1391,16 +1394,16 @@ mod tests {
             ]"#
         );
 
-        let specs = parse_and_validate_e2b_mounts(&raw, "/workspace").expect("valid mounts");
+        let specs = parse_and_validate_volume_mounts(&raw, "/workspace").expect("valid mounts");
         assert_eq!(
             specs,
             vec![
-                E2BMountSpec {
+                VolumeMountSpec {
                     volume_id: vid1.to_string(),
                     staging_path: format!("/run/cubepod/volumes/{vid1}"),
                     target_path: "/mnt/dataset".to_string(),
                 },
-                E2BMountSpec {
+                VolumeMountSpec {
                     volume_id: vid2.to_string(),
                     staging_path: format!("/run/cubepod/volumes/{vid2}"),
                     target_path: "/mnt/models".to_string(),
@@ -1409,7 +1412,7 @@ mod tests {
         );
 
         // Empty array is valid
-        assert!(parse_and_validate_e2b_mounts("[]", "/workspace")
+        assert!(parse_and_validate_volume_mounts("[]", "/workspace")
             .unwrap()
             .is_empty());
 
@@ -1418,7 +1421,7 @@ mod tests {
             r#"[{{"volume_id":"{vid1}","staging_path":"/run/cubepod/volumes/{vid1}","target_path":"/workspace2"}}]"#
         );
         assert_eq!(
-            parse_and_validate_e2b_mounts(&sibling, "/workspace")
+            parse_and_validate_volume_mounts(&sibling, "/workspace")
                 .unwrap()
                 .len(),
             1
@@ -1426,7 +1429,7 @@ mod tests {
     }
 
     #[test]
-    fn e2b_mounts_rejects_invalid_volume_id() {
+    fn volume_mounts_rejects_invalid_volume_id() {
         let cases = [
             // Missing volume_id
             r#"[{"staging_path":"/run/cubepod/volumes/0123456789abcdef0123456789abcdef","target_path":"/mnt/data"}]"#,
@@ -1440,14 +1443,14 @@ mod tests {
 
         for raw in cases {
             assert!(
-                parse_and_validate_e2b_mounts(raw, "/workspace").is_err(),
+                parse_and_validate_volume_mounts(raw, "/workspace").is_err(),
                 "expected error for {raw}"
             );
         }
     }
 
     #[test]
-    fn e2b_mounts_rejects_bad_staging_path() {
+    fn volume_mounts_rejects_bad_staging_path() {
         let vid = "0123456789abcdef0123456789abcdef";
         let other_vid = "ffffffffffffffffffffffffffffffff";
         let cases = [
@@ -1464,14 +1467,14 @@ mod tests {
 
         for raw in cases {
             assert!(
-                parse_and_validate_e2b_mounts(&raw, "/workspace").is_err(),
+                parse_and_validate_volume_mounts(&raw, "/workspace").is_err(),
                 "expected error for {raw}"
             );
         }
     }
 
     #[test]
-    fn e2b_mounts_rejects_reserved_workspace_traversal_and_duplicates() {
+    fn volume_mounts_rejects_reserved_workspace_traversal_and_duplicates() {
         let vid1 = "0123456789abcdef0123456789abcdef";
         let vid2 = "fedcba9876543210fedcba9876543210";
 
@@ -1496,7 +1499,7 @@ mod tests {
                 r#"[{{"volume_id":"{vid1}","staging_path":"/run/cubepod/volumes/{vid1}","target_path":"{target}"}}]"#
             );
             assert!(
-                parse_and_validate_e2b_mounts(&raw, "/workspace").is_err(),
+                parse_and_validate_volume_mounts(&raw, "/workspace").is_err(),
                 "expected target_path {target:?} to be rejected"
             );
         }
@@ -1508,29 +1511,29 @@ mod tests {
                 {{"volume_id":"{vid2}","staging_path":"/run/cubepod/volumes/{vid2}","target_path":"//mnt//data/"}}
             ]"#
         );
-        let err = parse_and_validate_e2b_mounts(&dup_raw, "/workspace").unwrap_err();
+        let err = parse_and_validate_volume_mounts(&dup_raw, "/workspace").unwrap_err();
         assert!(err.contains("duplicate"), "unexpected error: {err}");
 
-        // Overlapping nested target_path between two E2B mounts
+        // Overlapping nested target_path between two volume mounts
         let nested_raw = format!(
             r#"[
                 {{"volume_id":"{vid1}","staging_path":"/run/cubepod/volumes/{vid1}","target_path":"/mnt/ds"}},
                 {{"volume_id":"{vid2}","staging_path":"/run/cubepod/volumes/{vid2}","target_path":"/mnt/ds/sub"}}
             ]"#
         );
-        let err = parse_and_validate_e2b_mounts(&nested_raw, "/workspace").unwrap_err();
+        let err = parse_and_validate_volume_mounts(&nested_raw, "/workspace").unwrap_err();
         assert!(err.contains("overlaps mount"), "unexpected error: {err}");
     }
 
     #[test]
-    fn e2b_mounts_env_and_file_fallback() {
+    fn volume_mounts_env_and_file_fallback() {
         let vid1 = "0123456789abcdef0123456789abcdef";
         let vid2 = "fedcba9876543210fedcba9876543210";
-        let file_path = unique_temp_path("test-e2b-mounts", "json");
+        let file_path = unique_temp_path("test-volume-mounts", "json");
         let _guard = TempFileGuard(file_path.clone());
 
         // Missing file and no env -> empty
-        assert!(load_e2b_mounts_from(None, &file_path, "/workspace")
+        assert!(load_volume_mounts_from(None, &file_path, "/workspace")
             .unwrap()
             .is_empty());
 
@@ -1538,9 +1541,9 @@ mod tests {
         let file_json = format!(
             r#"[{{"volume_id":"{vid1}","staging_path":"/run/cubepod/volumes/{vid1}","target_path":"/mnt/from-file"}}]"#
         );
-        fs::write(&file_path, file_json).expect("write e2b-mounts.json");
+        fs::write(&file_path, file_json).expect("write volume-mounts.json");
 
-        let from_file = load_e2b_mounts_from(Some(""), &file_path, "/workspace").unwrap();
+        let from_file = load_volume_mounts_from(Some(""), &file_path, "/workspace").unwrap();
         assert_eq!(from_file.len(), 1);
         assert_eq!(from_file[0].target_path, "/mnt/from-file");
 
@@ -1548,34 +1551,34 @@ mod tests {
         let env_json = format!(
             r#"[{{"volume_id":"{vid2}","staging_path":"/run/cubepod/volumes/{vid2}","target_path":"/mnt/from-env"}}]"#
         );
-        let from_env = load_e2b_mounts_from(Some(&env_json), &file_path, "/workspace").unwrap();
+        let from_env = load_volume_mounts_from(Some(&env_json), &file_path, "/workspace").unwrap();
         assert_eq!(from_env.len(), 1);
         assert_eq!(from_env[0].target_path, "/mnt/from-env");
     }
 
     #[test]
-    fn mount_e2b_volumes_fails_fast_when_staging_missing() {
+    fn mount_volumes_fails_fast_when_staging_missing() {
         let vid = "0123456789abcdef0123456789abcdef";
-        let spec = E2BMountSpec {
+        let spec = VolumeMountSpec {
             volume_id: vid.to_string(),
             staging_path: format!("/run/cubepod/volumes/{vid}-nonexistent"),
             target_path: "/mnt/dataset".to_string(),
         };
-        let err = mount_e2b_volumes(&[spec], Path::new("/"), 1000, 1000, false).unwrap_err();
+        let err = mount_volumes(&[spec], Path::new("/"), 1000, 1000, false).unwrap_err();
         assert!(err.contains("does not exist"), "unexpected error: {err}");
     }
     #[test]
-    fn e2b_already_mounted_target_needs_no_mount_capability() {
-        let root = unique_temp_path("e2b-direct", "dir");
+    fn already_mounted_target_needs_no_mount_capability() {
+        let root = unique_temp_path("volume-direct", "dir");
         let target = root.join("data");
         fs::create_dir_all(&target).unwrap();
         fs::write(target.join("persist.txt"), "real-volume").unwrap();
-        let mount = E2BMountSpec {
+        let mount = VolumeMountSpec {
             volume_id: "0123456789abcdef0123456789abcdef".into(),
             staging_path: target.to_string_lossy().into_owned(),
             target_path: "/data".into(),
         };
-        mount_e2b_volumes(
+        mount_volumes(
             &[mount],
             &root,
             unsafe { libc::getuid() },

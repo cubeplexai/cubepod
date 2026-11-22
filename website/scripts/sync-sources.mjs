@@ -66,11 +66,11 @@ function syncScalarBundle() {
 // 3. Parse CRDs in deploy/helm/cubepod/crds/*.yaml and emit reference/crds.md (EN + ZH)
 const CRD_FIELD_DESCRIPTIONS = {
   // PodBox
-  'spec.e2bVolumeMounts': 'Official E2B RWX volume mounts attached to the sandbox container.',
-  'spec.e2bVolumeMounts[].volumeID': '32-character hexadecimal E2B volume identifier.',
-  'spec.e2bVolumeMounts[].pvcName': 'Shared ReadWriteMany PVC name hosting E2B volumes.',
-  'spec.e2bVolumeMounts[].subPath': 'Subdirectory path inside the shared PVC for this volume.',
-  'spec.e2bVolumeMounts[].path': 'Absolute mount path inside the sandbox container.',
+  'spec.volumeMounts': 'Persistent RWX volume mounts attached to the sandbox container.',
+  'spec.volumeMounts[].volumeID': '32-character hexadecimal volume identifier.',
+  'spec.volumeMounts[].pvcName': 'Shared ReadWriteMany PVC name hosting persistent volumes.',
+  'spec.volumeMounts[].subPath': 'Subdirectory path inside the shared PVC for this volume.',
+  'spec.volumeMounts[].path': 'Absolute mount path inside the sandbox container.',
   'spec.templateRef': 'Name of the `PodTemplate` defining runtime class, base OCI image, storage, and egress defaults.',
   'spec.warmPoolRef': 'Optional `PodWarmPool` name to claim a pre-attached standby MicroVM in `< 50ms`.',
   'spec.desiredState': 'Target sandbox compute state (`Running` or `Paused`). Setting `Paused` deletes the Pod (0 CPU/RAM) while retaining PVCs.',
@@ -490,25 +490,25 @@ const HELM_VALUE_DESCRIPTIONS = {
     en: '*Added in v0.7.0.* Filesystem directory (`CUBEPOD_EVENTS_DIR`) used only when `events.backend` is `"file"`.',
     zh: '*v0.7.0 新增。* 仅当 `events.backend` 为 `"file"` 时使用的本地事件目录（`CUBEPOD_EVENTS_DIR`）。',
   },
-  'featureGates.k8sE2BVolumeMounts': {
-    en: '*Changed in v0.6.0.* Wired into `--feature-gate=K8sE2BVolumeMounts=...`; auto-enabled whenever `e2bVolumes.enabled` is `true` or `e2bVolumes.rwxStorageClassName` is non-empty.',
-    zh: '*v0.6.0 变更。* 注入 `--feature-gate=K8sE2BVolumeMounts=...`；当 `e2bVolumes.enabled` 为 `true` 或 `e2bVolumes.rwxStorageClassName` 非空时会自动开启。',
+  'featureGates.k8sVolumeMounts': {
+    en: '*Changed in v0.8.0.* Wired into `--feature-gate=K8sVolumeMounts=...`; auto-enabled whenever `volumes.enabled` is `true` or `volumes.rwxStorageClassName` is non-empty.',
+    zh: '*v0.8.0 变更。* 注入 `--feature-gate=K8sVolumeMounts=...`；当 `volumes.enabled` 为 `true` 或 `volumes.rwxStorageClassName` 非空时会自动开启。',
   },
-  'e2bVolumes.enabled': {
-    en: 'Mount the shared RWX E2B volumes PVC (`CUBEPOD_E2B_VOLUME_DIR`) into `cubepod-gateway`. Automatically activated when `e2bVolumes.rwxStorageClassName` is set (*Changed in v0.6.0*).',
-    zh: '是否在 `cubepod-gateway` 中挂载共享 RWX E2B 卷 PVC（`CUBEPOD_E2B_VOLUME_DIR`）。自 *v0.6.0* 起，配置 `e2bVolumes.rwxStorageClassName` 时会自动激活。',
+  'volumes.enabled': {
+    en: 'Mount the shared RWX persistent volumes PVC (`CUBEPOD_VOLUMES_DIR`) into `cubepod-gateway`. Automatically activated when `volumes.rwxStorageClassName` is set (*Changed in v0.8.0*).',
+    zh: '是否在 `cubepod-gateway` 中挂载共享 RWX 持久卷 PVC（`CUBEPOD_VOLUMES_DIR`）。配置 `volumes.rwxStorageClassName` 时会自动激活（*v0.8.0 变更*）。',
   },
-  'e2bVolumes.pvcName': {
+  'volumes.pvcName': {
     en: 'Shared `ReadWriteMany` PVC name mounted by `cubepod-gateway` and Kata sandbox Pods.',
     zh: '供 `cubepod-gateway` 与 Kata 沙箱 Pod 共同挂载的 `ReadWriteMany` PVC 名称。',
   },
-  'e2bVolumes.rwxStorageClassName': {
-    en: '*Changed in v0.6.0.* StorageClass for the shared `ReadWriteMany` E2B volume PVC (`e2b-volumes-pvc.yaml`). When non-empty, automatically activates `e2bVolumes` and enables `K8sE2BVolumeMounts`.',
-    zh: '*v0.6.0 变更。* 用于创建共享 `ReadWriteMany` E2B 卷 PVC（`e2b-volumes-pvc.yaml`）的 StorageClass。一旦设置为非空值，将自动激活 `e2bVolumes` 并开启 `K8sE2BVolumeMounts`。',
+  'volumes.rwxStorageClassName': {
+    en: '*Changed in v0.8.0.* StorageClass for the shared `ReadWriteMany` volumes PVC (`volumes-pvc.yaml`). When non-empty, automatically activates `volumes` and enables `K8sVolumeMounts`.',
+    zh: '*v0.8.0 变更。* 用于创建共享 `ReadWriteMany` 卷 PVC（`volumes-pvc.yaml`）的 StorageClass。一旦设置为非空值，将自动激活 `volumes` 并开启 `K8sVolumeMounts`。',
   },
-  'e2bVolumes.size': {
-    en: 'Capacity requested for the shared `ReadWriteMany` E2B volumes PVC.',
-    zh: '共享 `ReadWriteMany` E2B 卷 PVC 申请的存储容量。',
+  'volumes.size': {
+    en: 'Capacity requested for the shared `ReadWriteMany` volumes PVC.',
+    zh: '共享 `ReadWriteMany` 卷 PVC 申请的存储容量。',
   },
 };
 
@@ -544,8 +544,8 @@ function syncHelmValues() {
         : `> Synced directly from [\`deploy/helm/cubepod/values.yaml\`](https://github.com/cubeplexai/cubepod/blob/main/deploy/helm/cubepod/values.yaml) (Chart \`${chart.version}\` · App \`${chart.appVersion}\`).`,
       '',
       isZh
-        ? '> **v0.6.0 配置变更：** 新增 `gateway.podDisruptionBudget.*`（`pdb.yaml`）、`egress.transparent`、`secrets.*`（支持 `"k8s"` 多副本 HA 后端与密钥引用），统一通过 `--feature-gate` 注入 `featureGates.*`，且配置 `e2bVolumes.rwxStorageClassName` 后会自动激活 `e2bVolumes` 并开启 `K8sE2BVolumeMounts`。'
-        : '> **Changed / Added in v0.6.0:** Added `gateway.podDisruptionBudget.*` (`pdb.yaml`), `egress.transparent`, and `secrets.*` (`"k8s"` HA backend + encryption key Secret wiring); unified `featureGates.*` `--feature-gate` flags; and made setting `e2bVolumes.rwxStorageClassName` automatically activate `e2bVolumes` and `K8sE2BVolumeMounts`.',
+        ? '> **v0.6.0 配置变更：** 新增 `gateway.podDisruptionBudget.*`（`pdb.yaml`）、`egress.transparent`、`secrets.*`（支持 `"k8s"` 多副本 HA 后端与密钥引用），统一通过 `--feature-gate` 注入 `featureGates.*`，且配置 RWX StorageClass 后会自动激活持久卷并开启 Kubernetes 挂载。'
+        : '> **Changed / Added in v0.6.0:** Added `gateway.podDisruptionBudget.*` (`pdb.yaml`), `egress.transparent`, and `secrets.*` (`"k8s"` HA backend + encryption key Secret wiring); unified `featureGates.*` `--feature-gate` flags; and made setting an RWX StorageClass automatically activate shared persistent volumes.',
       '',
       isZh
         ? '> **v0.7.0 配置变更：** 新增 `events.*`（`events.enabled`、`events.backend`，默认 `"k8s"` 多副本 HA 后端，以及 `events.dir`），用于沙箱生命周期事件、Webhook 与死信。'

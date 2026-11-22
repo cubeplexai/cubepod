@@ -1,19 +1,19 @@
-{{- if .Values.e2bVolumes.rwxStorageClassName }}
+{{- if .Values.volumes.rwxStorageClassName }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ .Values.e2bVolumes.pvcName }}
+  name: {{ .Values.volumes.pvcName }}
   namespace: {{ .Release.Namespace }}
   annotations:
     "helm.sh/resource-policy": keep
   labels:
     {{- include "cubepod.labels" . | nindent 4 }}
-    app.kubernetes.io/component: e2b-volumes
+    app.kubernetes.io/component: volumes
 spec:
   accessModes:
     - ReadWriteMany
-  storageClassName: {{ .Values.e2bVolumes.rwxStorageClassName | quote }}
+  storageClassName: {{ .Values.volumes.rwxStorageClassName | quote }}
   resources:
     requests:
-      storage: {{ .Values.e2bVolumes.size | quote }}
+      storage: {{ .Values.volumes.size | quote }}
 {{- end }}

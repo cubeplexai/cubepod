@@ -25,8 +25,8 @@ func LocalTemplateTag(slug, buildID string) string {
 	return fmt.Sprintf("cubepod-templates/%s:%s", slug, buildID)
 }
 
-// SandboxVolumeMount attaches an official E2B volume to a container path.
-// DockerVolume, when set, must start with cubepod-e2bvol- or cpod-test-.
+// SandboxVolumeMount attaches a shared volume to a container path.
+// DockerVolume, when set, must start with cubepod-vol- or cpod-test-.
 // Otherwise HostPath is bind-mounted. Invalid mounts are rejected.
 type SandboxVolumeMount struct {
 	HostPath      string `json:"hostPath,omitempty"`

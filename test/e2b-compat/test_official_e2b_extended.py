@@ -43,7 +43,7 @@ def direct_gateway_url() -> Generator[str, None, None]:
     env["TMPDIR"] = temp_dir
     env["CUBEPOD_WORKSPACE_DIR"] = os.path.join(temp_dir, "workspaces")
     env["CUBEPOD_STATE"] = os.path.join(temp_dir, "state")
-    env["CUBEPOD_E2B_VOLUME_DIR"] = os.path.join(temp_dir, "volumes")
+    env["CUBEPOD_VOLUMES_DIR"] = os.path.join(temp_dir, "volumes")
     env["CUBEPOD_SECRETS_DIR"] = os.path.join(temp_dir, "secrets")
     env["KUBECONFIG"] = os.path.join(temp_dir, "nonexistent-kubeconfig")
     env.pop("KUBERNETES_SERVICE_HOST", None)

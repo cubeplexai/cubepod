@@ -14,17 +14,16 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
-// e2bPVCPrefix is the PVC name prefix reserved for E2B volume claims.
-// Official E2B volumeMounts are gated off on the live Kubernetes runtime in
-// Alpha (returning 501 Not Implemented) and no e2bvol-<id> PVCs are created on
-// live K8s; only the Docker runtime and MemoryKubeClient unit tests use them.
+// volumePVCPrefix is the PVC name prefix reserved for CubePod volume claims.
+// Kubernetes volumeMounts are gated behind FeatureGateK8sVolumeMounts and require
+// a shared RWX PVC (SharedPVCName) for multi-pod / fork safety.
 const (
-	e2bPVCPrefix              = "e2bvol-"
+	volumePVCPrefix           = "vol-"
 	defaultMaxVolumeFileBytes = 64 << 20 // 64 MiB
 )
 
-// E2BVolumeConfig points the gateway at a durable volume directory.
-type E2BVolumeConfig struct {
+// VolumeConfig points the gateway at a durable volume directory.
+type VolumeConfig struct {
 	// Dir is the gateway-local store root. Required.
 	Dir string
 	// HostDir is the Docker daemon's view of Dir. Empty means HostPath == local path.
@@ -43,16 +42,16 @@ type E2BVolumeConfig struct {
 	MaxBytesPerTenant int64
 	// KMS optionally envelope-encrypts volume content tokens in meta.json.
 	KMS volume.KMSProvider
-	// K8sE2BVolumeMounts enables official E2B volumeMounts on live Kubernetes.
-	K8sE2BVolumeMounts bool
+	// K8sVolumeMounts enables volumeMounts on live Kubernetes.
+	K8sVolumeMounts bool
 	// SharedPVCName is the cluster-wide RWX PVC shared between gateway and Kata pods.
 	SharedPVCName string
 }
 
-// E2BVolumeMount is the runtime attachment for one sandbox mount.
+// VolumeMount is the runtime attachment for one sandbox mount.
 // HostPath is what the Docker daemon should bind. DockerVolume, when set, is
 // a named volume (cpod-test-vol-<id>) backed by that same directory.
-type E2BVolumeMount struct {
+type VolumeMount struct {
 	VolumeName    string `json:"volumeName"`
 	VolumeID      string `json:"volumeID"`
 	ContainerPath string `json:"containerPath"`
@@ -60,10 +59,10 @@ type E2BVolumeMount struct {
 	DockerVolume  string `json:"dockerVolume,omitempty"`
 }
 
-// ConfigureE2BVolumes opens (or reopens) the durable volume store.
-func (s *Server) ConfigureE2BVolumes(cfg E2BVolumeConfig) error {
+// ConfigureVolumes opens (or reopens) the durable volume store.
+func (s *Server) ConfigureVolumes(cfg VolumeConfig) error {
 	if cfg.Dir == "" {
-		return errors.New("e2b volume dir is required")
+		return errors.New("volume dir is required")
 	}
 	vcfg := volume.Config{
 		HostDir:             cfg.HostDir,
@@ -79,17 +78,17 @@ func (s *Server) ConfigureE2BVolumes(cfg E2BVolumeConfig) error {
 		return err
 	}
 	s.mu.Lock()
-	s.e2bDir = cfg.Dir
-	s.e2bCfg = vcfg
-	s.e2bMaxFileBytes = cfg.MaxFileSizeBytes
-	s.e2bK8sMounts = cfg.K8sE2BVolumeMounts
-	if cfg.K8sE2BVolumeMounts {
+	s.volumesDir = cfg.Dir
+	s.volumeCfg = vcfg
+	s.volumeMaxFileBytes = cfg.MaxFileSizeBytes
+	s.k8sVolumeMounts = cfg.K8sVolumeMounts
+	if cfg.K8sVolumeMounts {
 		if s.featureGates == nil {
 			s.featureGates = DefaultFeatureGates()
 		}
-		s.featureGates[FeatureGateK8sE2BVolumeMounts] = true
+		s.featureGates[FeatureGateK8sVolumeMounts] = true
 	}
-	s.e2bSharedPVC = strings.TrimSpace(cfg.SharedPVCName)
+	s.volumesSharedPVC = strings.TrimSpace(cfg.SharedPVCName)
 	active := make(map[string]struct{}, len(s.sandboxes))
 	for id := range s.sandboxes {
 		active[id] = struct{}{}
@@ -102,7 +101,7 @@ func (s *Server) ConfigureE2BVolumes(cfg E2BVolumeConfig) error {
 		boxes, listErr := reconciler.KubeClient().ListPodBoxes(context.Background(), reconciler.Namespace())
 		if listErr != nil {
 			// Avoid wiping persisted mounts.json if the API server is temporarily unreachable on boot.
-			slog.Warn("skipping e2b mount reconciliation: failed to list PodBoxes", "err", listErr)
+			slog.Warn("skipping volume mount reconciliation: failed to list PodBoxes", "err", listErr)
 			shouldReconcile = false
 		} else {
 			for _, box := range boxes {
@@ -115,13 +114,13 @@ func (s *Server) ConfigureE2BVolumes(cfg E2BVolumeConfig) error {
 	if shouldReconcile {
 		st.ReconcileMounts(active)
 	}
-	s.e2b.Store(st)
+	s.volumeStore.Store(st)
 	return nil
 }
 
 func (s *Server) maxVolumeFileBytes() int64 {
 	s.mu.RLock()
-	n := s.e2bMaxFileBytes
+	n := s.volumeMaxFileBytes
 	s.mu.RUnlock()
 	if n <= 0 {
 		return defaultMaxVolumeFileBytes
@@ -129,29 +128,29 @@ func (s *Server) maxVolumeFileBytes() int64 {
 	return n
 }
 
-func (s *Server) sharedE2BPVC() string {
+func (s *Server) sharedVolumePVC() string {
 	s.mu.RLock()
-	pvc := s.e2bSharedPVC
+	pvc := s.volumesSharedPVC
 	s.mu.RUnlock()
 	return pvc
 }
 
 func (s *Server) isKubeVolumeMountsUnsupported() bool {
 	s.mu.RLock()
-	k8sMounts := s.e2bK8sMounts
+	k8sMounts := s.k8sVolumeMounts
 	if s.featureGates != nil {
-		k8sMounts = s.featureGates[FeatureGateK8sE2BVolumeMounts]
+		k8sMounts = s.featureGates[FeatureGateK8sVolumeMounts]
 	}
-	sharedPVC := s.e2bSharedPVC
+	sharedPVC := s.volumesSharedPVC
 	live := s.livePodRouting
 	s.mu.RUnlock()
 	return live && s.runtime == nil && (!k8sMounts || sharedPVC == "")
 }
 
-// E2BVolumeMounts returns the volumes attached to a sandbox. The compose
+// VolumeMounts returns the volumes attached to a sandbox. The compose
 // harness uses this to set Docker Mounts/Binds. An unknown sandbox returns nil.
-func (s *Server) E2BVolumeMounts(sandboxID string) []E2BVolumeMount {
-	st := s.e2b.Load()
+func (s *Server) VolumeMounts(sandboxID string) []VolumeMount {
+	st := s.volumeStore.Load()
 	if st == nil || sandboxID == "" {
 		return nil
 	}
@@ -159,9 +158,9 @@ func (s *Server) E2BVolumeMounts(sandboxID string) []E2BVolumeMount {
 	if len(specs) == 0 {
 		return nil
 	}
-	out := make([]E2BVolumeMount, 0, len(specs))
+	out := make([]VolumeMount, 0, len(specs))
 	for _, m := range specs {
-		out = append(out, E2BVolumeMount{
+		out = append(out, VolumeMount{
 			VolumeName:    m.VolumeName,
 			VolumeID:      m.VolumeID,
 			ContainerPath: m.ContainerPath,
@@ -172,10 +171,10 @@ func (s *Server) E2BVolumeMounts(sandboxID string) []E2BVolumeMount {
 	return out
 }
 
-// E2BVolumeDataDir returns the local data directory for a volume, for tests
+// VolumeDataDir returns the local data directory for a volume, for tests
 // and operators. It is empty when the id is unknown.
-func (s *Server) E2BVolumeDataDir(volumeID string) string {
-	st := s.e2b.Load()
+func (s *Server) VolumeDataDir(volumeID string) string {
+	st := s.volumeStore.Load()
 	if st == nil {
 		return ""
 	}
@@ -186,29 +185,29 @@ func (s *Server) E2BVolumeDataDir(volumeID string) string {
 	return dir
 }
 
-func (s *Server) e2bStore() (*volume.Store, error) {
-	if st := s.e2b.Load(); st != nil {
+func (s *Server) getVolumeStore() (*volume.Store, error) {
+	if st := s.volumeStore.Load(); st != nil {
 		return st, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if st := s.e2b.Load(); st != nil {
+	if st := s.volumeStore.Load(); st != nil {
 		return st, nil
 	}
-	dir := s.e2bDir
+	dir := s.volumesDir
 	if dir == "" {
-		return nil, errors.New("e2b volume store is not configured")
+		return nil, errors.New("volume store is not configured")
 	}
-	st, err := volume.Open(dir, s.e2bCfg)
+	st, err := volume.Open(dir, s.volumeCfg)
 	if err != nil {
 		return nil, err
 	}
-	s.e2b.Store(st)
+	s.volumeStore.Store(st)
 	return st, nil
 }
 
-func (s *Server) requireE2BStore(w http.ResponseWriter) (*volume.Store, bool) {
-	st, err := s.e2bStore()
+func (s *Server) requireVolumeStore(w http.ResponseWriter) (*volume.Store, bool) {
+	st, err := s.getVolumeStore()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "volume store unavailable")
 		return nil, false
@@ -254,7 +253,7 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	st, ok := s.requireE2BStore(w)
+	st, ok := s.requireVolumeStore(w)
 	if !ok {
 		return
 	}
@@ -269,12 +268,12 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	vol, err := st.Create(key, req.Name)
 	if err != nil {
 		if errors.Is(err, volume.ErrLimitExceeded) {
-			s.E2BVolumeQuotaRejectionsTotal.Add(1)
+			s.VolumeQuotaRejectionsTotal.Add(1)
 		}
 		writeVolumeMgmtError(w, err, req.Name)
 		return
 	}
-	s.ensureE2BVolumePVC(r.Context(), st, vol.VolumeID)
+	s.ensureVolumePVC(r.Context(), st, vol.VolumeID)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]string{
@@ -289,7 +288,7 @@ func (s *Server) handleRotateVolumeKey(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	st, ok := s.requireE2BStore(w)
+	st, ok := s.requireVolumeStore(w)
 	if !ok {
 		return
 	}
@@ -328,7 +327,7 @@ func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	st, ok := s.requireE2BStore(w)
+	st, ok := s.requireVolumeStore(w)
 	if !ok {
 		return
 	}
@@ -353,7 +352,7 @@ func (s *Server) handleGetVolume(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	st, ok := s.requireE2BStore(w)
+	st, ok := s.requireVolumeStore(w)
 	if !ok {
 		return
 	}
@@ -375,7 +374,7 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	st, ok := s.requireE2BStore(w)
+	st, ok := s.requireVolumeStore(w)
 	if !ok {
 		return
 	}
@@ -387,7 +386,7 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, box := range boxes {
-			for _, m := range box.Spec.E2BVolumeMounts {
+			for _, m := range box.Spec.VolumeMounts {
 				if m.VolumeID == id {
 					writeError(w, http.StatusConflict, "volume is mounted by a sandbox")
 					return
@@ -400,7 +399,7 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 		writeVolumeMgmtError(w, err, "")
 		return
 	}
-	s.deleteE2BVolumePVC(r.Context(), vol.PVCNamespace, vol.PVCName, vol.VolumeID)
+	s.deleteVolumePVC(r.Context(), vol.PVCNamespace, vol.PVCName, vol.VolumeID)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -429,7 +428,7 @@ func (s *Server) authVolumeContent(w http.ResponseWriter, r *http.Request) (*vol
 		writeContentError(w, http.StatusUnauthorized, "volume token is required")
 		return nil, volume.Volume{}, false
 	}
-	st, ok := s.requireE2BStore(w)
+	st, ok := s.requireVolumeStore(w)
 	if !ok {
 		return nil, volume.Volume{}, false
 	}
@@ -489,7 +488,7 @@ func (s *Server) handlePutVolumeFile(w http.ResponseWriter, r *http.Request) {
 	ent, err := st.WriteFile(vol.VolumeID, p, r.Body, opts)
 	if err != nil {
 		if errors.Is(err, volume.ErrLimitExceeded) {
-			s.E2BVolumeQuotaRejectionsTotal.Add(1)
+			s.VolumeQuotaRejectionsTotal.Add(1)
 		}
 		writeVolumeContentError(w, err)
 		return
@@ -678,7 +677,7 @@ func queryBool(r *http.Request, key string) bool {
 	return v == "true" || v == "1"
 }
 
-func (s *Server) ensureE2BVolumePVC(ctx context.Context, st *volume.Store, volumeID string) {
+func (s *Server) ensureVolumePVC(ctx context.Context, st *volume.Store, volumeID string) {
 	if s.isKubeVolumeMountsUnsupported() {
 		return
 	}
@@ -686,13 +685,13 @@ func (s *Server) ensureE2BVolumePVC(ctx context.Context, st *volume.Store, volum
 		return
 	}
 	ns := s.reconciler.Namespace()
-	if sharedPVC := s.sharedE2BPVC(); sharedPVC != "" {
+	if sharedPVC := s.sharedVolumePVC(); sharedPVC != "" {
 		if err := st.NotePVC(volumeID, sharedPVC, ns); err != nil {
-			slog.Warn("e2b volume shared PVC note failed", "volumeID", volumeID, "pvc", sharedPVC, "err", err)
+			slog.Warn("volume shared PVC note failed", "volumeID", volumeID, "pvc", sharedPVC, "err", err)
 		}
 		return
 	}
-	name := e2bPVCPrefix + volumeID
+	name := volumePVCPrefix + volumeID
 	pvc := controller.BlockPVCManifest{
 		Name:             name,
 		Namespace:        ns,
@@ -701,57 +700,57 @@ func (s *Server) ensureE2BVolumePVC(ctx context.Context, st *volume.Store, volum
 		Size:             "1Gi",
 		AccessModes:      []string{"ReadWriteOnce"},
 		Labels: map[string]string{
-			"cubepod.io/e2b-volume-id":     volumeID,
-			"app.kubernetes.io/managed-by": "cubepod-e2b-volume",
+			"cubepod.io/volume-id":         volumeID,
+			"app.kubernetes.io/managed-by": "cubepod-volumes",
 		},
 	}
 	// Not the sandbox workspace PVC. The Kata pod is not updated to mount this
-	// claim; see the package comment on e2bPVCPrefix.
+	// claim; see the package comment on volumePVCPrefix.
 	if err := s.reconciler.KubeClient().EnsurePVC(ctx, pvc); err != nil {
-		slog.Warn("e2b volume filesystem PVC was not recorded", "volumeID", volumeID, "err", err)
+		slog.Warn("volume filesystem PVC was not recorded", "volumeID", volumeID, "err", err)
 		return
 	}
 	if err := st.NotePVC(volumeID, name, ns); err != nil {
-		slog.Warn("e2b volume PVC note failed", "volumeID", volumeID, "err", err)
+		slog.Warn("volume PVC note failed", "volumeID", volumeID, "err", err)
 	}
 }
 
-func (s *Server) deleteE2BVolumePVC(ctx context.Context, namespace, pvcName, volumeID string) {
+func (s *Server) deleteVolumePVC(ctx context.Context, namespace, pvcName, volumeID string) {
 	if s.reconciler == nil || s.reconciler.KubeClient() == nil {
 		return
 	}
 	if pvcName == "" || volumeID == "" {
 		return
 	}
-	if shared := s.sharedE2BPVC(); shared != "" && pvcName == shared {
+	if shared := s.sharedVolumePVC(); shared != "" && pvcName == shared {
 		return
 	}
-	if pvcName != e2bPVCPrefix+volumeID || !strings.HasPrefix(pvcName, e2bPVCPrefix) {
+	if pvcName != volumePVCPrefix+volumeID || !strings.HasPrefix(pvcName, volumePVCPrefix) {
 		return
 	}
 	if err := s.reconciler.KubeClient().DeletePVC(ctx, namespace, pvcName); err != nil {
-		slog.Warn("e2b volume PVC delete failed", "pvc", pvcName, "err", err)
+		slog.Warn("volume PVC delete failed", "pvc", pvcName, "err", err)
 	}
 }
 
-// planSandboxVolumeMounts resolves official volumeMounts for the caller's API key.
+// planSandboxVolumeMounts resolves volumeMounts for the caller's API key.
 // An empty list is not an error and does not require a key (existing sandbox creates).
 func (s *Server) planSandboxVolumeMounts(r *http.Request, mounts []sandboxVolumeMountReq) ([]volume.PlannedMount, int, string) {
 	if len(mounts) == 0 {
 		return nil, 0, ""
 	}
 	if s.isKubeVolumeMountsUnsupported() {
-		s.E2BVolumeMountErrorsTotal.Add(1)
-		return nil, http.StatusNotImplemented, "official E2B volumeMounts are not supported on the Kubernetes runtime"
+		s.VolumeMountErrorsTotal.Add(1)
+		return nil, http.StatusNotImplemented, "volumeMounts are not supported on the Kubernetes runtime"
 	}
 	key := managementAPIKey(r)
 	if key == "" {
-		s.E2BVolumeMountErrorsTotal.Add(1)
+		s.VolumeMountErrorsTotal.Add(1)
 		return nil, http.StatusUnauthorized, "API key is required"
 	}
-	st, err := s.e2bStore()
+	st, err := s.getVolumeStore()
 	if err != nil {
-		s.E2BVolumeMountErrorsTotal.Add(1)
+		s.VolumeMountErrorsTotal.Add(1)
 		return nil, http.StatusInternalServerError, "volume store unavailable"
 	}
 	reqs := make([]volume.MountRequest, len(mounts))
@@ -760,7 +759,7 @@ func (s *Server) planSandboxVolumeMounts(r *http.Request, mounts []sandboxVolume
 	}
 	planned, err := st.LookupMounts(key, reqs)
 	if err != nil {
-		s.E2BVolumeMountErrorsTotal.Add(1)
+		s.VolumeMountErrorsTotal.Add(1)
 		switch {
 		case errors.Is(err, volume.ErrUnauthorized):
 			return nil, http.StatusUnauthorized, "API key is unauthorized or revoked"
@@ -783,21 +782,21 @@ func (s *Server) commitSandboxVolumeMounts(sandboxID, apiKey string, planned []v
 	if len(planned) == 0 {
 		return nil
 	}
-	st := s.e2b.Load()
+	st := s.volumeStore.Load()
 	if st == nil {
-		s.E2BVolumeMountErrorsTotal.Add(1)
+		s.VolumeMountErrorsTotal.Add(1)
 		return errors.New("volume store unavailable")
 	}
 	if err := st.CommitMounts(sandboxID, apiKey, planned); err != nil {
-		s.E2BVolumeMountErrorsTotal.Add(1)
+		s.VolumeMountErrorsTotal.Add(1)
 		return err
 	}
-	s.E2BVolumeMountsTotal.Add(uint64(len(planned)))
+	s.VolumeMountsTotal.Add(uint64(len(planned)))
 	return nil
 }
 
 func (s *Server) releaseSandboxVolumeMounts(sandboxID string) {
-	st := s.e2b.Load()
+	st := s.volumeStore.Load()
 	if st == nil {
 		return
 	}
@@ -805,18 +804,18 @@ func (s *Server) releaseSandboxVolumeMounts(sandboxID string) {
 }
 
 func (s *Server) copySandboxVolumeMounts(fromID, toID string) {
-	st := s.e2b.Load()
+	st := s.volumeStore.Load()
 	if st == nil {
 		return
 	}
 	if err := st.CopyMounts(fromID, toID); err != nil {
-		s.E2BVolumeMountErrorsTotal.Add(1)
-		slog.Warn("copy e2b volume mounts failed", "from", fromID, "to", toID, "err", err)
+		s.VolumeMountErrorsTotal.Add(1)
+		slog.Warn("copy volume mounts failed", "from", fromID, "to", toID, "err", err)
 	}
 }
 
 func (s *Server) mapVolumeMountPath(sandboxID, userPath string) (string, bool, error) {
-	st := s.e2b.Load()
+	st := s.volumeStore.Load()
 	if st == nil {
 		return "", false, nil
 	}

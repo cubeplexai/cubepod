@@ -282,8 +282,8 @@ func TestSandboxCreateWithE2BNetworkSecretsAndRotation(t *testing.T) {
 
 func TestE2BSecretsQuotaControlCharsAndVolumeFailureRollback(t *testing.T) {
 	srv, _ := newSecretsTestServer(t)
-	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{Dir: t.TempDir()}); err != nil {
-		t.Fatalf("ConfigureE2BVolumes: %v", err)
+	if err := srv.ConfigureVolumes(gateway.VolumeConfig{Dir: t.TempDir()}); err != nil {
+		t.Fatalf("ConfigureVolumes: %v", err)
 	}
 	h := srv.Handler()
 

@@ -25,8 +25,8 @@ import (
 const (
 	defaultHTTPKMSTimeout = 10 * time.Second
 	maxKMSResponseBytes   = 1 << 20 // 1 MiB
-	localKEKAAD           = "cubepod-e2b-vol-kek-wrap-v1"
-	envelopeTokenAADPref  = "cubepod-e2b-vol-token-v1\x00"
+	localKEKAAD           = "cubepod-vol-kek-wrap-v1"
+	envelopeTokenAADPref  = "cubepod-vol-token-v1\x00"
 )
 
 // ErrKMS indicates a KMS configuration, wrapping, or unwrapping failure.
@@ -90,7 +90,7 @@ func NewLocalKEKProvider(keyID string, key []byte) (*LocalKEKProvider, error) {
 	}
 	id := strings.TrimSpace(keyID)
 	if id == "" {
-		sum := sha256.Sum256(append([]byte("cubepod-e2b-volumes-kek-id\x00"), keyCopy...))
+		sum := sha256.Sum256(append([]byte("cubepod-volumes-kek-id\x00"), keyCopy...))
 		id = "local:" + hex.EncodeToString(sum[:8])
 	}
 	return &LocalKEKProvider{

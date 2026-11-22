@@ -3039,8 +3039,8 @@ func TestUnifiedFeatureGatesAndDisabling(t *testing.T) {
 	}
 
 	defs := gateway.DefaultFeatureGates()
-	if defs[gateway.FeatureGateK8sE2BVolumeMounts] {
-		t.Fatalf("expected K8sE2BVolumeMounts to default false: %+v", defs)
+	if defs[gateway.FeatureGateK8sVolumeMounts] {
+		t.Fatalf("expected K8sVolumeMounts to default false: %+v", defs)
 	}
 	for _, g := range []string{
 		gateway.FeatureGateE2BTemplateAPI,

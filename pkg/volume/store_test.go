@@ -467,7 +467,7 @@ func TestStore_QuotaDotDotAndReconcileMounts(t *testing.T) {
 
 func TestDockerClient_EnsureBindVolumeNosuidAnd409DeviceCheck(t *testing.T) {
 	var createBody map[string]any
-	device := "/var/lib/cubepod/e2b/vol1/data"
+	device := "/var/lib/cubepod/volumes/vol1/data"
 	inspectDevice := device
 	inspectCode := http.StatusOK
 	createCode := http.StatusCreated
@@ -522,7 +522,7 @@ func TestStore_NotePVC_SharedRWX(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := st.NotePVC(v.VolumeID, "cubepod-e2b-volumes", "cubepod-system"); err != nil {
+	if err := st.NotePVC(v.VolumeID, "cubepod-volumes", "cubepod-system"); err != nil {
 		t.Fatalf("NotePVC shared RWX failed: %v", err)
 	}
 	if err := st.NotePVC(v.VolumeID, "../bad", "cubepod-system"); err == nil {
@@ -537,7 +537,7 @@ func TestStore_NotePVC_SharedRWX(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get after reopen: %v", err)
 	}
-	if got.PVCName != "cubepod-e2b-volumes" || got.PVCNamespace != "cubepod-system" {
+	if got.PVCName != "cubepod-volumes" || got.PVCNamespace != "cubepod-system" {
 		t.Fatalf("unexpected persisted PVC metadata: %+v", got)
 	}
 }

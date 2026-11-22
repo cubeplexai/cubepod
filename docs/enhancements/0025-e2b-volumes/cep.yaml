@@ -28,10 +28,10 @@ feature-gates:
       - "pkg/runtime"
 disable-supported: true
 metrics:
-  - "cubepod_e2b_volume_mounts_total"
-  - "cubepod_e2b_volume_mount_errors_total"
-  - "cubepod_e2b_volume_quota_rejections_total"
-  - "cubepod_e2b_volumes_storage_capacity_bytes"
-  - "cubepod_e2b_volumes_storage_used_bytes"
-  - "cubepod_e2b_volumes_storage_available_bytes"
-  - "cubepod_e2b_volumes_total"
+  - "cubepod_volume_mounts_total"
+  - "cubepod_volume_mount_errors_total"
+  - "cubepod_volume_quota_rejections_total"
+  - "cubepod_volumes_storage_capacity_bytes"
+  - "cubepod_volumes_storage_used_bytes"
+  - "cubepod_volumes_storage_available_bytes"
+  - "cubepod_volumes_total"
