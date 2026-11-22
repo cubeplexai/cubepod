@@ -59,15 +59,20 @@ class BuildKitCompatChartTests(unittest.TestCase):
 
     def test_storage_class_and_fsgroup_wiring(self):
         for replicas in (1, 2):
+            default_rendered = render_buildkit(replicas=replicas)
+            self.assertIn("fsGroup: 1000", default_rendered)
+            self.assertNotIn("storageClassName:", default_rendered)
+
             rendered = render_buildkit(
                 replicas=replicas,
                 extra_sets=(
-                    "templateBuild.buildkit.cacheStorageClassName=longhorn",
-                    "templateBuild.contextStore.storageClassName=longhorn",
+                    "templateBuild.buildkit.cacheStorageClassName=longhorn-cache",
+                    "templateBuild.contextStore.storageClassName=longhorn-ctx",
                 ),
             )
             self.assertIn("fsGroup: 1000", rendered)
-            self.assertIn('storageClassName: "longhorn"', rendered)
+            self.assertIn('storageClassName: "longhorn-cache"', rendered)
+            self.assertIn('storageClassName: "longhorn-ctx"', rendered)
 
 
 if __name__ == "__main__":
