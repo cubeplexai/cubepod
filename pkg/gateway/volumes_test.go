@@ -95,7 +95,7 @@ func createVol(t *testing.T, ts *httptest.Server, key, name string) volCreate {
 	return got
 }
 
-func TestE2BVolumeManagement(t *testing.T) {
+func TestVolumeManagement(t *testing.T) {
 	_, ts, mem := newVolumeHarness(t, "")
 	key := "cpod_test_api_key"
 
@@ -197,7 +197,7 @@ func TestE2BVolumeManagement(t *testing.T) {
 	}
 }
 
-func TestE2BVolumeContentAndEscape(t *testing.T) {
+func TestVolumeContentAndEscape(t *testing.T) {
 	srv, ts, _ := newVolumeHarness(t, "")
 	key := "cpod_test_api_key"
 	vol := createVol(t, ts, key, "cpod-test-content")
@@ -430,7 +430,7 @@ func TestE2BVolumeContentAndEscape(t *testing.T) {
 	}
 }
 
-func TestE2BVolumeIsolationMountsAndRestart(t *testing.T) {
+func TestVolumeIsolationMountsAndRestart(t *testing.T) {
 	dir := t.TempDir()
 	srv, ts, mem := newVolumeHarness(t, dir)
 	keyA := "cpod_test_api_key"
@@ -630,7 +630,7 @@ func TestE2BVolumeIsolationMountsAndRestart(t *testing.T) {
 	}
 }
 
-func TestE2BVolumeConcurrent(t *testing.T) {
+func TestVolumeConcurrent(t *testing.T) {
 	_, ts, _ := newVolumeHarness(t, "")
 	key := "cpod_test_api_key"
 	vol := createVol(t, ts, key, "cpod-test-race")
@@ -699,7 +699,7 @@ func TestE2BVolumeConcurrent(t *testing.T) {
 	}
 }
 
-func TestE2BVolumeSandboxCreateMountsOnPod(t *testing.T) {
+func TestVolumeSandboxCreateMountsOnPod(t *testing.T) {
 	_, ts, mem := newVolumeHarness(t, "")
 	keyA := "cpod_test_api_key"
 	vol := createVol(t, ts, keyA, "cpod-test-pod-mount")
@@ -759,7 +759,7 @@ func TestE2BVolumeSandboxCreateMountsOnPod(t *testing.T) {
 	resp.Body.Close()
 }
 
-func TestE2BVolumeReservedMountPathRejected(t *testing.T) {
+func TestVolumeReservedMountPathRejected(t *testing.T) {
 	_, ts, _ := newVolumeHarness(t, "")
 	keyA := "cpod_test_api_key"
 	vol := createVol(t, ts, keyA, "cpod-test-reserved-path")
@@ -950,7 +950,7 @@ func TestVolumeLiveK8sRWXEnabledAndFork(t *testing.T) {
 	}
 }
 
-func TestE2BVolumeUploadSizeLimitTenantCapAndSetuidMask(t *testing.T) {
+func TestVolumeUploadSizeLimitTenantCapAndSetuidMask(t *testing.T) {
 	dir := t.TempDir()
 	mem := controller.NewMemoryKubeClient()
 	rec := controller.NewReconciler(controller.WithKubeClient(mem))
@@ -1155,7 +1155,7 @@ func TestVolumeMountCounters(t *testing.T) {
 	}
 }
 
-func TestE2BVolumeRotateKeyEndpointAndSandboxMountIsolation(t *testing.T) {
+func TestVolumeRotateKeyEndpointAndSandboxMountIsolation(t *testing.T) {
 	dir := t.TempDir()
 	kekProv, err := volume.NewLocalKEKProvider("gw-kek-v1", bytes.Repeat([]byte{0x5a}, 32))
 	if err != nil {
@@ -1301,7 +1301,7 @@ func TestE2BVolumeRotateKeyEndpointAndSandboxMountIsolation(t *testing.T) {
 	}
 }
 
-func TestE2BVolumeKMSQuotaAndPrometheusMetrics(t *testing.T) {
+func TestVolumeKMSQuotaAndPrometheusMetrics(t *testing.T) {
 	// Spin up a mock external HTTP KMS server to verify Gateway + HTTPKMSProvider integration.
 	rawKEK := bytes.Repeat([]byte{0x91}, 32)
 	backingKMS, err := volume.NewLocalKEKProvider("ext-kms-gw", rawKEK)
