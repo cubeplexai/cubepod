@@ -1,4 +1,4 @@
-# CEP-0030: Firecracker NFS Transport for Official E2B Volumes
+# CEP-0031: Firecracker NFS Transport for Official E2B Volumes
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
@@ -37,7 +37,7 @@
 
 ## Release Signoff Checklist
 
-- [x] Enhancement design documented in `docs/enhancements/0030-firecracker-volume-nfs/`
+- [x] Enhancement design documented in `docs/enhancements/0031-firecracker-volume-nfs/`
 - [x] Enhancement scope, Goals, and Non-Goals are agreed upon (`provisional` -> `implementable`)
 - [x] API / CRD (`pod.cubeplex.ai/v1alpha1`) and E2B-superset OpenAPI changes are specified (no public volume API change; internal `CUBEPOD_VOLUME_MOUNTS` transport fields only)
 - [x] Dual-runtime behavior (Kubernetes Kata Firecracker NFS, Kubernetes `kata-qemu` / `kata-clh` virtio-fs, and Local Docker loopback) is defined
