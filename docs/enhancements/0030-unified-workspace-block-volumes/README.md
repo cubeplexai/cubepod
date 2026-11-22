@@ -20,6 +20,7 @@ Tracking Issue: [#146](https://github.com/cubeplexai/cubepod/issues/146) (Milest
 - [Design Details](#design-details)
   - [API / CRD / Wire Changes](#api--crd--wire-changes)
   - [State Machine & Data Flow](#state-machine--data-flow)
+  - [Legacy `/workspace` Data Migration Strategy](#legacy-workspace-data-migration-strategy)
   - [Boundary Conditions & Failure Recovery](#boundary-conditions--failure-recovery)
   - [Test Plan](#test-plan)
   - [Graduation Criteria](#graduation-criteria)
@@ -34,12 +35,14 @@ Tracking Issue: [#146](https://github.com/cubeplexai/cubepod/issues/146) (Milest
 ## Release Signoff Checklist
 
 - [x] Enhancement design documented in `docs/enhancements/0030-unified-workspace-block-volumes/`
-- [ ] `POST /volumes` (`type: "shared" | "block"`) and volume metadata extension (`sizeBytes` / PVC binding) specified in OpenAPI (`api/openapi/cubepod-v1.yaml`) and implemented in `pkg/volume` + `pkg/gateway`
-- [ ] `PodBoxSpec.WorkspaceVolume` (or unified `/workspace` PVC attachment from `/volumes` `type: "block"`) implemented in `api/v1alpha1` & `pkg/controller` without coupling `/workspace` to `/rootfs-upper` (AGENTS.md Invariant 1)
-- [ ] Single-writer exclusivity (`409 Conflict` when attached to a non-Paused/active PodBox) & CSI `VolumeSnapshot` CoW Fork behavior verified
+- [ ] `POST /volumes` (`type: "shared" | "block"`) and volume metadata extension (`sizeBytes`, `legacyVolumeKey`, PVC binding) specified in OpenAPI (`api/openapi/cubepod-v1.yaml`) and implemented in `pkg/volume` + `pkg/gateway`
+- [ ] `PodBoxSpec.WorkspaceVolume` (and `KubeClient.GetPVC` / `KubeClient.ListPVCs`) implemented in `api/v1alpha1` & `pkg/controller` without coupling `/workspace` to `/rootfs-upper` (AGENTS.md Invariant 1)
+- [ ] Single-writer exclusivity (`409 Conflict` when attached to a non-Terminated PodBox) & CSI `VolumeSnapshot` CoW Fork behavior verified
+- [ ] Legacy `/workspace` data migration implemented & verified: zero-copy in-place adoption (active `PodBox` auto-adoption + `cubepod volume migrate-legacy` CLI/Job + optional CSI `VolumeSnapshot` clone) with pre/post-upgrade data integrity checks
 - [ ] Anonymous `/workspace` WarmPool claim (`< 50ms`) preserved unchanged
 - [ ] Dual-runtime behavior implemented and tested across **Production Kubernetes (`Kata + CSI Block`)** and **Local Development (`Docker + Loopback ext4`)**
 - [ ] Statechart / TLC check run for `PodBox` / block volume attach-detach lifecycle transitions (`AGENTS.md`)
+- [ ] Deployed & soak-verified in test/staging environment (`v0.8.0`) before graduating to `v1.0.0` GA
 
 ---
 
@@ -183,6 +186,51 @@ flowchart TD
     DelCheck -->|"No"| Purge["Delete PVC vol-<id> + metadata"]
 ```
 
+### Legacy `/workspace` Data Migration Strategy
+
+Production and staging clusters currently running `v0.7.x` (and earlier `0.x` releases) already hold user data inside existing `/workspace` PVCs and local loopback directories. Upgrading to `v0.8.0` and graduating to `v1.0.0` MUST NOT lose, overwrite, or orphan this data.
+
+#### Inventory of Legacy `/workspace` Assets in Deployed Clusters
+
+1. **Active Anonymous Sandboxes (`spec.VolumeKey == ""`)**:
+   - Ephemeral `/workspace` PVCs named `<boxName>-workspace-pvc` (labels `pod.cubeplex.ai/box=<boxName>`, `pod.cubeplex.ai/vol-type=workspace`).
+   - Kept intact as-is; `PodBoxSpec.WorkspaceVolume` is `nil`, so `WorkspacePVCName` resolves `<boxName>-workspace-pvc` identically across upgrade and rolling restarts.
+2. **Active Sandboxes with `spec.VolumeKey != ""` (`Running` or `Paused`)**:
+   - Persistent `/workspace` PVCs named `<SanitizeVolumeKey(volumeKey)>-workspace-pvc`.
+   - The `PodBox` CR carries `annotations["cubepod.io/volume-key"]` and `annotations["cubepod.io/owner-tenant"]` (`pkg/gateway/sandboxes.go`).
+3. **Retained Orphaned Legacy `VolumeKey` PVCs (Sandbox Already Deleted in `<= v0.7.x`)**:
+   - When a sandbox created with `volumeKey` was deleted prior to `v0.8.0`, `reconciler.deletePodBoxLocked` intentionally retained `<sanitized>-workspace-pvc` even though the `PodBox` CR was deleted.
+   - Only the Kubernetes `PersistentVolumeClaim` (`pod.cubeplex.ai/vol-type=workspace`) remains; `owner-tenant` is absent on the PVC itself because pre-`v0.8.0` `BuildBlockPVCsWithOptions` did not copy tenant annotations onto the PVC.
+4. **Local Development (`Docker + Loopback ext4`)**:
+   - Existing directories or sparse images under `<workspaceBaseDir>` associated with prior sandboxes / `volumeKey` workloads.
+
+#### Two Migration Modes (Lossless by Design)
+
+Because `pkg/volume.Store` (`meta.json`) and `PodBoxSpec.WorkspaceVolume.PVCName` store an explicit `pvcName` string rather than requiring `pvcName == "vol-" + volumeID`, migration supports **Zero-Copy In-Place Adoption** as the primary path and optional **CSI Snapshot Clone**:
+
+1. **Mode 1 — Zero-Copy In-Place Adoption (Default, Zero Downtime)**:
+   - **Why zero-copy**: Kubernetes does not allow renaming an existing `PersistentVolumeClaim` (`metadata.name` is immutable). Instead, `volume.Store` records `pvcName: "<legacy-pvc-name>"` (e.g. `<sanitized>-workspace-pvc`), `type: "block"`, `size` (read from PVC `spec.resources.requests.storage`), and optional `legacyVolumeKey` in `meta.json`.
+   - **Data safety invariant**: Existing ext4 blocks on the CSI volume are untouched. When a new sandbox attaches the adopted volume, `podd-init` `ensure_ext4` detects the existing valid `ext4` superblock (`blkid` / `dumpe2fs` check) and skips formatting, running only `e2fsck -p` before mounting at `/workspace`.
+   - **Automatic Adoption for Active `PodBox`es (`syncFromKube`)**:
+     - On `cubepod-gateway` boot and periodic resync, for any `PodBox` whose `spec.VolumeKey != ""` and `spec.WorkspaceVolume == nil` and whose `annotations["cubepod.io/owner-tenant"]` is present, Gateway automatically registers a deterministic `type: "block"` entry in `volume.Store` under that `owner-tenant` hash referencing `status.WorkspacePVCName` (idempotent; skips if already registered).
+     - Subsequent `GET /volumes` calls immediately show the volume; `POST /sandboxes` with either `volumeMounts: [{name, path: "/workspace"}]` OR legacy `extension.volumeKey` resolves to the exact same `volume.Store` lock, preventing concurrent multi-attach (`409 Conflict`).
+   - **Idempotent Migration CLI / Upgrade Job (`cubepod volume migrate-legacy`)**:
+     - Covers **already-deleted sandboxes' retained PVCs** (Scenario 3 above) and **local workspace directories** (Scenario 4), as well as pre-populating entries cleanly during the `v0.8.0` test/production rollout:
+       - Lists PVCs in `controller.workloadNamespace` with label `pod.cubeplex.ai/vol-type=workspace` via `KubeClient.ListPVCs` (skipping WarmPool standby PVCs `*-warm-*`, active ephemeral `<podBox>-workspace-pvc` without `VolumeKey`, and already-managed `vol-*` PVCs).
+       - Resolves tenant ownership in strict precedence order:
+         1. Active `PodBox` annotation (`cubepod.io/owner-tenant` + `cubepod.io/volume-key`);
+         2. Operator-supplied `--owner-map <file.json>` (mapping `pvcName` or `volumeKey` -> `tenantID` or `apiKey`);
+         3. Explicit `--default-api-key` (only when operator explicitly passes it for single-tenant staging/legacy clusters; never auto-assigned to arbitrary callers without authorization).
+       - Writes `meta.json` (`type: "block"`, `pvcName: pvc.Name`, `pvcNamespace`) atomically under `.store.lock` `flock` and patches non-breaking tracking labels/annotations onto the migrated PVC (`cubepod.io/volume-id`, `app.kubernetes.io/managed-by=cubepod-volumes`).
+   - **Lazy Claim Compatibility for Legacy `extension.volumeKey` Callers**:
+     - During `v0.8.0`, if a client calls `POST /sandboxes` with `extension.volumeKey = K` and that volume was not yet pre-migrated:
+       - Gateway checks whether PVC `<SanitizeVolumeKey(K)>-workspace-pvc` already exists via `KubeClient.GetPVC`.
+       - Because knowledge of the exact raw string `K` (which maps deterministically via `SanitizeVolumeKey`) served as the caller credential in `<= v0.7.x`, if the PVC exists and has no active owner `PodBox` belonging to a *different* `owner-tenant`, Gateway adopts it under the caller's tenant on attach and populates `PodBoxSpec.WorkspaceVolume`! If an active `PodBox` with a *different* `cubepod.io/owner-tenant` owns that PVC, Gateway rejects the request with `409 Conflict` / `403 Forbidden`.
+
+2. **Mode 2 — Optional CSI Snapshot Clone Migration (`--clone-to-canonical`)**:
+   - Available in `cubepod volume migrate-legacy --clone-to-canonical` when an operator wants canonical `vol-<volumeID>` PVC names and independent backup before retiring legacy PVCs.
+   - Creates a CSI `VolumeSnapshot` of the legacy PVC (`WaitVolumeSnapshotReady`), creates a new `vol-<volumeID>` PVC with `DataSourceSnapshot`, verifies `Bound` status, and retains the original `<sanitized>-workspace-pvc` untouched until the operator manually removes it after validation.
+
 ### Boundary Conditions & Failure Recovery
 
 - **Gateway Crash Between `CommitMounts` and `UpsertPodBox`**:
@@ -198,28 +246,34 @@ flowchart TD
   - `pkg/volume/store_test.go`: Creating `type: "block"` volumes, tenant byte/size quota checks, rejection of concurrent block mounts (`ErrInUse` -> `409`), and cleanup after unmount.
   - `pkg/controller/manifests_test.go`: `BuildBlockPVCsWithOptions` and `BuildPodManifest` with `spec.WorkspaceVolume` (`vol-<id>` mapped to `/dev/cubepod-workspace`, no `<boxName>-workspace-pvc` leak, CSI snapshot fork pointing to `vol-<id>`).
   - `pkg/controller/reconciler_test.go`: State-machine verification ensuring `DeletePodBox` and rollback do NOT delete `vol-<id>`, and `ForkFrom` creates a separate cloned PVC for the child without inheriting `WorkspaceVolume`.
-  - `pkg/gateway/volumes_test.go`: Full API tests for `POST /volumes` (`type: "block"`), `/volumecontent` rejection (`400`), `POST /sandboxes` mounting at `/workspace`, non-`/workspace` path rejection for block volumes, `409` concurrent mount rejection, `DELETE /volumes/{id}` `409` while mounted -> `204` after sandbox delete, and `POST /sandboxes/{id}/fork` independence.
+  - `pkg/gateway/volumes_test.go`: Full API tests for `POST /volumes` (`type: "block"`), `/volumecontent` rejection (`400`), `POST /sandboxes` mounting at `/workspace`, non-`/workspace` path rejection for block volumes, `409` concurrent mount rejection, `DELETE /volumes/{id}` `409` while mounted -> `204` after sandbox delete, `POST /sandboxes/{id}/fork` independence, and legacy `/workspace` PVC auto-adoption / lazy `volumeKey` bridging / cross-tenant guard.
+  - `cmd/cubepod/` migration CLI tests: Idempotent `cubepod volume migrate-legacy` execution against Memory/fake K8s PVCs and local workspace directories, `--owner-map` resolution, and `--clone-to-canonical` snapshot flow.
 - **State Machine Verification (`AGENTS.md`)**:
   - Run `/statechart` (TLA+/TLC model check) covering `Available -> Attached -> Paused (Pod deleted, volume leased) -> Running -> Detached -> Deleted` and `ForkFrom` snapshot clone invariants before implementation PRs merge.
 - **Integration / E2E Tests**:
   - `make test-e2e`: Local Docker / loopback `ext4` persistence across sandbox delete -> recreate via `/volumes` (`type: "block"`).
   - `make test-k8s-e2e`: Live Kata + Longhorn V2 Block CSI test: create block volume -> attach at `/workspace` -> write data -> delete sandbox -> create new sandbox with same block volume -> verify data intact -> fork sandbox -> mutate child `/workspace` and verify parent block volume untouched -> delete both sandboxes -> delete block volume.
 
+- **Release & Staging Verification Plan (`v0.8.0` -> Test Cluster -> `v1.0.0` GA)**:
+  - Before `v1.0.0` GA, deploy `v0.8.0` into the staging/test Kubernetes cluster that contains representative `v0.7.x` legacy `/workspace` PVCs (active `Running`, `Paused`, and deleted-sandbox retained `<sanitized>-workspace-pvc` claims):
+    1. Record SHA-256 checksums of sentinel files inside legacy `/workspace` PVCs;
+    2. Upgrade control plane (`cubepod-controller`, `cubepod-gateway`, CRD) in place to `v0.8.0` and confirm existing `PodBox`es remain healthy without unintended Pod restarts;
+    3. Run `cubepod volume migrate-legacy` (and test lazy `volumeKey` adoption + `type: "block"` mounts);
+    4. Verify `GET /volumes` lists the migrated block volumes, re-attaching at `/workspace` preserves exact sentinel file checksums (`ensure_ext4` skips formatting), concurrent attach returns `409 Conflict`, CSI `VolumeSnapshot` fork isolates writes from the parent block volume, and `DELETE /volumes/{id}` cleanly reclaims the PVC once unmounted.
+
 ### Graduation Criteria
 
-- **Alpha (`v0.8.0`)**:
-  - [ ] Behind `BlockWorkspaceVolumes` feature gate (default `false` or opt-in in Alpha).
-  - [ ] Full Go/Rust unit tests (`-race`) and statechart check passing; local loopback Docker E2E verified.
-- **Beta (`v0.9.0`)**:
-  - [ ] `BlockWorkspaceVolumes` enabled by default; HA multi-replica gateway `flock` exclusivity + live Kata Block CSI E2E (`TestK8sLiveBlockWorkspaceVolume`) passing.
-  - [ ] `extension.volumeKey` marked deprecated in docs/OpenAPI with migration guidance to `/volumes` (`type: "block"`).
-- **GA / Stable (`v1.0.0`)**:
-  - [ ] Production bake time in CubePlex workloads; `extension.volumeKey` removed or kept solely as thin sugar over `/volumes` (`type: "block"`).
+- **Release Scope (`v0.8.0` — Complete Production-Launchable Feature Set + Test Environment Rollout)**:
+  - [ ] All runtime, API, CRD, Helm, SDK (Python/TS/Go), monitoring, statechart (`/statechart`), and legacy `/workspace` migration capabilities implemented and passing automated unit/E2E suites (`make test`, `make test-e2e`, `make test-k8s-e2e`).
+  - [ ] Deployed to staging/test Kubernetes environment and verified end-to-end, including in-place `v0.7.x -> v0.8.0` upgrade and legacy `/workspace` data migration without data loss.
+- **GA / Formal Production Release (`v1.0.0`)**:
+  - [ ] Staging/test deployment soak complete with zero data-loss or multi-attach incidents; `BlockWorkspaceVolumes` enabled by default (`true`); `extension.volumeKey` documented as legacy compatibility alias (or switched to auto-adopt bridge) with zero breaking data migration gaps for existing users.
 
 ### Upgrade / Downgrade Strategy
 
 - `CreateVolumeRequest.Type` defaults to `"shared"` when omitted; all existing `/volumes` clients behave identically without changes.
-- `PodBoxSpec.WorkspaceVolume` is optional (`omitempty`); existing `PodBox` CRs and anonymous/WarmPool sandboxes are unaffected.
+- `PodBoxSpec.WorkspaceVolume` is optional (`omitempty`); existing `PodBox` CRs (`spec.VolumeKey` and anonymous/WarmPool sandboxes) continue operating seamlessly without Pod recreation.
+- In-place adopted legacy PVCs keep their original `<sanitized>-workspace-pvc` claim names; if an operator rolls back from `v0.8.0` to `v0.7.x`, legacy `extension.volumeKey` callers continue resolving those exact PVCs without data loss. (`--clone-to-canonical` also preserves the original PVC until manually deleted.)
 - Disabling `BlockWorkspaceVolumes` rejects new `POST /volumes` (`type: "block"`) requests with `501 Not Implemented` while existing sandboxes continue running.
 
 ---
