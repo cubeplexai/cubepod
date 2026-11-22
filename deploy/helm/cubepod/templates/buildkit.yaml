@@ -2,6 +2,7 @@
 {{- $ctxBackend := include "cubepod.contextStoreBackend" . }}
 {{- $bkReplicas := include "cubepod.buildkitReplicaCount" . | int }}
 {{- $bkTLSSecret := include "cubepod.buildkitTLSSecretName" . }}
+{{- $appArmorGA := semverCompare ">=1.30.0-0" .Capabilities.KubeVersion.Version }}
 {{- $cacheSize := .Values.templateBuild.cacheSize | default "20Gi" | toString }}
 {{- $cacheSizeMB := 20480 }}
 {{- if hasSuffix "Gi" $cacheSize }}
@@ -123,6 +124,10 @@ spec:
       app.kubernetes.io/component: buildkit
   template:
     metadata:
+      {{- if not $appArmorGA }}
+      annotations:
+        container.apparmor.security.beta.kubernetes.io/buildkitd: unconfined
+      {{- end }}
       labels:
         app.kubernetes.io/name: cubepod
         app.kubernetes.io/instance: {{ .Release.Name }}
@@ -151,8 +156,10 @@ spec:
             runAsGroup: 1000
             seccompProfile:
               type: Unconfined
+            {{- if $appArmorGA }}
             appArmorProfile:
               type: Unconfined
+            {{- end }}
           ports:
             - name: buildkit
               containerPort: 1234

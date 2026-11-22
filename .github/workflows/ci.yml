@@ -111,11 +111,14 @@ jobs:
         run: helm lint deploy/helm/cubepod
 
       - name: Helm Template Verification
-        run: helm template cubepod-ci deploy/helm/cubepod
+        run: |
+          helm template cubepod-ci deploy/helm/cubepod >/dev/null
+          helm template cubepod-ci deploy/helm/cubepod --kube-version 1.27.8 --set templateBuild.enabled=true >/dev/null
 
-      - name: Panel secret chart and entrypoint regressions
+      - name: Panel secret, BuildKit compat, and entrypoint regressions
         run: |
           python3 deploy/helm/test_panel_secret.py -v
+          python3 deploy/helm/test_buildkit_compat.py -v
           python3 deploy/docker-compose/test_entrypoint.py -v
 
   e2e-suite:
