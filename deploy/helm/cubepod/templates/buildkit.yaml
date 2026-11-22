@@ -28,6 +28,9 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
+  {{- if .Values.templateBuild.buildkit.cacheStorageClassName }}
+  storageClassName: {{ .Values.templateBuild.buildkit.cacheStorageClassName | quote }}
+  {{- end }}
   resources:
     requests:
       storage: {{ .Values.templateBuild.cacheSize }}
@@ -45,6 +48,9 @@ metadata:
 spec:
   accessModes:
     - ReadWriteOnce
+  {{- if .Values.templateBuild.contextStore.storageClassName }}
+  storageClassName: {{ .Values.templateBuild.contextStore.storageClassName | quote }}
+  {{- end }}
   resources:
     requests:
       storage: 10Gi
@@ -133,6 +139,8 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/component: buildkit
     spec:
+      securityContext:
+        fsGroup: 1000
       {{- include "cubepod.podImagePullSecrets" . | nindent 6 }}
       {{- with .Values.templateBuild.buildkit.nodeSelector }}
       nodeSelector:
@@ -195,6 +203,9 @@ spec:
       spec:
         accessModes:
           - ReadWriteOnce
+        {{- if .Values.templateBuild.buildkit.cacheStorageClassName }}
+        storageClassName: {{ .Values.templateBuild.buildkit.cacheStorageClassName | quote }}
+        {{- end }}
         resources:
           requests:
             storage: {{ .Values.templateBuild.cacheSize }}

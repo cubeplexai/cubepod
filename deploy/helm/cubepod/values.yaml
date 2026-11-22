@@ -142,6 +142,8 @@ templateBuild:
   contextStore:
     # Context archive and log backend: "local" (single-replica RWO PVC) or "s3" (shared object storage for HA controller replicas)
     backend: "local"
+    # Optional StorageClassName for cubepod-template-context PVC (when backend is "local")
+    storageClassName: ""
     s3:
       endpoint: ""
       bucket: ""
@@ -155,6 +157,8 @@ templateBuild:
     image: "moby/buildkit:rootless"
     address: "tcp://cubepod-buildkit.cubepod-system.svc:1234"
     nodeSelector: {}
+    # Optional StorageClassName for cubepod-buildkit-cache PVC / StatefulSet volumeClaimTemplates (recommend block-backed ext4 such as longhorn over NFS)
+    cacheStorageClassName: ""
     tls:
       enabled: false
       # Existing Kubernetes Secret containing ca.crt, tls.crt, and tls.key for BuildKit mTLS (:1234)

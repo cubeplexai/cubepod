@@ -626,7 +626,7 @@ func (r *Reconciler) RegisterTemplate(name string, spec v1alpha1.PodTemplateSpec
 		r.templateObjects[name] = &tpl
 		_ = r.indexTemplateLocked(&tpl)
 		if r.kubeClient != nil {
-			_ = r.kubeClient.CreatePodTemplate(context.Background(), tpl)
+			_ = createPodTemplateWithStatus(context.Background(), r.kubeClient, r.namespace, &tpl)
 		}
 	} else {
 		tpl := r.templateObjects[name]
