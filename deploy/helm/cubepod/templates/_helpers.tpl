@@ -160,21 +160,21 @@ Egress CA volume when egress.caSecretName is configured
 
 
 {{/*
-True ("true") when E2B Volumes should be active (explicitly enabled OR rwxStorageClassName is set)
+True ("true") when persistent Volumes should be active (explicitly enabled OR rwxStorageClassName is set)
 */}}
-{{- define "cubepod.e2bVolumesActive" -}}
-{{- $ev := .Values.e2bVolumes | default dict -}}
-{{- if or $ev.enabled (ne (default "" $ev.rwxStorageClassName) "") -}}
+{{- define "cubepod.volumesActive" -}}
+{{- $v := .Values.volumes | default dict -}}
+{{- if or $v.enabled (ne (default "" $v.rwxStorageClassName) "") -}}
 true
 {{- end -}}
 {{- end }}
 
 {{/*
-Effective K8sE2BVolumeMounts gate ("true" or "false")
+Effective K8sVolumeMounts gate ("true" or "false")
 */}}
-{{- define "cubepod.k8sE2BVolumeMountsEnabled" -}}
+{{- define "cubepod.k8sVolumeMountsEnabled" -}}
 {{- $fg := .Values.featureGates | default dict -}}
-{{- if or $fg.k8sE2BVolumeMounts (eq (include "cubepod.e2bVolumesActive" .) "true") -}}
+{{- if or $fg.k8sVolumeMounts (eq (include "cubepod.volumesActive" .) "true") -}}
 true
 {{- else -}}
 false
@@ -199,7 +199,7 @@ Comma-separated feature gates string for controller and gateway
 */}}
 {{- define "cubepod.featureGatesCSV" -}}
 {{- $fg := .Values.featureGates | default dict -}}
-{{- printf "E2BTemplateAPI=%s,TransparentEgress=%s,DesktopStack=%s,StatelessGatewayHA=%s,E2BFilesystemWatch=%s,E2BSecretsAPI=%s,SandboxEventsAndWebhooks=%s,K8sE2BVolumeMounts=%s" (include "cubepod.boolDefaultTrue" $fg.e2bTemplateAPI) (include "cubepod.transparentEgressEnabled" .) (include "cubepod.boolDefaultTrue" $fg.desktopStack) (include "cubepod.boolDefaultTrue" $fg.statelessGatewayHA) (include "cubepod.boolDefaultTrue" $fg.e2bFilesystemWatch) (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) (include "cubepod.boolDefaultTrue" $fg.sandboxEventsAndWebhooks) (include "cubepod.k8sE2BVolumeMountsEnabled" .) -}}
+{{- printf "E2BTemplateAPI=%s,TransparentEgress=%s,DesktopStack=%s,StatelessGatewayHA=%s,E2BFilesystemWatch=%s,E2BSecretsAPI=%s,SandboxEventsAndWebhooks=%s,K8sVolumeMounts=%s" (include "cubepod.boolDefaultTrue" $fg.e2bTemplateAPI) (include "cubepod.transparentEgressEnabled" .) (include "cubepod.boolDefaultTrue" $fg.desktopStack) (include "cubepod.boolDefaultTrue" $fg.statelessGatewayHA) (include "cubepod.boolDefaultTrue" $fg.e2bFilesystemWatch) (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) (include "cubepod.boolDefaultTrue" $fg.sandboxEventsAndWebhooks) (include "cubepod.k8sVolumeMountsEnabled" .) -}}
 {{- end }}
 
 {{/*

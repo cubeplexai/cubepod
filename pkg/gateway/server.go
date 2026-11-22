@@ -71,7 +71,7 @@ type SandboxRecord struct {
 // Canonical gateway feature gate names.
 const (
 	FeatureGateE2BTemplateAPI           = "E2BTemplateAPI"
-	FeatureGateK8sE2BVolumeMounts       = "K8sE2BVolumeMounts"
+	FeatureGateK8sVolumeMounts          = "K8sVolumeMounts"
 	FeatureGateTransparentEgress        = "TransparentEgress"
 	FeatureGateDesktopStack             = "DesktopStack"
 	FeatureGateStatelessGatewayHA       = "StatelessGatewayHA"
@@ -87,7 +87,7 @@ type FeatureGates map[string]bool
 func DefaultFeatureGates() FeatureGates {
 	return FeatureGates{
 		FeatureGateE2BTemplateAPI:           true,
-		FeatureGateK8sE2BVolumeMounts:       false,
+		FeatureGateK8sVolumeMounts:          false,
 		FeatureGateTransparentEgress:        true,
 		FeatureGateDesktopStack:             true,
 		FeatureGateStatelessGatewayHA:       true,
@@ -308,47 +308,47 @@ func (w *lockedWriter) Write(p []byte) (n int, err error) {
 
 // Server serves the CubePod Control Plane and Panel Proxy routes.
 type Server struct {
-	reconciler                    *controller.Reconciler
-	mu                            sync.RWMutex
-	sandboxMu                     sync.Mutex
-	sandboxLocks                  map[string]*sandboxOpLock
-	sandboxes                     map[string]*SandboxRecord
-	commands                      map[string]*commandEntry
-	watchers                      map[string]*dirWatcher
-	endpoints                     map[string]map[int]string
-	workspaceBaseDir              string
-	panelSecret                   []byte
-	vault                         *egress.Vault
-	ca                            *egress.CA
-	strictEgressMTLS              bool
-	livePodRouting                bool
-	metrics                       *Metrics
-	e2bTemplateAPI                bool
-	templateBuild                 bool
-	controllerURL                 string
-	probeTimeout                  time.Duration
-	httpClient                    *http.Client
-	e2b                           atomic.Pointer[volume.Store]
-	secrets                       atomic.Pointer[secret.Store]
-	events                        atomic.Pointer[events.Manager]
-	e2bDir                        string
-	e2bCfg                        volume.Config
-	e2bMaxFileBytes               int64
-	e2bK8sMounts                  bool
-	e2bSharedPVC                  string
-	runtime                       runtime.Backend
-	featureGates                  FeatureGates
-	syncMu                        sync.Mutex
-	samplerMu                     sync.Mutex
-	samplerCancel                 context.CancelFunc
-	samplerWG                     sync.WaitGroup
-	syncInterval                  time.Duration
-	syncCancel                    context.CancelFunc
-	syncWG                        sync.WaitGroup
-	crdResyncsTotal               atomic.Uint64
-	E2BVolumeMountsTotal          atomic.Uint64
-	E2BVolumeMountErrorsTotal     atomic.Uint64
-	E2BVolumeQuotaRejectionsTotal atomic.Uint64
+	reconciler                 *controller.Reconciler
+	mu                         sync.RWMutex
+	sandboxMu                  sync.Mutex
+	sandboxLocks               map[string]*sandboxOpLock
+	sandboxes                  map[string]*SandboxRecord
+	commands                   map[string]*commandEntry
+	watchers                   map[string]*dirWatcher
+	endpoints                  map[string]map[int]string
+	workspaceBaseDir           string
+	panelSecret                []byte
+	vault                      *egress.Vault
+	ca                         *egress.CA
+	strictEgressMTLS           bool
+	livePodRouting             bool
+	metrics                    *Metrics
+	e2bTemplateAPI             bool
+	templateBuild              bool
+	controllerURL              string
+	probeTimeout               time.Duration
+	httpClient                 *http.Client
+	volumeStore                atomic.Pointer[volume.Store]
+	secrets                    atomic.Pointer[secret.Store]
+	events                     atomic.Pointer[events.Manager]
+	volumesDir                 string
+	volumeCfg                  volume.Config
+	volumeMaxFileBytes         int64
+	k8sVolumeMounts            bool
+	volumesSharedPVC           string
+	runtime                    runtime.Backend
+	featureGates               FeatureGates
+	syncMu                     sync.Mutex
+	samplerMu                  sync.Mutex
+	samplerCancel              context.CancelFunc
+	samplerWG                  sync.WaitGroup
+	syncInterval               time.Duration
+	syncCancel                 context.CancelFunc
+	syncWG                     sync.WaitGroup
+	crdResyncsTotal            atomic.Uint64
+	VolumeMountsTotal          atomic.Uint64
+	VolumeMountErrorsTotal     atomic.Uint64
+	VolumeQuotaRejectionsTotal atomic.Uint64
 }
 
 // SetRuntime installs a product execution backend used during sandbox create,
@@ -411,8 +411,8 @@ func (s *Server) SetFeatureGate(name string, enabled bool) {
 	switch name {
 	case FeatureGateE2BTemplateAPI:
 		s.e2bTemplateAPI = enabled
-	case FeatureGateK8sE2BVolumeMounts:
-		s.e2bK8sMounts = enabled
+	case FeatureGateK8sVolumeMounts:
+		s.k8sVolumeMounts = enabled
 	}
 	r := s.reconciler
 	s.mu.Unlock()

@@ -135,7 +135,7 @@ featureGates:
   e2bFilesystemWatch: true
   e2bSecretsAPI: true
   sandboxEventsAndWebhooks: true
-  k8sE2BVolumeMounts: false
+  k8sVolumeMounts: false
 
 templateBuild:
   enabled: false
@@ -168,8 +168,8 @@ templateBuild:
     pullSecret: "cubepod-buildkit-pull"
     repositoryPrefix: "cubepod-templates"
 
-e2bVolumes:
+volumes:
   enabled: false
-  pvcName: "cubepod-e2b-volumes"
+  pvcName: "cubepod-volumes"
   rwxStorageClassName: ""
   size: "20Gi"

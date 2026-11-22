@@ -353,8 +353,8 @@ func TestMetricsCEPAlignmentAndPanelGauge(t *testing.T) {
 	if err := srv.ConfigureE2BSecrets(gateway.E2BSecretConfig{Dir: t.TempDir()}); err != nil {
 		t.Fatalf("ConfigureE2BSecrets failed: %v", err)
 	}
-	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{Dir: t.TempDir()}); err != nil {
-		t.Fatalf("ConfigureE2BVolumes failed: %v", err)
+	if err := srv.ConfigureVolumes(gateway.VolumeConfig{Dir: t.TempDir()}); err != nil {
+		t.Fatalf("ConfigureVolumes failed: %v", err)
 	}
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
@@ -480,8 +480,8 @@ func TestMetricsCEPAlignmentAndPanelGauge(t *testing.T) {
 	checks := map[string]string{
 		"cubepod_panel_active_sessions":                                                        "0",
 		"cubepod_secrets_store_count":                                                          "1",
-		"cubepod_e2b_volume_mounts_total":                                                      "1",
-		"cubepod_e2b_volume_mount_errors_total":                                                "1",
+		"cubepod_volume_mounts_total":                                                          "1",
+		"cubepod_volume_mount_errors_total":                                                    "1",
 		"cubepod_gateway_crd_resyncs_total":                                                    "2",
 		`cubepod_secrets_operations_total{op="create",status="ok"}`:                            "1",
 		`cubepod_sandbox_forks_total{mode="loopback",result="ok"}`:                             "1",

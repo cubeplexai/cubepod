@@ -330,36 +330,36 @@ func TestDockerBackend_CommandBuilder(t *testing.T) {
 	}
 }
 
-func TestDockerBackend_E2BVolumeMount(t *testing.T) {
+func TestDockerBackend_VolumeMount(t *testing.T) {
 	docker := NewDockerBackend(DockerConfig{BaseDir: t.TempDir()})
 	spec := SandboxSpec{
 		SandboxID: "sb-vol",
 		VolumeMounts: []SandboxVolumeMount{
-			{HostPath: "/var/lib/cubepod/e2b/data", ContainerPath: "/mnt/data"},
+			{HostPath: "/var/lib/cubepod/volumes/data", ContainerPath: "/mnt/data"},
 			{DockerVolume: "cpod-test-vol-abc", ContainerPath: "/mnt/named"},
-			{DockerVolume: "cubepod-e2bvol-abc", ContainerPath: "/mnt/cpod-test-vol"},
+			{DockerVolume: "cubepod-vol-abc", ContainerPath: "/mnt/cpod-test-vol"},
 		},
 	}
 	args, err := docker.BuildRunArgs(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Contains(args, "/var/lib/cubepod/e2b/data:/mnt/data") {
+	if !slices.Contains(args, "/var/lib/cubepod/volumes/data:/mnt/data") {
 		t.Fatalf("missing host bind: %v", args)
 	}
 	if !slices.Contains(args, "cpod-test-vol-abc:/mnt/named") {
 		t.Fatalf("missing test named volume: %v", args)
 	}
-	if !slices.Contains(args, "cubepod-e2bvol-abc:/mnt/cpod-test-vol") {
+	if !slices.Contains(args, "cubepod-vol-abc:/mnt/cpod-test-vol") {
 		t.Fatalf("missing product named volume: %v", args)
 	}
 
 	bad := []SandboxVolumeMount{
 		{DockerVolume: "other-vol", ContainerPath: "/mnt/rejected"},
-		{HostPath: "/var/lib/cubepod/e2b", ContainerPath: "/mnt/not-data"},
-		{HostPath: "/var/lib/cubepod/e2b/data", ContainerPath: "/workspace"},
-		{HostPath: "/var/lib/cubepod/e2b/data", ContainerPath: "/rootfs-upper"},
-		{HostPath: "/var/lib/cubepod/e2b/data", ContainerPath: "relative"},
+		{HostPath: "/var/lib/cubepod/volumes", ContainerPath: "/mnt/not-data"},
+		{HostPath: "/var/lib/cubepod/volumes/data", ContainerPath: "/workspace"},
+		{HostPath: "/var/lib/cubepod/volumes/data", ContainerPath: "/rootfs-upper"},
+		{HostPath: "/var/lib/cubepod/volumes/data", ContainerPath: "relative"},
 	}
 	for _, m := range bad {
 		_, err := docker.BuildRunArgs(SandboxSpec{SandboxID: "sb-vol", VolumeMounts: []SandboxVolumeMount{m}})
@@ -391,7 +391,7 @@ func TestDockerBackend_InjectBinOff(t *testing.T) {
 	args, err := docker.BuildRunArgs(SandboxSpec{
 		SandboxID: "sb-image",
 		VolumeMounts: []SandboxVolumeMount{
-			{DockerVolume: "cubepod-e2bvol-abc", ContainerPath: "/mnt/data"},
+			{DockerVolume: "cubepod-vol-abc", ContainerPath: "/mnt/data"},
 		},
 	})
 	if err != nil {
@@ -401,7 +401,7 @@ func TestDockerBackend_InjectBinOff(t *testing.T) {
 	if strings.Contains(joined, "/opt/cubepod/bin") || strings.Contains(joined, "podd-init") || strings.Contains(joined, ":/workspace") {
 		t.Fatalf("image-local sandbox still injected host paths: %v", args)
 	}
-	if !slices.Contains(args, "cubepod-e2bvol-abc:/mnt/data") {
+	if !slices.Contains(args, "cubepod-vol-abc:/mnt/data") {
 		t.Fatalf("missing volume: %v", args)
 	}
 	if !slices.Contains(args, "cubepod-compat-compose-sandbox:local") {

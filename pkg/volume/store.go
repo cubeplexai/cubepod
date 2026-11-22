@@ -6,10 +6,10 @@
 // 0700. Only {id}/data is mounted into a sandbox. When Docker volume
 // provisioning is enabled, each volume is also exposed as a named volume
 // whose local driver bind-mounts that data directory. The name must start
-// with cubepod-e2bvol- (product) or cpod-test- (tests) and must match this
+// with cubepod-vol- (product) or cpod-test- (tests) and must match this
 // volume id.
 //
-// Callers attach the filesystem claim e2bvol-<id> on the sandbox pod. This
+// Callers attach the filesystem claim vol-<id> on the sandbox pod. This
 // package records the claim. It does not talk to a live Kata cluster.
 package volume
 
@@ -86,7 +86,7 @@ type Config struct {
 	HostDir string
 	// DockerVolumes creates and deletes named volumes via the Docker API.
 	DockerVolumes bool
-	// DockerPrefix defaults to cpod-test-vol-. Product callers set cubepod-e2bvol-.
+	// DockerPrefix defaults to cpod-test-vol-. Product callers set cubepod-vol-.
 	// The prefix must itself be an allowed Docker volume name.
 	DockerPrefix string
 	// DockerHost is DOCKER_HOST (tcp:// or unix://). Empty uses the environment.
@@ -299,7 +299,7 @@ func (s *Store) CapacityStats() (CapacityStats, error) {
 }
 
 func rawKeyHash(apiKey string) string {
-	sum := sha256.Sum256([]byte("cubepod-e2b-volume-v1\x00" + apiKey))
+	sum := sha256.Sum256([]byte("cubepod-volume-v1\x00" + apiKey))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -1856,7 +1856,7 @@ func cleanMountPath(p string) (string, error) {
 		}
 	}
 	c := path.Clean(p)
-	if c == "/" || c == "." || strings.HasPrefix(c, "../") || !v1alpha1.ValidE2BContainerPath(c) {
+	if c == "/" || c == "." || strings.HasPrefix(c, "../") || !v1alpha1.ValidVolumeContainerPath(c) {
 		return "", ErrInvalidPath
 	}
 	return c, nil

@@ -82,7 +82,7 @@ export async function startDirectGateway(): Promise<GatewayHandle> {
     TMPDIR: tempDir,
     CUBEPOD_WORKSPACE_DIR: path.join(tempDir, 'workspaces'),
     CUBEPOD_STATE: path.join(tempDir, 'state'),
-    CUBEPOD_E2B_VOLUME_DIR: path.join(tempDir, 'volumes'),
+    CUBEPOD_VOLUMES_DIR: path.join(tempDir, 'volumes'),
     CUBEPOD_SECRETS_DIR: path.join(tempDir, 'secrets'),
     // Gateway refuses to start without a panel HMAC secret (Helm/Compose generate one).
     CUBEPOD_PANEL_SECRET: process.env.CUBEPOD_PANEL_SECRET || 'cubepod-test-panel-secret',

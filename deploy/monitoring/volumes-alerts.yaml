@@ -1,0 +1,64 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cubepod-volumes-alerts
+  namespace: cubepod-system
+  labels:
+    app.kubernetes.io/name: cubepod
+    app.kubernetes.io/component: gateway
+    app.kubernetes.io/part-of: cubepod
+spec:
+  groups:
+    - name: cubepod.volumes.rules
+      rules:
+        - alert: CubePodVolumesRWXNearFull
+          expr: |
+            cubepod_volumes_storage_capacity_bytes > 0
+            and (cubepod_volumes_storage_used_bytes / cubepod_volumes_storage_capacity_bytes) >= 0.80
+            and (cubepod_volumes_storage_used_bytes / cubepod_volumes_storage_capacity_bytes) < 0.90
+          for: 5m
+          labels:
+            severity: warning
+            component: gateway
+          annotations:
+            summary: "CubePod shared RWX volume storage is >= 80% full"
+            description: >-
+              CubePod Gateway ({{ $labels.instance }}) reports volume storage utilization above 80%
+              for more than 5 minutes. Expand the cubepod-volumes RWX PVC or prune unused tenant volumes.
+        - alert: CubePodVolumesRWXNearFull
+          expr: |
+            cubepod_volumes_storage_capacity_bytes > 0
+            and (cubepod_volumes_storage_used_bytes / cubepod_volumes_storage_capacity_bytes) >= 0.90
+          for: 5m
+          labels:
+            severity: critical
+            component: gateway
+          annotations:
+            summary: "CubePod shared RWX volume storage is >= 90% full (critical)"
+            description: >-
+              CubePod Gateway ({{ $labels.instance }}) reports volume storage utilization above 90%
+              for more than 5 minutes. Immediate PVC expansion or tenant volume cleanup is required to
+              prevent ENOSPC upload and sandbox write failures.
+        - alert: CubePodVolumesMountErrors
+          expr: increase(cubepod_volume_mount_errors_total[5m]) > 0
+          for: 2m
+          labels:
+            severity: warning
+            component: gateway
+          annotations:
+            summary: "CubePod volume mount errors detected"
+            description: >-
+              CubePod Gateway ({{ $labels.instance }}) recorded volume mount planning or attachment
+              errors in the last 5 minutes. Inspect gateway logs, K8sVolumeMounts gate configuration,
+              and shared RWX PVC availability.
+        - alert: CubePodVolumesQuotaRejections
+          expr: increase(cubepod_volume_quota_rejections_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+            component: gateway
+          annotations:
+            summary: "CubePod volume tenant quota rejections sustained"
+            description: >-
+              CubePod Gateway ({{ $labels.instance }}) rejected volume creations or file uploads with
+              HTTP 429 due to per-tenant volume count or byte quota limits over the last 5 minutes.

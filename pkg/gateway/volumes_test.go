@@ -27,7 +27,7 @@ func newVolumeHarness(t *testing.T, dir string) (*gateway.Server, *httptest.Serv
 	mem := controller.NewMemoryKubeClient()
 	rec := controller.NewReconciler(controller.WithKubeClient(mem))
 	srv := gateway.NewServer(rec)
-	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{Dir: dir}); err != nil {
+	if err := srv.ConfigureVolumes(gateway.VolumeConfig{Dir: dir}); err != nil {
 		t.Fatalf("configure volumes: %v", err)
 	}
 	ts := httptest.NewServer(srv.Handler())
@@ -155,20 +155,20 @@ func TestE2BVolumeManagement(t *testing.T) {
 		t.Fatalf("list entry %#v", listed[0])
 	}
 
-	var e2bPVC int
+	var volPVC int
 	for _, pvc := range mem.ListPVCs() {
-		if strings.HasPrefix(pvc.Name, "e2bvol-") {
-			e2bPVC++
-			if pvc.Name != "e2bvol-"+vol.VolumeID || pvc.VolumeMode != "Filesystem" || pvc.StorageClassName != "standard" {
+		if strings.HasPrefix(pvc.Name, "vol-") {
+			volPVC++
+			if pvc.Name != "vol-"+vol.VolumeID || pvc.VolumeMode != "Filesystem" || pvc.StorageClassName != "standard" {
 				t.Fatalf("pvc: %+v", pvc)
 			}
-			if pvc.Labels["cubepod.io/e2b-volume-id"] != vol.VolumeID {
+			if pvc.Labels["cubepod.io/volume-id"] != vol.VolumeID {
 				t.Fatalf("pvc labels: %+v", pvc.Labels)
 			}
 		}
 	}
-	if e2bPVC != 1 {
-		t.Fatalf("expected 1 e2b filesystem PVC, got %d (%v)", e2bPVC, mem.ListPVCs())
+	if volPVC != 1 {
+		t.Fatalf("expected 1 volume filesystem PVC, got %d (%v)", volPVC, mem.ListPVCs())
 	}
 
 	resp = volReq(t, http.MethodDelete, ts.URL+"/volumes/"+vol.VolumeID, key, nil, "")
@@ -188,7 +188,7 @@ func TestE2BVolumeManagement(t *testing.T) {
 	}
 	left := 0
 	for _, pvc := range mem.ListPVCs() {
-		if pvc.Name == "e2bvol-"+vol.VolumeID {
+		if pvc.Name == "vol-"+vol.VolumeID {
 			left++
 		}
 	}
@@ -396,7 +396,7 @@ func TestE2BVolumeContentAndEscape(t *testing.T) {
 	if strings.Contains(string(host), marker) {
 		t.Fatal("write escaped the volume root onto the host")
 	}
-	dataDir := srv.E2BVolumeDataDir(vol.VolumeID)
+	dataDir := srv.VolumeDataDir(vol.VolumeID)
 	if dataDir == "" {
 		t.Fatal("missing data dir")
 	}
@@ -494,7 +494,7 @@ func TestE2BVolumeIsolationMountsAndRestart(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated || sbB.SandboxID == "" {
 		t.Fatalf("same-name mount: %d %+v", resp.StatusCode, sbB)
 	}
-	bMounts := srv.E2BVolumeMounts(sbB.SandboxID)
+	bMounts := srv.VolumeMounts(sbB.SandboxID)
 	if len(bMounts) != 1 || bMounts[0].VolumeID != same.VolumeID || bMounts[0].VolumeID == vol.VolumeID {
 		t.Fatalf("key B mounted the wrong volume: %+v", bMounts)
 	}
@@ -513,7 +513,7 @@ func TestE2BVolumeIsolationMountsAndRestart(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated || sb.SandboxID == "" {
 		t.Fatalf("sandbox: %d %+v", resp.StatusCode, sb)
 	}
-	mounts := srv.E2BVolumeMounts(sb.SandboxID)
+	mounts := srv.VolumeMounts(sb.SandboxID)
 	if len(mounts) != 1 || mounts[0].ContainerPath != "/mnt/data" || mounts[0].VolumeName != "cpod-test-persist" {
 		t.Fatalf("mount spec: %+v", mounts)
 	}
@@ -559,7 +559,7 @@ func TestE2BVolumeIsolationMountsAndRestart(t *testing.T) {
 	if delResp.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete sandbox: %d", delResp.StatusCode)
 	}
-	if specs := srv.E2BVolumeMounts(sb.SandboxID); len(specs) != 0 {
+	if specs := srv.VolumeMounts(sb.SandboxID); len(specs) != 0 {
 		t.Fatalf("mounts remain after sandbox delete: %+v", specs)
 	}
 
@@ -609,7 +609,7 @@ func TestE2BVolumeIsolationMountsAndRestart(t *testing.T) {
 	}
 	foundPVC := false
 	for _, pvc := range mem2.ListPVCs() {
-		if pvc.Name == "e2bvol-"+vol.VolumeID && pvc.VolumeMode == "Filesystem" {
+		if pvc.Name == "vol-"+vol.VolumeID && pvc.VolumeMode == "Filesystem" {
 			foundPVC = true
 		}
 	}
@@ -724,7 +724,7 @@ func TestE2BVolumeSandboxCreateMountsOnPod(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected pod %s, pods=%v", sb.SandboxID, podNames(mem))
 	}
-	pvc := "e2bvol-" + vol.VolumeID
+	pvc := "vol-" + vol.VolumeID
 	var sawVol, sawMount, sawWS bool
 	for _, v := range pod.Volumes {
 		if v.PersistentVolumeClaim == pvc {
@@ -739,16 +739,16 @@ func TestE2BVolumeSandboxCreateMountsOnPod(t *testing.T) {
 			continue
 		}
 		for _, m := range c.VolumeMounts {
-			if m.MountPath == "/run/cubepod/volumes/"+vol.VolumeID && (m.Name == pvc || m.Name == "e2bvol-"+vol.VolumeID) {
+			if m.MountPath == "/run/cubepod/volumes/"+vol.VolumeID && (m.Name == pvc || m.Name == "vol-"+vol.VolumeID) {
 				sawMount = true
 			}
 		}
 	}
 	if !sawVol || !sawMount || !sawWS {
-		t.Fatalf("pod missing official mount or workspace (vol=%v mount=%v ws=%v) volumes=%+v containers=%+v", sawVol, sawMount, sawWS, pod.Volumes, pod.Containers)
+		t.Fatalf("pod missing volume mount or workspace (vol=%v mount=%v ws=%v) volumes=%+v containers=%+v", sawVol, sawMount, sawWS, pod.Volumes, pod.Containers)
 	}
-	if box, err := mem.GetPodBox(context.Background(), "cubepod-workloads", sb.SandboxID); err != nil || box == nil || len(box.Spec.E2BVolumeMounts) != 1 {
-		t.Fatalf("expected PodBox spec to record official mounts: err=%v box=%+v", err, box)
+	if box, err := mem.GetPodBox(context.Background(), "cubepod-workloads", sb.SandboxID); err != nil || box == nil || len(box.Spec.VolumeMounts) != 1 {
+		t.Fatalf("expected PodBox spec to record volume mounts: err=%v box=%+v", err, box)
 	}
 	del, _ := http.NewRequest(http.MethodDelete, ts.URL+"/sandboxes/"+sb.SandboxID, nil)
 	del.Header.Set("X-API-KEY", keyA)
@@ -785,13 +785,13 @@ func podNames(mem *controller.MemoryKubeClient) []string {
 	return names
 }
 
-func TestE2BVolumeLiveK8sGatedOff(t *testing.T) {
+func TestVolumeLiveK8sGatedOff(t *testing.T) {
 	srv, ts, mem := newVolumeHarness(t, "")
 	srv.SetLivePodRouting(true)
 	keyA := "cpod_test_api_key"
 
 	vol := createVol(t, ts, keyA, "cpod-test-k8s-gated")
-	if _, ok := mem.GetPVC("cubepod-workloads", "e2bvol-"+vol.VolumeID); ok {
+	if _, ok := mem.GetPVC("cubepod-workloads", "vol-"+vol.VolumeID); ok {
 		t.Fatalf("expected no PVC created on live K8s when volumeMounts are gated off")
 	}
 
@@ -807,16 +807,16 @@ func TestE2BVolumeLiveK8sGatedOff(t *testing.T) {
 	}
 }
 
-func TestE2BVolumeLiveK8sEnabledWithoutSharedPVC_Returns501(t *testing.T) {
+func TestVolumeLiveK8sEnabledWithoutSharedPVC_Returns501(t *testing.T) {
 	dir := t.TempDir()
 	mem := controller.NewMemoryKubeClient()
 	rec := controller.NewReconciler(controller.WithKubeClient(mem))
 	srv := gateway.NewServer(rec)
 	srv.SetLivePodRouting(true)
-	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
-		Dir:                dir,
-		K8sE2BVolumeMounts: true,
-		SharedPVCName:      "",
+	if err := srv.ConfigureVolumes(gateway.VolumeConfig{
+		Dir:             dir,
+		K8sVolumeMounts: true,
+		SharedPVCName:   "",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -837,17 +837,17 @@ func TestE2BVolumeLiveK8sEnabledWithoutSharedPVC_Returns501(t *testing.T) {
 	}
 }
 
-func TestE2BVolumeLiveK8sRWXEnabledAndFork(t *testing.T) {
+func TestVolumeLiveK8sRWXEnabledAndFork(t *testing.T) {
 	dir := t.TempDir()
 	mem := controller.NewMemoryKubeClient()
 	rec := controller.NewReconciler(controller.WithKubeClient(mem))
 	srv := gateway.NewServer(rec)
 	srv.SetLivePodRouting(true)
-	sharedPVC := "cubepod-e2b-volumes"
-	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
-		Dir:                dir,
-		K8sE2BVolumeMounts: true,
-		SharedPVCName:      sharedPVC,
+	sharedPVC := "cubepod-volumes"
+	if err := srv.ConfigureVolumes(gateway.VolumeConfig{
+		Dir:             dir,
+		K8sVolumeMounts: true,
+		SharedPVCName:   sharedPVC,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -856,8 +856,8 @@ func TestE2BVolumeLiveK8sRWXEnabledAndFork(t *testing.T) {
 
 	keyA := "cpod_test_api_key"
 	vol := createVol(t, ts, keyA, "cpod-test-k8s-rwx")
-	if _, ok := mem.GetPVC("cubepod-workloads", "e2bvol-"+vol.VolumeID); ok {
-		t.Fatalf("expected no per-volume e2bvol-* PVC created when SharedPVCName is set")
+	if _, ok := mem.GetPVC("cubepod-workloads", "vol-"+vol.VolumeID); ok {
+		t.Fatalf("expected no per-volume vol-* PVC created when SharedPVCName is set")
 	}
 
 	body, _ := json.Marshal(map[string]any{
@@ -876,12 +876,12 @@ func TestE2BVolumeLiveK8sRWXEnabledAndFork(t *testing.T) {
 	readJSON(t, resp, &sb)
 
 	box, err := mem.GetPodBox(context.Background(), "cubepod-workloads", sb.SandboxID)
-	if err != nil || box == nil || len(box.Spec.E2BVolumeMounts) != 1 {
-		t.Fatalf("expected PodBox with 1 E2BVolumeMount, err=%v box=%+v", err, box)
+	if err != nil || box == nil || len(box.Spec.VolumeMounts) != 1 {
+		t.Fatalf("expected PodBox with 1 VolumeMount, err=%v box=%+v", err, box)
 	}
-	gotMount := box.Spec.E2BVolumeMounts[0]
+	gotMount := box.Spec.VolumeMounts[0]
 	if gotMount.PVCName != sharedPVC || gotMount.SubPath != vol.VolumeID+"/data" || gotMount.Path != "/mnt/dataset" {
-		t.Fatalf("unexpected PodBox E2BVolumeMount: %+v", gotMount)
+		t.Fatalf("unexpected PodBox VolumeMount: %+v", gotMount)
 	}
 
 	pod, ok := mem.GetPod("cubepod-workloads", sb.SandboxID)
@@ -901,13 +901,13 @@ func TestE2BVolumeLiveK8sRWXEnabledAndFork(t *testing.T) {
 			}
 		}
 		for _, e := range c.Env {
-			if e.Name == "CUBEPOD_E2B_MOUNTS" && e.Value == wantEnv {
+			if e.Name == "CUBEPOD_VOLUME_MOUNTS" && e.Value == wantEnv {
 				sawEnv = true
 			}
 		}
 	}
 	if !sawStaging || !sawEnv {
-		t.Fatalf("pod missing staging mount or CUBEPOD_E2B_MOUNTS (staging=%v env=%v) containers=%+v", sawStaging, sawEnv, pod.Containers)
+		t.Fatalf("pod missing staging mount or CUBEPOD_VOLUME_MOUNTS (staging=%v env=%v) containers=%+v", sawStaging, sawEnv, pod.Containers)
 	}
 
 	// Fork the sandbox and verify mount inheritance + DELETE /volumes/{id} tracking.
@@ -922,11 +922,11 @@ func TestE2BVolumeLiveK8sRWXEnabledAndFork(t *testing.T) {
 	}
 	readJSON(t, forkResp, &child)
 	childBox, err := mem.GetPodBox(context.Background(), "cubepod-workloads", child.SandboxID)
-	if err != nil || childBox == nil || len(childBox.Spec.E2BVolumeMounts) != 1 {
-		t.Fatalf("expected forked PodBox to inherit E2BVolumeMounts, err=%v box=%+v", err, childBox)
+	if err != nil || childBox == nil || len(childBox.Spec.VolumeMounts) != 1 {
+		t.Fatalf("expected forked PodBox to inherit VolumeMounts, err=%v box=%+v", err, childBox)
 	}
-	if childBox.Spec.E2BVolumeMounts[0].PVCName != sharedPVC || childBox.Spec.E2BVolumeMounts[0].SubPath != vol.VolumeID+"/data" {
-		t.Fatalf("unexpected forked PodBox mount: %+v", childBox.Spec.E2BVolumeMounts[0])
+	if childBox.Spec.VolumeMounts[0].PVCName != sharedPVC || childBox.Spec.VolumeMounts[0].SubPath != vol.VolumeID+"/data" {
+		t.Fatalf("unexpected forked PodBox mount: %+v", childBox.Spec.VolumeMounts[0])
 	}
 
 	// Delete parent; volume must still be busy (409) because fork holds a reference.
@@ -955,7 +955,7 @@ func TestE2BVolumeUploadSizeLimitTenantCapAndSetuidMask(t *testing.T) {
 	mem := controller.NewMemoryKubeClient()
 	rec := controller.NewReconciler(controller.WithKubeClient(mem))
 	srv := gateway.NewServer(rec)
-	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+	if err := srv.ConfigureVolumes(gateway.VolumeConfig{
 		Dir:                 dir,
 		MaxFileSizeBytes:    16,
 		MaxVolumesPerTenant: 2,
@@ -1004,7 +1004,7 @@ func TestE2BVolumeUploadSizeLimitTenantCapAndSetuidMask(t *testing.T) {
 	if mode, _ := ent["mode"].(float64); int(mode) != 0o755 {
 		t.Fatalf("expected masked mode 0755 (%d), got %v", 0o755, ent["mode"])
 	}
-	fi, err := os.Lstat(filepath.Join(srv.E2BVolumeDataDir(v1.VolumeID), "su"))
+	fi, err := os.Lstat(filepath.Join(srv.VolumeDataDir(v1.VolumeID), "su"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1013,23 +1013,23 @@ func TestE2BVolumeUploadSizeLimitTenantCapAndSetuidMask(t *testing.T) {
 	}
 }
 
-func TestE2BVolume_RestartPreservesPodBoxMountsAndBlocksDelete(t *testing.T) {
+func TestVolume_RestartPreservesPodBoxMountsAndBlocksDelete(t *testing.T) {
 	dir := t.TempDir()
 	mem := controller.NewMemoryKubeClient()
 	rec := controller.NewReconciler(controller.WithKubeClient(mem), controller.WithNamespace("cubepod-workloads"))
 	srv := gateway.NewServer(rec)
 	srv.SetLivePodRouting(true)
-	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
-		Dir:                dir,
-		K8sE2BVolumeMounts: true,
-		SharedPVCName:      "cubepod-e2b-volumes",
+	if err := srv.ConfigureVolumes(gateway.VolumeConfig{
+		Dir:             dir,
+		K8sVolumeMounts: true,
+		SharedPVCName:   "cubepod-volumes",
 	}); err != nil {
 		t.Fatalf("configure volumes: %v", err)
 	}
 	ts := httptest.NewServer(srv.Handler())
 	defer ts.Close()
 
-	// Create volume (NotePVC should record cubepod-e2b-volumes) and attach via sandbox create.
+	// Create volume (NotePVC should record cubepod-volumes) and attach via sandbox create.
 	vol := createVol(t, ts, "key-r", "persist-vol")
 	volID := vol.VolumeID
 
@@ -1049,10 +1049,10 @@ func TestE2BVolume_RestartPreservesPodBoxMountsAndBlocksDelete(t *testing.T) {
 	rec2 := controller.NewReconciler(controller.WithKubeClient(mem), controller.WithNamespace("cubepod-workloads"))
 	srv2 := gateway.NewServer(rec2)
 	srv2.SetLivePodRouting(true)
-	if err := srv2.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
-		Dir:                dir,
-		K8sE2BVolumeMounts: true,
-		SharedPVCName:      "cubepod-e2b-volumes",
+	if err := srv2.ConfigureVolumes(gateway.VolumeConfig{
+		Dir:             dir,
+		K8sVolumeMounts: true,
+		SharedPVCName:   "cubepod-volumes",
 	}); err != nil {
 		t.Fatalf("reconfigure volumes after restart: %v", err)
 	}
@@ -1060,7 +1060,7 @@ func TestE2BVolume_RestartPreservesPodBoxMountsAndBlocksDelete(t *testing.T) {
 	defer ts2.Close()
 
 	// Mounts must survive restart.
-	if mounts := srv2.E2BVolumeMounts(sbxID); len(mounts) != 1 || mounts[0].VolumeID != volID {
+	if mounts := srv2.VolumeMounts(sbxID); len(mounts) != 1 || mounts[0].VolumeID != volID {
 		t.Fatalf("expected mounts preserved across gateway restart, got %+v", mounts)
 	}
 
@@ -1077,13 +1077,13 @@ func TestE2BVolume_RestartPreservesPodBoxMountsAndBlocksDelete(t *testing.T) {
 	}
 }
 
-func TestE2BVolumeMountCounters(t *testing.T) {
+func TestVolumeMountCounters(t *testing.T) {
 	srv, ts, _ := newVolumeHarness(t, "")
 	key := "cpod_test_counters"
 	v1 := createVol(t, ts, key, "vol-one")
 	v2 := createVol(t, ts, key, "vol-two")
 
-	// 1. Successful sandbox create with 2 mounts increments E2BVolumeMountsTotal by 2.
+	// 1. Successful sandbox create with 2 mounts increments VolumeMountsTotal by 2.
 	body, _ := json.Marshal(map[string]any{
 		"templateID": "base",
 		"volumeMounts": []map[string]string{
@@ -1099,14 +1099,14 @@ func TestE2BVolumeMountCounters(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("expected 201, got %d", resp.StatusCode)
 	}
-	if got := srv.E2BVolumeMountsTotal.Load(); got != 2 {
-		t.Fatalf("E2BVolumeMountsTotal = %d; want 2", got)
+	if got := srv.VolumeMountsTotal.Load(); got != 2 {
+		t.Fatalf("VolumeMountsTotal = %d; want 2", got)
 	}
-	if got := srv.E2BVolumeMountErrorsTotal.Load(); got != 0 {
-		t.Fatalf("E2BVolumeMountErrorsTotal = %d; want 0", got)
+	if got := srv.VolumeMountErrorsTotal.Load(); got != 0 {
+		t.Fatalf("VolumeMountErrorsTotal = %d; want 0", got)
 	}
 
-	// 2. Planning failures increment E2BVolumeMountErrorsTotal.
+	// 2. Planning failures increment VolumeMountErrorsTotal.
 	missingBody, _ := json.Marshal(map[string]any{
 		"templateID":   "base",
 		"volumeMounts": []map[string]string{{"name": "does-not-exist", "path": "/mnt/missing"}},
@@ -1127,11 +1127,11 @@ func TestE2BVolumeMountCounters(t *testing.T) {
 		t.Fatalf("expected 400 for reserved mount path, got %d", rReserved.StatusCode)
 	}
 
-	if got := srv.E2BVolumeMountErrorsTotal.Load(); got != 2 {
-		t.Fatalf("E2BVolumeMountErrorsTotal = %d; want 2", got)
+	if got := srv.VolumeMountErrorsTotal.Load(); got != 2 {
+		t.Fatalf("VolumeMountErrorsTotal = %d; want 2", got)
 	}
-	if got := srv.E2BVolumeMountsTotal.Load(); got != 2 {
-		t.Fatalf("E2BVolumeMountsTotal = %d; want 2", got)
+	if got := srv.VolumeMountsTotal.Load(); got != 2 {
+		t.Fatalf("VolumeMountsTotal = %d; want 2", got)
 	}
 
 	// 3. Clean up sandbox and test K8s gated 501 increments error counter.
@@ -1148,10 +1148,10 @@ func TestE2BVolumeMountCounters(t *testing.T) {
 	rGated := volReq(t, http.MethodPost, ts.URL+"/sandboxes", key, body, "application/json")
 	rGated.Body.Close()
 	if rGated.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("expected 501 when K8sE2BVolumeMounts is disabled, got %d", rGated.StatusCode)
+		t.Fatalf("expected 501 when K8sVolumeMounts is disabled, got %d", rGated.StatusCode)
 	}
-	if got := srv.E2BVolumeMountErrorsTotal.Load(); got != 3 {
-		t.Fatalf("E2BVolumeMountErrorsTotal = %d; want 3", got)
+	if got := srv.VolumeMountErrorsTotal.Load(); got != 3 {
+		t.Fatalf("VolumeMountErrorsTotal = %d; want 3", got)
 	}
 }
 
@@ -1164,7 +1164,7 @@ func TestE2BVolumeRotateKeyEndpointAndSandboxMountIsolation(t *testing.T) {
 	mem := controller.NewMemoryKubeClient()
 	rec := controller.NewReconciler(controller.WithKubeClient(mem), controller.WithNamespace("cubepod-workloads"))
 	srv := gateway.NewServer(rec)
-	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+	if err := srv.ConfigureVolumes(gateway.VolumeConfig{
 		Dir: dir,
 		KMS: kekProv,
 	}); err != nil {
@@ -1265,7 +1265,7 @@ func TestE2BVolumeRotateKeyEndpointAndSandboxMountIsolation(t *testing.T) {
 	// Reopen gateway over same dir: newKey retains access, active sandbox mount still blocks delete (409),
 	// and deleting sandbox releases mount so DELETE /volumes/{id} succeeds (204).
 	srv2 := gateway.NewServer(rec)
-	if err := srv2.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+	if err := srv2.ConfigureVolumes(gateway.VolumeConfig{
 		Dir: dir,
 		KMS: kekProv,
 	}); err != nil {
@@ -1291,7 +1291,7 @@ func TestE2BVolumeRotateKeyEndpointAndSandboxMountIsolation(t *testing.T) {
 	rDelSb := volReq(t, http.MethodDelete, ts.URL+"/sandboxes/"+sb.SandboxID, newKey, nil, "")
 	rDelSb.Body.Close()
 	// Reconcile srv2 with updated PodBox state and delete v1 cleanly.
-	if err := srv2.ConfigureE2BVolumes(gateway.E2BVolumeConfig{Dir: dir, KMS: kekProv}); err != nil {
+	if err := srv2.ConfigureVolumes(gateway.VolumeConfig{Dir: dir, KMS: kekProv}); err != nil {
 		t.Fatal(err)
 	}
 	rDelOK := volReq(t, http.MethodDelete, ts2.URL+"/volumes/"+v1.VolumeID, newKey, nil, "")
@@ -1359,7 +1359,7 @@ func TestE2BVolumeKMSQuotaAndPrometheusMetrics(t *testing.T) {
 	mem := controller.NewMemoryKubeClient()
 	rec := controller.NewReconciler(controller.WithKubeClient(mem))
 	srv := gateway.NewServer(rec)
-	if err := srv.ConfigureE2BVolumes(gateway.E2BVolumeConfig{
+	if err := srv.ConfigureVolumes(gateway.VolumeConfig{
 		Dir:                 dir,
 		MaxVolumesPerTenant: 2,
 		MaxBytesPerTenant:   50,
@@ -1429,11 +1429,11 @@ func TestE2BVolumeKMSQuotaAndPrometheusMetrics(t *testing.T) {
 	mResp.Body.Close()
 	promText := string(promBody)
 	for _, wantSubstr := range []string{
-		"cubepod_e2b_volumes_storage_capacity_bytes ",
-		"cubepod_e2b_volumes_storage_used_bytes ",
-		"cubepod_e2b_volumes_storage_available_bytes ",
-		"cubepod_e2b_volumes_total 3\n",
-		"cubepod_e2b_volume_quota_rejections_total 2\n",
+		"cubepod_volumes_storage_capacity_bytes ",
+		"cubepod_volumes_storage_used_bytes ",
+		"cubepod_volumes_storage_available_bytes ",
+		"cubepod_volumes_total 3\n",
+		"cubepod_volume_quota_rejections_total 2\n",
 	} {
 		if !strings.Contains(promText, wantSubstr) {
 			t.Fatalf("Prometheus /metrics missing %q in:\n%s", wantSubstr, promText)
@@ -1449,13 +1449,13 @@ func TestE2BVolumeKMSQuotaAndPrometheusMetrics(t *testing.T) {
 	}
 	var jMetrics map[string]any
 	readJSON(t, jResp, &jMetrics)
-	if capVal, _ := jMetrics["cubepod_e2b_volumes_storage_capacity_bytes"].(float64); capVal <= 0 {
-		t.Fatalf("expected positive storage capacity bytes in JSON metrics, got %v", jMetrics["cubepod_e2b_volumes_storage_capacity_bytes"])
+	if capVal, _ := jMetrics["cubepod_volumes_storage_capacity_bytes"].(float64); capVal <= 0 {
+		t.Fatalf("expected positive storage capacity bytes in JSON metrics, got %v", jMetrics["cubepod_volumes_storage_capacity_bytes"])
 	}
-	if totVal, _ := jMetrics["cubepod_e2b_volumes_total"].(float64); int(totVal) != 3 {
-		t.Fatalf("expected cubepod_e2b_volumes_total=3, got %v", jMetrics["cubepod_e2b_volumes_total"])
+	if totVal, _ := jMetrics["cubepod_volumes_total"].(float64); int(totVal) != 3 {
+		t.Fatalf("expected cubepod_volumes_total=3, got %v", jMetrics["cubepod_volumes_total"])
 	}
-	if rejVal, _ := jMetrics["cubepod_e2b_volume_quota_rejections_total"].(float64); int(rejVal) != 2 {
-		t.Fatalf("expected cubepod_e2b_volume_quota_rejections_total=2, got %v", jMetrics["cubepod_e2b_volume_quota_rejections_total"])
+	if rejVal, _ := jMetrics["cubepod_volume_quota_rejections_total"].(float64); int(rejVal) != 2 {
+		t.Fatalf("expected cubepod_volume_quota_rejections_total=2, got %v", jMetrics["cubepod_volume_quota_rejections_total"])
 	}
 }

@@ -265,7 +265,7 @@ func (d *DockerBackend) planRun(spec SandboxSpec) (dockerRunPlan, error) {
 	}
 	for _, m := range spec.VolumeMounts {
 		path := filepath.Clean(m.ContainerPath)
-		if !v1alpha1.ValidE2BContainerPath(path) {
+		if !v1alpha1.ValidVolumeContainerPath(path) {
 			return dockerRunPlan{}, fmt.Errorf("invalid volume mount path %q", m.ContainerPath)
 		}
 		if m.DockerVolume != "" {

@@ -1283,9 +1283,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 	var createdForkSnapshots []string
 	if !exists {
 		// 1. Pre-Attached WarmPool Claim (when warmPoolRef is set, no ForkFrom,
-		// no deterministic VolumeKey, no custom NetworkPolicy, and no official E2B volume mounts).
-		// Standby pods have no per-sandbox NetworkPolicy or E2B volume mounts.
-		if spec.WarmPoolRef != "" && spec.ForkFrom == nil && spec.VolumeKey == "" && len(spec.E2BVolumeMounts) == 0 && spec.NetworkPolicy == nil {
+		// no deterministic VolumeKey, no custom NetworkPolicy, and no volume mounts).
+		// Standby pods have no per-sandbox NetworkPolicy or volume mounts.
+		if spec.WarmPoolRef != "" && spec.ForkFrom == nil && spec.VolumeKey == "" && len(spec.VolumeMounts) == 0 && spec.NetworkPolicy == nil {
 			entry, err := r.claimWarmPodLocked(ctx, spec.WarmPoolRef, name)
 			if err != nil {
 				return nil, fmt.Errorf("failed to claim from warm pool %q for box %q: %w", spec.WarmPoolRef, name, err)
@@ -1496,13 +1496,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		status.PodIP = ""
 		status.PausedAt = &now
 	default:
-		if err := ValidateOfficialVolumeMounts(spec.E2BVolumeMounts); err != nil {
+		if err := ValidateVolumeMounts(spec.VolumeMounts); err != nil {
 			if createdCold {
 				r.rollbackColdCreateLocked(ctx, name, spec, status, "")
 			} else if didResetRootFS {
 				r.persistFailedTransitionLocked(ctx, name, spec, status, status.PodName, effectiveImage, now)
 			}
-			return nil, fmt.Errorf("invalid official E2B volume mounts: %w", err)
+			return nil, fmt.Errorf("invalid volume mounts: %w", err)
 		}
 		if claimedFromWarmPool && status.PodName != "" && status.PodIP != "" {
 			status.Phase = v1alpha1.PodBoxPhaseRunning

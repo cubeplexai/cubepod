@@ -23,10 +23,10 @@ services:
       CUBEPOD_DOCKER_BIN_DIR: ${E2E_HOST_BIN:?}
       CUBEPOD_DOCKER_BASE_DIR: /var/lib/cubepod/docker
       CUBEPOD_DOCKER_HOST_BASE_DIR: ${E2E_HOST_DATA:?}
-      CUBEPOD_E2B_VOLUME_DIR: /var/lib/cubepod/volumes/e2b
-      CUBEPOD_E2B_VOLUME_HOST_DIR: ${E2E_HOST_VOLUMES:?}/e2b
-      CUBEPOD_E2B_DOCKER_VOLUMES: "true"
-      CUBEPOD_E2B_DOCKER_PREFIX: cubepod-e2bvol-${COMPOSE_PROJECT_NAME}-
+      CUBEPOD_VOLUMES_DIR: /var/lib/cubepod/volumes/store
+      CUBEPOD_VOLUMES_HOST_DIR: ${E2E_HOST_VOLUMES:?}/store
+      CUBEPOD_VOLUMES_DOCKER: "true"
+      CUBEPOD_VOLUMES_DOCKER_PREFIX: cubepod-vol-${COMPOSE_PROJECT_NAME}-
     volumes:
       - runtime-bin:/opt/cubepod/bin:ro
       - sandbox-data:/var/lib/cubepod/docker

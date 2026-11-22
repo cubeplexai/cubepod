@@ -40,10 +40,10 @@ featureGates:
   e2bTemplateAPI: true
   transparentEgress: false
   desktopStack: false
-  k8sE2BVolumeMounts: true
+  k8sVolumeMounts: true
 secrets:
   enabled: false
-e2bVolumes:
+volumes:
   enabled: true
-  pvcName: cubepod-e2b-volumes
+  pvcName: cubepod-volumes
   rwxStorageClassName: ""

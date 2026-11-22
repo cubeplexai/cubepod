@@ -21,18 +21,18 @@ milestone:
   beta: "v0.7.0"
   stable: "v1.0.0"
 feature-gates:
-  - name: "K8sE2BVolumeMounts"
+  - name: "K8sVolumeMounts"
     components:
       - "podd-init"
       - "cubepod-controller"
       - "cubepod-gateway"
 disable-supported: true
 metrics:
-  - "cubepod_e2b_volume_mounts_total"
-  - "cubepod_e2b_volume_mount_errors_total"
-  - "cubepod_e2b_volume_quota_rejections_total"
-  - "cubepod_e2b_volumes_storage_capacity_bytes"
-  - "cubepod_e2b_volumes_storage_used_bytes"
-  - "cubepod_e2b_volumes_storage_available_bytes"
-  - "cubepod_e2b_volumes_total"
-  - "cubepod_podd_init_e2b_bind_duration_ms"
+  - "cubepod_volume_mounts_total"
+  - "cubepod_volume_mount_errors_total"
+  - "cubepod_volume_quota_rejections_total"
+  - "cubepod_volumes_storage_capacity_bytes"
+  - "cubepod_volumes_storage_used_bytes"
+  - "cubepod_volumes_storage_available_bytes"
+  - "cubepod_volumes_total"
+  - "cubepod_podd_init_volume_bind_duration_ms"

@@ -1105,9 +1105,9 @@ func TestK8sLiveE2EWatchAndMakeDir(t *testing.T) {
 	t.Logf("[K8s-E2E] MakeDir + recursive WatchDir + CreateWatcher/GetWatcherEvents/RemoveWatcher verified")
 }
 
-// TestK8sLiveE2EVolumeMountsAndFork verifies E2B volumeMounts on a live Kata Pod:
+// TestK8sLiveVolumeMountsAndFork verifies volumeMounts on a live Kata Pod:
 // nosuid,nodev mount flags, shared RWX persistence, ForkFrom inheritance, and RWO fork conflict.
-func TestK8sLiveE2EVolumeMountsAndFork(t *testing.T) {
+func TestK8sLiveVolumeMountsAndFork(t *testing.T) {
 	cfg := requireLiveE2EConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
@@ -1129,7 +1129,7 @@ func TestK8sLiveE2EVolumeMountsAndFork(t *testing.T) {
 	}
 	if volStatus == http.StatusNotImplemented || volStatus == http.StatusNotFound ||
 		(volStatus == http.StatusInternalServerError && strings.Contains(string(volBody), "volume store unavailable")) {
-		t.Skipf("Skipping E2B volumeMounts E2E: volume store unavailable on cluster (HTTP %d: %s)", volStatus, volBody)
+		t.Skipf("Skipping volumeMounts E2E: volume store unavailable on cluster (HTTP %d: %s)", volStatus, volBody)
 	}
 	if volStatus != http.StatusCreated && volStatus != http.StatusOK {
 		t.Fatalf("POST /volumes status=%d body=%s", volStatus, volBody)
@@ -1172,7 +1172,7 @@ func TestK8sLiveE2EVolumeMountsAndFork(t *testing.T) {
 		t.Fatalf("POST /sandboxes with volumeMounts: %v", err)
 	}
 	if sbxStatus == http.StatusNotImplemented {
-		t.Skipf("Skipping E2B volumeMounts E2E: K8sE2BVolumeMounts gate or shared RWX PVC not configured (%s)", sbxBody)
+		t.Skipf("Skipping volumeMounts E2E: K8sVolumeMounts gate or shared RWX PVC not configured (%s)", sbxBody)
 	}
 	if sbxStatus != http.StatusCreated && sbxStatus != http.StatusOK {
 		t.Fatalf("POST /sandboxes with volumeMounts status=%d body=%s", sbxStatus, sbxBody)
@@ -1191,8 +1191,8 @@ func TestK8sLiveE2EVolumeMountsAndFork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetPodBox parent: %v", err)
 	}
-	if len(parentBox.Spec.E2BVolumeMounts) != 1 || parentBox.Spec.E2BVolumeMounts[0].Path != "/mnt/shared" {
-		t.Fatalf("expected parent PodBox E2BVolumeMounts at /mnt/shared, got %+v", parentBox.Spec.E2BVolumeMounts)
+	if len(parentBox.Spec.VolumeMounts) != 1 || parentBox.Spec.VolumeMounts[0].Path != "/mnt/shared" {
+		t.Fatalf("expected parent PodBox VolumeMounts at /mnt/shared, got %+v", parentBox.Spec.VolumeMounts)
 	}
 
 	mountRes, err := c.RunCommand(ctx, parent.SandboxID, client.RunCommandRequest{
@@ -1215,10 +1215,10 @@ func TestK8sLiveE2EVolumeMountsAndFork(t *testing.T) {
 		t.Fatalf("write /mnt/shared/from-parent.txt: %v", err)
 	}
 
-	// Fork parent and verify E2BVolumeMounts inheritance + shared RWX persistence
+	// Fork parent and verify VolumeMounts inheritance + shared RWX persistence
 	child, err := c.ForkSandbox(ctx, parent.SandboxID)
 	if err != nil {
-		t.Fatalf("ForkSandbox with E2B volumeMounts: %v", err)
+		t.Fatalf("ForkSandbox with volumeMounts: %v", err)
 	}
 	defer func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -1233,8 +1233,8 @@ func TestK8sLiveE2EVolumeMountsAndFork(t *testing.T) {
 	if childBox.Spec.ForkFrom == nil || childBox.Spec.ForkFrom.PodBoxName != parent.SandboxID {
 		t.Fatalf("expected child ForkFrom.PodBoxName=%s, got %+v", parent.SandboxID, childBox.Spec.ForkFrom)
 	}
-	if len(childBox.Spec.E2BVolumeMounts) != 1 || childBox.Spec.E2BVolumeMounts[0].PVCName != parentBox.Spec.E2BVolumeMounts[0].PVCName {
-		t.Fatalf("expected child PodBox to inherit E2BVolumeMounts, got %+v", childBox.Spec.E2BVolumeMounts)
+	if len(childBox.Spec.VolumeMounts) != 1 || childBox.Spec.VolumeMounts[0].PVCName != parentBox.Spec.VolumeMounts[0].PVCName {
+		t.Fatalf("expected child PodBox to inherit VolumeMounts, got %+v", childBox.Spec.VolumeMounts)
 	}
 
 	childShared, err := c.ReadFile(ctx, child.SandboxID, "/mnt/shared/from-parent.txt")
@@ -1264,8 +1264,8 @@ func TestK8sLiveE2EVolumeMountsAndFork(t *testing.T) {
 			TemplateRef:      cfg.SandboxImage,
 			DesiredState:     v1alpha1.DesiredStatePaused,
 			RootfsGeneration: 1,
-			E2BVolumeMounts: []v1alpha1.E2BVolumeMount{
-				{VolumeID: "vol-rwo-check", PVCName: "e2bvol-rwo-check", Path: "/mnt/rwo"},
+			VolumeMounts: []v1alpha1.VolumeMount{
+				{VolumeID: "vol-rwo-check", PVCName: "vol-rwo-check", Path: "/mnt/rwo"},
 			},
 		},
 	}

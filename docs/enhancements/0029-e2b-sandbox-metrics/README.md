@@ -42,20 +42,20 @@
 
 ## Summary
 
-CEP-0029 aligns CubePod with the upstream E2B Sandbox Metrics API (`GET /sandboxes/{sandboxID}/metrics` and `GET /sandboxes/metrics`) and closes observability gaps across `podd-init`, `podd`, and `cubepod-gateway`. It introduces in-guest resource sampling in `podd` (`GET /metrics` JSON `SandboxMetric` plus `GET /v1/prometheus` Prometheus text exposition), records E2B volume bind-mount duration (`e2b_bind_duration_ms`) in `podd-init`'s `/run/cubepod/init-state.json`, adds Gateway time-range filtering and per-sandbox bounded ring-buffer caching, and implements the Prometheus counters, gauges, and histograms specified across prior CEPs (`CEP-0001`, `CEP-0002`, `CEP-0004`, `CEP-0018`, `CEP-0021`, `CEP-0022`, `CEP-0026`, `CEP-0027`).
+CEP-0029 aligns CubePod with the upstream E2B Sandbox Metrics API (`GET /sandboxes/{sandboxID}/metrics` and `GET /sandboxes/metrics`) and closes observability gaps across `podd-init`, `podd`, and `cubepod-gateway`. It introduces in-guest resource sampling in `podd` (`GET /metrics` JSON `SandboxMetric` plus `GET /v1/prometheus` Prometheus text exposition), records volume bind-mount duration (`volume_bind_duration_ms`) in `podd-init`'s `/run/cubepod/init-state.json`, adds Gateway time-range filtering and per-sandbox bounded ring-buffer caching, and implements the Prometheus counters, gauges, and histograms specified across prior CEPs (`CEP-0001`, `CEP-0002`, `CEP-0004`, `CEP-0018`, `CEP-0021`, `CEP-0022`, `CEP-0026`, `CEP-0027`).
 
 ---
 
 ## Motivation
 
 1. **E2B SDK Compatibility Gap**: Upstream E2B SDKs expose `sbx.get_metrics(start, end)` (`GET /sandboxes/{sandboxID}/metrics`) and batch metrics (`GET /sandboxes/metrics?sandboxIds=...`) returning `SandboxMetric` snapshots (`timestamp`, `timestampUnix`, `cpuCount`, `cpuUsedPct`, `memUsed`, `memTotal`, `memCache`, `diskUsed`, `diskTotal`). CubePod currently lacks both Gateway routes and in-guest `/metrics` sampling in `podd`.
-2. **Prometheus Metric Drift**: Several earlier CEPs declared Prometheus metric names (such as `cubepod_e2b_requests_total`, `cubepod_e2b_request_duration_seconds`, `cubepod_panel_active_sessions`, `cubepod_secrets_operations_total`, `cubepod_secrets_store_count`, `cubepod_e2b_volume_mounts_total`, `cubepod_sandbox_forks_total`, `cubepod_gateway_crd_resyncs_total`, `cubepod_podd_active_processes`, `cubepod_podd_init_duration_milliseconds`, and `cubepod_podd_init_e2b_bind_duration_ms`) that were either not yet exported or differed slightly from `metrics.go` names (`cubepod_gateway_http_requests_total` vs `cubepod_gateway_requests_total`).
+2. **Prometheus Metric Drift**: Several earlier CEPs declared Prometheus metric names (such as `cubepod_e2b_requests_total`, `cubepod_e2b_request_duration_seconds`, `cubepod_panel_active_sessions`, `cubepod_secrets_operations_total`, `cubepod_secrets_store_count`, `cubepod_volume_mounts_total`, `cubepod_sandbox_forks_total`, `cubepod_gateway_crd_resyncs_total`, `cubepod_podd_active_processes`, `cubepod_podd_init_duration_milliseconds`, and `cubepod_podd_init_volume_bind_duration_ms`) that were either not yet exported or differed slightly from `metrics.go` names (`cubepod_gateway_http_requests_total` vs `cubepod_gateway_requests_total`).
 
 ### Goals
 
 1. **E2B Single & Batch Sandbox Metrics**: Implement `GET /sandboxes/{sandboxID}/metrics` (`?start=`, `?end=`, optional `?autoResume=false`) returning `[]SandboxMetric`, and `GET /sandboxes/metrics` (`?sandboxIds=a,b`) returning `{"sandboxes": {id: SandboxMetric}}`.
 2. **Zero-Dependency Guest Resource Sampling (`podd`)**: Implement `GET /metrics` in `crates/podd` using only `std` and `libc` to sample `/proc/stat`, `/proc/meminfo`, cgroup v2/v1 limits, and `libc::statvfs`, plus Prometheus exposition on `GET /v1/prometheus` (and `/metrics?format=prometheus` or `Accept: text/plain`).
-3. **`podd-init` Bind Timing**: Measure E2B volume bind-mount duration in `crates/podd-init` and persist `e2b_bind_duration_ms` in `/run/cubepod/init-state.json`.
+3. **`podd-init` Bind Timing**: Measure volume bind-mount duration in `crates/podd-init` and persist `volume_bind_duration_ms` in `/run/cubepod/init-state.json`.
 4. **Complete Gateway Prometheus Exposition**: Export all missing CEP metrics on `cubepod-gateway` `GET /metrics` while keeping existing `cubepod_gateway_http_requests_total` and `cubepod_gateway_autoresume_total` intact for backward compatibility.
 
 ### Non-Goals
@@ -124,11 +124,11 @@ CEP-0029 aligns CubePod with the upstream E2B Sandbox Metrics API (`GET /sandbox
 - `GET /v1/prometheus`: Returns Prometheus text exposition (`text/plain; version=0.0.4; charset=utf-8`) containing:
   - `cubepod_podd_active_processes` (gauge)
   - `cubepod_podd_init_duration_milliseconds` (gauge, from `/run/cubepod/init-state.json` `duration_ms`)
-  - `cubepod_podd_init_e2b_bind_duration_ms` (gauge, from `/run/cubepod/init-state.json` `e2b_bind_duration_ms`)
+  - `cubepod_podd_init_volume_bind_duration_ms` (gauge, from `/run/cubepod/init-state.json` `volume_bind_duration_ms`)
 
 #### 3. `podd-init` State File (`crates/podd-init`)
 
-Adds `"e2b_bind_duration_ms": <u64>` to `/run/cubepod/init-state.json`:
+Adds `"volume_bind_duration_ms": <u64>` to `/run/cubepod/init-state.json`:
 
 ```json
 {
@@ -138,7 +138,7 @@ Adds `"e2b_bind_duration_ms": <u64>` to `/run/cubepod/init-state.json`:
   "workspace_device": "/dev/cubepod-workspace",
   "workspace_action": "mounted",
   "duration_ms": 42,
-  "e2b_bind_duration_ms": 3
+  "volume_bind_duration_ms": 3
 }
 ```
 
@@ -151,8 +151,8 @@ Adds `"e2b_bind_duration_ms": <u64>` to `/run/cubepod/init-state.json`:
 - `cubepod_panel_active_sessions` (gauge, tracked in `panel.go` around `proxy.ServeHTTP`)
 - `cubepod_secrets_operations_total{op,status}` (counter)
 - `cubepod_secrets_store_count` (gauge)
-- `cubepod_e2b_volume_mounts_total` (counter)
-- `cubepod_e2b_volume_mount_errors_total` (counter)
+- `cubepod_volume_mounts_total` (counter)
+- `cubepod_volume_mount_errors_total` (counter)
 - `cubepod_sandbox_forks_total{mode,result}` (counter)
 - `cubepod_sandbox_fork_duration_seconds` (histogram)
 - `cubepod_gateway_crd_resyncs_total` (counter)
@@ -190,7 +190,7 @@ flowchart LR
 ### Test Plan
 
 - **Unit Tests (Rust)**:
-  - `podd-init`: Verify `e2b_bind_duration_ms` serialization in `InitState::to_json` and `setup_and_pivot`.
+  - `podd-init`: Verify `volume_bind_duration_ms` serialization in `InitState::to_json` and `setup_and_pivot`.
   - `podd`: Verify RFC3339 formatting, `/proc/stat` delta CPU calculation, `/proc/meminfo` & cgroup memory parsing, `statvfs` disk reporting, `GET /metrics` JSON schema, and `GET /v1/prometheus` exposition including `init-state.json` gauges.
 - **Unit Tests (Go, `-race`)**:
   - `sandbox_metrics_test.go`: Verify `GET /sandboxes/{id}/metrics` against a mock `podd` server, local fallback mode, `?start=` / `?end=` filtering (unix seconds & RFC3339), invalid range `400`, paused `autoResume=false` vs auto-resume, and `GET /sandboxes/metrics` batch filtering.
@@ -199,13 +199,13 @@ flowchart LR
 
 ### Graduation Criteria
 
-- **Alpha (`v0.6`)**: `GET /sandboxes/{sandboxID}/metrics`, `GET /sandboxes/metrics`, `podd` `/metrics` & `/v1/prometheus`, `podd-init` `e2b_bind_duration_ms`, and all Gateway Prometheus metrics implemented and verified via `cargo test` and `go test -race`.
+- **Alpha (`v0.6`)**: `GET /sandboxes/{sandboxID}/metrics`, `GET /sandboxes/metrics`, `podd` `/metrics` & `/v1/prometheus`, `podd-init` `volume_bind_duration_ms`, and all Gateway Prometheus metrics implemented and verified via `cargo test` and `go test -race`.
 - **Beta (`v0.7`)** *(implemented)*: Background periodic sampler in Gateway/Controller populating ring buffers continuously for running sandboxes; live `make test-k8s-e2e` metrics assertions enabled.
 - **GA (`v1.0`)**: Production soak in CubePlex with Prometheus recording rules and alerting dashboards (manifests shipped in `deploy/monitoring/`; soak pending).
 
 ### Upgrade / Downgrade Strategy
 
-- All API additions (`GET /sandboxes/{sandboxID}/metrics`, `GET /sandboxes/metrics`, `podd` `/metrics`, `podd` `/v1/prometheus`) and `init-state.json` field (`e2b_bind_duration_ms`) are strictly additive.
+- All API additions (`GET /sandboxes/{sandboxID}/metrics`, `GET /sandboxes/metrics`, `podd` `/metrics`, `podd` `/v1/prometheus`) and `init-state.json` field (`volume_bind_duration_ms`) are strictly additive.
 - Existing Prometheus series (`cubepod_gateway_http_requests_total`, `cubepod_gateway_autoresume_total`) remain emitted alongside the new CEP-aligned names so existing Grafana dashboards continue working without modification.
 
 ---
@@ -214,10 +214,10 @@ flowchart LR
 
 - **Feature Enablement and Rollback**: Always enabled in `v0.6`; additive HTTP routes and additive JSON/Prometheus fields require no data migration and can be rolled back safely by downgrading binaries.
 - **Rollout, Upgrade and Rollback Planning**: In-memory ring buffers are ephemeral per gateway replica; rolling upgrades immediately resume sampling live `podd` instances without disrupting `Running` or `Paused` sandboxes or `/workspace` PVCs.
-- **Monitoring Requirements**: `cubepod_e2b_requests_total`, `cubepod_e2b_request_duration_seconds`, `cubepod_panel_active_sessions`, `cubepod_podd_active_processes`, `cubepod_podd_init_duration_milliseconds`, `cubepod_podd_init_e2b_bind_duration_ms`.
+- **Monitoring Requirements**: `cubepod_e2b_requests_total`, `cubepod_e2b_request_duration_seconds`, `cubepod_panel_active_sessions`, `cubepod_podd_active_processes`, `cubepod_podd_init_duration_milliseconds`, `cubepod_podd_init_volume_bind_duration_ms`.
 - **Dependencies**: Linux `/proc` (`stat`, `meminfo`), `statvfs(2)`, optional cgroup v2/v1 files; zero new third-party dependencies in Rust or Go.
 - **Scalability**: Bounded `120`-entry ring buffer per sandbox keeps memory overhead negligible (`< 15 KiB` per sandbox); `endpoint` label normalization prevents Prometheus cardinality explosion.
-- **Troubleshooting**: Scrape `GET /v1/prometheus` on `podd` (`:49983`) or `GET /metrics` on `cubepod-gateway` (`:8080`); inspect `/run/cubepod/init-state.json` inside the guest for `duration_ms` and `e2b_bind_duration_ms`.
+- **Troubleshooting**: Scrape `GET /v1/prometheus` on `podd` (`:49983`) or `GET /metrics` on `cubepod-gateway` (`:8080`); inspect `/run/cubepod/init-state.json` inside the guest for `duration_ms` and `volume_bind_duration_ms`.
 
 ---
 

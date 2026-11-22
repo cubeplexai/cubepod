@@ -32,7 +32,7 @@ available=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
 [[ -z $(d ps -aq --filter "label=com.docker.compose.project=$COMPOSE_PROJECT_NAME") ]]
 ! d network inspect "${COMPOSE_PROJECT_NAME}_default" >/dev/null 2>&1
 [[ -z $(d ps -aq --filter "name=^/${COMPOSE_PROJECT_NAME}-sb-") ]]
-[[ -z $(d volume ls --format '{{.Name}}' | awk -v p="cubepod-e2bvol-${COMPOSE_PROJECT_NAME}-" 'index($0,p)==1') ]]
+[[ -z $(d volume ls --format '{{.Name}}' | awk -v p="cubepod-vol-${COMPOSE_PROJECT_NAME}-" 'index($0,p)==1') ]]
 for suffix in runtime-bin sandbox-data volumes; do
   ! d volume inspect "$COMPOSE_PROJECT_NAME-$suffix" >/dev/null 2>&1
 done
@@ -42,7 +42,7 @@ export E2E_CONTROL_IMAGE="docker.io/cubepod-compose/control:$COMPOSE_PROJECT_NAM
 export E2E_SANDBOX_IMAGE="docker.io/cubepod-compose/sandbox:$COMPOSE_PROJECT_NAME"
 export E2E_HOST_BIN=uninitialized E2E_HOST_DATA=uninitialized E2E_HOST_VOLUMES=uninitialized
 sandbox_ids() { d ps -aq --filter "name=^/${COMPOSE_PROJECT_NAME}-sb-"; }
-volume_names() { d volume ls --format '{{.Name}}' | awk -v p="cubepod-e2bvol-${COMPOSE_PROJECT_NAME}-" 'index($0,p)==1'; }
+volume_names() { d volume ls --format '{{.Name}}' | awk -v p="cubepod-vol-${COMPOSE_PROJECT_NAME}-" 'index($0,p)==1'; }
 collect() {
   c ps --all >"$ARTIFACTS/compose-ps.txt" 2>&1 || true
   c logs --no-color --timestamps >"$ARTIFACTS/compose.log" 2>&1 || true

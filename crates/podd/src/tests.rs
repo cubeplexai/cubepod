@@ -4833,7 +4833,7 @@ fn test_podd_metrics_json_and_prometheus_endpoints() {
     let prom_text = String::from_utf8_lossy(&body);
     assert!(prom_text.contains("cubepod_podd_active_processes "));
     assert!(prom_text.contains("cubepod_podd_init_duration_milliseconds "));
-    assert!(prom_text.contains("cubepod_podd_init_e2b_bind_duration_ms "));
+    assert!(prom_text.contains("cubepod_podd_init_volume_bind_duration_ms "));
 
     // 3. Prometheus format via ?format=prometheus and Accept: text/plain
     let (status, _, body_q) = get(&addr, "/metrics?format=prometheus");

@@ -324,9 +324,9 @@ func BuildBlockPVCsWithOptions(boxName string, tpl v1alpha1.PodTemplateSpec, spe
 	return rootfsPVC, workspacePVC
 }
 
-// E2BPVCName is the filesystem claim for an official E2B volume: e2bvol-<id>.
+// VolumePVCName returns the filesystem claim for a shared volume: vol-<id>.
 // It is never the workspace PVC.
-func E2BPVCName(volumeID string) (string, bool) {
+func VolumePVCName(volumeID string) (string, bool) {
 	if len(volumeID) != 32 {
 		return "", false
 	}
@@ -336,10 +336,10 @@ func E2BPVCName(volumeID string) (string, bool) {
 			return "", false
 		}
 	}
-	return "e2bvol-" + volumeID, true
+	return "vol-" + volumeID, true
 }
 
-func validE2BSubPath(subPath string) bool {
+func validVolumeSubPath(subPath string) bool {
 	if subPath == "" || strings.HasPrefix(subPath, "/") || strings.Contains(subPath, "\\") {
 		return false
 	}
@@ -351,62 +351,62 @@ func validE2BSubPath(subPath string) bool {
 	return true
 }
 
-// ValidateOfficialVolumeMounts verifies that all official E2B volume mounts
+// ValidateVolumeMounts verifies that all volume mounts
 // have a valid volume ID, matching PVC name (or a non-empty shared PVC name
 // when subPath is set), valid container path, and no duplicate mount paths.
-func ValidateOfficialVolumeMounts(mounts []v1alpha1.E2BVolumeMount) error {
+func ValidateVolumeMounts(mounts []v1alpha1.VolumeMount) error {
 	seenPath := map[string]struct{}{}
 	for _, m := range mounts {
-		pvc, ok := E2BPVCName(m.VolumeID)
+		pvc, ok := VolumePVCName(m.VolumeID)
 		if !ok {
-			return fmt.Errorf("invalid official E2B volumeID %q", m.VolumeID)
+			return fmt.Errorf("invalid volumeID %q", m.VolumeID)
 		}
 		if m.SubPath != "" {
-			if !validE2BSubPath(m.SubPath) {
-				return fmt.Errorf("invalid official E2B subPath %q", m.SubPath)
+			if !validVolumeSubPath(m.SubPath) {
+				return fmt.Errorf("invalid volume subPath %q", m.SubPath)
 			}
 			if strings.TrimSpace(m.PVCName) == "" {
-				return fmt.Errorf("missing official E2B pvcName for volume %s with subPath", m.VolumeID)
+				return fmt.Errorf("missing pvcName for volume %s with subPath", m.VolumeID)
 			}
 		} else if m.PVCName != "" && m.PVCName != pvc {
-			return fmt.Errorf("mismatched official E2B pvcName %q for volume %s", m.PVCName, m.VolumeID)
+			return fmt.Errorf("mismatched pvcName %q for volume %s", m.PVCName, m.VolumeID)
 		}
-		if !v1alpha1.ValidE2BContainerPath(m.Path) {
-			return fmt.Errorf("invalid official E2B mount path %q", m.Path)
+		if !v1alpha1.ValidVolumeContainerPath(m.Path) {
+			return fmt.Errorf("invalid volume mount path %q", m.Path)
 		}
 		if _, dup := seenPath[m.Path]; dup {
-			return fmt.Errorf("duplicate official E2B mount path %q", m.Path)
+			return fmt.Errorf("duplicate volume mount path %q", m.Path)
 		}
 		seenPath[m.Path] = struct{}{}
 	}
 	return nil
 }
 
-type e2bMountEnvEntry struct {
+type volumeMountEnvEntry struct {
 	VolumeID    string `json:"volume_id"`
 	StagingPath string `json:"staging_path"`
 	TargetPath  string `json:"target_path"`
 }
 
-// applyOfficialVolumeMounts stages each official E2B volume at
+// applyVolumeMounts stages each shared volume at
 // /run/cubepod/volumes/<volumeID>, deduplicates shared PVCs in pod.Volumes,
-// and passes the staging->target mapping to podd-init via CUBEPOD_E2B_MOUNTS.
+// and passes the staging->target mapping to podd-init via CUBEPOD_VOLUME_MOUNTS.
 // When mountDirect is true (Filesystem volume mode with an empty runtime class),
 // the kubelet also mounts each volume at its final path so standard containers
 // do not need CAP_SYS_ADMIN or a pivot_root to expose the volume.
-func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest, mounts []v1alpha1.E2BVolumeMount, mountDirect bool) ([]VolumeManifest, ContainerManifest) {
+func applyVolumeMounts(volumes []VolumeManifest, main ContainerManifest, mounts []v1alpha1.VolumeMount, mountDirect bool) ([]VolumeManifest, ContainerManifest) {
 	if len(mounts) == 0 {
 		return volumes, main
 	}
-	if err := ValidateOfficialVolumeMounts(mounts); err != nil {
+	if err := ValidateVolumeMounts(mounts); err != nil {
 		return volumes, main
 	}
 	seenPVC := map[string]struct{}{}
-	envEntries := make([]e2bMountEnvEntry, 0, len(mounts))
+	envEntries := make([]volumeMountEnvEntry, 0, len(mounts))
 	for _, m := range mounts {
 		pvc := m.PVCName
 		if pvc == "" {
-			pvc, _ = E2BPVCName(m.VolumeID)
+			pvc, _ = VolumePVCName(m.VolumeID)
 		}
 		if _, ok := seenPVC[pvc]; !ok {
 			seenPVC[pvc] = struct{}{}
@@ -428,7 +428,7 @@ func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest,
 				SubPath:   m.SubPath,
 			})
 		}
-		envEntries = append(envEntries, e2bMountEnvEntry{
+		envEntries = append(envEntries, volumeMountEnvEntry{
 			VolumeID:    m.VolumeID,
 			StagingPath: stagingPath,
 			TargetPath:  m.Path,
@@ -436,7 +436,7 @@ func applyOfficialVolumeMounts(volumes []VolumeManifest, main ContainerManifest,
 	}
 	if raw, err := json.Marshal(envEntries); err == nil {
 		main.Env = append(main.Env, EnvVar{
-			Name:  "CUBEPOD_E2B_MOUNTS",
+			Name:  "CUBEPOD_VOLUME_MOUNTS",
 			Value: string(raw),
 		})
 	}
@@ -647,7 +647,7 @@ func BuildPodManifest(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha
 	// the identical mount and only initializes ownership. Kata/block-mode
 	// workloads keep the staging + in-guest bind-mount path.
 	mountDirect := strings.EqualFold(vm, "Filesystem") && rtClass == ""
-	volumes, mainContainer = applyOfficialVolumeMounts(volumes, mainContainer, spec.E2BVolumeMounts, mountDirect)
+	volumes, mainContainer = applyVolumeMounts(volumes, mainContainer, spec.VolumeMounts, mountDirect)
 
 	var containers []ContainerManifest
 

@@ -35,7 +35,7 @@ spec:
                   type: string
                 volumeKey:
                   type: string
-                e2bVolumeMounts:
+                volumeMounts:
                   type: array
                   maxItems: 32
                   items:

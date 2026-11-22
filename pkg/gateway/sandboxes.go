@@ -773,17 +773,17 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		RootfsGeneration: 1,
 		WarmPoolRef:      req.WarmPoolRef,
 		VolumeKey:        volumeKey,
-		E2BVolumeMounts:  s.plannedToPodBoxMounts(plannedMounts),
+		VolumeMounts:     s.plannedToPodBoxMounts(plannedMounts),
 		NetworkPolicy:    cloneNetworkPolicy(netPolicy),
 	}
 
-	// Official E2B volume mounts or per-sandbox network/secret policies must be
+	// Persistent volume mounts or per-sandbox network/secret policies must be
 	// present on the pod at create time, so a pre-warmed standby cannot be claimed.
 	if len(plannedMounts) > 0 || netPolicy != nil {
 		spec.WarmPoolRef = ""
 	}
 
-	// Automatic WarmPool Claim: skip when deterministic VolumeKey, official mounts,
+	// Automatic WarmPool Claim: skip when deterministic VolumeKey, volume mounts,
 	// or custom network/secret policies are requested.
 	if spec.WarmPoolRef == "" && volumeKey == "" && len(plannedMounts) == 0 && netPolicy == nil {
 		warmPoolName := s.reconciler.FindAvailableWarmPool(req.TemplateID)
@@ -1055,7 +1055,7 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	spec := s.withOfficialMounts(v1alpha1.PodBoxSpec{
+	spec := s.withVolumeMounts(v1alpha1.PodBoxSpec{
 		TemplateRef:      templateID,
 		DesiredState:     v1alpha1.DesiredStatePaused,
 		RootfsGeneration: rootfsGen,
@@ -1132,7 +1132,7 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	// Auto-resume from Paused if needed (E2B connect semantics).
-	spec := s.withOfficialMounts(v1alpha1.PodBoxSpec{
+	spec := s.withVolumeMounts(v1alpha1.PodBoxSpec{
 		TemplateRef:      recCopy.TemplateID,
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: recCopy.RootfsGeneration,
@@ -1396,7 +1396,7 @@ func (s *Server) handleResetRootfs(w http.ResponseWriter, r *http.Request) {
 	liveRouting := s.livePodRouting
 	s.mu.RUnlock()
 
-	spec := s.withOfficialMounts(v1alpha1.PodBoxSpec{
+	spec := s.withVolumeMounts(v1alpha1.PodBoxSpec{
 		TemplateRef:      recCopy.TemplateID,
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: recCopy.RootfsGeneration,
@@ -1470,24 +1470,24 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 	s.mu.RUnlock()
 
 	childID := fmt.Sprintf("cpod-fork-%d", time.Now().UnixNano())
-	spec := s.withOfficialMounts(v1alpha1.PodBoxSpec{
+	spec := s.withVolumeMounts(v1alpha1.PodBoxSpec{
 		TemplateRef:      parentCopy.TemplateID,
 		DesiredState:     v1alpha1.DesiredStateRunning,
 		RootfsGeneration: 1,
 		ForkFrom:         &v1alpha1.ForkSource{PodBoxName: parentID},
 		NetworkPolicy:    cloneNetworkPolicy(parentCopy.NetworkPolicy),
 	}, parentID)
-	if len(spec.E2BVolumeMounts) == 0 && s.reconciler != nil && s.reconciler.KubeClient() != nil {
-		if parentBox, getErr := s.reconciler.KubeClient().GetPodBox(r.Context(), s.reconciler.Namespace(), parentID); getErr == nil && parentBox != nil && len(parentBox.Spec.E2BVolumeMounts) > 0 {
-			spec.E2BVolumeMounts = append([]v1alpha1.E2BVolumeMount(nil), parentBox.Spec.E2BVolumeMounts...)
+	if len(spec.VolumeMounts) == 0 && s.reconciler != nil && s.reconciler.KubeClient() != nil {
+		if parentBox, getErr := s.reconciler.KubeClient().GetPodBox(r.Context(), s.reconciler.Namespace(), parentID); getErr == nil && parentBox != nil && len(parentBox.Spec.VolumeMounts) > 0 {
+			spec.VolumeMounts = append([]v1alpha1.VolumeMount(nil), parentBox.Spec.VolumeMounts...)
 		}
 	}
-	if len(spec.E2BVolumeMounts) > 0 && liveRouting && s.runtime == nil {
-		sharedPVC := s.sharedE2BPVC()
-		for _, m := range spec.E2BVolumeMounts {
+	if len(spec.VolumeMounts) > 0 && liveRouting && s.runtime == nil {
+		sharedPVC := s.sharedVolumePVC()
+		for _, m := range spec.VolumeMounts {
 			if sharedPVC == "" || m.PVCName != sharedPVC {
-				s.E2BVolumeMountErrorsTotal.Add(1)
-				writeError(w, http.StatusConflict, "cannot fork sandbox with RWO per-volume E2B PVC on Kubernetes")
+				s.VolumeMountErrorsTotal.Add(1)
+				writeError(w, http.StatusConflict, "cannot fork sandbox with RWO per-volume PVC on Kubernetes")
 				return
 			}
 		}
@@ -1694,7 +1694,7 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 	resumed := false
 	var wireRec *SandboxRecord
 	if recCopy.State == string(v1alpha1.PodBoxPhasePaused) || recCopy.State == "Paused" {
-		spec := s.withOfficialMounts(v1alpha1.PodBoxSpec{
+		spec := s.withVolumeMounts(v1alpha1.PodBoxSpec{
 			TemplateRef:      recCopy.TemplateID,
 			DesiredState:     v1alpha1.DesiredStateRunning,
 			RootfsGeneration: recCopy.RootfsGeneration,

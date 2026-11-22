@@ -12,22 +12,22 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/volume"
 )
 
-func (s *Server) plannedToPodBoxMounts(planned []volume.PlannedMount) []v1alpha1.E2BVolumeMount {
+func (s *Server) plannedToPodBoxMounts(planned []volume.PlannedMount) []v1alpha1.VolumeMount {
 	if len(planned) == 0 {
 		return nil
 	}
 	sharedPVC := ""
 	if s != nil && s.livePodRouting && s.runtime == nil {
-		sharedPVC = s.sharedE2BPVC()
+		sharedPVC = s.sharedVolumePVC()
 	}
-	out := make([]v1alpha1.E2BVolumeMount, 0, len(planned))
+	out := make([]v1alpha1.VolumeMount, 0, len(planned))
 	for _, p := range planned {
-		pvc, ok := controller.E2BPVCName(p.VolumeID)
+		pvc, ok := controller.VolumePVCName(p.VolumeID)
 		if !ok {
 			continue
 		}
 		if sharedPVC != "" {
-			out = append(out, v1alpha1.E2BVolumeMount{
+			out = append(out, v1alpha1.VolumeMount{
 				VolumeID: p.VolumeID,
 				PVCName:  sharedPVC,
 				SubPath:  p.VolumeID + "/data",
@@ -35,7 +35,7 @@ func (s *Server) plannedToPodBoxMounts(planned []volume.PlannedMount) []v1alpha1
 			})
 			continue
 		}
-		out = append(out, v1alpha1.E2BVolumeMount{
+		out = append(out, v1alpha1.VolumeMount{
 			VolumeID: p.VolumeID,
 			PVCName:  pvc,
 			Path:     p.Path,
@@ -44,8 +44,8 @@ func (s *Server) plannedToPodBoxMounts(planned []volume.PlannedMount) []v1alpha1
 	return out
 }
 
-func (s *Server) podBoxE2BMounts(sandboxID string) []v1alpha1.E2BVolumeMount {
-	st := s.e2b.Load()
+func (s *Server) podBoxVolumeMounts(sandboxID string) []v1alpha1.VolumeMount {
+	st := s.volumeStore.Load()
 	if st == nil || sandboxID == "" {
 		return nil
 	}
@@ -60,15 +60,15 @@ func (s *Server) podBoxE2BMounts(sandboxID string) []v1alpha1.E2BVolumeMount {
 	return s.plannedToPodBoxMounts(planned)
 }
 
-func (s *Server) withOfficialMounts(spec v1alpha1.PodBoxSpec, sandboxID string) v1alpha1.PodBoxSpec {
-	if mounts := s.podBoxE2BMounts(sandboxID); len(mounts) > 0 {
-		spec.E2BVolumeMounts = mounts
+func (s *Server) withVolumeMounts(spec v1alpha1.PodBoxSpec, sandboxID string) v1alpha1.PodBoxSpec {
+	if mounts := s.podBoxVolumeMounts(sandboxID); len(mounts) > 0 {
+		spec.VolumeMounts = mounts
 	}
 	return spec
 }
 
 func (s *Server) runtimeVolumeMounts(sandboxID string) []runtime.SandboxVolumeMount {
-	specs := s.E2BVolumeMounts(sandboxID)
+	specs := s.VolumeMounts(sandboxID)
 	if len(specs) == 0 {
 		return nil
 	}

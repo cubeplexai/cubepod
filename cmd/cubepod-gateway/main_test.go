@@ -19,7 +19,7 @@ func TestResolveSecretsConfig(t *testing.T) {
 	kc := controller.NewMemoryKubeClient()
 
 	// 1. Unset backend + live hasKube + empty CUBEPOD_SECRETS_DIR -> defaults to k8s
-	enabled, isK8s, cfg, err := resolveSecretsConfig("", "", "/var/lib/cubepod/e2b-volumes", "", "", true, kc, "cubepod-workloads")
+	enabled, isK8s, cfg, err := resolveSecretsConfig("", "", "/var/lib/cubepod/volumes", "", "", true, kc, "cubepod-workloads")
 	if err != nil || !enabled || !isK8s || cfg.Backend != "k8s" || cfg.Namespace != "cubepod-workloads" {
 		t.Fatalf("unexpected auto k8s result: enabled=%v isK8s=%v cfg=%+v err=%v", enabled, isK8s, cfg, err)
 	}
@@ -38,7 +38,7 @@ func TestResolveSecretsConfig(t *testing.T) {
 	}
 
 	// 4. Explicit CUBEPOD_SECRETS_BACKEND=disabled
-	enabled, isK8s, _, err = resolveSecretsConfig("disabled", "/tmp/secrets", "/var/lib/cubepod/e2b-volumes", "", "", true, kc, "ns1")
+	enabled, isK8s, _, err = resolveSecretsConfig("disabled", "/tmp/secrets", "/var/lib/cubepod/volumes", "", "", true, kc, "ns1")
 	if err != nil || enabled || isK8s {
 		t.Fatalf("expected disabled secrets, got enabled=%v isK8s=%v err=%v", enabled, isK8s, err)
 	}
@@ -72,7 +72,7 @@ func TestResolveEventsConfig(t *testing.T) {
 	}
 
 	// 4. Volume-dir sibling fallback when no state dir is configured
-	enabled, _, cfg, err = resolveEventsConfig("file", "", "", "/var/lib/cubepod/e2b-volumes", "", "", false, nil, "")
+	enabled, _, cfg, err = resolveEventsConfig("file", "", "", "/var/lib/cubepod/volumes", "", "", false, nil, "")
 	if err != nil || !enabled || cfg.Dir != "/var/lib/cubepod/events" {
 		t.Fatalf("unexpected volume sibling result: enabled=%v cfg=%+v err=%v", enabled, cfg, err)
 	}
@@ -196,18 +196,18 @@ func TestResolveE2BTemplateAPIFlag(t *testing.T) {
 	}
 }
 
-func TestResolveE2BVolumeConfig(t *testing.T) {
+func TestResolveVolumeConfig(t *testing.T) {
 	hexKEK := hex.EncodeToString(bytes.Repeat([]byte{0x22}, 32))
 	envMap := map[string]string{
-		"CUBEPOD_E2B_VOLUME_DIR":             "/tmp/e2b-vols",
-		"CUBEPOD_E2B_VOLUMES_KEK":            hexKEK,
-		"CUBEPOD_E2B_VOLUMES_KEK_ID":         "kek-prod-1",
-		"CUBEPOD_E2B_MAX_TENANT_BYTES":       "10485760",
-		"CUBEPOD_E2B_MAX_VOLUMES_PER_TENANT": "12",
+		"CUBEPOD_VOLUMES_DIR":              "/tmp/vols",
+		"CUBEPOD_VOLUMES_KEK":              hexKEK,
+		"CUBEPOD_VOLUMES_KEK_ID":           "kek-prod-1",
+		"CUBEPOD_VOLUMES_MAX_TENANT_BYTES": "10485760",
+		"CUBEPOD_VOLUMES_MAX_PER_TENANT":   "12",
 	}
-	enabled, vcfg, err := resolveE2BVolumeConfig(func(k string) string { return envMap[k] }, "")
+	enabled, vcfg, err := resolveVolumeConfig(func(k string) string { return envMap[k] }, "")
 	if err != nil || !enabled {
-		t.Fatalf("resolveE2BVolumeConfig local KEK: enabled=%v err=%v", enabled, err)
+		t.Fatalf("resolveVolumeConfig local KEK: enabled=%v err=%v", enabled, err)
 	}
 	if vcfg.KMS == nil || vcfg.KMS.KeyID() != "kek-prod-1" || vcfg.MaxBytesPerTenant != 10485760 || vcfg.MaxVolumesPerTenant != 12 {
 		t.Fatalf("unexpected vcfg: %+v", vcfg)
@@ -215,31 +215,31 @@ func TestResolveE2BVolumeConfig(t *testing.T) {
 
 	// External HTTP KMS URL takes precedence and validates HTTPS for remote hosts.
 	envHTTP := map[string]string{
-		"CUBEPOD_E2B_VOLUME_DIR":         "/tmp/e2b-vols",
-		"CUBEPOD_E2B_VOLUMES_KMS_URL":    "https://kms.internal.example:8443/v1",
-		"CUBEPOD_E2B_VOLUMES_KMS_TOKEN":  "secret-kms-bearer",
-		"CUBEPOD_E2B_VOLUMES_KMS_KEY_ID": "vault-vol-kek",
+		"CUBEPOD_VOLUMES_DIR":        "/tmp/vols",
+		"CUBEPOD_VOLUMES_KMS_URL":    "https://kms.internal.example:8443/v1",
+		"CUBEPOD_VOLUMES_KMS_TOKEN":  "secret-kms-bearer",
+		"CUBEPOD_VOLUMES_KMS_KEY_ID": "vault-vol-kek",
 	}
-	enabled, vcfg, err = resolveE2BVolumeConfig(func(k string) string { return envHTTP[k] }, "")
+	enabled, vcfg, err = resolveVolumeConfig(func(k string) string { return envHTTP[k] }, "")
 	if err != nil || !enabled || vcfg.KMS == nil || vcfg.KMS.KeyID() != "vault-vol-kek" {
-		t.Fatalf("resolveE2BVolumeConfig HTTP KMS: enabled=%v vcfg=%+v err=%v", enabled, vcfg, err)
+		t.Fatalf("resolveVolumeConfig HTTP KMS: enabled=%v vcfg=%+v err=%v", enabled, vcfg, err)
 	}
 
 	// Malformed KEK must return an error without echoing the raw secret string.
 	badEnv := map[string]string{
-		"CUBEPOD_E2B_VOLUME_DIR":  "/tmp/e2b-vols",
-		"CUBEPOD_E2B_VOLUMES_KEK": "super-sensitive-invalid-kek",
+		"CUBEPOD_VOLUMES_DIR": "/tmp/vols",
+		"CUBEPOD_VOLUMES_KEK": "super-sensitive-invalid-kek",
 	}
-	if _, _, err := resolveE2BVolumeConfig(func(k string) string { return badEnv[k] }, ""); err == nil || strings.Contains(err.Error(), "super-sensitive-invalid-kek") {
+	if _, _, err := resolveVolumeConfig(func(k string) string { return badEnv[k] }, ""); err == nil || strings.Contains(err.Error(), "super-sensitive-invalid-kek") {
 		t.Fatalf("expected redacted error on malformed KEK, got %v", err)
 	}
 
-	// Invalid CUBEPOD_E2B_MAX_TENANT_BYTES must fail fast.
+	// Invalid CUBEPOD_VOLUMES_MAX_TENANT_BYTES must fail fast.
 	badQuota := map[string]string{
-		"CUBEPOD_E2B_VOLUME_DIR":       "/tmp/e2b-vols",
-		"CUBEPOD_E2B_MAX_TENANT_BYTES": "-5",
+		"CUBEPOD_VOLUMES_DIR":              "/tmp/vols",
+		"CUBEPOD_VOLUMES_MAX_TENANT_BYTES": "-5",
 	}
-	if _, _, err := resolveE2BVolumeConfig(func(k string) string { return badQuota[k] }, ""); err == nil {
-		t.Fatal("expected error for negative CUBEPOD_E2B_MAX_TENANT_BYTES")
+	if _, _, err := resolveVolumeConfig(func(k string) string { return badQuota[k] }, ""); err == nil {
+		t.Fatal("expected error for negative CUBEPOD_VOLUMES_MAX_TENANT_BYTES")
 	}
 }
