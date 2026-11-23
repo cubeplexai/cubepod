@@ -1,0 +1,78 @@
+name: Experimental Firecracker guest kernel
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish an experimental GHCR candidate after real KVM boot (not a volume proof)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: guest-kernel-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install archive tools on the disposable hosted runner
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Build the source/config-pinned Kata kernel
+        run: |
+          mkdir -p kernel-evidence
+          set -o pipefail
+          bash test/guest-kernel/build.sh "$GITHUB_WORKSPACE/kernel-artifacts" 2>&1 | tee kernel-evidence/compile.log
+      - name: Require a real KVM Firecracker boot with exact release and built-in NFS
+        run: |
+          set -o pipefail
+          tools=$(cat kernel-artifacts/tools-image.txt)
+          timeout 100s docker run --rm -i --network none --device /dev/kvm \
+            --memory=512m --cpus=1 -v "$GITHUB_WORKSPACE/kernel-artifacts:/art:ro" \
+            "$tools" python3 - /art < test/guest-kernel/preflight.py 2>&1 | tee kernel-evidence/guest.log
+      - name: Publish experimental artifact and produce an immutable deployment pin
+        if: inputs.publish
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner=${GITHUB_REPOSITORY_OWNER,,}
+          image="ghcr.io/$owner/cubepod-fc-kernel"
+          tag="6.18.62-cubepod-nfs1-experimental-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          docker build -f test/guest-kernel/Artifact.Dockerfile --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" --label "org.opencontainers.image.revision=$GITHUB_SHA" -t "$image:$tag" kernel-artifacts/custom
+          docker push "$image:$tag" | tee kernel-evidence/push.log
+          docker pull "$image:$tag"
+          ref=$(docker image inspect "$image:$tag" --format '{{index .RepoDigests 0}}')
+          python3 - "$ref" <<'PY'
+          import json,sys
+          from pathlib import Path
+          meta=json.loads(Path('kernel-artifacts/custom/manifest.json').read_text())
+          pin={k:meta[k] for k in ('schema','kernel_release','kernel_sha256','config_sha256')}
+          pin['image']=sys.argv[1]
+          Path('kernel-evidence/pin.json').write_text(json.dumps(pin,indent=2)+'\n')
+          PY
+          python3 deploy/k8s/kata/guest-kernel/pin.py read kernel-evidence/pin.json
+          # Exercise the same digest + checksum consumer used by deployment.
+          bash deploy/k8s/kata/guest-kernel/fetch.sh kernel-evidence/pin.json "$RUNNER_TEMP/verified-guest-kernel"
+          {
+            echo '## Experimental guest kernel (NOT a volume-persistence proof)'
+            echo "Image: \`$ref\`"
+            echo 'Download pin.json from the evidence artifact; do not deploy a mutable tag.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload source/config checksums and real-guest evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: experimental-guest-kernel-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            kernel-evidence/
+            kernel-artifacts/custom/
+            kernel-artifacts/tools-image-id.txt
+          if-no-files-found: warn
+          retention-days: 14

@@ -21,6 +21,10 @@ class RuntimeProofTest(unittest.TestCase):
         for text in ('', '6.18.62\n', 'KATA_GUEST_READY\n', '6.12.113\nKATA_GUEST_READY\n'):
             self.assertFalse(guest_ready(text))
         self.assertTrue(guest_ready('6.18.62\r\nKATA_GUEST_READY\r\n'))
+        custom='6.18.62-cubepod-nfs1'
+        self.assertTrue(guest_ready(custom+'\nKATA_GUEST_READY\n',custom))
+        self.assertFalse(guest_ready('6.18.62\nKATA_GUEST_READY\n',custom))
+        self.assertFalse(guest_ready(custom+'\nKATA_GUEST_READY\n'))
 
     def verify(self, runtime='kata-clh-e2e', count=12, expected='kata-clh-e2e', reports=None):
         events = [{'type':'ADDED', 'object':{'kind':'Pod','metadata':{'name':f'sandbox-{i}'},'spec':{'runtimeClassName':runtime}}} for i in range(count)]
