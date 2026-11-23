@@ -101,7 +101,7 @@ build_images() {
     [[ "$component" != injector ]] || image=podd
     local target=$component
     if [[ "$component" == sandbox && -n ${KATA_VMM:-} ]]; then target=sandbox-block; fi
-    timeout 600s docker build -f "$HERE/Dockerfile" --target "$target" -t "docker.io/cubepod-kind/$image:$CLUSTER_NAME" "$BUILD"
+    timeout 600s docker build -f "$HERE/Dockerfile" --target "$target" --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" -t "docker.io/cubepod-kind/$image:$CLUSTER_NAME" "$BUILD"
   done
 }
 ensure_new_cluster() {
