@@ -78,6 +78,7 @@ const (
 	FeatureGateE2BFilesystemWatch       = "E2BFilesystemWatch"
 	FeatureGateE2BSecretsAPI            = "E2BSecretsAPI"
 	FeatureGateSandboxEventsAndWebhooks = "SandboxEventsAndWebhooks"
+	FeatureGateBlockWorkspaceVolumes    = "BlockWorkspaceVolumes"
 )
 
 // FeatureGates holds gateway feature gate enablement flags.
@@ -94,6 +95,7 @@ func DefaultFeatureGates() FeatureGates {
 		FeatureGateE2BFilesystemWatch:       true,
 		FeatureGateE2BSecretsAPI:            true,
 		FeatureGateSandboxEventsAndWebhooks: true,
+		FeatureGateBlockWorkspaceVolumes:    true,
 	}
 }
 
@@ -308,47 +310,87 @@ func (w *lockedWriter) Write(p []byte) (n int, err error) {
 
 // Server serves the CubePod Control Plane and Panel Proxy routes.
 type Server struct {
-	reconciler                 *controller.Reconciler
-	mu                         sync.RWMutex
-	sandboxMu                  sync.Mutex
-	sandboxLocks               map[string]*sandboxOpLock
-	sandboxes                  map[string]*SandboxRecord
-	commands                   map[string]*commandEntry
-	watchers                   map[string]*dirWatcher
-	endpoints                  map[string]map[int]string
-	workspaceBaseDir           string
-	panelSecret                []byte
-	vault                      *egress.Vault
-	ca                         *egress.CA
-	strictEgressMTLS           bool
-	livePodRouting             bool
-	metrics                    *Metrics
-	e2bTemplateAPI             bool
-	templateBuild              bool
-	controllerURL              string
-	probeTimeout               time.Duration
-	httpClient                 *http.Client
-	volumeStore                atomic.Pointer[volume.Store]
-	secrets                    atomic.Pointer[secret.Store]
-	events                     atomic.Pointer[events.Manager]
-	volumesDir                 string
-	volumeCfg                  volume.Config
-	volumeMaxFileBytes         int64
-	k8sVolumeMounts            bool
-	volumesSharedPVC           string
-	runtime                    runtime.Backend
-	featureGates               FeatureGates
-	syncMu                     sync.Mutex
-	samplerMu                  sync.Mutex
-	samplerCancel              context.CancelFunc
-	samplerWG                  sync.WaitGroup
-	syncInterval               time.Duration
-	syncCancel                 context.CancelFunc
-	syncWG                     sync.WaitGroup
-	crdResyncsTotal            atomic.Uint64
-	VolumeMountsTotal          atomic.Uint64
-	VolumeMountErrorsTotal     atomic.Uint64
-	VolumeQuotaRejectionsTotal atomic.Uint64
+	reconciler                      *controller.Reconciler
+	mu                              sync.RWMutex
+	sandboxMu                       sync.Mutex
+	sandboxLocks                    map[string]*sandboxOpLock
+	sandboxes                       map[string]*SandboxRecord
+	commands                        map[string]*commandEntry
+	watchers                        map[string]*dirWatcher
+	endpoints                       map[string]map[int]string
+	workspaceBaseDir                string
+	panelSecret                     []byte
+	vault                           *egress.Vault
+	ca                              *egress.CA
+	strictEgressMTLS                bool
+	livePodRouting                  bool
+	metrics                         *Metrics
+	e2bTemplateAPI                  bool
+	templateBuild                   bool
+	controllerURL                   string
+	probeTimeout                    time.Duration
+	httpClient                      *http.Client
+	volumeStore                     atomic.Pointer[volume.Store]
+	secrets                         atomic.Pointer[secret.Store]
+	events                          atomic.Pointer[events.Manager]
+	volumesDir                      string
+	volumeCfg                       volume.Config
+	volumeMaxFileBytes              int64
+	k8sVolumeMounts                 bool
+	volumesSharedPVC                string
+	allowLazyLegacyVolumeClaim      *bool
+	attachLeaseGracePeriod          time.Duration
+	runtime                         runtime.Backend
+	featureGates                    FeatureGates
+	syncMu                          sync.Mutex
+	samplerMu                       sync.Mutex
+	samplerCancel                   context.CancelFunc
+	samplerWG                       sync.WaitGroup
+	syncInterval                    time.Duration
+	syncCancel                      context.CancelFunc
+	syncWG                          sync.WaitGroup
+	crdResyncsTotal                 atomic.Uint64
+	VolumeMountsTotal               atomic.Uint64
+	VolumeMountErrorsTotal          atomic.Uint64
+	VolumeQuotaRejectionsTotal      atomic.Uint64
+	BlockVolumeAttachConflictsTotal atomic.Uint64
+}
+
+// SetAllowLazyLegacyVolumeClaim configures whether unmigrated legacy extension.volumeKey
+// PVCs may be lazily adopted on first attach. Defaults to true.
+func (s *Server) SetAllowLazyLegacyVolumeClaim(allow bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v := allow
+	s.allowLazyLegacyVolumeClaim = &v
+}
+
+// AllowLazyLegacyVolumeClaim reports whether lazy legacy extension.volumeKey adoption is enabled.
+func (s *Server) AllowLazyLegacyVolumeClaim() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.allowLazyLegacyVolumeClaim == nil {
+		return true
+	}
+	return *s.allowLazyLegacyVolumeClaim
+}
+
+// SetAttachLeaseGracePeriod configures the grace period before a NotFound PVC attach lease
+// is treated as orphaned and eligible for preemption/cleanup. Defaults to 30s.
+func (s *Server) SetAttachLeaseGracePeriod(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attachLeaseGracePeriod = d
+}
+
+// AttachLeaseGracePeriod returns the configured attach lease grace period (default 30s).
+func (s *Server) AttachLeaseGracePeriod() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.attachLeaseGracePeriod <= 0 {
+		return 30 * time.Second
+	}
+	return s.attachLeaseGracePeriod
 }
 
 // SetRuntime installs a product execution backend used during sandbox create,

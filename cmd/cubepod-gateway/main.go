@@ -417,6 +417,15 @@ func resolveVolumeConfig(getenv func(string) string, effectiveStateDir string) (
 	case "1", "true", "yes":
 		vcfg.K8sVolumeMounts = true
 	}
+	if raw := strings.ToLower(strings.TrimSpace(getenv("CUBEPOD_VOLUMES_ALLOW_LAZY_LEGACY_CLAIM"))); raw != "" {
+		allow := raw == "1" || raw == "true" || raw == "yes"
+		vcfg.AllowLazyLegacyClaim = &allow
+	}
+	if raw := strings.TrimSpace(getenv("CUBEPOD_VOLUMES_ATTACH_LEASE_GRACE_SECONDS")); raw != "" {
+		if secs, convErr := strconv.Atoi(raw); convErr == nil && secs > 0 {
+			vcfg.AttachLeaseGracePeriod = time.Duration(secs) * time.Second
+		}
+	}
 	if raw := strings.TrimSpace(getenv("CUBEPOD_VOLUMES_MAX_FILE_BYTES")); raw != "" {
 		if n, convErr := strconv.ParseInt(raw, 10, 64); convErr == nil && n > 0 {
 			vcfg.MaxFileSizeBytes = n

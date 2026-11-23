@@ -245,7 +245,13 @@ func (s *Server) syncFromKube(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 	s.crdResyncsTotal.Add(1)
-	return s.reconciler.SyncFromKube(ctx)
+	n, err := s.reconciler.SyncFromKube(ctx)
+	if err == nil && s.reconciler.KubeClient() != nil && s.volumeStore.Load() != nil {
+		if boxes, listErr := s.reconciler.KubeClient().ListPodBoxes(ctx, s.reconciler.Namespace()); listErr == nil {
+			s.autoAdoptLegacyPodBoxVolumes(ctx, boxes)
+		}
+	}
+	return n, err
 }
 
 // CRDResyncsTotal returns the number of Kubernetes CRD resyncs performed by the gateway.
@@ -744,6 +750,33 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		writeError(w, mountStatus, mountMsg)
 		return
 	}
+	hasPlannedBlockMount := false
+	for _, pm := range plannedMounts {
+		if pm.Type == v1alpha1.VolumeTypeBlock {
+			hasPlannedBlockMount = true
+			break
+		}
+	}
+	if volumeKey != "" && hasPlannedBlockMount {
+		writeError(w, http.StatusBadRequest, "cannot specify both extension.volumeKey and a block volume mount at /workspace")
+		return
+	}
+
+	ownerTenant := ""
+	if key := managementAPIKey(r); key != "" {
+		ownerTenant = events.TenantHash(key)
+	}
+	if volumeKey != "" && !hasPlannedBlockMount {
+		if adoptedMount, adopted, lazyStatus, lazyMsg := s.tryLazyAdoptLegacyVolumeKey(r.Context(), managementAPIKey(r), ownerTenant, volumeKey); lazyStatus != 0 {
+			writeError(w, lazyStatus, lazyMsg)
+			return
+		} else if adopted {
+			plannedMounts = append(plannedMounts, adoptedMount)
+			hasPlannedBlockMount = true
+			volumeKey = ""
+		}
+	}
+
 	netPolicy := cloneNetworkPolicy(req.Extension.NetworkPolicy)
 	if netPolicy == nil {
 		netPolicy = cloneNetworkPolicy(req.NetworkPolicy)
@@ -797,7 +830,44 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var acquiredBlockMount *volume.PlannedMount
+	if hasPlannedBlockMount {
+		st := s.volumeStore.Load()
+		for i := range plannedMounts {
+			if plannedMounts[i].Type == v1alpha1.VolumeTypeBlock {
+				if err := s.acquireBlockVolumePVCLease(r.Context(), st, id, plannedMounts[i]); err != nil {
+					if s.vault != nil {
+						s.vault.RevokeSandbox(id)
+					}
+					if errors.Is(err, volume.ErrInUse) {
+						s.BlockVolumeAttachConflictsTotal.Add(1)
+						writeError(w, http.StatusConflict, "block volume is already attached to another sandbox")
+						return
+					}
+					writeError(w, http.StatusInternalServerError, "failed to acquire block volume lease: "+err.Error())
+					return
+				}
+				pmCopy := plannedMounts[i]
+				acquiredBlockMount = &pmCopy
+				break
+			}
+		}
+	}
+
 	if err := s.commitSandboxVolumeMounts(id, managementAPIKey(r), plannedMounts); err != nil {
+		if acquiredBlockMount != nil && s.reconciler != nil && s.reconciler.KubeClient() != nil {
+			pvcName := acquiredBlockMount.PVCName
+			if pvcName == "" {
+				pvcName = volumePVCPrefix + acquiredBlockMount.VolumeID
+			}
+			if pvc, getErr := s.reconciler.KubeClient().GetPVCManifest(r.Context(), s.reconciler.Namespace(), pvcName); getErr == nil && pvc != nil &&
+				pvc.Annotations != nil && pvc.Annotations[controller.PVCAnnotationAttachedSandbox] == id {
+				_, _ = s.reconciler.KubeClient().UpdatePVCAnnotationsCAS(r.Context(), s.reconciler.Namespace(), pvcName, pvc.ResourceVersion, map[string]string{
+					controller.PVCAnnotationAttachedSandbox: "",
+					controller.PVCAnnotationAttachedAt:      "",
+				})
+			}
+		}
 		if s.vault != nil {
 			s.vault.RevokeSandbox(id)
 		}
@@ -809,14 +879,15 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid volume mount path")
 			return
 		}
+		if errors.Is(err, volume.ErrInUse) {
+			s.BlockVolumeAttachConflictsTotal.Add(1)
+			writeError(w, http.StatusConflict, "block volume is already attached to another sandbox")
+			return
+		}
 		writeError(w, http.StatusConflict, "volume mount failed")
 		return
 	}
 
-	ownerTenant := ""
-	if key := managementAPIKey(r); key != "" {
-		ownerTenant = events.TenantHash(key)
-	}
 	if ownerTenant != "" && s.reconciler != nil {
 		s.reconciler.SetBoxAnnotations(id, map[string]string{"cubepod.io/owner-tenant": ownerTenant})
 	}
@@ -862,6 +933,11 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	workspaceDir := s.workspaceDirForSandbox(id, volumeKey)
+	if acquiredBlockMount != nil {
+		if dir := s.VolumeDataDir(acquiredBlockMount.VolumeID); dir != "" {
+			workspaceDir = dir
+		}
+	}
 	if err := os.MkdirAll(workspaceDir, 0755); err != nil {
 		s.rollbackCreatedSandbox(r.Context(), id)
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1482,6 +1558,9 @@ func (s *Server) handleForkSandbox(w http.ResponseWriter, r *http.Request) {
 			spec.VolumeMounts = append([]v1alpha1.VolumeMount(nil), parentBox.Spec.VolumeMounts...)
 		}
 	}
+	// Forked sandboxes receive an independent CSI VolumeSnapshot clone of /workspace;
+	// inherit only shared RWX mounts and never the parent's exclusive RWO block mount.
+	spec.VolumeMounts = spec.SharedVolumeMounts()
 	if len(spec.VolumeMounts) > 0 && liveRouting && s.runtime == nil {
 		sharedPVC := s.sharedVolumePVC()
 		for _, m := range spec.VolumeMounts {
@@ -1596,6 +1675,14 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
+	hasManagedBlockMount := false
+	for _, m := range s.VolumeMounts(id) {
+		if m.ContainerPath == "/workspace" {
+			hasManagedBlockMount = true
+			break
+		}
+	}
+
 	s.deleteRuntimeSandbox(r.Context(), id)
 	_ = s.reconciler.DeleteBox(r.Context(), id, deleteVolumes)
 
@@ -1605,6 +1692,7 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	wireRec := cloneSandboxRecord(rec)
 	s.mu.Unlock()
 
+	s.releaseSandboxBlockPVCLeases(r.Context(), id)
 	s.releaseSandboxVolumeMounts(id)
 	s.releaseLocalSandbox(id)
 	s.Metrics().sandboxMetricsStore().delete(id)
@@ -1622,7 +1710,7 @@ func (s *Server) handleDeleteSandbox(w http.ResponseWriter, r *http.Request) {
 	if cleanupRec == nil {
 		cleanupRec = prevRec
 	}
-	if cleanupRec != nil && cleanupRec.WorkspaceDir != "" && (cleanupRec.VolumeKey == "" || deleteVolumes) {
+	if cleanupRec != nil && cleanupRec.WorkspaceDir != "" && !hasManagedBlockMount && (cleanupRec.VolumeKey == "" || deleteVolumes) {
 		_ = os.RemoveAll(filepath.Dir(cleanupRec.WorkspaceDir))
 	}
 	w.WriteHeader(http.StatusNoContent)

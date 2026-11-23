@@ -93,10 +93,15 @@ func SanitizeLabelValue(v string) string {
 	return s
 }
 
-// WorkspacePVCName returns the workspace PVC name for a PodBox. When
-// spec.VolumeKey is non-empty, it returns a deterministic DNS-1123 name based on
-// VolumeKey so workspace data persists across delete -> create cycles.
+// WorkspacePVCName returns the workspace PVC name for a PodBox.
+// Precedence:
+// 1. Managed block volume mount at /workspace (spec.VolumeMounts with type: "block")
+// 2. Legacy deterministic spec.VolumeKey
+// 3. Ephemeral per-sandbox <podBoxName>-workspace-pvc
 func WorkspacePVCName(podBoxName string, spec v1alpha1.PodBoxSpec) string {
+	if m := spec.WorkspaceBlockMount(); m != nil && strings.TrimSpace(m.PVCName) != "" {
+		return strings.TrimSpace(m.PVCName)
+	}
 	if spec.VolumeKey != "" {
 		return SanitizeVolumeKey(spec.VolumeKey) + workspacePVCSuffix
 	}
@@ -108,6 +113,7 @@ func WorkspacePVCName(podBoxName string, spec v1alpha1.PodBoxSpec) string {
 type BlockPVCManifest struct {
 	Name               string            `json:"name"`
 	Namespace          string            `json:"namespace,omitempty"`
+	ResourceVersion    string            `json:"resourceVersion,omitempty"`
 	StorageClassName   string            `json:"storageClassName"`
 	VolumeMode         string            `json:"volumeMode"`
 	Size               string            `json:"size"`
@@ -117,6 +123,7 @@ type BlockPVCManifest struct {
 	DataSourceKind     string            `json:"dataSourceKind,omitempty"`
 	DataSourceAPIGroup string            `json:"dataSourceAPIGroup,omitempty"`
 	Labels             map[string]string `json:"labels,omitempty"`
+	Annotations        map[string]string `json:"annotations,omitempty"`
 }
 
 // BlockPVCOptions configures PVC synthesis for BuildBlockPVCsWithOptions.
@@ -353,26 +360,41 @@ func validVolumeSubPath(subPath string) bool {
 
 // ValidateVolumeMounts verifies that all volume mounts
 // have a valid volume ID, matching PVC name (or a non-empty shared PVC name
-// when subPath is set), valid container path, and no duplicate mount paths.
+// when subPath is set, or a non-empty block PVC name for type: "block"),
+// valid container path, and no duplicate mount paths.
 func ValidateVolumeMounts(mounts []v1alpha1.VolumeMount) error {
 	seenPath := map[string]struct{}{}
+	blockCount := 0
 	for _, m := range mounts {
 		pvc, ok := VolumePVCName(m.VolumeID)
 		if !ok {
 			return fmt.Errorf("invalid volumeID %q", m.VolumeID)
 		}
-		if m.SubPath != "" {
-			if !validVolumeSubPath(m.SubPath) {
-				return fmt.Errorf("invalid volume subPath %q", m.SubPath)
-			}
+		if m.IsBlock() {
 			if strings.TrimSpace(m.PVCName) == "" {
-				return fmt.Errorf("missing pvcName for volume %s with subPath", m.VolumeID)
+				return fmt.Errorf("missing pvcName for block volume %s", m.VolumeID)
 			}
-		} else if m.PVCName != "" && m.PVCName != pvc {
-			return fmt.Errorf("mismatched pvcName %q for volume %s", m.PVCName, m.VolumeID)
-		}
-		if !v1alpha1.ValidVolumeContainerPath(m.Path) {
-			return fmt.Errorf("invalid volume mount path %q", m.Path)
+			if m.Path != "/workspace" {
+				return fmt.Errorf("block volume mount path must be /workspace, got %q", m.Path)
+			}
+			blockCount++
+			if blockCount > 1 {
+				return fmt.Errorf("at most one block volume mount is allowed per sandbox")
+			}
+		} else {
+			if m.SubPath != "" {
+				if !validVolumeSubPath(m.SubPath) {
+					return fmt.Errorf("invalid volume subPath %q", m.SubPath)
+				}
+				if strings.TrimSpace(m.PVCName) == "" {
+					return fmt.Errorf("missing pvcName for volume %s with subPath", m.VolumeID)
+				}
+			} else if m.PVCName != "" && m.PVCName != pvc {
+				return fmt.Errorf("mismatched pvcName %q for volume %s", m.PVCName, m.VolumeID)
+			}
+			if !v1alpha1.ValidVolumeContainerPath(m.Path) {
+				return fmt.Errorf("invalid volume mount path %q", m.Path)
+			}
 		}
 		if _, dup := seenPath[m.Path]; dup {
 			return fmt.Errorf("duplicate volume mount path %q", m.Path)
@@ -647,7 +669,7 @@ func BuildPodManifest(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha
 	// the identical mount and only initializes ownership. Kata/block-mode
 	// workloads keep the staging + in-guest bind-mount path.
 	mountDirect := strings.EqualFold(vm, "Filesystem") && rtClass == ""
-	volumes, mainContainer = applyVolumeMounts(volumes, mainContainer, spec.VolumeMounts, mountDirect)
+	volumes, mainContainer = applyVolumeMounts(volumes, mainContainer, spec.SharedVolumeMounts(), mountDirect)
 
 	var containers []ContainerManifest
 

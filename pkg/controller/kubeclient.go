@@ -39,6 +39,10 @@ var (
 // KubeClient abstracts Kubernetes resource operations for PodBox workloads.
 type KubeClient interface {
 	EnsurePVC(ctx context.Context, pvc BlockPVCManifest) error
+	GetPVCManifest(ctx context.Context, namespace, name string) (*BlockPVCManifest, error)
+	ListPVCManifests(ctx context.Context, namespace, labelSelector string) ([]BlockPVCManifest, error)
+	PatchPVCLabels(ctx context.Context, namespace, name string, labels map[string]string) error
+	UpdatePVCAnnotationsCAS(ctx context.Context, namespace, name, resourceVersion string, annotations map[string]string) (*BlockPVCManifest, error)
 	DeletePVC(ctx context.Context, namespace, name string) error
 	EnsurePod(ctx context.Context, pod PodManifest) (podIP string, err error)
 	DeletePod(ctx context.Context, namespace, name string) error
@@ -503,12 +507,126 @@ func (m *MemoryKubeClient) DeletePodWarmPool(_ context.Context, namespace, name 
 	return nil
 }
 
-// EnsurePVC records the PVC manifest in memory.
+// EnsurePVC records the PVC manifest in memory (idempotent if already present, matching K8s 409 semantics).
 func (m *MemoryKubeClient) EnsurePVC(_ context.Context, pvc BlockPVCManifest) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.PVCs[pvcKey(pvc.Namespace, pvc.Name)] = pvc
+	key := pvcKey(pvc.Namespace, pvc.Name)
+	if _, exists := m.PVCs[key]; exists {
+		return nil
+	}
+	cp := cloneBlockPVCManifest(pvc)
+	if cp.Namespace == "" {
+		cp.Namespace = "default"
+	}
+	m.rvCounter++
+	cp.ResourceVersion = strconv.FormatInt(m.rvCounter, 10)
+	m.PVCs[key] = cp
 	return nil
+}
+
+// GetPVCManifest retrieves a typed PVC manifest by namespace and name.
+func (m *MemoryKubeClient) GetPVCManifest(_ context.Context, namespace, name string) (*BlockPVCManifest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	pvc, ok := m.PVCs[pvcKey(namespace, name)]
+	if !ok {
+		return nil, fmt.Errorf("%w: pvc %s/%s", ErrKubeNotFound, namespace, name)
+	}
+	cp := cloneBlockPVCManifest(pvc)
+	return &cp, nil
+}
+
+// ListPVCManifests returns PVCs in namespace matching an optional comma-separated k=v label selector.
+func (m *MemoryKubeClient) ListPVCManifests(_ context.Context, namespace, labelSelector string) ([]BlockPVCManifest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	ns := namespace
+	if ns == "" {
+		ns = "default"
+	}
+	selector := parseLabelSelector(labelSelector)
+	var out []BlockPVCManifest
+	for k, pvc := range m.PVCs {
+		if !strings.HasPrefix(k, ns+"/") {
+			continue
+		}
+		if !matchesLabelSelectors(pvc.Labels, selector) {
+			continue
+		}
+		out = append(out, cloneBlockPVCManifest(pvc))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+// PatchPVCLabels merges labels onto an existing PVC in memory.
+func (m *MemoryKubeClient) PatchPVCLabels(_ context.Context, namespace, name string, labels map[string]string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := pvcKey(namespace, name)
+	pvc, ok := m.PVCs[key]
+	if !ok {
+		return fmt.Errorf("%w: pvc %s/%s", ErrKubeNotFound, namespace, name)
+	}
+	if pvc.Labels == nil {
+		pvc.Labels = map[string]string{}
+	}
+	for k, v := range labels {
+		pvc.Labels[k] = v
+	}
+	m.rvCounter++
+	pvc.ResourceVersion = strconv.FormatInt(m.rvCounter, 10)
+	m.PVCs[key] = pvc
+	return nil
+}
+
+// UpdatePVCAnnotationsCAS atomically updates annotations on an existing PVC when resourceVersion matches.
+// A nil value or empty string for a key removes that annotation.
+func (m *MemoryKubeClient) UpdatePVCAnnotationsCAS(_ context.Context, namespace, name, resourceVersion string, annotations map[string]string) (*BlockPVCManifest, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := pvcKey(namespace, name)
+	pvc, ok := m.PVCs[key]
+	if !ok {
+		return nil, fmt.Errorf("%w: pvc %s/%s", ErrKubeNotFound, namespace, name)
+	}
+	if resourceVersion != "" && pvc.ResourceVersion != "" && pvc.ResourceVersion != resourceVersion {
+		return nil, fmt.Errorf("%w: pvc %s/%s resourceVersion mismatch (%s != %s)", ErrCASConflict, namespace, name, pvc.ResourceVersion, resourceVersion)
+	}
+	nextAnns := map[string]string{}
+	for k, v := range pvc.Annotations {
+		nextAnns[k] = v
+	}
+	for k, v := range annotations {
+		if v == "" {
+			delete(nextAnns, k)
+		} else {
+			nextAnns[k] = v
+		}
+	}
+	pvc.Annotations = nextAnns
+	m.rvCounter++
+	pvc.ResourceVersion = strconv.FormatInt(m.rvCounter, 10)
+	m.PVCs[key] = pvc
+	cp := cloneBlockPVCManifest(pvc)
+	return &cp, nil
+}
+
+func cloneBlockPVCManifest(pvc BlockPVCManifest) BlockPVCManifest {
+	cp := pvc
+	if pvc.AccessModes != nil {
+		cp.AccessModes = append([]string(nil), pvc.AccessModes...)
+	}
+	if pvc.Labels != nil {
+		cp.Labels = make(map[string]string, len(pvc.Labels))
+		maps.Copy(cp.Labels, pvc.Labels)
+	}
+	if pvc.Annotations != nil {
+		cp.Annotations = make(map[string]string, len(pvc.Annotations))
+		maps.Copy(cp.Annotations, pvc.Annotations)
+	}
+	return cp
 }
 
 // DeletePVC removes the PVC manifest from memory.
@@ -1363,6 +1481,148 @@ func (c *RESTKubeClient) EnsurePVC(ctx context.Context, pvc BlockPVCManifest) er
 		return fmt.Errorf("EnsurePVC failed: status %d (%s)", resp.StatusCode, string(respBody))
 	}
 	return nil
+}
+
+// GetPVCManifest retrieves a typed PersistentVolumeClaim manifest.
+func (c *RESTKubeClient) GetPVCManifest(ctx context.Context, namespace, name string) (*BlockPVCManifest, error) {
+	ns := c.resolveNamespace(namespace)
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/persistentvolumeclaims/%s", c.baseURL, ns, name)
+	resp, err := c.doRequest(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("GetPVCManifest request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("%w: pvc %s/%s", ErrKubeNotFound, ns, name)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GetPVCManifest failed: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var raw coreV1PVC
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("GetPVCManifest decode failed: %w", err)
+	}
+	m := fromCoreV1PVC(raw)
+	return &m, nil
+}
+
+// ListPVCManifests lists PersistentVolumeClaims in namespace with an optional labelSelector.
+func (c *RESTKubeClient) ListPVCManifests(ctx context.Context, namespace, labelSelector string) ([]BlockPVCManifest, error) {
+	ns := c.resolveNamespace(namespace)
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/persistentvolumeclaims", c.baseURL, ns)
+	if strings.TrimSpace(labelSelector) != "" {
+		reqURL += "?labelSelector=" + url.QueryEscape(strings.TrimSpace(labelSelector))
+	}
+	resp, err := c.doRequest(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("ListPVCManifests request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("ListPVCManifests failed: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var list coreV1PVCList
+	if err := json.Unmarshal(body, &list); err != nil {
+		return nil, fmt.Errorf("ListPVCManifests decode failed: %w", err)
+	}
+	out := make([]BlockPVCManifest, 0, len(list.Items))
+	for _, item := range list.Items {
+		out = append(out, fromCoreV1PVC(item))
+	}
+	return out, nil
+}
+
+// PatchPVCLabels merges metadata.labels onto an existing PVC using strategic/merge patch.
+func (c *RESTKubeClient) PatchPVCLabels(ctx context.Context, namespace, name string, labels map[string]string) error {
+	ns := c.resolveNamespace(namespace)
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/persistentvolumeclaims/%s", c.baseURL, ns, name)
+	payload, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{
+			"labels": labels,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, reqURL, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("PatchPVCLabels request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("%w: pvc %s/%s", ErrKubeNotFound, ns, name)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("PatchPVCLabels failed: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// UpdatePVCAnnotationsCAS updates PVC metadata.annotations using optimistic concurrency (resourceVersion).
+// Empty values delete the corresponding annotation key.
+func (c *RESTKubeClient) UpdatePVCAnnotationsCAS(ctx context.Context, namespace, name, resourceVersion string, annotations map[string]string) (*BlockPVCManifest, error) {
+	ns := c.resolveNamespace(namespace)
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/persistentvolumeclaims/%s", c.baseURL, ns, name)
+	patchAnns := make(map[string]any, len(annotations))
+	for k, v := range annotations {
+		if v == "" {
+			patchAnns[k] = nil
+		} else {
+			patchAnns[k] = v
+		}
+	}
+	meta := map[string]any{
+		"annotations": patchAnns,
+	}
+	if resourceVersion != "" {
+		meta["resourceVersion"] = resourceVersion
+	}
+	payload, err := json.Marshal(map[string]any{
+		"metadata": meta,
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, reqURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/merge-patch+json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("UpdatePVCAnnotationsCAS request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("%w: pvc %s/%s", ErrKubeNotFound, ns, name)
+	}
+	if resp.StatusCode == http.StatusConflict {
+		return nil, fmt.Errorf("%w: pvc %s/%s conflict: %s", ErrCASConflict, ns, name, string(body))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("UpdatePVCAnnotationsCAS failed: HTTP %d: %s", resp.StatusCode, string(body))
+	}
+	var raw coreV1PVC
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("UpdatePVCAnnotationsCAS decode failed: %w", err)
+	}
+	m := fromCoreV1PVC(raw)
+	return &m, nil
 }
 
 // DeletePVC deletes a PersistentVolumeClaim by namespace and name.

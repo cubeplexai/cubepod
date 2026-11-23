@@ -233,13 +233,36 @@ type NetworkPolicySpec struct {
 	SecretRefBindings []SecretRefBinding    `json:"secretRefBindings,omitempty"`
 }
 
-// VolumeMount attaches one shared volume to the sandbox container.
-// It is not the workspace VolumeKey.
+const (
+	// VolumeTypeShared is a ReadWriteMany shared filesystem volume mounted via VolumeMounts + subPath.
+	VolumeTypeShared = "shared"
+	// VolumeTypeBlock is an exclusive ReadWriteOnce block workspace volume mounted via VolumeDevices.
+	VolumeTypeBlock = "block"
+)
+
+// VolumeMount attaches one managed volume (shared RWX filesystem or exclusive RWO block)
+// to the sandbox container.
 type VolumeMount struct {
 	VolumeID string `json:"volumeID"`
-	PVCName  string `json:"pvcName"`
-	SubPath  string `json:"subPath,omitempty"`
-	Path     string `json:"path"`
+	// Type is "shared" (default when omitted) or "block".
+	Type    string `json:"type,omitempty"`
+	PVCName string `json:"pvcName"`
+	// SubPath is used only for shared RWX volumes.
+	SubPath string `json:"subPath,omitempty"`
+	Path    string `json:"path"`
+}
+
+// EffectiveType returns the normalized volume type ("shared" when empty).
+func (m VolumeMount) EffectiveType() string {
+	if strings.EqualFold(strings.TrimSpace(m.Type), VolumeTypeBlock) {
+		return VolumeTypeBlock
+	}
+	return VolumeTypeShared
+}
+
+// IsBlock reports whether this mount references an exclusive block volume.
+func (m VolumeMount) IsBlock() bool {
+	return m.EffectiveType() == VolumeTypeBlock
 }
 
 // reservedVolumeMounts are container paths a mounted volume must not cover.
@@ -307,8 +330,9 @@ type PodBoxSpec struct {
 	// data persists across sandbox delete -> create cycles.
 	VolumeKey string `json:"volumeKey,omitempty"`
 
-	// VolumeMounts are shared volumes mounted when the pod is created.
-	// They stay distinct from VolumeKey and are never raw block devices.
+	// VolumeMounts are managed volumes attached when the pod is created.
+	// Entries with type "" or "shared" are RWX filesystem mounts; entries with
+	// type "block" (restricted to path "/workspace") attach as exclusive RWO block devices.
 	VolumeMounts []VolumeMount `json:"volumeMounts,omitempty"`
 
 	// DesiredState controls whether the MicroVM Pod is active ("Running") or suspended ("Paused").
@@ -327,6 +351,28 @@ type PodBoxSpec struct {
 
 	// NetworkPolicy defines zero-trust egress rules and secret bindings for this sandbox.
 	NetworkPolicy *NetworkPolicySpec `json:"networkPolicy,omitempty"`
+}
+
+// WorkspaceBlockMount returns the first block volume mount targeting /workspace, or nil.
+func (s PodBoxSpec) WorkspaceBlockMount() *VolumeMount {
+	for i := range s.VolumeMounts {
+		if s.VolumeMounts[i].IsBlock() && s.VolumeMounts[i].Path == "/workspace" {
+			m := s.VolumeMounts[i]
+			return &m
+		}
+	}
+	return nil
+}
+
+// SharedVolumeMounts returns only non-block (shared RWX) mounts from VolumeMounts.
+func (s PodBoxSpec) SharedVolumeMounts() []VolumeMount {
+	var out []VolumeMount
+	for _, m := range s.VolumeMounts {
+		if !m.IsBlock() {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // PodBoxStatus represents the observed status of a PodBox instance.
