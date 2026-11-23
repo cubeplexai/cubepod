@@ -24,6 +24,7 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/runtime"
 	"github.com/cubeplexai/cubepod/pkg/version"
 	"github.com/cubeplexai/cubepod/pkg/volume"
+	"github.com/cubeplexai/cubepod/pkg/volumenfs"
 )
 
 func envOrDefault(key, fallback string) string {
@@ -98,6 +99,10 @@ func main() {
 		egressTLSCert         = flag.String("egress-tls-cert", os.Getenv("CUBEPOD_EGRESS_TLS_CERT"), "Optional TLS server certificate PEM path for --egress-mtls-addr")
 		egressTLSKey          = flag.String("egress-tls-key", os.Getenv("CUBEPOD_EGRESS_TLS_KEY"), "Optional TLS server private key PEM path for --egress-mtls-addr")
 		metricsSampleInterval = flag.Duration("metrics-sample-interval", envDuration("CUBEPOD_METRICS_SAMPLE_INTERVAL", 10*time.Second), "Background sandbox metrics sampling interval (0 disables)")
+		volumeNFSService      = flag.String("volume-nfs-service", envOrDefault("CUBEPOD_VOLUME_NFS_SERVICE", "cubepod-volume-nfs"), "Kubernetes Service name for cubepod-volume-nfs")
+		volumeNFSNamespace    = flag.String("volume-nfs-namespace", os.Getenv("CUBEPOD_VOLUME_NFS_NAMESPACE"), "Namespace of the cubepod-volume-nfs Service (defaults to the gateway namespace)")
+		volumeNFSLeaseURL     = flag.String("volume-nfs-lease-url", os.Getenv("CUBEPOD_VOLUME_NFS_LEASE_URL"), "Internal lease API URL (not the NFS port)")
+		volumeNFSPort         = flag.Int("volume-nfs-port", 2049, "NFS TCP port advertised to guests and egress exemptions")
 	)
 	flag.Parse()
 
@@ -109,6 +114,10 @@ func main() {
 		}
 	})
 	e2bAPIEnabled := resolveE2BTemplateAPIFlag(e2bFlagSet, *e2bTemplateAPI, gates)
+	firecrackerVolumeNFS := false
+	if v, ok := gates[controller.FeatureGateFirecrackerVolumeNFS]; ok {
+		firecrackerVolumeNFS = v
+	}
 
 	effectiveStateDir := *stateDir
 	if effectiveStateDir == "" {
@@ -127,6 +136,7 @@ func main() {
 		"egressImage", *egressImage,
 		"livePodRouting", *livePodRouting,
 		"e2bTemplateAPI", e2bAPIEnabled,
+		"firecrackerVolumeNFS", firecrackerVolumeNFS,
 		"templateBuild", *templateBuild,
 		"controllerURL", *controllerURL,
 		"contextStoreBackend", *contextStoreBackend,
@@ -206,6 +216,20 @@ func main() {
 		}
 		opts = append(opts, controller.WithEgressUpstreamCA(pemBytes))
 	}
+
+	nfsSettings := controller.VolumeNFSSettings{
+		Enabled:     firecrackerVolumeNFS,
+		ServiceName: *volumeNFSService,
+		ServiceNS:   *volumeNFSNamespace,
+		NFSPort:     *volumeNFSPort,
+	}
+	if *volumeNFSLeaseURL != "" {
+		nfsSettings.LeaseClient = volumenfs.NewClient(*volumeNFSLeaseURL, nil)
+	}
+	if rest, ok := kubeClient.(*controller.RESTKubeClient); ok {
+		nfsSettings.Lookup = controller.RESTVolumeNFSLookup{Client: rest}
+	}
+	opts = append(opts, controller.WithVolumeNFS(nfsSettings))
 
 	reconciler := controller.NewReconciler(opts...)
 	if n, err := reconciler.SyncFromKube(context.Background()); err != nil {

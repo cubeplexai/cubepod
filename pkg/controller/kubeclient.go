@@ -32,9 +32,15 @@ var (
 	ErrCASConflict = errors.New("CAS conflict: pod already claimed or precondition failed")
 	// ErrKubeNotFound is returned when a requested Kubernetes object does not exist (404 NotFound).
 	ErrKubeNotFound = errors.New("kubernetes object not found")
+	// ErrPodNotFound is returned by GetPodPhase when the Pod does not exist (HTTP 404).
+	ErrPodNotFound = errors.New("pod not found")
 	// ErrKubeAlreadyExists is returned when creating a Kubernetes object whose name is already taken (409 AlreadyExists).
 	ErrKubeAlreadyExists = errors.New("kubernetes object already exists")
 )
+
+// PodIPHook is invoked the first time waitForPodRunning observes a non-empty
+// podIP, and must run before the Pod becomes Ready. A non-nil error fails the wait.
+type PodIPHook func(ctx context.Context, namespace, name, podIP string) error
 
 // KubeClient abstracts Kubernetes resource operations for PodBox workloads.
 type KubeClient interface {
@@ -111,6 +117,8 @@ type MemoryKubeClient struct {
 	Webhooks        map[string]v1alpha1.SandboxWebhook
 	// Events holds core/v1 Events in insertion order, bounded by MaxMemoryKubeEvents.
 	Events []KubeEvent
+	// GetPodPhaseErr, if set, is returned by GetPodPhase without inspecting the Pod.
+	GetPodPhaseErr error
 
 	rvCounter     int64
 	templateRVSeq uint64
@@ -660,6 +668,35 @@ func (m *MemoryKubeClient) EnsurePod(_ context.Context, pod PodManifest) (string
 	return ip, nil
 }
 
+// EnsurePodWithHook assigns a pod IP, invokes hook before the in-memory Pod is
+// recorded as existing (standing in for Ready), then stores the Pod.
+func (m *MemoryKubeClient) EnsurePodWithHook(ctx context.Context, pod PodManifest, hook PodIPHook) (string, error) {
+	m.mu.Lock()
+	key := podKey(pod.Namespace, pod.Name)
+	if existing, ok := m.Pods[key]; ok {
+		ip := m.IPs[key]
+		if ip == "" {
+			ip = "10.244.0.42"
+			m.IPs[key] = ip
+		}
+		_ = existing
+		m.mu.Unlock()
+		return ip, fmt.Errorf("%w: pod %s/%s already exists (409 Conflict)", ErrPodAlreadyExists, pod.Namespace, pod.Name)
+	}
+	ip, ok := m.IPs[key]
+	if !ok {
+		ip = "10.244.0.42"
+		m.IPs[key] = ip
+	}
+	m.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx, pod.Namespace, pod.Name, ip); err != nil {
+			return ip, err
+		}
+	}
+	return m.EnsurePod(ctx, pod)
+}
+
 // DeletePod removes the Pod manifest from memory.
 func (m *MemoryKubeClient) DeletePod(_ context.Context, namespace, name string) error {
 	m.mu.Lock()
@@ -676,8 +713,11 @@ func (m *MemoryKubeClient) GetPodPhase(_ context.Context, namespace, name string
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	key := podKey(namespace, name)
+	if m.GetPodPhaseErr != nil {
+		return "", m.GetPodPhaseErr
+	}
 	if _, ok := m.Pods[key]; !ok {
-		return "", fmt.Errorf("pod %s/%s not found", namespace, name)
+		return "", fmt.Errorf("pod %s/%s: %w", namespace, name, ErrPodNotFound)
 	}
 	if phase, ok := m.PodPhases[key]; ok && phase != "" {
 		return phase, nil
@@ -1649,6 +1689,17 @@ func (c *RESTKubeClient) DeletePVC(ctx context.Context, namespace, name string) 
 // serialized into the Pod JSON payload so podd-init has CAP_SYS_ADMIN.
 // If the APIServer returns 409 Conflict, it returns ErrPodAlreadyExists.
 func (c *RESTKubeClient) EnsurePod(ctx context.Context, pod PodManifest) (string, error) {
+	return c.ensurePod(ctx, pod, nil, false)
+}
+
+// EnsurePodWithHook is EnsurePod plus a synchronous onPodIP hook used to bind
+// a volume NFS lease the first time podIP is observed, before Ready.
+// A timeout without Ready is an error even if an IP was seen.
+func (c *RESTKubeClient) EnsurePodWithHook(ctx context.Context, pod PodManifest, hook PodIPHook) (string, error) {
+	return c.ensurePod(ctx, pod, hook, true)
+}
+
+func (c *RESTKubeClient) ensurePod(ctx context.Context, pod PodManifest, hook PodIPHook, requireReady bool) (string, error) {
 	ns := c.podNamespace(pod)
 	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods", c.baseURL, ns)
 
@@ -1664,10 +1715,12 @@ func (c *RESTKubeClient) EnsurePod(ctx context.Context, pod PodManifest) (string
 	}
 	defer resp.Body.Close()
 
+	wait := c.waitForRunning || hook != nil
 	if resp.StatusCode == http.StatusConflict {
 		var podIP string
-		if c.waitForRunning {
-			podIP, _ = c.waitForPodRunning(ctx, ns, pod.Name)
+		if wait {
+			// Do not bind a newly minted lease to an already-running Pod.
+			podIP, _ = c.waitForPodRunning(ctx, ns, pod.Name, nil, requireReady)
 		} else {
 			podIP, _ = c.getPodIP(ctx, ns, pod.Name)
 		}
@@ -1679,8 +1732,8 @@ func (c *RESTKubeClient) EnsurePod(ctx context.Context, pod PodManifest) (string
 		return "", fmt.Errorf("EnsurePod failed: status %d (%s)", resp.StatusCode, string(respBody))
 	}
 
-	if c.waitForRunning {
-		return c.waitForPodRunning(ctx, ns, pod.Name)
+	if wait {
+		return c.waitForPodRunning(ctx, ns, pod.Name, hook, requireReady)
 	}
 
 	var podResp struct {
@@ -1692,7 +1745,7 @@ func (c *RESTKubeClient) EnsurePod(ctx context.Context, pod PodManifest) (string
 	return podResp.Status.PodIP, nil
 }
 
-func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name string) (string, error) {
+func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name string, hook PodIPHook, requireReady bool) (string, error) {
 	interval := c.pollInterval
 	if interval <= 0 {
 		interval = 500 * time.Millisecond
@@ -1708,8 +1761,18 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	hooked := false
+	var lastIP, lastPhase string
+	var lastErr error
 	for {
 		ip, phase, ready, err := c.getPodStatus(pollCtx, namespace, name)
+		lastIP, lastPhase, lastErr = ip, phase, err
+		if ip != "" && hook != nil && !hooked {
+			if hookErr := hook(pollCtx, namespace, name, ip); hookErr != nil {
+				return ip, fmt.Errorf("onPodIP hook failed for pod %s/%s: %w", namespace, name, hookErr)
+			}
+			hooked = true
+		}
 		if err == nil && ((phase == "Running" && ip != "" && ready) || phase == "Succeeded") {
 			return ip, nil
 		}
@@ -1719,10 +1782,13 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 
 		select {
 		case <-pollCtx.Done():
-			if ip != "" {
-				return ip, nil
+			if requireReady {
+				return lastIP, fmt.Errorf("timed out waiting for pod %s/%s to become Ready (last phase=%q, ip=%q, err=%v)", namespace, name, lastPhase, lastIP, lastErr)
 			}
-			return "", fmt.Errorf("timed out waiting for pod %s/%s to reach Running phase (last phase=%q, err=%v)", namespace, name, phase, err)
+			if lastIP != "" {
+				return lastIP, nil
+			}
+			return "", fmt.Errorf("timed out waiting for pod %s/%s to reach Running phase (last phase=%q, err=%v)", namespace, name, lastPhase, lastErr)
 		case <-ticker.C:
 		}
 	}
@@ -1760,6 +1826,9 @@ func (c *RESTKubeClient) getPodStatus(ctx context.Context, namespace, name strin
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusNotFound {
+			return "", "", false, fmt.Errorf("getPodStatus failed: status %d (%s): %w", resp.StatusCode, string(respBody), ErrPodNotFound)
+		}
 		return "", "", false, fmt.Errorf("getPodStatus failed: status %d (%s)", resp.StatusCode, string(respBody))
 	}
 
@@ -2042,4 +2111,67 @@ func (c *RESTKubeClient) ListPods(ctx context.Context, namespace string, labelSe
 		res = append(res, pm)
 	}
 	return res, nil
+}
+
+// GetServiceClusterIP returns spec.clusterIP for a namespaced Service.
+func (c *RESTKubeClient) GetServiceClusterIP(ctx context.Context, namespace, name string) (string, error) {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/api/v1/namespaces/%s/services/%s", c.baseURL, ns, name)
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", fmt.Errorf("get service %s/%s: %w", ns, name, err)
+	}
+	defer resp.Body.Close()
+	body := readAllBody(resp)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("get service %s/%s: status %d (%s)", ns, name, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	ip, err := decodeServiceClusterIP(body)
+	if err != nil {
+		return "", fmt.Errorf("decode service %s/%s: %w", ns, name, err)
+	}
+	return ip, nil
+}
+
+// ServiceHasReadyEndpoints reports whether an Endpoints object has at least one address.
+func (c *RESTKubeClient) ServiceHasReadyEndpoints(ctx context.Context, namespace, name string) (bool, error) {
+	ns := c.resolveNamespace(namespace)
+	url := fmt.Sprintf("%s/api/v1/namespaces/%s/endpoints/%s", c.baseURL, ns, name)
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, fmt.Errorf("get endpoints %s/%s: %w", ns, name, err)
+	}
+	defer resp.Body.Close()
+	body := readAllBody(resp)
+	if resp.StatusCode == http.StatusNotFound {
+		return false, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("get endpoints %s/%s: status %d (%s)", ns, name, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return decodeEndpointsReady(body), nil
+}
+
+// GetRuntimeClass returns handler and labels for a cluster-scoped RuntimeClass.
+func (c *RESTKubeClient) GetRuntimeClass(ctx context.Context, name string) (string, map[string]string, error) {
+	url := fmt.Sprintf("%s/apis/node.k8s.io/v1/runtimeclasses/%s", c.baseURL, name)
+	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", nil, fmt.Errorf("get runtimeclass %s: %w", name, err)
+	}
+	defer resp.Body.Close()
+	body := readAllBody(resp)
+	if resp.StatusCode != http.StatusOK {
+		return "", nil, fmt.Errorf("get runtimeclass %s: status %d (%s)", name, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var obj struct {
+		Metadata struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"metadata"`
+		Handler string `json:"handler"`
+	}
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return "", nil, err
+	}
+	return obj.Handler, obj.Metadata.Labels, nil
 }

@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
+	"github.com/cubeplexai/cubepod/pkg/volumenfs"
 )
 
 const (
@@ -406,8 +408,22 @@ func ValidateVolumeMounts(mounts []v1alpha1.VolumeMount) error {
 
 type volumeMountEnvEntry struct {
 	VolumeID    string `json:"volume_id"`
-	StagingPath string `json:"staging_path"`
+	StagingPath string `json:"staging_path,omitempty"`
 	TargetPath  string `json:"target_path"`
+	Transport   string `json:"transport,omitempty"`
+	NFSTarget   string `json:"nfs_target,omitempty"`
+}
+
+// VolumeNFSOptions describes the Firecracker NFS transport injected into a Pod.
+type VolumeNFSOptions struct {
+	ClusterIP string
+	Port      int
+	LeaseID   string
+}
+
+// Ready reports whether the NFS target can be written into CUBEPOD_VOLUME_MOUNTS.
+func (o VolumeNFSOptions) Ready() bool {
+	return strings.TrimSpace(o.LeaseID) != "" && strings.TrimSpace(o.ClusterIP) != ""
 }
 
 // applyVolumeMounts stages each shared volume at
@@ -416,11 +432,36 @@ type volumeMountEnvEntry struct {
 // When mountDirect is true (Filesystem volume mode with an empty runtime class),
 // the kubelet also mounts each volume at its final path so standard containers
 // do not need CAP_SYS_ADMIN or a pivot_root to expose the volume.
-func applyVolumeMounts(volumes []VolumeManifest, main ContainerManifest, mounts []v1alpha1.VolumeMount, mountDirect bool) ([]VolumeManifest, ContainerManifest) {
+// When nfs.Ready() is true, official volumes are not attached as Kata VolumeMounts
+// (that path is a one-way copy on Firecracker) and CUBEPOD_VOLUME_MOUNTS entries
+// use transport "nfs".
+func applyVolumeMounts(volumes []VolumeManifest, main ContainerManifest, mounts []v1alpha1.VolumeMount, mountDirect bool, nfs VolumeNFSOptions) ([]VolumeManifest, ContainerManifest) {
 	if len(mounts) == 0 {
 		return volumes, main
 	}
 	if err := ValidateVolumeMounts(mounts); err != nil {
+		return volumes, main
+	}
+	if nfs.Ready() {
+		port := nfs.Port
+		if port <= 0 {
+			port = volumenfs.DefaultNFSPort
+		}
+		envEntries := make([]volumeMountEnvEntry, 0, len(mounts))
+		for _, m := range mounts {
+			envEntries = append(envEntries, volumeMountEnvEntry{
+				VolumeID:   m.VolumeID,
+				TargetPath: m.Path,
+				Transport:  "nfs",
+				NFSTarget:  volumenfs.NFSTarget(nfs.ClusterIP, nfs.LeaseID, m.VolumeID),
+			})
+		}
+		if raw, err := json.Marshal(envEntries); err == nil {
+			main.Env = append(main.Env,
+				EnvVar{Name: "CUBEPOD_VOLUME_MOUNTS", Value: string(raw)},
+				EnvVar{Name: "CUBEPOD_VOLUME_NFS_PORT", Value: strconv.Itoa(port)},
+			)
+		}
 		return volumes, main
 	}
 	seenPVC := map[string]struct{}{}
@@ -470,6 +511,8 @@ type PodBuildOptions struct {
 	VolumeMode        string
 	ImagePullSecrets  []string
 	TransparentEgress bool
+	VolumeNFS         VolumeNFSOptions
+	IsFirecracker     bool
 }
 
 // BuildKataPod synthesizes the complete Kubernetes Pod manifest for running a Kata or container sandbox.
@@ -669,7 +712,16 @@ func BuildPodManifest(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha
 	// the identical mount and only initializes ownership. Kata/block-mode
 	// workloads keep the staging + in-guest bind-mount path.
 	mountDirect := strings.EqualFold(vm, "Filesystem") && rtClass == ""
-	volumes, mainContainer = applyVolumeMounts(volumes, mainContainer, spec.SharedVolumeMounts(), mountDirect)
+	// Firecracker must never attach official shared volumes as Kata VolumeMounts.
+	// When NFS options are incomplete the mounts are omitted; the controller
+	// is responsible for failing closed before EnsurePod. Block workspace
+	// mounts (CEP-0030) are excluded by SharedVolumeMounts and never use NFS.
+	sharedMounts := spec.SharedVolumeMounts()
+	if (opts.IsFirecracker || IsFirecrackerRuntimeName(rtClass)) && !opts.VolumeNFS.Ready() && len(sharedMounts) > 0 {
+		// Omit official-volume VolumeMounts to avoid the one-way copy path (#122).
+	} else {
+		volumes, mainContainer = applyVolumeMounts(volumes, mainContainer, sharedMounts, mountDirect, opts.VolumeNFS)
+	}
 
 	var containers []ContainerManifest
 
@@ -732,6 +784,16 @@ func BuildPodManifest(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha
 			egressEnv = append(egressEnv, EnvVar{
 				Name:  "CUBEPOD_TRANSPARENT",
 				Value: "1",
+			})
+		}
+		if opts.VolumeNFS.Ready() {
+			port := opts.VolumeNFS.Port
+			if port <= 0 {
+				port = volumenfs.DefaultNFSPort
+			}
+			egressEnv = append(egressEnv, EnvVar{
+				Name:  "CUBEPOD_VOLUME_NFS_ADDR",
+				Value: volumenfs.NFSAddr(opts.VolumeNFS.ClusterIP, port),
 			})
 		}
 
