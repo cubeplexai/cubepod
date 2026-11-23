@@ -2235,12 +2235,23 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 		}
 	}
 	spec, hasSpec := r.specs[name]
-	isManagedBlock := hasSpec && spec.WorkspaceBlockMount() != nil
+	isManagedBlock := (hasSpec && spec.WorkspaceBlockMount() != nil) || strings.HasPrefix(status.WorkspacePVCName, "vol-")
+	pvcVerifyErr := false
 	if !isManagedBlock && status.WorkspacePVCName != "" && r.kubeClient != nil {
-		if pvc, err := r.kubeClient.GetPVCManifest(ctx, r.namespace, status.WorkspacePVCName); err == nil && pvc != nil {
+		pvc, err := r.kubeClient.GetPVCManifest(ctx, r.namespace, status.WorkspacePVCName)
+		if err == nil && pvc != nil {
 			if pvc.Labels[PVCLabelManagedBy] == PVCLabelManagedByVolumes {
 				isManagedBlock = true
 			}
+		} else if err != nil && !errors.Is(err, ErrKubeNotFound) {
+			// Fail closed: do not risk deleting a potentially managed /volumes block PVC
+			// when Kubernetes PVC metadata cannot be verified.
+			pvcVerifyErr = true
+			slog.Warn("skipping workspace PVC deletion: failed to verify managed-by label",
+				"podBox", name,
+				"pvc", status.WorkspacePVCName,
+				"err", err,
+			)
 		}
 	}
 	if isManagedBlock {
@@ -2256,7 +2267,7 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 		if status.RootfsPVCName != "" {
 			_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.RootfsPVCName)
 		}
-		if status.WorkspacePVCName != "" {
+		if status.WorkspacePVCName != "" && !pvcVerifyErr {
 			_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.WorkspacePVCName)
 		}
 	} else {

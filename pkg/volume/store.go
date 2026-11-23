@@ -376,6 +376,18 @@ func (s *Store) promoteOwnerTenantLocked(tenant, apiKey string) {
 	for id, rec := range s.vols {
 		if rec.meta.Tenant == "" && rec.meta.OwnerTenantHash == oh {
 			delete(s.byName, nameKey("owner:"+oh, rec.meta.Name))
+			name := rec.meta.Name
+			if existingID, dup := s.byName[nameKey(tenant, name)]; dup && existingID != id {
+				suffix := id
+				if len(suffix) > 8 {
+					suffix = suffix[:8]
+				}
+				if len(name)+1+len(suffix) > maxVolumeNameLen {
+					name = name[:maxVolumeNameLen-1-len(suffix)]
+				}
+				name = name + "-" + suffix
+				rec.meta.Name = name
+			}
 			rec.meta.Tenant = tenant
 			s.byName[nameKey(tenant, rec.meta.Name)] = id
 			_ = s.saveMetaUnlocked(rec)
@@ -767,6 +779,13 @@ func (s *Store) AdoptBlockVolume(opts AdoptBlockVolumeOpts) (Volume, bool, error
 		if err != nil {
 			return err
 		}
+		var encToken, kmsKeyID string
+		if s.cfg.KMS != nil {
+			encToken, kmsKeyID, err = sealVolumeToken(context.Background(), s.cfg.KMS, id, token)
+			if err != nil {
+				return err
+			}
+		}
 		rec := &volRec{
 			meta: Volume{
 				VolumeID:        id,
@@ -777,6 +796,8 @@ func (s *Store) AdoptBlockVolume(opts AdoptBlockVolumeOpts) (Volume, bool, error
 				LegacyVolumeKey: strings.TrimSpace(opts.LegacyVolumeKey),
 				OwnerTenantHash: ownerHash,
 				Token:           token,
+				EncryptedToken:  encToken,
+				KMSKeyID:        kmsKeyID,
 				Tenant:          tenant,
 				CreatedAt:       time.Now().UTC(),
 				PVCName:         cleanPVC,
@@ -957,6 +978,7 @@ func (s *Store) RotateAPIKey(oldAPIKey, newAPIKey string) (int, error) {
 		if oldTenant == "" {
 			oldTenant = oldHash
 		}
+		s.promoteOwnerTenantLocked(oldTenant, oldAPIKey)
 
 		if existingTenant, ok := s.tenantKeys[newHash]; ok && existingTenant != "" && existingTenant != oldTenant {
 			return ErrConflict

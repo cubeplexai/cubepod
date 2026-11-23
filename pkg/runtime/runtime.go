@@ -36,13 +36,14 @@ type SandboxVolumeMount struct {
 
 // SandboxSpec describes the configuration and metadata for running a sandbox instance.
 type SandboxSpec struct {
-	SandboxID        string               `json:"sandboxID"`
-	TemplateID       string               `json:"templateID"`
-	VolumeKey        string               `json:"volumeKey,omitempty"`
-	RootfsGeneration int64                `json:"rootfsGeneration,omitempty"`
-	Image            string               `json:"image,omitempty"`
-	Env              map[string]string    `json:"env,omitempty"`
-	VolumeMounts     []SandboxVolumeMount `json:"volumeMounts,omitempty"`
+	SandboxID         string               `json:"sandboxID"`
+	TemplateID        string               `json:"templateID"`
+	VolumeKey         string               `json:"volumeKey,omitempty"`
+	WorkspaceHostPath string               `json:"workspaceHostPath,omitempty"`
+	RootfsGeneration  int64                `json:"rootfsGeneration,omitempty"`
+	Image             string               `json:"image,omitempty"`
+	Env               map[string]string    `json:"env,omitempty"`
+	VolumeMounts      []SandboxVolumeMount `json:"volumeMounts,omitempty"`
 }
 
 // InstanceInfo represents the operational status and endpoints of a running/provisioned sandbox.

@@ -62,6 +62,7 @@ type VolumeConfig struct {
 type VolumeMount struct {
 	VolumeName    string `json:"volumeName"`
 	VolumeID      string `json:"volumeID"`
+	Type          string `json:"type,omitempty"`
 	ContainerPath string `json:"containerPath"`
 	HostPath      string `json:"hostPath"`
 	DockerVolume  string `json:"dockerVolume,omitempty"`
@@ -182,6 +183,7 @@ func (s *Server) VolumeMounts(sandboxID string) []VolumeMount {
 		out = append(out, VolumeMount{
 			VolumeName:    m.VolumeName,
 			VolumeID:      m.VolumeID,
+			Type:          m.Type,
 			ContainerPath: m.ContainerPath,
 			HostPath:      m.HostPath,
 			DockerVolume:  m.DockerVolume,
@@ -434,7 +436,11 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("volumeID")
-	volMeta, hasVol := st.GetByID(id)
+	volMeta, err := st.Get(key, id)
+	if err != nil {
+		writeVolumeMgmtError(w, err, "")
+		return
+	}
 	if s.reconciler != nil && s.reconciler.KubeClient() != nil {
 		boxes, listErr := s.reconciler.KubeClient().ListPodBoxes(r.Context(), s.reconciler.Namespace())
 		if listErr != nil {
@@ -449,9 +455,20 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 			}
 			for _, m := range box.Spec.VolumeMounts {
 				if m.VolumeID == id {
-					if hasVol && volMeta.IsBlock() {
+					if volMeta.IsBlock() {
 						s.BlockVolumeAttachConflictsTotal.Add(1)
 					}
+					writeError(w, http.StatusConflict, "volume is mounted by a sandbox")
+					return
+				}
+			}
+			if volMeta.IsBlock() && volMeta.PVCName != "" {
+				boxPVC := strings.TrimSpace(box.Status.WorkspacePVCName)
+				if boxPVC == "" {
+					boxPVC = controller.WorkspacePVCName(box.Metadata.Name, box.Spec)
+				}
+				if boxPVC == volMeta.PVCName {
+					s.BlockVolumeAttachConflictsTotal.Add(1)
 					writeError(w, http.StatusConflict, "volume is mounted by a sandbox")
 					return
 				}
@@ -464,17 +481,21 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// For managed block volumes, also verify the K8s PVC attach lease is free or reclaimable.
-		if hasVol && volMeta.IsBlock() && volMeta.PVCName != "" {
+		if volMeta.IsBlock() && volMeta.PVCName != "" {
 			if err := s.ensureBlockVolumeLeaseFreeForDelete(r.Context(), st, volMeta); err != nil {
-				s.BlockVolumeAttachConflictsTotal.Add(1)
-				writeError(w, http.StatusConflict, "volume is mounted by a sandbox")
+				if errors.Is(err, volume.ErrInUse) {
+					s.BlockVolumeAttachConflictsTotal.Add(1)
+					writeError(w, http.StatusConflict, "volume is mounted by a sandbox")
+					return
+				}
+				writeError(w, http.StatusInternalServerError, "failed to verify block volume lease: "+err.Error())
 				return
 			}
 		}
 	}
 	vol, err := st.Delete(key, id)
 	if err != nil {
-		if errors.Is(err, volume.ErrInUse) && hasVol && volMeta.IsBlock() {
+		if errors.Is(err, volume.ErrInUse) && volMeta.IsBlock() {
 			s.BlockVolumeAttachConflictsTotal.Add(1)
 		}
 		writeVolumeMgmtError(w, err, "")
@@ -1048,14 +1069,33 @@ func (s *Server) acquireBlockVolumePVCLease(ctx context.Context, st *volume.Stor
 		if !reclaimable && oldHolder != sandboxID {
 			return volume.ErrInUse
 		}
-		if oldHolder != "" && oldHolder != sandboxID && st != nil {
-			st.EvictMount(oldHolder, pm.VolumeID)
-		}
 		_, err = kc.UpdatePVCAnnotationsCAS(ctx, ns, pvcName, pvc.ResourceVersion, map[string]string{
 			controller.PVCAnnotationAttachedSandbox: sandboxID,
 			controller.PVCAnnotationAttachedAt:      time.Now().UTC().Format(time.RFC3339Nano),
 		})
 		if err == nil {
+			if st != nil {
+				if oldHolder != "" && oldHolder != sandboxID {
+					st.EvictMount(oldHolder, pm.VolumeID)
+				}
+				// Also evict any stale mounts.json owner whose PVC lease was cleared
+				// asynchronously (e.g. controller ReapIdle on PausedTTLSeconds expiration).
+				for _, owner := range st.ActiveMountOwners(pm.VolumeID) {
+					if owner == sandboxID {
+						continue
+					}
+					box, getErr := kc.GetPodBox(ctx, ns, owner)
+					if getErr != nil {
+						if errors.Is(getErr, controller.ErrKubeNotFound) || strings.Contains(strings.ToLower(getErr.Error()), "not found") {
+							st.EvictMount(owner, pm.VolumeID)
+						}
+						continue
+					}
+					if box == nil || box.Status.Phase == v1alpha1.PodBoxPhaseTerminated || box.Status.Phase == v1alpha1.PodBoxPhaseFailed {
+						st.EvictMount(owner, pm.VolumeID)
+					}
+				}
+			}
 			return nil
 		}
 		if errors.Is(err, controller.ErrCASConflict) {
@@ -1186,6 +1226,20 @@ func (s *Server) autoAdoptLegacyPodBoxVolumes(ctx context.Context, boxes []v1alp
 			controller.PVCLabelVolumeID:  vol.VolumeID,
 			controller.PVCLabelManagedBy: controller.PVCLabelManagedByVolumes,
 		})
+		if box.Status.Phase != v1alpha1.PodBoxPhaseTerminated && box.Status.Phase != v1alpha1.PodBoxPhaseFailed && box.Metadata.Name != "" {
+			if curPVC, getErr := kc.GetPVCManifest(ctx, ns, pvcName); getErr == nil && curPVC != nil {
+				holder := ""
+				if curPVC.Annotations != nil {
+					holder = strings.TrimSpace(curPVC.Annotations[controller.PVCAnnotationAttachedSandbox])
+				}
+				if holder == "" {
+					_, _ = kc.UpdatePVCAnnotationsCAS(ctx, ns, pvcName, curPVC.ResourceVersion, map[string]string{
+						controller.PVCAnnotationAttachedSandbox: box.Metadata.Name,
+						controller.PVCAnnotationAttachedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+					})
+				}
+			}
+		}
 	}
 }
 

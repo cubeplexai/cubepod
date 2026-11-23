@@ -1673,6 +1673,27 @@ func TestBlockWorkspaceVolume_LegacyAutoAdoptionAndLazyClaimBridge(t *testing.T)
 	if labeledPVC.Labels[controller.PVCLabelManagedBy] != controller.PVCLabelManagedByVolumes || labeledPVC.Labels[controller.PVCLabelVolumeID] != vols[0]["volumeID"] {
 		t.Fatalf("expected auto-adopted PVC to have cubepod-volumes labels, got %+v", labeledPVC.Labels)
 	}
+	if labeledPVC.Annotations[controller.PVCAnnotationAttachedSandbox] != "legacy-box-1" {
+		t.Fatalf("expected auto-adopted active PVC to have attach lease for legacy-box-1, got %+v", labeledPVC.Annotations)
+	}
+	// Concurrent attach to auto-adopted active legacy volume must return 409 Conflict.
+	dupLegacyAttach := volReq(t, http.MethodPost, ts.URL+"/sandboxes", tenantAKey, []byte(`{"templateID":"ubuntu:24.04","volumeMounts":[{"name":"active-legacy-ws","path":"/workspace"}]}`), "application/json")
+	dupLegacyAttach.Body.Close()
+	if dupLegacyAttach.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict attaching active auto-adopted legacy volume, got %d", dupLegacyAttach.StatusCode)
+	}
+	// DELETE /volumes/{id} on active auto-adopted legacy volume must return 409 Conflict for owner,
+	// and 404 Not Found (no mount-state leak) for another tenant.
+	delActiveLegacy := volReq(t, http.MethodDelete, ts.URL+"/volumes/"+vols[0]["volumeID"], tenantAKey, nil, "")
+	delActiveLegacy.Body.Close()
+	if delActiveLegacy.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict deleting active auto-adopted legacy volume, got %d", delActiveLegacy.StatusCode)
+	}
+	crossDel := volReq(t, http.MethodDelete, ts.URL+"/volumes/"+vols[0]["volumeID"], tenantBKey, nil, "")
+	crossDel.Body.Close()
+	if crossDel.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 Not Found on cross-tenant DELETE /volumes, got %d", crossDel.StatusCode)
+	}
 
 	// Cross-tenant attempt by Tenant B to claim active-legacy-ws via extension.volumeKey -> 403 Forbidden.
 	crossResp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", tenantBKey, []byte(`{"templateID":"ubuntu:24.04","extension":{"volumeKey":"active-legacy-ws"}}`), "application/json")
@@ -1728,5 +1749,65 @@ func TestBlockWorkspaceVolume_LegacyAutoAdoptionAndLazyClaimBridge(t *testing.T)
 	}
 	if _, stillThere := mem.GetPVC("cubepod-workloads", retainedPVC); stillThere {
 		t.Fatalf("expected Mode 1 adopted legacy PVC %s to be deleted by DELETE /volumes/%s", retainedPVC, retainedVolID)
+	}
+}
+
+func TestBlockVolumes_ReapIdleStaleMountEviction(t *testing.T) {
+	ctx := context.Background()
+	mem := controller.NewMemoryKubeClient()
+	rec := controller.NewReconciler(controller.WithKubeClient(mem), controller.WithNamespace("cubepod-workloads"))
+	srv := gateway.NewServer(rec)
+	if err := srv.ConfigureVolumes(gateway.VolumeConfig{Dir: t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	const apiKey = "cpod_reap_evict_tenant"
+	createResp := volReq(t, http.MethodPost, ts.URL+"/volumes", apiKey, []byte(`{"name":"reap-ws","type":"block","size":"20Gi"}`), "application/json")
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create block volume status = %d; want 201", createResp.StatusCode)
+	}
+	var vol struct {
+		VolumeID string `json:"volumeID"`
+	}
+	readJSON(t, createResp, &vol)
+
+	// Attach to sandbox 1.
+	sb1Resp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", apiKey, []byte(`{"templateID":"ubuntu:24.04","volumeMounts":[{"name":"reap-ws","path":"/workspace"}]}`), "application/json")
+	if sb1Resp.StatusCode != http.StatusCreated {
+		t.Fatalf("sb1 create status = %d; want 201", sb1Resp.StatusCode)
+	}
+	var sb1 struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	readJSON(t, sb1Resp, &sb1)
+
+	// Simulate controller ReapIdle: PodBox transitions to Terminated and PVC attach-sandbox lease is cleared,
+	// while gateway mounts.json still holds sb1 -> vol.VolumeID.
+	box, err := mem.GetPodBox(ctx, "cubepod-workloads", sb1.SandboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	box.Status.Phase = v1alpha1.PodBoxPhaseTerminated
+	if err := mem.UpsertPodBox(ctx, *box); err != nil {
+		t.Fatal(err)
+	}
+	pvc, err := mem.GetPVCManifest(ctx, "cubepod-workloads", "vol-"+vol.VolumeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mem.UpdatePVCAnnotationsCAS(ctx, "cubepod-workloads", pvc.Name, pvc.ResourceVersion, map[string]string{
+		controller.PVCAnnotationAttachedSandbox: "",
+		controller.PVCAnnotationAttachedAt:      "",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Attaching the volume to sandbox 2 must evict the stale Terminated owner from mounts.json and succeed (201).
+	sb2Resp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", apiKey, []byte(`{"templateID":"ubuntu:24.04","volumeMounts":[{"name":"reap-ws","path":"/workspace"}]}`), "application/json")
+	defer sb2Resp.Body.Close()
+	if sb2Resp.StatusCode != http.StatusCreated {
+		t.Fatalf("sb2 create after ReapIdle lease release status = %d; want 201", sb2Resp.StatusCode)
 	}
 }

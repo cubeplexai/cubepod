@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
@@ -60,19 +61,25 @@ func MigrateLegacyWorkspaces(ctx context.Context, kc controller.KubeClient, st *
 	}
 
 	if kc != nil {
-		boxes, _ := kc.ListPodBoxes(ctx, ns)
+		boxes, err := kc.ListPodBoxes(ctx, ns)
+		if err != nil {
+			return report, fmt.Errorf("list PodBoxes: %w", err)
+		}
 		activeEphemeralPVCs := map[string]struct{}{}
 		boxOwnerByPVC := map[string]struct {
 			tenantHash string
 			volumeKey  string
+			boxName    string
+			active     bool
 		}{}
 		for _, box := range boxes {
 			pvcName := strings.TrimSpace(box.Status.WorkspacePVCName)
 			if pvcName == "" {
 				pvcName = controller.WorkspacePVCName(box.Metadata.Name, box.Spec)
 			}
+			isActive := box.Status.Phase != v1alpha1.PodBoxPhaseTerminated && box.Status.Phase != v1alpha1.PodBoxPhaseFailed
 			if box.Spec.VolumeKey == "" && box.Spec.WorkspaceBlockMount() == nil {
-				if box.Status.Phase != v1alpha1.PodBoxPhaseTerminated && box.Status.Phase != v1alpha1.PodBoxPhaseFailed {
+				if isActive {
 					activeEphemeralPVCs[pvcName] = struct{}{}
 				}
 				continue
@@ -85,7 +92,9 @@ func MigrateLegacyWorkspaces(ctx context.Context, kc controller.KubeClient, st *
 				boxOwnerByPVC[pvcName] = struct {
 					tenantHash string
 					volumeKey  string
-				}{tenantHash: ownerTenant, volumeKey: box.Spec.VolumeKey}
+					boxName    string
+					active     bool
+				}{tenantHash: ownerTenant, volumeKey: box.Spec.VolumeKey, boxName: box.Metadata.Name, active: isActive}
 			}
 		}
 
@@ -117,7 +126,7 @@ func MigrateLegacyWorkspaces(ctx context.Context, kc controller.KubeClient, st *
 			adoptOpts.Name = strings.TrimSuffix(pvc.Name, "-workspace-pvc")
 
 			if info, ok := boxOwnerByPVC[pvc.Name]; ok && info.tenantHash != "" {
-				adoptOpts.TenantHash = info.tenantHash
+				adoptOpts.OwnerTenantHash = info.tenantHash
 				adoptOpts.LegacyVolumeKey = info.volumeKey
 				if info.volumeKey != "" {
 					adoptOpts.Name = info.volumeKey
@@ -235,6 +244,20 @@ func MigrateLegacyWorkspaces(ctx context.Context, kc controller.KubeClient, st *
 				controller.PVCLabelManagedBy: controller.PVCLabelManagedByVolumes,
 			}); err != nil {
 				return report, fmt.Errorf("label adopted PVC %s: %w", pvc.Name, err)
+			}
+			if info, ok := boxOwnerByPVC[pvc.Name]; ok && info.active && info.boxName != "" {
+				if curPVC, getErr := kc.GetPVCManifest(ctx, ns, pvc.Name); getErr == nil && curPVC != nil {
+					holder := ""
+					if curPVC.Annotations != nil {
+						holder = strings.TrimSpace(curPVC.Annotations[controller.PVCAnnotationAttachedSandbox])
+					}
+					if holder == "" {
+						_, _ = kc.UpdatePVCAnnotationsCAS(ctx, ns, pvc.Name, curPVC.ResourceVersion, map[string]string{
+							controller.PVCAnnotationAttachedSandbox: info.boxName,
+							controller.PVCAnnotationAttachedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+						})
+					}
+				}
 			}
 			report.Migrated = append(report.Migrated, LegacyMigrateEntry{
 				Source:   pvc.Name,
