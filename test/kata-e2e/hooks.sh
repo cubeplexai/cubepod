@@ -36,7 +36,7 @@ kata_prepare() {
     timeout 620s curl -fsSL --retry 2 --max-time 600 "https://github.com/kata-containers/kata-containers/releases/download/$KATA_VERSION/kata-go-static-$KATA_VERSION-amd64.tar.zst" -o "$bundle"
   fi
   echo "$KATA_SHA256  $bundle" | sha256sum -c -
-  timeout 300s docker build -f "$KATA_HERE/Tools.Dockerfile" -t "$KATA_TOOLS" "$KATA_HERE"
+  timeout 300s docker build -f "$KATA_HERE/Tools.Dockerfile" --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" -t "$KATA_TOOLS" "$KATA_HERE"
   timeout 30s docker volume create --label "io.cubepod.e2e=$CLUSTER_NAME" "$KATA_VOLUME" >/dev/null
   timeout 180s docker run --rm -i --name "$CLUSTER_NAME-extract" --label "io.cubepod.e2e=$CLUSTER_NAME" -v "$KATA_VOLUME:/opt/kata" "$KATA_TOOLS" tar --zstd -xf - -C / <"$bundle"
   timeout 90s docker run --rm -i --name "$CLUSTER_NAME-kvm" --label "io.cubepod.e2e=$CLUSTER_NAME" --memory=128m --cpus=1 --network none --device /dev/kvm "$KATA_TOOLS" python3 - <"$KATA_HERE/kvm_preflight.py" >"$ARTIFACTS/kvm-preflight.log" 2>&1
