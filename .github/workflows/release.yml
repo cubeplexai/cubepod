@@ -83,7 +83,7 @@ jobs:
           DIST_DIR="dist"
           mkdir -p ${DIST_DIR}
 
-          for binary in podd-init podd cubepod-controller cubepod-gateway cubepod-egress cubepod; do
+          for binary in podd-init podd cubepod-controller cubepod-gateway cubepod-egress cubepod-volume-nfs cubepod; do
             if [ -f "bin/${binary}" ]; then
               cp "bin/${binary}" "${DIST_DIR}/${binary}-${TAG_NAME}-${ARCH}"
             fi
@@ -278,6 +278,9 @@ jobs:
           - image: cubepod-egress
             dockerfile: images/egress/Dockerfile
             context: .
+          - image: cubepod-volume-nfs
+            dockerfile: images/volume-nfs/Dockerfile
+            context: .
           - image: cubepod-sandbox-base
             dockerfile: images/sandbox-base/Dockerfile
             context: .
@@ -356,7 +359,7 @@ jobs:
           manifest="release-manifest-${RELEASE_TAG}.yaml"
           printf 'release: %s\nsource_commit: %s\nimages:\n' "$RELEASE_TAG" "$source_commit" > "$manifest"
 
-          for target in podd controller gateway egress sandbox-base desktop; do
+          for target in podd controller gateway egress volume-nfs sandbox-base desktop; do
             ref="ghcr.io/${IMAGE_OWNER}/cubepod-${target}:${RELEASE_TAG}"
             digest=$(docker buildx imagetools inspect "$ref" --format '{{.Manifest.Digest}}')
             [[ "$digest" == sha256:* ]]

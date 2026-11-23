@@ -197,9 +197,20 @@ false
 {{/*
 Comma-separated feature gates string for controller and gateway
 */}}
+{{- define "cubepod.firecrackerVolumeNFSEnabled" -}}
+{{- $fg := .Values.featureGates | default dict -}}
+{{- $v := .Values.volumes | default dict -}}
+{{- $nfs := $v.nfs | default dict -}}
+{{- if or $fg.firecrackerVolumeNFS $nfs.enabled -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end }}
+
 {{- define "cubepod.featureGatesCSV" -}}
 {{- $fg := .Values.featureGates | default dict -}}
-{{- printf "E2BTemplateAPI=%s,TransparentEgress=%s,DesktopStack=%s,StatelessGatewayHA=%s,E2BFilesystemWatch=%s,E2BSecretsAPI=%s,SandboxEventsAndWebhooks=%s,K8sVolumeMounts=%s,BlockWorkspaceVolumes=%s" (include "cubepod.boolDefaultTrue" $fg.e2bTemplateAPI) (include "cubepod.transparentEgressEnabled" .) (include "cubepod.boolDefaultTrue" $fg.desktopStack) (include "cubepod.boolDefaultTrue" $fg.statelessGatewayHA) (include "cubepod.boolDefaultTrue" $fg.e2bFilesystemWatch) (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) (include "cubepod.boolDefaultTrue" $fg.sandboxEventsAndWebhooks) (include "cubepod.k8sVolumeMountsEnabled" .) (include "cubepod.boolDefaultTrue" $fg.blockWorkspaceVolumes) -}}
+{{- printf "E2BTemplateAPI=%s,TransparentEgress=%s,DesktopStack=%s,StatelessGatewayHA=%s,E2BFilesystemWatch=%s,E2BSecretsAPI=%s,SandboxEventsAndWebhooks=%s,K8sVolumeMounts=%s,BlockWorkspaceVolumes=%s,FirecrackerVolumeNFS=%s" (include "cubepod.boolDefaultTrue" $fg.e2bTemplateAPI) (include "cubepod.transparentEgressEnabled" .) (include "cubepod.boolDefaultTrue" $fg.desktopStack) (include "cubepod.boolDefaultTrue" $fg.statelessGatewayHA) (include "cubepod.boolDefaultTrue" $fg.e2bFilesystemWatch) (include "cubepod.boolDefaultTrue" $fg.e2bSecretsAPI) (include "cubepod.boolDefaultTrue" $fg.sandboxEventsAndWebhooks) (include "cubepod.k8sVolumeMountsEnabled" .) (include "cubepod.boolDefaultTrue" $fg.blockWorkspaceVolumes) (include "cubepod.firecrackerVolumeNFSEnabled" .) -}}
 {{- end }}
 
 {{/*

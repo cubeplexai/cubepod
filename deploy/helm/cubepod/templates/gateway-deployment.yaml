@@ -63,6 +63,11 @@ spec:
             {{- end }}
             - "--e2b-template-api={{ include "cubepod.boolDefaultTrue" $fg.e2bTemplateAPI }}"
             - "--feature-gate={{ include "cubepod.featureGatesCSV" . }}"
+            {{- $nfs := ((.Values.volumes).nfs | default dict) }}
+            - "--volume-nfs-service={{ include "cubepod.fullname" . }}-volume-nfs"
+            - "--volume-nfs-namespace={{ .Release.Namespace }}"
+            - "--volume-nfs-lease-url=http://{{ include "cubepod.fullname" . }}-volume-nfs.{{ .Release.Namespace }}.svc:{{ default 8080 $nfs.leasePort }}"
+            - "--volume-nfs-port={{ default 2049 $nfs.port }}"
             - "--metrics-sample-interval={{ .Values.gateway.metricsSampleInterval | default "10s" }}"
             - "--template-build={{ .Values.templateBuild.enabled }}"
             - "--template-probe-timeout={{ .Values.templateBuild.probeTimeout }}"

@@ -1,4 +1,4 @@
-.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress build-cli test test-rust test-go test-e2e test-e2b-compat test-e2b-compat-ts test-k8s-e2e test-k8s-block test-k8s-longhorn-v2 test-soak fmt vet clean docs-dev docs-build
+.PHONY: help build build-rust build-podd-init build-podd build-go build-controller build-gateway build-egress build-volume-nfs build-cli test test-rust test-go test-e2e test-e2b-compat test-e2b-compat-ts test-k8s-e2e test-k8s-block test-k8s-longhorn-v2 test-soak fmt vet clean docs-dev docs-build
 
 GO ?= go
 CARGO ?= $(shell which cargo 2>/dev/null || echo "$(HOME)/.cargo/bin/cargo")
@@ -10,7 +10,7 @@ help:
 	@echo "CubePod Build & Development Makefile (Rust In-Guest Crates + Go Control Plane)"
 	@echo ""
 	@echo "Usage:"
-	@echo "  make build              Build all binaries (Rust: podd-init, podd | Go: cubepod-controller, cubepod-gateway, cubepod-egress, cubepod)"
+	@echo "  make build              Build all binaries (Rust: podd-init, podd | Go: cubepod-controller, cubepod-gateway, cubepod-egress, cubepod-volume-nfs, cubepod)"
 	@echo "  make build-podd-init    Build Rust PID 1 OverlayFS pivot mounter (crates/podd-init)"
 	@echo "  make build-podd         Build Rust in-guest execution daemon (crates/podd)"
 	@echo "  make build-controller   Build Go Kubernetes Operator (cmd/cubepod-controller)"
@@ -26,7 +26,7 @@ help:
 	@echo "  make fmt                Format Rust and Go source code"
 	@echo "  make clean              Remove build artifacts"
 
-build: build-podd-init build-podd build-controller build-gateway build-egress build-cli
+build: build-podd-init build-podd build-controller build-gateway build-egress build-volume-nfs build-cli
 
 build-podd-init:
 	@mkdir -p $(BINDIR)
@@ -49,6 +49,10 @@ build-gateway:
 build-egress:
 	@mkdir -p $(BINDIR)
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BINDIR)/cubepod-egress ./cmd/cubepod-egress
+
+build-volume-nfs:
+	@mkdir -p $(BINDIR)
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BINDIR)/cubepod-volume-nfs ./cmd/cubepod-volume-nfs
 
 build-cli:
 	@mkdir -p $(BINDIR)
