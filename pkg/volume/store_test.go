@@ -74,8 +74,8 @@ func TestStorePermissionsAndMountPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if modeOf(t, st.Dir())&0o077 != 0 {
-		t.Fatalf("store root mode %#o", modeOf(t, st.Dir()))
+	if modeOf(t, st.Dir()) != 0o710 {
+		t.Fatalf("store root mode %#o want 0710", modeOf(t, st.Dir()))
 	}
 
 	vol, err := st.Create("cpod_test_api_key", "cpod-test-secure")
@@ -88,8 +88,8 @@ func TestStorePermissionsAndMountPaths(t *testing.T) {
 	parent := filepath.Join(st.Dir(), vol.VolumeID)
 	meta := filepath.Join(parent, "meta.json")
 	data := filepath.Join(parent, "data")
-	if modeOf(t, parent)&0o077 != 0 {
-		t.Fatalf("volume parent mode %#o", modeOf(t, parent))
+	if modeOf(t, parent) != 0o710 {
+		t.Fatalf("volume parent mode %#o want 0710", modeOf(t, parent))
 	}
 	if modeOf(t, meta)&0o077 != 0 {
 		t.Fatalf("meta mode %#o", modeOf(t, meta))
@@ -190,17 +190,38 @@ func TestStorePermissionsAndMountPaths(t *testing.T) {
 	if _, err := Open(dir, Config{}); err != nil {
 		t.Fatal(err)
 	}
-	if modeOf(t, dir)&0o077 != 0 {
-		t.Fatalf("reopen root mode %#o", modeOf(t, dir))
+	if modeOf(t, dir) != 0o710 {
+		t.Fatalf("reopen root mode %#o want 0710", modeOf(t, dir))
 	}
 
 	if os.Getuid() != 0 {
 		t.Log("skipping non-owner traversal check: not root")
 		return
 	}
-	sibling := filepath.Join(st.Dir(), other.VolumeID, "data")
-	for _, target := range []string{st.Dir(), sibling, filepath.Join(st.Dir(), other.VolumeID)} {
+	otherParent := filepath.Join(st.Dir(), other.VolumeID)
+	otherMeta := filepath.Join(otherParent, "meta.json")
+	// Directory search (group +x) lets cubepod-volume-nfs reach data/, but
+	// the store root and per-volume dirs stay unlistable and metadata is 0600.
+	for _, target := range []string{st.Dir(), otherParent, otherMeta} {
 		assertNotTraversable(t, target)
+	}
+	for _, target := range []string{data, filepath.Join(otherParent, "data")} {
+		assertTraversable(t, target)
+	}
+}
+
+func assertTraversable(t *testing.T, target string) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(),
+		"CUBE_VOLUME_DROP=1",
+		"CUBE_VOLUME_UID=1000",
+		"CUBE_VOLUME_GID=1000",
+		"CUBE_VOLUME_PATH="+target,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("uid 1000 should traverse %s: %v %s", target, err, out)
 	}
 }
 
