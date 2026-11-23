@@ -137,6 +137,9 @@ featureGates:
   sandboxEventsAndWebhooks: true
   blockWorkspaceVolumes: true
   k8sVolumeMounts: false
+  # Firecracker official volume NFS transport (CEP-0031). Default off until the
+  # implementation gate (real Firecracker guest kernel mount without nfs-common) is proven.
+  firecrackerVolumeNFS: false
 
 templateBuild:
   enabled: false
@@ -179,3 +182,23 @@ volumes:
   rwxStorageClassName: ""
   size: "20Gi"
   allowLazyLegacyClaim: true
+  # In-cluster userspace NFSv3 proxy for official volumes on Kata Firecracker (CEP-0031).
+  # Alpha is single-replica; a process restart may ESTALE active mounts. Added in v0.8.0.
+  nfs:
+    enabled: false
+    image:
+      registry: "ghcr.io"
+      repository: "cubeplexai/cubepod-volume-nfs"
+      tag: "v0.7.1"
+      pullPolicy: "IfNotPresent"
+    port: 2049
+    leasePort: 8080
+    # Alpha must remain 1: go-nfs filehandles are in-memory.
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "1000m"
+        memory: "512Mi"
