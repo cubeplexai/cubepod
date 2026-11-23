@@ -72,3 +72,30 @@ Sandbox-create failures caused by [issue #120](https://github.com/cubeplexai/cub
 are handled the same way. `kata-qemu` is another
 formal runtime, planned for its own VMM/transport/full-SDK lane and not implicitly
 covered here. Runtime and guest diagnostics join the ordinary kind test artifacts.
+
+### Experimental pinned Firecracker guest kernel
+
+Added after v0.7.1 (unreleased). The optional `KATA_FC_KERNEL_LOCK` input selects a
+custom kernel **only in the isolated Firecracker lane's private Kata config**:
+
+```bash
+KATA_VMM=fc KATA_FC_KERNEL_LOCK=/absolute/path/to/pin.json \
+  CLUSTER_NAME=cubepod-private-fc bash test/kind-e2e/run.sh
+```
+
+The **Experimental Firecracker guest kernel** workflow builds Kata 4.4.0's
+Linux 6.18.62 configuration with built-in NFSv3 and requires a real KVM guest
+preflight. Publication is opt-in. Its evidence artifact supplies `pin.json` with
+an immutable GHCR digest, exact kernel release and binary/config checksums;
+mutable tags and checksum mismatches are rejected. Private packages require an
+authorized registry login. The helper at
+`deploy/k8s/kata/guest-kernel/fetch.sh` only fetches verified files; it never runs
+the artifact image or modifies host Kata/containerd services.
+
+These are **experimental kernel candidates, not a volume-persistence proof**.
+This option does not enable `FirecrackerVolumeNFS`, change production defaults or
+remove #120/#122 test skips. Built-in NFS is necessary but not sufficient: real
+helper-free mounting, preserved pod source IP and the official SDK's
+across-destroy/recreate persistence tests must all pass separately. See
+`test/guest-kernel/README.md` in the source tree for the full version contract,
+checksums, build commands and limitations.

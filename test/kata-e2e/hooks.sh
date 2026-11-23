@@ -11,6 +11,10 @@ kata_node() {
 kata_prepare() {
   python3 -m unittest discover -s "$KATA_HERE" -p test_harness.py
   [[ "$KATA_VMM" == fc || "$KATA_VMM" == clh ]] || return 1
+  if [[ -n ${KATA_FC_KERNEL_LOCK:-} ]]; then
+    [[ "$KATA_VMM" == fc ]] || { echo 'Custom FC kernel cannot be used on another runtime'; return 1; }
+    [[ ! -e "$STATE/custom-kernel" && ! -L "$STATE/custom-kernel" && ! -e "$STATE/custom-kernel-owned" ]] || { echo 'Refusing existing custom kernel state'; return 1; }
+  fi
   [[ ! -e "$STATE/kata-owned" ]] || { echo 'Refusing existing Kata state: use down first'; return 1; }
   [[ $(uname -m) == x86_64 && $(uname -r) != 6.18.62 ]] || { echo 'Need x64 host and distinguishable guest kernel'; return 1; }
   [[ ${KEEP_CLUSTER:-0} != 1 ]] || { echo 'Kata lanes currently require owned cleanup, not KEEP_CLUSTER'; return 1; }
@@ -37,6 +41,16 @@ kata_prepare() {
   timeout 180s docker run --rm -i --name "$CLUSTER_NAME-extract" --label "io.cubepod.e2e=$CLUSTER_NAME" -v "$KATA_VOLUME:/opt/kata" "$KATA_TOOLS" tar --zstd -xf - -C / <"$bundle"
   timeout 90s docker run --rm -i --name "$CLUSTER_NAME-kvm" --label "io.cubepod.e2e=$CLUSTER_NAME" --memory=128m --cpus=1 --network none --device /dev/kvm "$KATA_TOOLS" python3 - <"$KATA_HERE/kvm_preflight.py" >"$ARTIFACTS/kvm-preflight.log" 2>&1
   timeout 90s docker run --rm -i --name "$CLUSTER_NAME-guest" --label "io.cubepod.e2e=$CLUSTER_NAME" --memory=512m --cpus=1 --network none --device /dev/kvm -v "$KATA_VOLUME:/opt/kata:ro" "$KATA_TOOLS" python3 - "$KATA_VMM" <"$KATA_HERE/guest_preflight.py" >"$ARTIFACTS/host-guest.log" 2>&1
+  if [[ -n ${KATA_FC_KERNEL_LOCK:-} ]]; then
+    [[ "$KATA_VMM" == fc ]] || { echo 'Custom FC kernel cannot be used on another runtime'; return 1; }
+    bash "$ROOT/deploy/k8s/kata/guest-kernel/fetch.sh" "$KATA_FC_KERNEL_LOCK" "$STATE/custom-kernel"
+    printf '%s\n' "$CLUSTER_NAME" > "$STATE/custom-kernel-owned"
+    export E2E_GUEST_KERNEL
+    E2E_GUEST_KERNEL=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["kernel_release"])' "$STATE/custom-kernel/pin.json")
+    timeout 30s docker run -d --name "$CLUSTER_NAME-custom-kernel" --label "io.cubepod.e2e=$CLUSTER_NAME" -v "$KATA_VOLUME:/opt/kata" "$KATA_TOOLS" sleep 90
+    timeout 30s docker cp "$STATE/custom-kernel/vmlinux" "$CLUSTER_NAME-custom-kernel:/opt/kata/share/kata-containers/vmlinux-cubepod-custom"
+    timeout 30s docker rm -f "$CLUSTER_NAME-custom-kernel"
+  fi
   KATA_MOUNT=$(timeout 30s docker volume inspect --format '{{.Mountpoint}}' "$KATA_VOLUME")
   [[ "$KATA_MOUNT" == /* && "$KATA_MOUNT" != *$'\n'* ]] || return 1
   if [[ "$KATA_VMM" == fc ]]; then
@@ -69,7 +83,7 @@ kata_configure() {
     timeout 30s docker cp "$STATE/containerd/bin/containerd" "$CLUSTER_NAME-control-plane:/usr/local/bin/containerd-e2e"
     kata_node bash -ec 'mkdir -p /etc/systemd/system/containerd.service.d; printf "[Service]\nExecStart=\nExecStart=/usr/local/bin/containerd-e2e\nEnvironment=PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin\n" >/etc/systemd/system/containerd.service.d/e2e.conf; systemctl daemon-reload'
   fi
-  timeout 180s docker exec -i "$CLUSTER_NAME-control-plane" python3 - "$KATA_VMM" "$CLUSTER_NAME" <"$KATA_HERE/configure_node.py" >"$ARTIFACTS/configure-node.log" 2>&1
+  timeout 180s docker exec -i "$CLUSTER_NAME-control-plane" python3 - "$KATA_VMM" "$CLUSTER_NAME" "${KATA_FC_KERNEL_LOCK:+custom}" <"$KATA_HERE/configure_node.py" >"$ARTIFACTS/configure-node.log" 2>&1
   kata_node systemctl restart containerd
   k wait --for=condition=Ready node --all --timeout=120s
   kata_node ctr plugins ls >"$ARTIFACTS/containerd-plugins.txt"
@@ -135,7 +149,7 @@ kata_watch_sdks() {
   # Capture actual thin-pool usage, sector geometry and filesystem headers before
   # SDK mutation and again on failure, without mounting or repairing any disk.
   kata_block_diagnostics before-sdks || echo "Read-only FC diagnostics incomplete; full SDK and cleanup assertions still required" >&2
-  export E2E_GUEST_KERNEL=6.18.62
+  export E2E_GUEST_KERNEL=${E2E_GUEST_KERNEL:-6.18.62}
   timeout 1300s kubectl --context "kind-$CLUSTER_NAME" --request-timeout=0 get pods -n "$NS" -l pod.cubeplex.ai/box --watch --output-watch-events -o json >"$ARTIFACTS/sdk-pods-watch.json" 2>"$ARTIFACTS/sdk-pods-watch.stderr" &
   KATA_WATCH_PID=$!
 }
@@ -204,5 +218,9 @@ kata_cleanup() {
   if docker image inspect "cubepod-kata-e2e-tools:$CLUSTER_NAME" >/dev/null 2>&1; then timeout 30s docker image rm "cubepod-kata-e2e-tools:$CLUSTER_NAME" || return 1; fi
   [[ -z $(docker ps -aq --filter "label=io.cubepod.e2e=$CLUSTER_NAME") ]] || return 1
   ! docker volume inspect "$volume" >/dev/null 2>&1 || return 1
+  if [[ -f "$STATE/custom-kernel-owned" && $(<"$STATE/custom-kernel-owned") == "$CLUSTER_NAME" ]]; then
+    rm -rf -- "$STATE/custom-kernel"
+    rm -f "$STATE/custom-kernel-owned"
+  fi
   rm -f "$STATE/kata-owned" "$STATE/kata-profile"
 }

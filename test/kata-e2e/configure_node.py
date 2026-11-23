@@ -8,7 +8,10 @@ import subprocess
 import sys
 import tomllib
 
-vmm, cluster = sys.argv[1:]
+vmm, cluster = sys.argv[1:3]
+custom_kernel = sys.argv[3] if len(sys.argv) > 3 else ""
+assert custom_kernel in ("", "custom")
+assert not custom_kernel or vmm == "fc"
 assert vmm in ('fc', 'clh') and re.fullmatch(r'cubepod-[a-z0-9-]+', cluster)
 base = Path('/var/lib/cubepod-kata-e2e') / cluster
 base.mkdir(parents=True, exist_ok=True)
@@ -26,6 +29,11 @@ for index in range(128):
     assert stat.S_ISBLK(actual.st_mode) and actual.st_rdev == expected, 'Unexpected private loop alias'
 print(f'Published {loop_entries} private loop aliases; no loop associated by publication', flush=True)
 config = Path(f'/opt/kata/share/defaults/kata-containers/configuration-{vmm}.toml').read_text()
+if custom_kernel:
+    kernel = '/opt/kata/share/kata-containers/vmlinux-cubepod-custom'
+    assert Path(kernel).is_file(), 'Missing checksum-verified custom guest kernel'
+    config, changed = re.subn(r'^kernel\s*=.*$', f'kernel = "{kernel}"', config, flags=re.M)
+    assert changed == 1 and tomllib.loads(config)['hypervisor']['firecracker']['kernel'] == kernel
 config = re.sub(r'^default_memory\s*=.*$', 'default_memory = 512', config, flags=re.M)
 config = re.sub(r'^default_maxvcpus\s*=.*$', 'default_maxvcpus = 1', config, flags=re.M)
 config = re.sub(r'^enable_debug\s*=.*$', 'enable_debug = true', config, flags=re.M)
