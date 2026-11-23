@@ -497,6 +497,13 @@ func (d *DockerBackend) Fork(ctx context.Context, sourceSandboxID, newSandboxID 
 	if err := cloneWithQuiesce(ctx, d.client(), sourceURL, isRunning, sourceDir, newDir); err != nil {
 		return nil, err
 	}
+	if ws := strings.TrimSpace(sourceSpec.WorkspaceHostPath); ws != "" {
+		if st, statErr := os.Stat(ws); statErr == nil && st.IsDir() {
+			if err := cloneWithQuiesce(ctx, d.client(), sourceURL, isRunning, ws, filepath.Join(newDir, "workspace")); err != nil {
+				return nil, fmt.Errorf("clone managed block workspace: %w", err)
+			}
+		}
+	}
 
 	env := copyEnv(sourceSpec.Env)
 	if env == nil {

@@ -1563,6 +1563,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				status.Message = fenceErr.Error()
 				spec.Lifecycle.LeaseExpiresAt = nil
 				r.specs[name] = spec
+				r.deleteEgressSecretsLocked(ctx, name)
 				if createdCold && status.RootfsPVCName != "" {
 					_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.RootfsPVCName)
 				}
