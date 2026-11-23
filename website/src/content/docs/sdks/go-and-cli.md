@@ -255,6 +255,12 @@ Requires `featureGates.e2bTemplateAPI=true` on the Gateway for catalog/registrat
 | `cubepod warmpool create <name> [--template <id>] [--replicas <n>]` | Create or scale a `PodWarmPool` (default template `cubeplex-ubuntu24-desktop`, replicas `2`). |
 | `cubepod warmpool list` | List all active WarmPools and their ready replica counts. |
 
+#### Volume Migration Commands (*Added in v0.8.0*)
+
+| Command | Description |
+| :--- | :--- |
+| `cubepod volume migrate-legacy --volumes-dir <dir> [--namespace <ns>] [--owner-map <file.json>] [--default-api-key <key>] [--workspace-base-dir <dir>] [--clone-to-canonical] [--dry-run]` | Idempotently adopt pre-`v0.8.0` legacy `/workspace` PVCs and local workspace directories into `/volumes` (`type: "block"`). Defaults to zero-copy in-place adoption; pass `--clone-to-canonical` to clone via CSI `VolumeSnapshot` into `vol-<id>` PVCs while keeping originals intact. |
+
 ### CLI Workflow Example
 
 ```bash

@@ -26,9 +26,23 @@ func (s *Server) plannedToPodBoxMounts(planned []volume.PlannedMount) []v1alpha1
 		if !ok {
 			continue
 		}
+		if p.Type == v1alpha1.VolumeTypeBlock {
+			blockPVC := p.PVCName
+			if blockPVC == "" {
+				blockPVC = pvc
+			}
+			out = append(out, v1alpha1.VolumeMount{
+				VolumeID: p.VolumeID,
+				Type:     v1alpha1.VolumeTypeBlock,
+				PVCName:  blockPVC,
+				Path:     p.Path,
+			})
+			continue
+		}
 		if sharedPVC != "" {
 			out = append(out, v1alpha1.VolumeMount{
 				VolumeID: p.VolumeID,
+				Type:     v1alpha1.VolumeTypeShared,
 				PVCName:  sharedPVC,
 				SubPath:  p.VolumeID + "/data",
 				Path:     p.Path,
@@ -37,6 +51,7 @@ func (s *Server) plannedToPodBoxMounts(planned []volume.PlannedMount) []v1alpha1
 		}
 		out = append(out, v1alpha1.VolumeMount{
 			VolumeID: p.VolumeID,
+			Type:     v1alpha1.VolumeTypeShared,
 			PVCName:  pvc,
 			Path:     p.Path,
 		})
@@ -55,7 +70,17 @@ func (s *Server) podBoxVolumeMounts(sandboxID string) []v1alpha1.VolumeMount {
 	}
 	planned := make([]volume.PlannedMount, 0, len(specs))
 	for _, m := range specs {
-		planned = append(planned, volume.PlannedMount{VolumeID: m.VolumeID, Name: m.VolumeName, Path: m.ContainerPath})
+		pm := volume.PlannedMount{
+			VolumeID: m.VolumeID,
+			Name:     m.VolumeName,
+			Type:     m.Type,
+			Path:     m.ContainerPath,
+		}
+		if vol, ok := st.GetByID(m.VolumeID); ok {
+			pm.Type = vol.EffectiveType()
+			pm.PVCName = vol.PVCName
+		}
+		planned = append(planned, pm)
 	}
 	return s.plannedToPodBoxMounts(planned)
 }
@@ -97,6 +122,7 @@ func (s *Server) rollbackCreatedSandbox(ctx context.Context, sandboxID string) {
 	if s.reconciler != nil {
 		_ = s.reconciler.DeleteBox(ctx, sandboxID, false)
 	}
+	s.releaseSandboxBlockPVCLeases(ctx, sandboxID)
 	s.releaseSandboxVolumeMounts(sandboxID)
 	s.releaseLocalSandbox(sandboxID)
 	if s.vault != nil {

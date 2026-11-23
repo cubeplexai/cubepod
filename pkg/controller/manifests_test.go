@@ -517,3 +517,84 @@ func TestBuildKataPod_OfficialMountsWithoutPivot(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildPodManifest_BlockWorkspaceAndSharedMountsCoexist(t *testing.T) {
+	blockID := "11111111111111111111111111111111"
+	sharedID := "22222222222222222222222222222222"
+	blockPVC := "vol-" + blockID
+	sharedPVC := "cubepod-volumes"
+
+	tpl := sampleTemplate()
+	spec := v1alpha1.PodBoxSpec{
+		RootfsGeneration: 1,
+		VolumeMounts: []v1alpha1.VolumeMount{
+			{
+				VolumeID: blockID,
+				Type:     v1alpha1.VolumeTypeBlock,
+				PVCName:  blockPVC,
+				Path:     "/workspace",
+			},
+			{
+				VolumeID: sharedID,
+				Type:     v1alpha1.VolumeTypeShared,
+				PVCName:  sharedPVC,
+				SubPath:  sharedID + "/data",
+				Path:     "/mnt/datasets",
+			},
+		},
+	}
+
+	if gotWS := controller.WorkspacePVCName("box-1", spec); gotWS != blockPVC {
+		t.Fatalf("WorkspacePVCName = %q; want %q", gotWS, blockPVC)
+	}
+	if err := controller.ValidateVolumeMounts(spec.VolumeMounts); err != nil {
+		t.Fatalf("ValidateVolumeMounts failed: %v", err)
+	}
+
+	// Reject block volume at non-/workspace path or duplicate block volume.
+	if err := controller.ValidateVolumeMounts([]v1alpha1.VolumeMount{
+		{VolumeID: blockID, Type: v1alpha1.VolumeTypeBlock, PVCName: blockPVC, Path: "/mnt/other"},
+	}); err == nil {
+		t.Fatal("expected ValidateVolumeMounts to reject block volume at non-/workspace path")
+	}
+
+	_, wsPVC := controller.BuildBlockPVCs("box-1", tpl, spec, "Block")
+	if wsPVC.Name != blockPVC {
+		t.Fatalf("wsPVC.Name = %q; want %q", wsPVC.Name, blockPVC)
+	}
+
+	pod := controller.BuildPodManifest("box-1", tpl, spec, v1alpha1.PodBoxStatus{
+		RootfsPVCName:    "box-1-rootfs-pvc",
+		WorkspacePVCName: blockPVC,
+	}, controller.PodBuildOptions{VolumeMode: "Block"})
+
+	// Verify workspace-volume in pod.Volumes points to vol-<blockID>, and block volume is NOT staged under /run/cubepod/volumes.
+	foundWorkspaceVol := false
+	for _, v := range pod.Volumes {
+		if v.Name == "workspace-volume" && v.PersistentVolumeClaim == blockPVC {
+			foundWorkspaceVol = true
+		}
+		if v.Name == blockPVC {
+			t.Fatalf("block volume PVC %s must not be added as a shared VolumeMount volume", blockPVC)
+		}
+	}
+	if !foundWorkspaceVol {
+		t.Fatalf("expected workspace-volume to reference %s, got %+v", blockPVC, pod.Volumes)
+	}
+
+	main := pod.Containers[0]
+	foundDevice := false
+	for _, dev := range main.VolumeDevices {
+		if dev.Name == "workspace-volume" && dev.DevicePath == "/dev/cubepod-workspace" {
+			foundDevice = true
+		}
+	}
+	if !foundDevice {
+		t.Fatalf("expected /dev/cubepod-workspace VolumeDevice, got %+v", main.VolumeDevices)
+	}
+	for _, vm := range main.VolumeMounts {
+		if vm.Name == blockPVC {
+			t.Fatalf("block volume %s must not appear in container.VolumeMounts: %+v", blockPVC, main.VolumeMounts)
+		}
+	}
+}

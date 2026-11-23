@@ -30,6 +30,21 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/egress"
 )
 
+const (
+	// PVCAnnotationAttachedSandbox records the single sandbox currently holding an exclusive RWO block volume lease.
+	PVCAnnotationAttachedSandbox = "cubepod.io/attached-sandbox"
+	// PVCAnnotationAttachedAt records the RFC3339 timestamp when the attach lease was acquired.
+	PVCAnnotationAttachedAt = "cubepod.io/attached-at"
+	// PVCLabelVolumeID identifies the /volumes ID owning a managed block PVC.
+	PVCLabelVolumeID = "cubepod.io/volume-id"
+	// PVCLabelManagedBy is the standard Kubernetes management label.
+	PVCLabelManagedBy = "app.kubernetes.io/managed-by"
+	// PVCLabelManagedByVolumes marks PVCs whose lifecycle is owned by /volumes (never deleted by DeleteBox).
+	PVCLabelManagedByVolumes = "cubepod-volumes"
+	// ReasonWorkspaceVolumeLeaseLost is set on a PodBox that fails controller fencing before Pod startup.
+	ReasonWorkspaceVolumeLeaseLost = "WorkspaceVolumeLeaseLost"
+)
+
 // ReconcilerOption configures a Reconciler instance.
 type ReconcilerOption func(*Reconciler)
 
@@ -565,6 +580,19 @@ func (r *Reconciler) StorageClassName() string {
 		return "standard"
 	}
 	return r.defaultStorageClass
+}
+
+// VolumeMode returns the default PVC volumeMode ("Block" or "Filesystem") configured on the reconciler.
+func (r *Reconciler) VolumeMode() string {
+	if r == nil {
+		return "Block"
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.volumeMode == "" {
+		return "Block"
+	}
+	return r.volumeMode
 }
 
 // ContextStore returns the currently configured build context and log store.
@@ -1444,7 +1472,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			rootfsPVC.Namespace = r.namespace
 			wsPVC.Namespace = r.namespace
 			_ = r.kubeClient.EnsurePVC(ctx, rootfsPVC)
-			_ = r.kubeClient.EnsurePVC(ctx, wsPVC)
+			if spec.WorkspaceBlockMount() == nil {
+				_ = r.kubeClient.EnsurePVC(ctx, wsPVC)
+			}
 		}
 		r.boxes[name] = status
 	}
@@ -1523,6 +1553,32 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 		status.Phase = v1alpha1.PodBoxPhaseRunning
 		if status.PodName == "" {
 			status.PodName = name
+		}
+		if blockMount := spec.WorkspaceBlockMount(); blockMount != nil && r.kubeClient != nil {
+			if fenceErr := r.verifyWorkspaceBlockLeaseLocked(ctx, name, blockMount.PVCName); fenceErr != nil {
+				status.Phase = v1alpha1.PodBoxPhaseFailed
+				status.PodName = ""
+				status.PodIP = ""
+				status.Reason = ReasonWorkspaceVolumeLeaseLost
+				status.Message = fenceErr.Error()
+				spec.Lifecycle.LeaseExpiresAt = nil
+				r.specs[name] = spec
+				if createdCold && status.RootfsPVCName != "" {
+					_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.RootfsPVCName)
+				}
+				_ = r.kubeClient.UpsertPodBox(ctx, v1alpha1.PodBox{
+					APIVersion: "cubepod.io/v1alpha1",
+					Kind:       "PodBox",
+					Metadata: v1alpha1.ObjectMeta{
+						Name:        name,
+						Namespace:   r.namespace,
+						Annotations: r.podBoxAnnotationsLocked(name, ""),
+					},
+					Spec:   spec,
+					Status: *status,
+				})
+				return nil, fenceErr
+			}
 		}
 		pullSecrets := append([]string{r.templatePullSecret}, r.defaultImagePullSecrets...)
 		podManifest := BuildPodManifest(name, tpl, spec, *status, PodBuildOptions{
@@ -1946,8 +2002,8 @@ func (r *Reconciler) rollbackColdCreateLocked(ctx context.Context, name string, 
 			if status.RootfsPVCName != "" {
 				_ = r.kubeClient.DeletePVC(cleanupCtx, r.namespace, status.RootfsPVCName)
 			}
-			// Preserve deterministic user workspace PVC across failures.
-			if spec.VolumeKey == "" && status.WorkspacePVCName != "" {
+			// Preserve deterministic user workspace PVC and managed /volumes block PVCs across failures.
+			if spec.VolumeKey == "" && spec.WorkspaceBlockMount() == nil && status.WorkspacePVCName != "" {
 				_ = r.kubeClient.DeletePVC(cleanupCtx, r.namespace, status.WorkspacePVCName)
 			}
 		}
@@ -2179,7 +2235,24 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 		}
 	}
 	spec, hasSpec := r.specs[name]
-	if deleteVolumes || !hasSpec || spec.VolumeKey == "" {
+	isManagedBlock := hasSpec && spec.WorkspaceBlockMount() != nil
+	if !isManagedBlock && status.WorkspacePVCName != "" && r.kubeClient != nil {
+		if pvc, err := r.kubeClient.GetPVCManifest(ctx, r.namespace, status.WorkspacePVCName); err == nil && pvc != nil {
+			if pvc.Labels[PVCLabelManagedBy] == PVCLabelManagedByVolumes {
+				isManagedBlock = true
+			}
+		}
+	}
+	if isManagedBlock {
+		// Managed /volumes block PVC lifecycle is owned exclusively by DELETE /volumes/{id};
+		// never delete it during DeleteBox even when deleteVolumes=true.
+		if status.RootfsPVCName != "" {
+			_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.RootfsPVCName)
+		}
+		if status.WorkspacePVCName != "" {
+			r.releaseWorkspaceBlockLeaseLocked(ctx, name, status.WorkspacePVCName)
+		}
+	} else if deleteVolumes || !hasSpec || spec.VolumeKey == "" {
 		if status.RootfsPVCName != "" {
 			_ = r.kubeClient.DeletePVC(ctx, r.namespace, status.RootfsPVCName)
 		}
@@ -2565,6 +2638,9 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 					if status.PodName != "" && r.kubeClient != nil {
 						_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
 					}
+					if blockMount := spec.WorkspaceBlockMount(); blockMount != nil {
+						r.releaseWorkspaceBlockLeaseLocked(ctx, name, blockMount.PVCName)
+					}
 					r.deleteEgressSecretsLocked(ctx, name)
 					*status = statusWithTerminated
 					terminated = append(terminated, name)
@@ -2868,4 +2944,43 @@ func (r *Reconciler) WarmCounter() int64 {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.warmCounter
+}
+
+// verifyWorkspaceBlockLeaseLocked checks that the managed block PVC exists and its
+// cubepod.io/attached-sandbox annotation still matches boxName (controller-side fencing).
+func (r *Reconciler) verifyWorkspaceBlockLeaseLocked(ctx context.Context, boxName, pvcName string) error {
+	if r.kubeClient == nil || pvcName == "" {
+		return nil
+	}
+	pvc, err := r.kubeClient.GetPVCManifest(ctx, r.namespace, pvcName)
+	if err != nil {
+		return fmt.Errorf("workspace block volume PVC %s unavailable: %w", pvcName, err)
+	}
+	holder := ""
+	if pvc.Annotations != nil {
+		holder = strings.TrimSpace(pvc.Annotations[PVCAnnotationAttachedSandbox])
+	}
+	if holder != boxName {
+		return fmt.Errorf("workspace block volume PVC %s lease lost (expected %q, held by %q)", pvcName, boxName, holder)
+	}
+	return nil
+}
+
+// releaseWorkspaceBlockLeaseLocked clears cubepod.io/attached-sandbox and cubepod.io/attached-at
+// on pvcName only if the lease is still held by boxName.
+func (r *Reconciler) releaseWorkspaceBlockLeaseLocked(ctx context.Context, boxName, pvcName string) {
+	if r.kubeClient == nil || pvcName == "" || boxName == "" {
+		return
+	}
+	pvc, err := r.kubeClient.GetPVCManifest(ctx, r.namespace, pvcName)
+	if err != nil || pvc == nil || pvc.Annotations == nil {
+		return
+	}
+	if strings.TrimSpace(pvc.Annotations[PVCAnnotationAttachedSandbox]) != boxName {
+		return
+	}
+	_, _ = r.kubeClient.UpdatePVCAnnotationsCAS(ctx, r.namespace, pvcName, pvc.ResourceVersion, map[string]string{
+		PVCAnnotationAttachedSandbox: "",
+		PVCAnnotationAttachedAt:      "",
+	})
 }

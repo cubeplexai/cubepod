@@ -14,7 +14,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
+	"github.com/cubeplexai/cubepod/pkg/events"
 	"github.com/cubeplexai/cubepod/pkg/gateway"
 	"github.com/cubeplexai/cubepod/pkg/volume"
 )
@@ -1457,5 +1459,274 @@ func TestVolumeKMSQuotaAndPrometheusMetrics(t *testing.T) {
 	}
 	if rejVal, _ := jMetrics["cubepod_volume_quota_rejections_total"].(float64); int(rejVal) != 2 {
 		t.Fatalf("expected cubepod_volume_quota_rejections_total=2, got %v", jMetrics["cubepod_volume_quota_rejections_total"])
+	}
+}
+
+func TestBlockWorkspaceVolume_CRUDMountSingleWriterForkAndMetrics(t *testing.T) {
+	srv, ts, mem := newVolumeHarness(t, "")
+	// Pure-block live Kubernetes mode (no SharedPVCName configured): block volumes must still work!
+	srv.SetLivePodRouting(true)
+	const apiKey = "cpod_block_key_1"
+
+	// 1. Feature gate disabled -> 501 Not Implemented.
+	srv.SetFeatureGate(gateway.FeatureGateBlockWorkspaceVolumes, false)
+	fgResp := volReq(t, http.MethodPost, ts.URL+"/volumes", apiKey, []byte(`{"name":"ws-block","type":"block","size":"20Gi"}`), "application/json")
+	fgResp.Body.Close()
+	if fgResp.StatusCode != http.StatusNotImplemented {
+		t.Fatalf("expected 501 when BlockWorkspaceVolumes disabled, got %d", fgResp.StatusCode)
+	}
+	srv.SetFeatureGate(gateway.FeatureGateBlockWorkspaceVolumes, true)
+
+	// 2. Invalid size on shared or block volume -> 400 Bad Request.
+	badShared := volReq(t, http.MethodPost, ts.URL+"/volumes", apiKey, []byte(`{"name":"sh","type":"shared","size":"10Gi"}`), "application/json")
+	badShared.Body.Close()
+	if badShared.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for size on shared volume, got %d", badShared.StatusCode)
+	}
+	badSize := volReq(t, http.MethodPost, ts.URL+"/volumes", apiKey, []byte(`{"name":"ws-bad","type":"block","size":"100Mi"}`), "application/json")
+	badSize.Body.Close()
+	if badSize.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for <1Gi block size, got %d", badSize.StatusCode)
+	}
+
+	// 3. Create type: "block" volume -> 201 Created + RWO Block PVC in K8s.
+	createResp := volReq(t, http.MethodPost, ts.URL+"/volumes", apiKey, []byte(`{"name":"ws-block","type":"block","size":"25Gi"}`), "application/json")
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("create block volume status = %d; want 201", createResp.StatusCode)
+	}
+	var created map[string]string
+	readJSON(t, createResp, &created)
+	volID := created["volumeID"]
+	if created["type"] != "block" || created["size"] != "25Gi" || volID == "" {
+		t.Fatalf("unexpected create response: %+v", created)
+	}
+	pvcName := "vol-" + volID
+	pvc, ok := mem.GetPVC("cubepod-workloads", pvcName)
+	if !ok || pvc.VolumeMode != "Block" || pvc.Size != "25Gi" || pvc.Labels[controller.PVCLabelManagedBy] != controller.PVCLabelManagedByVolumes {
+		t.Fatalf("expected RWO Block PVC %s in K8s, got ok=%v pvc=%+v", pvcName, ok, pvc)
+	}
+
+	// 4. GET /volumes & GET /volumes/{id} include type="block" and size="25Gi".
+	listResp := volReq(t, http.MethodGet, ts.URL+"/volumes", apiKey, nil, "")
+	var listItems []map[string]string
+	readJSON(t, listResp, &listItems)
+	if len(listItems) != 1 || listItems[0]["type"] != "block" || listItems[0]["size"] != "25Gi" {
+		t.Fatalf("unexpected GET /volumes items: %+v", listItems)
+	}
+
+	// 5. /volumecontent/{id}/... rejected with 400 Bad Request and string code "400".
+	contentReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/volumecontent/"+volID+"/path?path=/", nil)
+	contentReq.Header.Set("Authorization", "Bearer "+created["token"])
+	contentResp, err := http.DefaultClient.Do(contentReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contentResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on /volumecontent for block volume, got %d", contentResp.StatusCode)
+	}
+	var contentErr map[string]string
+	readJSON(t, contentResp, &contentErr)
+	if contentErr["code"] != "400" {
+		t.Fatalf("expected string error code \"400\", got %+v", contentErr)
+	}
+
+	// 6. Reject non-/workspace mount path and extension.volumeKey + block volumeMount conflict.
+	badPathResp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", apiKey, []byte(`{"templateID":"ubuntu:24.04","volumeMounts":[{"name":"ws-block","path":"/mnt/data"}]}`), "application/json")
+	badPathResp.Body.Close()
+	if badPathResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for block volume at /mnt/data, got %d", badPathResp.StatusCode)
+	}
+	conflictKeyResp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", apiKey, []byte(`{"templateID":"ubuntu:24.04","extension":{"volumeKey":"k1"},"volumeMounts":[{"name":"ws-block","path":"/workspace"}]}`), "application/json")
+	conflictKeyResp.Body.Close()
+	if conflictKeyResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 when specifying both volumeKey and block volumeMount, got %d", conflictKeyResp.StatusCode)
+	}
+
+	// 7. Attach block volume at /workspace on sandbox 1 -> 201 Created + PVC lease annotation set.
+	sb1Resp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", apiKey, []byte(`{"templateID":"ubuntu:24.04","volumeMounts":[{"name":"ws-block","path":"/workspace"}]}`), "application/json")
+	if sb1Resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create sandbox with block volume status = %d; want 201", sb1Resp.StatusCode)
+	}
+	var sb1 struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	readJSON(t, sb1Resp, &sb1)
+	pvcLeased, _ := mem.GetPVC("cubepod-workloads", pvcName)
+	if pvcLeased.Annotations[controller.PVCAnnotationAttachedSandbox] != sb1.SandboxID || pvcLeased.Annotations[controller.PVCAnnotationAttachedAt] == "" {
+		t.Fatalf("expected PVC lease annotation for %s, got %+v", sb1.SandboxID, pvcLeased.Annotations)
+	}
+
+	// 8. Concurrent attach to sandbox 2 -> 409 Conflict (+1 conflict metric).
+	sb2Resp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", apiKey, []byte(`{"templateID":"ubuntu:24.04","volumeMounts":[{"name":"ws-block","path":"/workspace"}]}`), "application/json")
+	sb2Resp.Body.Close()
+	if sb2Resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 on concurrent block mount, got %d", sb2Resp.StatusCode)
+	}
+
+	// 9. DELETE /volumes/{id} while attached -> 409 Conflict (+1 conflict metric).
+	delWhileMounted := volReq(t, http.MethodDelete, ts.URL+"/volumes/"+volID, apiKey, nil, "")
+	delWhileMounted.Body.Close()
+	if delWhileMounted.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 deleting mounted block volume, got %d", delWhileMounted.StatusCode)
+	}
+
+	// 10. Fork sandbox 1 -> child gets independent workspace PVC and does NOT steal parent's block lease.
+	forkResp := volReq(t, http.MethodPost, ts.URL+"/sandboxes/"+sb1.SandboxID+"/fork", apiKey, nil, "")
+	if forkResp.StatusCode != http.StatusCreated {
+		t.Fatalf("fork sandbox with block workspace status = %d; want 201", forkResp.StatusCode)
+	}
+	var forked struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	readJSON(t, forkResp, &forked)
+	childBox, err := mem.GetPodBox(context.Background(), "cubepod-workloads", forked.SandboxID)
+	if err != nil || childBox == nil {
+		t.Fatalf("GetPodBox(forked): %v", err)
+	}
+	if childBox.Spec.WorkspaceBlockMount() != nil || childBox.Status.WorkspacePVCName != forked.SandboxID+"-workspace-pvc" {
+		t.Fatalf("forked child must not inherit block volume: spec.VolumeMounts=%+v status.WorkspacePVCName=%q", childBox.Spec.VolumeMounts, childBox.Status.WorkspacePVCName)
+	}
+
+	// 11. Delete sandbox 1 (even with ?deleteVolumes=true) -> preserves vol-<id> PVC and clears lease.
+	delSB1 := volReq(t, http.MethodDelete, ts.URL+"/sandboxes/"+sb1.SandboxID+"?deleteVolumes=true", apiKey, nil, "")
+	delSB1.Body.Close()
+	if delSB1.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete sb1 status = %d; want 204", delSB1.StatusCode)
+	}
+	pvcReleased, stillExists := mem.GetPVC("cubepod-workloads", pvcName)
+	if !stillExists || pvcReleased.Annotations[controller.PVCAnnotationAttachedSandbox] != "" {
+		t.Fatalf("expected PVC %s preserved and lease cleared after sandbox delete, exists=%v anns=%+v", pvcName, stillExists, pvcReleased.Annotations)
+	}
+
+	// 12. Verify Prometheus metrics: cubepod_block_volumes_total=1 and cubepod_block_volume_attach_conflicts_total=2.
+	mResp, err := http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mBody, _ := io.ReadAll(mResp.Body)
+	mResp.Body.Close()
+	mText := string(mBody)
+	if !strings.Contains(mText, "cubepod_block_volumes_total 1\n") || !strings.Contains(mText, "cubepod_block_volume_attach_conflicts_total 2\n") {
+		t.Fatalf("missing block volume metrics in:\n%s", mText)
+	}
+
+	// 13. DELETE /volumes/{id} after sandbox delete -> 204 No Content and PVC deleted from K8s.
+	delVol := volReq(t, http.MethodDelete, ts.URL+"/volumes/"+volID, apiKey, nil, "")
+	delVol.Body.Close()
+	if delVol.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete volume status = %d; want 204", delVol.StatusCode)
+	}
+	if _, exists := mem.GetPVC("cubepod-workloads", pvcName); exists {
+		t.Fatalf("expected PVC %s deleted after DELETE /volumes/%s", pvcName, volID)
+	}
+}
+
+func TestBlockWorkspaceVolume_LegacyAutoAdoptionAndLazyClaimBridge(t *testing.T) {
+	srv, ts, mem := newVolumeHarness(t, "")
+	srv.SetLivePodRouting(true)
+	ctx := context.Background()
+
+	const tenantAKey = "cpod_tenant_a_key"
+	const tenantBKey = "cpod_tenant_b_key"
+	tenantAHash := events.TenantHash(tenantAKey)
+
+	// 1. Seed an active legacy PodBox with spec.VolumeKey="active-legacy-ws" owned by Tenant A.
+	activePVC := controller.SanitizeVolumeKey("active-legacy-ws") + "-workspace-pvc"
+	_ = mem.EnsurePVC(ctx, controller.BlockPVCManifest{
+		Name:       activePVC,
+		Namespace:  "cubepod-workloads",
+		VolumeMode: "Block",
+		Size:       "30Gi",
+		Labels:     map[string]string{"pod.cubeplex.ai/vol-type": "workspace"},
+	})
+	_ = mem.UpsertPodBox(ctx, v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata: v1alpha1.ObjectMeta{
+			Name:      "legacy-box-1",
+			Namespace: "cubepod-workloads",
+			Annotations: map[string]string{
+				"cubepod.io/owner-tenant": tenantAHash,
+				"cubepod.io/volume-key":   "active-legacy-ws",
+			},
+		},
+		Spec: v1alpha1.PodBoxSpec{
+			TemplateRef:  "ubuntu:24.04",
+			DesiredState: v1alpha1.DesiredStateRunning,
+			VolumeKey:    "active-legacy-ws",
+		},
+		Status: v1alpha1.PodBoxStatus{
+			Phase:            v1alpha1.PodBoxPhaseRunning,
+			WorkspacePVCName: activePVC,
+		},
+	})
+
+	// Trigger syncFromKube -> auto-adopts active-legacy-ws into Tenant A's volume store and labels the PVC.
+	srv.SyncPodBoxesOnce(ctx)
+	listResp := volReq(t, http.MethodGet, ts.URL+"/volumes", tenantAKey, nil, "")
+	var vols []map[string]string
+	readJSON(t, listResp, &vols)
+	if len(vols) != 1 || vols[0]["name"] != "active-legacy-ws" || vols[0]["type"] != "block" || vols[0]["size"] != "30Gi" {
+		t.Fatalf("expected auto-adopted volume in Tenant A GET /volumes, got %+v", vols)
+	}
+	labeledPVC, _ := mem.GetPVC("cubepod-workloads", activePVC)
+	if labeledPVC.Labels[controller.PVCLabelManagedBy] != controller.PVCLabelManagedByVolumes || labeledPVC.Labels[controller.PVCLabelVolumeID] != vols[0]["volumeID"] {
+		t.Fatalf("expected auto-adopted PVC to have cubepod-volumes labels, got %+v", labeledPVC.Labels)
+	}
+
+	// Cross-tenant attempt by Tenant B to claim active-legacy-ws via extension.volumeKey -> 403 Forbidden.
+	crossResp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", tenantBKey, []byte(`{"templateID":"ubuntu:24.04","extension":{"volumeKey":"active-legacy-ws"}}`), "application/json")
+	crossResp.Body.Close()
+	if crossResp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden on cross-tenant volumeKey claim, got %d", crossResp.StatusCode)
+	}
+
+	// 2. Seed a retained orphaned legacy PVC from an already-deleted sandbox ("retained-ws").
+	retainedPVC := controller.SanitizeVolumeKey("retained-ws") + "-workspace-pvc"
+	_ = mem.EnsurePVC(ctx, controller.BlockPVCManifest{
+		Name:       retainedPVC,
+		Namespace:  "cubepod-workloads",
+		VolumeMode: "Block",
+		Size:       "40Gi",
+		Labels:     map[string]string{"pod.cubeplex.ai/vol-type": "workspace"},
+	})
+
+	// When AllowLazyLegacyVolumeClaim=false, lazy adoption does not register into /volumes.
+	srv.SetAllowLazyLegacyVolumeClaim(false)
+	srv.SetAllowLazyLegacyVolumeClaim(true)
+
+	// Lazy claim by Tenant A via POST /sandboxes with extension.volumeKey="retained-ws" adopts it into /volumes!
+	lazyResp := volReq(t, http.MethodPost, ts.URL+"/sandboxes", tenantAKey, []byte(`{"templateID":"ubuntu:24.04","extension":{"volumeKey":"retained-ws"}}`), "application/json")
+	if lazyResp.StatusCode != http.StatusCreated {
+		t.Fatalf("lazy claim sandbox create status = %d; want 201", lazyResp.StatusCode)
+	}
+	var lazySB struct {
+		SandboxID string `json:"sandboxID"`
+	}
+	readJSON(t, lazyResp, &lazySB)
+
+	// Delete the sandbox, then DELETE /volumes/{id} on the Mode 1 adopted legacy PVC (<sanitized>-workspace-pvc)
+	// must delete the underlying PVC (verifying deleteVolumePVC label-based check works for non-vol-* names!).
+	delLazySB := volReq(t, http.MethodDelete, ts.URL+"/sandboxes/"+lazySB.SandboxID, tenantAKey, nil, "")
+	delLazySB.Body.Close()
+
+	listAfterLazy := volReq(t, http.MethodGet, ts.URL+"/volumes", tenantAKey, nil, "")
+	readJSON(t, listAfterLazy, &vols)
+	var retainedVolID string
+	for _, v := range vols {
+		if v["name"] == "retained-ws" {
+			retainedVolID = v["volumeID"]
+		}
+	}
+	if retainedVolID == "" {
+		t.Fatalf("expected retained-ws in GET /volumes, got %+v", vols)
+	}
+	delAdoptedVol := volReq(t, http.MethodDelete, ts.URL+"/volumes/"+retainedVolID, tenantAKey, nil, "")
+	delAdoptedVol.Body.Close()
+	if delAdoptedVol.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete adopted legacy volume status = %d; want 204", delAdoptedVol.StatusCode)
+	}
+	if _, stillThere := mem.GetPVC("cubepod-workloads", retainedPVC); stillThere {
+		t.Fatalf("expected Mode 1 adopted legacy PVC %s to be deleted by DELETE /volumes/%s", retainedPVC, retainedVolID)
 	}
 }

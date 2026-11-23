@@ -2245,6 +2245,16 @@ components:
           type: string
           pattern: "^[a-zA-Z0-9_-]+$"
           maxLength: 128
+        type:
+          type: string
+          enum:
+            - shared
+            - block
+          default: shared
+          description: Volume storage type. "shared" is a ReadWriteMany filesystem volume; "block" is an exclusive ReadWriteOnce /workspace block volume.
+        size:
+          type: string
+          description: Requested block volume capacity as a Kubernetes resource quantity (e.g. "20Gi"). Valid only for type "block" (range 1Gi..1Ti, default 20Gi).
     VolumeInfo:
       type: object
       required:
@@ -2254,6 +2264,13 @@ components:
         volumeID:
           type: string
         name:
+          type: string
+        type:
+          type: string
+          enum:
+            - shared
+            - block
+        size:
           type: string
     VolumeWithToken:
       allOf:

@@ -3830,3 +3830,169 @@ func TestMarkFailed_SyncsMemoryClearsLeaseAndBlocksResurrection(t *testing.T) {
 		t.Fatalf("Terminated box phase = %q; want Terminated", termBox.Status.Phase)
 	}
 }
+
+func TestReconciler_BlockWorkspaceVolume_FencingDeleteProtectionForkAndReapIdle(t *testing.T) {
+	ctx := context.Background()
+	kc := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(kc),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+
+	volID := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	volPVC := "vol-" + volID
+	nowStr := time.Now().UTC().Format(time.RFC3339Nano)
+
+	// 1. Pre-provision managed block PVC with cubepod-volumes ownership labels and lease for box-1.
+	if err := kc.EnsurePVC(ctx, controller.BlockPVCManifest{
+		Name:             volPVC,
+		Namespace:        "cubepod-workloads",
+		StorageClassName: "standard",
+		VolumeMode:       "Block",
+		Size:             "20Gi",
+		AccessModes:      []string{"ReadWriteOnce"},
+		Labels: map[string]string{
+			controller.PVCLabelVolumeID:  volID,
+			controller.PVCLabelManagedBy: controller.PVCLabelManagedByVolumes,
+		},
+		Annotations: map[string]string{
+			controller.PVCAnnotationAttachedSandbox: "box-1",
+			controller.PVCAnnotationAttachedAt:      nowStr,
+		},
+	}); err != nil {
+		t.Fatalf("EnsurePVC(%s): %v", volPVC, err)
+	}
+
+	spec1 := v1alpha1.PodBoxSpec{
+		TemplateRef:  "ubuntu:24.04",
+		DesiredState: v1alpha1.DesiredStateRunning,
+		Lifecycle:    v1alpha1.LifecyclePolicy{PausedTTLSeconds: 10},
+		VolumeMounts: []v1alpha1.VolumeMount{
+			{
+				VolumeID: volID,
+				Type:     v1alpha1.VolumeTypeBlock,
+				PVCName:  volPVC,
+				Path:     "/workspace",
+			},
+		},
+	}
+
+	st1, err := r.Reconcile(ctx, "box-1", spec1)
+	if err != nil {
+		t.Fatalf("Reconcile(box-1): %v", err)
+	}
+	if st1.Phase != v1alpha1.PodBoxPhaseRunning || st1.WorkspacePVCName != volPVC {
+		t.Fatalf("st1 = %+v; want Running with WorkspacePVCName=%s", st1, volPVC)
+	}
+	if _, leaked := kc.GetPVC("cubepod-workloads", "box-1-workspace-pvc"); leaked {
+		t.Fatal("ephemeral box-1-workspace-pvc must not be created when managed block mount is present")
+	}
+
+	// 2. Controller Fencing Check: box-2 attempting to start with the same PVC while lease is held by box-1
+	// MUST fail with WorkspaceVolumeLeaseLost and transition to Failed without starting a Pod.
+	_, err = r.Reconcile(ctx, "box-2", spec1)
+	if err == nil {
+		t.Fatal("expected Reconcile(box-2) to fail controller fencing check")
+	}
+	st2, ok := r.GetBox("box-2")
+	if !ok || st2.Phase != v1alpha1.PodBoxPhaseFailed || st2.Reason != controller.ReasonWorkspaceVolumeLeaseLost {
+		t.Fatalf("st2 = %+v (ok=%v); want Phase=Failed Reason=%s", st2, ok, controller.ReasonWorkspaceVolumeLeaseLost)
+	}
+
+	// 3. ForkFrom box-1 creates an independent child workspace PVC and does NOT inherit the block volume.
+	forkSpec := v1alpha1.PodBoxSpec{
+		TemplateRef:  "ubuntu:24.04",
+		DesiredState: v1alpha1.DesiredStateRunning,
+		ForkFrom:     &v1alpha1.ForkSource{PodBoxName: "box-1"},
+	}
+	forkSt, err := r.Reconcile(ctx, "box-fork", forkSpec)
+	if err != nil {
+		t.Fatalf("Reconcile(box-fork): %v", err)
+	}
+	if forkSt.WorkspacePVCName != "box-fork-workspace-pvc" {
+		t.Fatalf("forkSt.WorkspacePVCName = %q; want box-fork-workspace-pvc", forkSt.WorkspacePVCName)
+	}
+
+	// 4. Pause box-1, then expire PausedTTL via ReapIdle -> Terminated must clear the PVC attach lease.
+	spec1Paused := spec1
+	spec1Paused.DesiredState = v1alpha1.DesiredStatePaused
+	if _, err := r.Reconcile(ctx, "box-1", spec1Paused); err != nil {
+		t.Fatalf("Pause(box-1): %v", err)
+	}
+	_, terminated := r.ReapIdle(ctx, time.Now().UTC().Add(30*time.Second))
+	if len(terminated) != 1 || terminated[0] != "box-1" {
+		t.Fatalf("ReapIdle terminated = %v; want [box-1]", terminated)
+	}
+	pvcAfterReap, err := kc.GetPVCManifest(ctx, "cubepod-workloads", volPVC)
+	if err != nil {
+		t.Fatalf("GetPVCManifest after ReapIdle: %v", err)
+	}
+	if holder := pvcAfterReap.Annotations[controller.PVCAnnotationAttachedSandbox]; holder != "" {
+		t.Fatalf("expected ReapIdle to clear attached-sandbox annotation, got %q", holder)
+	}
+
+	// 5. Re-acquire lease for box-3, reconcile Running, then DeleteBox with deleteVolumes=true:
+	// managed block PVC MUST be preserved and its lease cleared.
+	_, err = kc.UpdatePVCAnnotationsCAS(ctx, "cubepod-workloads", volPVC, pvcAfterReap.ResourceVersion, map[string]string{
+		controller.PVCAnnotationAttachedSandbox: "box-3",
+		controller.PVCAnnotationAttachedAt:      nowStr,
+	})
+	if err != nil {
+		t.Fatalf("UpdatePVCAnnotationsCAS(box-3): %v", err)
+	}
+	if _, err := r.Reconcile(ctx, "box-3", spec1); err != nil {
+		t.Fatalf("Reconcile(box-3): %v", err)
+	}
+	if err := r.DeleteBox(ctx, "box-3", true); err != nil {
+		t.Fatalf("DeleteBox(box-3, deleteVolumes=true): %v", err)
+	}
+	pvcAfterDel, err := kc.GetPVCManifest(ctx, "cubepod-workloads", volPVC)
+	if err != nil {
+		t.Fatalf("managed block PVC %s must NOT be deleted by DeleteBox(deleteVolumes=true): %v", volPVC, err)
+	}
+	if holder := pvcAfterDel.Annotations[controller.PVCAnnotationAttachedSandbox]; holder != "" {
+		t.Fatalf("expected DeleteBox to clear attached-sandbox annotation, got %q", holder)
+	}
+
+	// 6. Mode 1 in-place adopted legacy PVC (<sanitized>-workspace-pvc) with cubepod-volumes label
+	// must also survive DeleteBox(deleteVolumes=true) even on !hasSpec cache-miss after controller restart.
+	adoptedPVC := "legacy-user-ws-workspace-pvc"
+	if err := kc.EnsurePVC(ctx, controller.BlockPVCManifest{
+		Name:        adoptedPVC,
+		Namespace:   "cubepod-workloads",
+		VolumeMode:  "Block",
+		Size:        "20Gi",
+		AccessModes: []string{"ReadWriteOnce"},
+		Labels: map[string]string{
+			controller.PVCLabelVolumeID:  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			controller.PVCLabelManagedBy: controller.PVCLabelManagedByVolumes,
+		},
+	}); err != nil {
+		t.Fatalf("EnsurePVC(%s): %v", adoptedPVC, err)
+	}
+	if err := kc.UpsertPodBox(ctx, v1alpha1.PodBox{
+		APIVersion: "cubepod.io/v1alpha1",
+		Kind:       "PodBox",
+		Metadata:   v1alpha1.ObjectMeta{Name: "box-adopted", Namespace: "cubepod-workloads"},
+		Status: v1alpha1.PodBoxStatus{
+			Phase:            v1alpha1.PodBoxPhaseRunning,
+			RootfsPVCName:    "box-adopted-rootfs-pvc",
+			WorkspacePVCName: adoptedPVC,
+		},
+	}); err != nil {
+		t.Fatalf("UpsertPodBox(box-adopted): %v", err)
+	}
+	rRestarted := controller.NewReconciler(
+		controller.WithKubeClient(kc),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	if _, err := rRestarted.SyncFromKube(ctx); err != nil {
+		t.Fatalf("SyncFromKube: %v", err)
+	}
+	if err := rRestarted.DeleteBox(ctx, "box-adopted", true); err != nil {
+		t.Fatalf("DeleteBox(box-adopted, true): %v", err)
+	}
+	if _, err := kc.GetPVCManifest(ctx, "cubepod-workloads", adoptedPVC); err != nil {
+		t.Fatalf("adopted legacy PVC %s with cubepod-volumes label must survive DeleteBox(!hasSpec, deleteVolumes=true): %v", adoptedPVC, err)
+	}
+}

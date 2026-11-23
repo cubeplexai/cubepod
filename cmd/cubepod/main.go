@@ -53,6 +53,7 @@ Commands:
   sandbox delete <id>                         Permanently terminate and delete sandbox
   warmpool create <name> [flags]              Create or scale a PodWarmPool
   warmpool list                               List all active PodWarmPools
+  volume migrate-legacy [flags]               Adopt legacy /workspace PVCs or local workspaces into /volumes
 `, version.Version)
 }
 
@@ -139,6 +140,9 @@ func main() {
 			os.Exit(1)
 		}
 		handleWarmpool(ctx, c, subArgs, jsonOutput)
+
+	case "volume":
+		handleVolume(ctx, subArgs, jsonOutput)
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", cmd)

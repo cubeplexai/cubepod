@@ -529,11 +529,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	volumeMountsTotal := s.VolumeMountsTotal.Load() + m.VolumeMountsTotal.Load()
 	volumeMountErrorsTotal := s.VolumeMountErrorsTotal.Load() + m.VolumeMountErrorsTotal.Load()
 	volumeQuotaRejectionsTotal := s.VolumeQuotaRejectionsTotal.Load() + m.VolumeQuotaRejectionsTotal.Load()
+	blockVolumeAttachConflictsTotal := s.BlockVolumeAttachConflictsTotal.Load()
 	var volCapStats volume.CapacityStats
+	blockVolumesTotal := 0
 	if volStore := s.volumeStore.Load(); volStore != nil {
 		if cs, err := volStore.CapacityStats(); err == nil {
 			volCapStats = cs
 		}
+		blockVolumesTotal = volStore.BlockVolumeCount()
 	}
 	crdResyncsTotal := s.crdResyncsTotal.Load() + m.CRDResyncsTotal.Load()
 
@@ -571,29 +574,31 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		e2bCount, e2bSum := m.e2bRequestDuration.Snapshot()
 		forkCount, forkSum := m.sandboxForkDur.Snapshot()
 		payload := map[string]interface{}{
-			"cubepod_gateway_http_requests_total":      m.HTTPRequestsTotal.Load(),
-			"cubepod_gateway_requests_total":           m.HTTPRequestsTotal.Load(),
-			"cubepod_gateway_sandboxes_created_total":  m.SandboxesCreatedTotal.Load(),
-			"cubepod_gateway_autoresume_total":         m.AutoresumeTotal.Load(),
-			"cubepod_gateway_auto_resumes_total":       m.AutoresumeTotal.Load(),
-			"cubepod_gateway_commands_executed_total":  m.CommandsExecutedTotal.Load(),
-			"cubepod_gateway_sandboxes_active_running": runningCount,
-			"cubepod_gateway_sandboxes_active_paused":  pausedCount,
-			"cubepod_gateway_warmpools_total":          warmpoolsTotal,
-			"cubepod_panel_active_sessions":            m.PanelActiveSessions.Load(),
-			"cubepod_secrets_store_count":              secretsStoreCount,
-			"cubepod_watch_streams_active":             watchStreamsActive,
-			"cubepod_watchers_active":                  watchersActive,
-			"cubepod_watch_events_total":               m.WatchEventsTotal.Load(),
-			"cubepod_watch_overflows_total":            m.WatchOverflowsTotal.Load(),
-			"cubepod_volume_mounts_total":              volumeMountsTotal,
-			"cubepod_volume_mount_errors_total":        volumeMountErrorsTotal,
-			"cubepod_volume_quota_rejections_total":    volumeQuotaRejectionsTotal,
-			"cubepod_volumes_storage_capacity_bytes":   volCapStats.CapacityBytes,
-			"cubepod_volumes_storage_used_bytes":       volCapStats.UsedBytes,
-			"cubepod_volumes_storage_available_bytes":  volCapStats.AvailableBytes,
-			"cubepod_volumes_total":                    volCapStats.VolumesTotal,
-			"cubepod_gateway_crd_resyncs_total":        crdResyncsTotal,
+			"cubepod_gateway_http_requests_total":         m.HTTPRequestsTotal.Load(),
+			"cubepod_gateway_requests_total":              m.HTTPRequestsTotal.Load(),
+			"cubepod_gateway_sandboxes_created_total":     m.SandboxesCreatedTotal.Load(),
+			"cubepod_gateway_autoresume_total":            m.AutoresumeTotal.Load(),
+			"cubepod_gateway_auto_resumes_total":          m.AutoresumeTotal.Load(),
+			"cubepod_gateway_commands_executed_total":     m.CommandsExecutedTotal.Load(),
+			"cubepod_gateway_sandboxes_active_running":    runningCount,
+			"cubepod_gateway_sandboxes_active_paused":     pausedCount,
+			"cubepod_gateway_warmpools_total":             warmpoolsTotal,
+			"cubepod_panel_active_sessions":               m.PanelActiveSessions.Load(),
+			"cubepod_secrets_store_count":                 secretsStoreCount,
+			"cubepod_watch_streams_active":                watchStreamsActive,
+			"cubepod_watchers_active":                     watchersActive,
+			"cubepod_watch_events_total":                  m.WatchEventsTotal.Load(),
+			"cubepod_watch_overflows_total":               m.WatchOverflowsTotal.Load(),
+			"cubepod_volume_mounts_total":                 volumeMountsTotal,
+			"cubepod_volume_mount_errors_total":           volumeMountErrorsTotal,
+			"cubepod_volume_quota_rejections_total":       volumeQuotaRejectionsTotal,
+			"cubepod_volumes_storage_capacity_bytes":      volCapStats.CapacityBytes,
+			"cubepod_volumes_storage_used_bytes":          volCapStats.UsedBytes,
+			"cubepod_volumes_storage_available_bytes":     volCapStats.AvailableBytes,
+			"cubepod_volumes_total":                       volCapStats.VolumesTotal,
+			"cubepod_block_volumes_total":                 blockVolumesTotal,
+			"cubepod_block_volume_attach_conflicts_total": blockVolumeAttachConflictsTotal,
+			"cubepod_gateway_crd_resyncs_total":           crdResyncsTotal,
 			"cubepod_e2b_request_duration_seconds": map[string]interface{}{
 				"count": e2bCount,
 				"sum":   e2bSum,
@@ -805,6 +810,14 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(&buf, "# HELP cubepod_volumes_total Current number of volumes stored across tenants\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_volumes_total gauge\n")
 	fmt.Fprintf(&buf, "cubepod_volumes_total %d\n", volCapStats.VolumesTotal)
+
+	fmt.Fprintf(&buf, "# HELP cubepod_block_volumes_total Active managed type=block workspace volumes across tenants\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_block_volumes_total gauge\n")
+	fmt.Fprintf(&buf, "cubepod_block_volumes_total %d\n", blockVolumesTotal)
+
+	fmt.Fprintf(&buf, "# HELP cubepod_block_volume_attach_conflicts_total Rejected concurrent block volume attach or delete 409 Conflict events\n")
+	fmt.Fprintf(&buf, "# TYPE cubepod_block_volume_attach_conflicts_total counter\n")
+	fmt.Fprintf(&buf, "cubepod_block_volume_attach_conflicts_total %d\n", blockVolumeAttachConflictsTotal)
 
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_warmpools_total Total configured warm pools\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_warmpools_total gauge\n")

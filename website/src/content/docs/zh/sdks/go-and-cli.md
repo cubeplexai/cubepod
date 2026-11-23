@@ -255,6 +255,12 @@ cubepod mcp    # 通过 stdio 启动 MCP JSON-RPC 2.0 服务端
 | `cubepod warmpool create <name> [--template <id>] [--replicas <n>]` | 创建或扩缩容 `PodWarmPool`（默认模板 `cubeplex-ubuntu24-desktop`，副本数 `2`）。 |
 | `cubepod warmpool list` | 列举所有 WarmPool 及其就绪副本数量。 |
 
+#### 卷迁移命令（*v0.8.0 新增*）
+
+| 命令 | 说明 |
+| :--- | :--- |
+| `cubepod volume migrate-legacy --volumes-dir <dir> [--namespace <ns>] [--owner-map <file.json>] [--default-api-key <key>] [--workspace-base-dir <dir>] [--clone-to-canonical] [--dry-run]` | 幂等接管 `v0.8.0` 之前的遗留 `/workspace` PVC 与本地工作区目录至 `/volumes`（`type: "block"`）。默认执行零拷贝原地接管；传入 `--clone-to-canonical` 可通过 CSI `VolumeSnapshot` 克隆为规范 `vol-<id>` PVC 并保留原 PVC 直至验证完成。 |
+
 ### CLI 工作流示例
 
 ```bash

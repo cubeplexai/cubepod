@@ -92,9 +92,11 @@ type VolumeSnapshot struct {
 
 // coreV1Metadata represents common object metadata in the Kubernetes v1 API.
 type coreV1Metadata struct {
-	Name      string            `json:"name"`
-	Namespace string            `json:"namespace,omitempty"`
-	Labels    map[string]string `json:"labels,omitempty"`
+	Name            string            `json:"name"`
+	Namespace       string            `json:"namespace,omitempty"`
+	ResourceVersion string            `json:"resourceVersion,omitempty"`
+	Labels          map[string]string `json:"labels,omitempty"`
+	Annotations     map[string]string `json:"annotations,omitempty"`
 }
 
 // coreV1ResourceRequirements describes the compute resource requirements for a container or PVC.
@@ -254,9 +256,11 @@ func toCoreV1PVC(pvc BlockPVCManifest, namespace string) coreV1PVC {
 		APIVersion: "v1",
 		Kind:       "PersistentVolumeClaim",
 		Metadata: coreV1Metadata{
-			Name:      pvc.Name,
-			Namespace: namespace,
-			Labels:    pvc.Labels,
+			Name:            pvc.Name,
+			Namespace:       namespace,
+			ResourceVersion: pvc.ResourceVersion,
+			Labels:          pvc.Labels,
+			Annotations:     pvc.Annotations,
 		},
 		Spec: coreV1PVCSpec{
 			AccessModes: pvc.AccessModes,
@@ -472,4 +476,37 @@ func toCoreV1Pod(pod PodManifest, namespace string) coreV1Pod {
 			ImagePullSecrets: imagePullSecrets,
 		},
 	}
+}
+
+type coreV1PVCList struct {
+	Items []coreV1PVC `json:"items"`
+}
+
+func fromCoreV1PVC(raw coreV1PVC) BlockPVCManifest {
+	m := BlockPVCManifest{
+		Name:            raw.Metadata.Name,
+		Namespace:       raw.Metadata.Namespace,
+		ResourceVersion: raw.Metadata.ResourceVersion,
+		VolumeMode:      raw.Spec.VolumeMode,
+		AccessModes:     append([]string(nil), raw.Spec.AccessModes...),
+	}
+	if raw.Spec.StorageClassName != nil {
+		m.StorageClassName = *raw.Spec.StorageClassName
+	}
+	if raw.Spec.Resources.Requests != nil {
+		m.Size = raw.Spec.Resources.Requests["storage"]
+	}
+	if len(raw.Metadata.Labels) > 0 {
+		m.Labels = make(map[string]string, len(raw.Metadata.Labels))
+		for k, v := range raw.Metadata.Labels {
+			m.Labels[k] = v
+		}
+	}
+	if len(raw.Metadata.Annotations) > 0 {
+		m.Annotations = make(map[string]string, len(raw.Metadata.Annotations))
+		for k, v := range raw.Metadata.Annotations {
+			m.Annotations[k] = v
+		}
+	}
+	return m
 }

@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -73,9 +74,24 @@ var (
 	ErrInvalidKey = errors.New("invalid api key")
 	// ErrLimitExceeded means the tenant has reached its volume or byte quota.
 	ErrLimitExceeded = errors.New("volume limit exceeded")
+	// ErrInvalidType means an unsupported volume type was requested.
+	ErrInvalidType = errors.New("invalid volume type")
+	// ErrInvalidSize means an invalid or out-of-range block volume size was requested.
+	ErrInvalidSize = errors.New("invalid volume size")
+	// ErrUnsupportedType means the operation is not supported for this volume type (e.g. /volumecontent on block).
+	ErrUnsupportedType = errors.New("content API is only supported for shared volumes")
 
 	volumeNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 	volumeIDRe   = regexp.MustCompile(`^[a-f0-9]{32}$`)
+)
+
+const (
+	// DefaultBlockVolumeSize is the default size for type: "block" volumes when omitted.
+	DefaultBlockVolumeSize = "20Gi"
+	// MinBlockVolumeBytes is the minimum allowed size for a block volume (1 GiB).
+	MinBlockVolumeBytes int64 = 1 << 30
+	// MaxBlockVolumeBytes is the maximum allowed size for a block volume (1 TiB).
+	MaxBlockVolumeBytes int64 = 1 << 40
 )
 
 // Config controls where volume bytes live, KMS token encryption, tenant quotas,
@@ -109,18 +125,59 @@ type CapacityStats struct {
 
 // Volume is the durable record returned to the management API.
 type Volume struct {
-	VolumeID       string    `json:"volumeID"`
-	Name           string    `json:"name"`
-	Token          string    `json:"token,omitempty"`
-	EncryptedToken string    `json:"encryptedToken,omitempty"`
-	KMSKeyID       string    `json:"kmsKeyID,omitempty"`
-	Tenant         string    `json:"tenant"`
-	CreatedAt      time.Time `json:"createdAt"`
-	DockerVolume   string    `json:"dockerVolume,omitempty"`
-	PVCName        string    `json:"pvcName,omitempty"`
-	PVCNamespace   string    `json:"pvcNamespace,omitempty"`
-	DataDir        string    `json:"-"`
-	DaemonDataDir  string    `json:"-"`
+	VolumeID        string    `json:"volumeID"`
+	Name            string    `json:"name"`
+	Type            string    `json:"type,omitempty"`
+	Size            string    `json:"size,omitempty"`
+	SizeBytes       int64     `json:"sizeBytes,omitempty"`
+	LegacyVolumeKey string    `json:"legacyVolumeKey,omitempty"`
+	OwnerTenantHash string    `json:"ownerTenantHash,omitempty"`
+	Token           string    `json:"token,omitempty"`
+	EncryptedToken  string    `json:"encryptedToken,omitempty"`
+	KMSKeyID        string    `json:"kmsKeyID,omitempty"`
+	Tenant          string    `json:"tenant"`
+	CreatedAt       time.Time `json:"createdAt"`
+	DockerVolume    string    `json:"dockerVolume,omitempty"`
+	PVCName         string    `json:"pvcName,omitempty"`
+	PVCNamespace    string    `json:"pvcNamespace,omitempty"`
+	DataDir         string    `json:"-"`
+	DaemonDataDir   string    `json:"-"`
+}
+
+// EffectiveType returns the normalized volume type ("shared" when empty).
+func (v Volume) EffectiveType() string {
+	if strings.EqualFold(strings.TrimSpace(v.Type), v1alpha1.VolumeTypeBlock) {
+		return v1alpha1.VolumeTypeBlock
+	}
+	return v1alpha1.VolumeTypeShared
+}
+
+// IsBlock reports whether this volume is an exclusive RWO block workspace volume.
+func (v Volume) IsBlock() bool {
+	return v.EffectiveType() == v1alpha1.VolumeTypeBlock
+}
+
+// CreateOpts configures optional fields when creating a volume.
+type CreateOpts struct {
+	Type            string
+	Size            string
+	SizeBytes       int64
+	LegacyVolumeKey string
+}
+
+// AdoptBlockVolumeOpts registers an existing legacy block PVC (or local directory)
+// into the volume store in-place without copying data.
+type AdoptBlockVolumeOpts struct {
+	APIKey          string
+	TenantHash      string
+	OwnerTenantHash string
+	Name            string
+	VolumeID        string
+	PVCName         string
+	PVCNamespace    string
+	Size            string
+	SizeBytes       int64
+	LegacyVolumeKey string
 }
 
 // Entry is a VolumeEntryStat payload.
@@ -156,6 +213,8 @@ type MountRequest struct {
 type PlannedMount struct {
 	VolumeID string
 	Name     string
+	Type     string
+	PVCName  string
 	Path     string
 }
 
@@ -163,6 +222,7 @@ type PlannedMount struct {
 type MountSpec struct {
 	VolumeName    string
 	VolumeID      string
+	Type          string
 	ContainerPath string
 	// HostPath is the path the Docker daemon should bind. It equals the
 	// gateway data directory when HostDir is unset.
@@ -303,6 +363,26 @@ func rawKeyHash(apiKey string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func ownerKeyHash(apiKey string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(apiKey)))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *Store) promoteOwnerTenantLocked(tenant, apiKey string) {
+	if tenant == "" || apiKey == "" {
+		return
+	}
+	oh := ownerKeyHash(apiKey)
+	for id, rec := range s.vols {
+		if rec.meta.Tenant == "" && rec.meta.OwnerTenantHash == oh {
+			delete(s.byName, nameKey("owner:"+oh, rec.meta.Name))
+			rec.meta.Tenant = tenant
+			s.byName[nameKey(tenant, rec.meta.Name)] = id
+			_ = s.saveMetaUnlocked(rec)
+		}
+	}
+}
+
 // resolveTenantLocked resolves an API key to its canonical tenant ID, rejecting
 // empty or rotated/revoked keys. Caller must hold s.mu.Lock().
 func (s *Store) resolveTenantLocked(apiKey string) (string, error) {
@@ -327,14 +407,93 @@ func ValidName(name string) bool {
 	return name != "" && len(name) <= maxVolumeNameLen && volumeNameRe.MatchString(name)
 }
 
-// Create inserts a volume for the API key's tenant.
+// ParseBlockSize parses a positive Kubernetes storage quantity (e.g. "20Gi", "1024Mi", "1Ti")
+// within [MinBlockVolumeBytes, MaxBlockVolumeBytes]. Empty string defaults to DefaultBlockVolumeSize.
+func ParseBlockSize(raw string) (string, int64, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return DefaultBlockVolumeSize, 20 << 30, nil
+	}
+	var numEnd int
+	for numEnd < len(s) && s[numEnd] >= '0' && s[numEnd] <= '9' {
+		numEnd++
+	}
+	if numEnd == 0 {
+		return "", 0, ErrInvalidSize
+	}
+	val, err := strconv.ParseInt(s[:numEnd], 10, 64)
+	if err != nil || val <= 0 {
+		return "", 0, ErrInvalidSize
+	}
+	unit := s[numEnd:]
+	var mult int64
+	switch unit {
+	case "Mi":
+		mult = 1 << 20
+	case "Gi":
+		mult = 1 << 30
+	case "Ti":
+		mult = 1 << 40
+	case "M":
+		mult = 1_000_000
+	case "G":
+		mult = 1_000_000_000
+	case "T":
+		mult = 1_000_000_000_000
+	default:
+		return "", 0, ErrInvalidSize
+	}
+	if val > MaxBlockVolumeBytes/mult {
+		return "", 0, ErrInvalidSize
+	}
+	bytes := val * mult
+	if bytes < MinBlockVolumeBytes || bytes > MaxBlockVolumeBytes {
+		return "", 0, ErrInvalidSize
+	}
+	return s, bytes, nil
+}
+
+// Create inserts a shared volume for the API key's tenant.
 // KMS envelope wrapping runs outside Store.mu so external HTTP KMS calls never block other tenants.
 func (s *Store) Create(apiKey, name string) (Volume, error) {
+	return s.CreateWithOptions(apiKey, name, CreateOpts{Type: v1alpha1.VolumeTypeShared})
+}
+
+// CreateWithOptions inserts a shared or block volume for the API key's tenant.
+func (s *Store) CreateWithOptions(apiKey, name string, opts CreateOpts) (Volume, error) {
 	if apiKey == "" {
 		return Volume{}, ErrUnauthorized
 	}
 	if !ValidName(name) {
 		return Volume{}, ErrInvalidName
+	}
+	volType := strings.TrimSpace(opts.Type)
+	if volType == "" {
+		volType = v1alpha1.VolumeTypeShared
+	}
+	if volType != v1alpha1.VolumeTypeShared && volType != v1alpha1.VolumeTypeBlock {
+		return Volume{}, ErrInvalidType
+	}
+	var sizeStr string
+	var sizeBytes int64
+	if volType == v1alpha1.VolumeTypeShared {
+		if strings.TrimSpace(opts.Size) != "" || opts.SizeBytes > 0 {
+			return Volume{}, ErrInvalidSize
+		}
+	} else {
+		if opts.SizeBytes > 0 && strings.TrimSpace(opts.Size) != "" {
+			sizeStr = strings.TrimSpace(opts.Size)
+			sizeBytes = opts.SizeBytes
+			if sizeBytes < MinBlockVolumeBytes || sizeBytes > MaxBlockVolumeBytes {
+				return Volume{}, ErrInvalidSize
+			}
+		} else {
+			var err error
+			sizeStr, sizeBytes, err = ParseBlockSize(opts.Size)
+			if err != nil {
+				return Volume{}, err
+			}
+		}
 	}
 
 	s.mu.Lock()
@@ -343,6 +502,7 @@ func (s *Store) Create(apiKey, name string) (Volume, error) {
 		s.mu.Unlock()
 		return Volume{}, err
 	}
+	s.promoteOwnerTenantLocked(tenant, apiKey)
 	if _, ok := s.byName[nameKey(tenant, name)]; ok {
 		s.mu.Unlock()
 		return Volume{}, ErrExists
@@ -357,8 +517,23 @@ func (s *Store) Create(apiKey, name string) (Volume, error) {
 		s.mu.Unlock()
 		return Volume{}, ErrLimitExceeded
 	}
+	maxTenantBytes := s.cfg.MaxBytesPerTenant
 	kms := s.cfg.KMS
 	s.mu.Unlock()
+
+	var qmu *sync.Mutex
+	if volType == v1alpha1.VolumeTypeBlock && maxTenantBytes > 0 {
+		qmu = s.tenantQuotaLock(tenant)
+		qmu.Lock()
+		defer qmu.Unlock()
+		used, err := s.tenantUsedBytes(tenant)
+		if err != nil {
+			return Volume{}, err
+		}
+		if used+sizeBytes > maxTenantBytes {
+			return Volume{}, ErrLimitExceeded
+		}
+	}
 
 	id, err := newID()
 	if err != nil {
@@ -398,15 +573,19 @@ func (s *Store) Create(apiKey, name string) (Volume, error) {
 	}
 	rec := &volRec{
 		meta: Volume{
-			VolumeID:       id,
-			Name:           name,
-			Token:          token,
-			EncryptedToken: encToken,
-			KMSKeyID:       kmsKeyID,
-			Tenant:         tenant,
-			CreatedAt:      time.Now().UTC(),
-			DataDir:        filepath.Join(s.dir, id, "data"),
-			DaemonDataDir:  s.daemonDataPath(id),
+			VolumeID:        id,
+			Name:            name,
+			Type:            volType,
+			Size:            sizeStr,
+			SizeBytes:       sizeBytes,
+			LegacyVolumeKey: strings.TrimSpace(opts.LegacyVolumeKey),
+			Token:           token,
+			EncryptedToken:  encToken,
+			KMSKeyID:        kmsKeyID,
+			Tenant:          tenant,
+			CreatedAt:       time.Now().UTC(),
+			DataDir:         filepath.Join(s.dir, id, "data"),
+			DaemonDataDir:   s.daemonDataPath(id),
 		},
 		attrs: map[string]fileAttr{},
 	}
@@ -444,7 +623,7 @@ func (s *Store) Create(apiKey, name string) (Volume, error) {
 	daemonDataDir := rec.meta.DaemonDataDir
 	s.mu.Unlock()
 
-	if dockerVolumes {
+	if dockerVolumes && volType == v1alpha1.VolumeTypeShared {
 		if dockerName, err := s.ensureDockerVolume(id, daemonDataDir); err == nil {
 			s.mu.Lock()
 			if cur, ok := s.vols[id]; ok {
@@ -456,6 +635,292 @@ func (s *Store) Create(apiKey, name string) (Volume, error) {
 		}
 	}
 	return out, nil
+}
+
+// RollbackCreate removes a freshly created volume when downstream provisioning (e.g. K8s EnsurePVC) fails.
+func (s *Store) RollbackCreate(id string) error {
+	if !volumeIDRe.MatchString(id) {
+		return ErrNotFound
+	}
+	s.mu.Lock()
+	rec, ok := s.vols[id]
+	if !ok {
+		s.mu.Unlock()
+		return nil
+	}
+	volDir := filepath.Join(s.dir, id)
+	if !s.withinRoot(volDir) {
+		s.mu.Unlock()
+		return ErrInvalidPath
+	}
+	_ = os.RemoveAll(volDir)
+	delete(s.byName, nameKey(rec.meta.Tenant, rec.meta.Name))
+	delete(s.vols, id)
+	s.mu.Unlock()
+	return nil
+}
+
+// DeterministicVolumeID derives a stable 32-char hex volume ID from a namespace/PVC pair
+// so multi-replica syncFromKube auto-adoption is idempotent across replicas.
+func DeterministicVolumeID(seed string) string {
+	sum := sha256.Sum256([]byte("cubepod-adopt-v1:" + seed))
+	return hex.EncodeToString(sum[:16])
+}
+
+// AdoptBlockVolume idempotently registers an existing legacy block PVC (or local directory)
+// into the store under the specified APIKey or TenantHash without touching underlying data.
+// Returns (volume, created, err).
+func (s *Store) AdoptBlockVolume(opts AdoptBlockVolumeOpts) (Volume, bool, error) {
+	cleanPVC := strings.TrimSpace(opts.PVCName)
+	if cleanPVC == "" {
+		return Volume{}, false, ErrInvalidName
+	}
+	name := strings.TrimSpace(opts.Name)
+	if name == "" {
+		name = sanitizeAdoptedName(cleanPVC)
+	}
+	if !ValidName(name) {
+		name = sanitizeAdoptedName(name)
+	}
+	sizeStr := strings.TrimSpace(opts.Size)
+	sizeBytes := opts.SizeBytes
+	if sizeStr == "" {
+		sizeStr = DefaultBlockVolumeSize
+	}
+	if sizeBytes <= 0 {
+		if canonical, b, err := ParseBlockSize(sizeStr); err == nil {
+			sizeStr = canonical
+			sizeBytes = b
+		} else {
+			sizeStr = DefaultBlockVolumeSize
+			sizeBytes = 20 << 30
+		}
+	}
+
+	var out Volume
+	var created bool
+	err := s.withStoreFlock(true, func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		tenant := strings.TrimSpace(opts.TenantHash)
+		ownerHash := strings.TrimSpace(opts.OwnerTenantHash)
+		nameTenant := tenant
+		if tenant == "" && ownerHash == "" {
+			if opts.APIKey == "" {
+				return ErrUnauthorized
+			}
+			var err error
+			tenant, err = s.resolveTenantLocked(opts.APIKey)
+			if err != nil {
+				return err
+			}
+			ownerHash = ownerKeyHash(opts.APIKey)
+			nameTenant = tenant
+		} else if tenant == "" && ownerHash != "" {
+			nameTenant = "owner:" + ownerHash
+		}
+
+		// Idempotent check by PVCName first.
+		for _, r := range s.vols {
+			if r.meta.PVCName == cleanPVC && r.meta.IsBlock() {
+				if (tenant != "" && r.meta.Tenant != "" && r.meta.Tenant != tenant) ||
+					(ownerHash != "" && r.meta.OwnerTenantHash != "" && r.meta.OwnerTenantHash != ownerHash) {
+					return ErrConflict
+				}
+				out = r.meta
+				created = false
+				return nil
+			}
+		}
+
+		// Resolve unique name within tenant if there is a collision.
+		finalName := name
+		if existingID, ok := s.byName[nameKey(nameTenant, finalName)]; ok {
+			if existing, exists := s.vols[existingID]; exists && existing.meta.PVCName == cleanPVC {
+				out = existing.meta
+				created = false
+				return nil
+			}
+			suffix := DeterministicVolumeID(cleanPVC)[:8]
+			if len(finalName)+1+len(suffix) > maxVolumeNameLen {
+				finalName = finalName[:maxVolumeNameLen-1-len(suffix)]
+			}
+			finalName = finalName + "-" + suffix
+		}
+
+		id := strings.TrimSpace(opts.VolumeID)
+		if id == "" || !volumeIDRe.MatchString(id) {
+			id = DeterministicVolumeID(opts.PVCNamespace + "/" + cleanPVC)
+		}
+		if existing, exists := s.vols[id]; exists {
+			if (tenant != "" && existing.meta.Tenant != "" && existing.meta.Tenant != tenant) ||
+				(ownerHash != "" && existing.meta.OwnerTenantHash != "" && existing.meta.OwnerTenantHash != ownerHash) {
+				return ErrConflict
+			}
+			out = existing.meta
+			created = false
+			return nil
+		}
+
+		token, err := newToken()
+		if err != nil {
+			return err
+		}
+		rec := &volRec{
+			meta: Volume{
+				VolumeID:        id,
+				Name:            finalName,
+				Type:            v1alpha1.VolumeTypeBlock,
+				Size:            sizeStr,
+				SizeBytes:       sizeBytes,
+				LegacyVolumeKey: strings.TrimSpace(opts.LegacyVolumeKey),
+				OwnerTenantHash: ownerHash,
+				Token:           token,
+				Tenant:          tenant,
+				CreatedAt:       time.Now().UTC(),
+				PVCName:         cleanPVC,
+				PVCNamespace:    strings.TrimSpace(opts.PVCNamespace),
+				DataDir:         filepath.Join(s.dir, id, "data"),
+				DaemonDataDir:   s.daemonDataPath(id),
+			},
+			attrs: map[string]fileAttr{},
+		}
+		volDir := filepath.Join(s.dir, id)
+		if err := os.MkdirAll(volDir, 0o700); err != nil {
+			return err
+		}
+		_ = os.Chmod(volDir, 0o700)
+		if err := os.MkdirAll(rec.meta.DataDir, 0o755); err != nil {
+			_ = os.RemoveAll(volDir)
+			return err
+		}
+		_ = ownPath(rec.meta.DataDir, WriteOpts{}, true)
+		if err := s.saveMetaUnlocked(rec); err != nil {
+			_ = os.RemoveAll(volDir)
+			return err
+		}
+		s.vols[id] = rec
+		s.byName[nameKey(nameTenant, finalName)] = id
+		out = rec.meta
+		created = true
+		return nil
+	})
+	return out, created, err
+}
+
+func sanitizeAdoptedName(raw string) string {
+	var b strings.Builder
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' {
+			b.WriteByte(c)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		out = "legacy-workspace"
+	}
+	if len(out) > maxVolumeNameLen {
+		out = out[:maxVolumeNameLen]
+	}
+	return out
+}
+
+// GetByID returns volume metadata by ID without tenant filtering (for internal control-plane checks).
+func (s *Store) GetByID(id string) (Volume, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok := s.vols[id]
+	if !ok {
+		return Volume{}, false
+	}
+	return rec.meta, true
+}
+
+// FindByPVCName looks up a managed block volume by its bound PVC name.
+func (s *Store) FindByPVCName(pvcName string) (Volume, bool) {
+	clean := strings.TrimSpace(pvcName)
+	if clean == "" {
+		return Volume{}, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.vols {
+		if r.meta.PVCName == clean && r.meta.IsBlock() {
+			return r.meta, true
+		}
+	}
+	return Volume{}, false
+}
+
+// ActiveMountOwners returns sandbox IDs currently recorded in mounts.json for volumeID.
+func (s *Store) ActiveMountOwners(volumeID string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var owners []string
+	for sb, ms := range s.mounts {
+		for _, m := range ms {
+			if m.VolumeID == volumeID {
+				owners = append(owners, sb)
+				break
+			}
+		}
+	}
+	sort.Strings(owners)
+	return owners
+}
+
+// EvictMount removes a stale sandbox mount entry for volumeID (or all mounts for sandboxID if volumeID == "").
+func (s *Store) EvictMount(sandboxID, volumeID string) bool {
+	if sandboxID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ms, ok := s.mounts[sandboxID]
+	if !ok {
+		return false
+	}
+	if volumeID == "" {
+		delete(s.mounts, sandboxID)
+		_ = s.saveMounts()
+		return true
+	}
+	filtered := ms[:0]
+	removed := false
+	for _, m := range ms {
+		if m.VolumeID == volumeID {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, m)
+	}
+	if !removed {
+		return false
+	}
+	if len(filtered) == 0 {
+		delete(s.mounts, sandboxID)
+	} else {
+		s.mounts[sandboxID] = filtered
+	}
+	_ = s.saveMounts()
+	return true
+}
+
+// BlockVolumeCount returns the number of managed type: "block" volumes across all tenants.
+func (s *Store) BlockVolumeCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, r := range s.vols {
+		if r.meta.IsBlock() {
+			n++
+		}
+	}
+	return n
 }
 
 // RotateAPIKey migrates all volumes and active mount ownership from oldAPIKey to
@@ -581,6 +1046,7 @@ func (s *Store) List(apiKey string) ([]Volume, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.promoteOwnerTenantLocked(tenant, apiKey)
 	out := make([]Volume, 0)
 	for _, rec := range s.vols {
 		if rec.meta.Tenant != tenant {
@@ -614,6 +1080,7 @@ func (s *Store) Get(apiKey, id string) (Volume, error) {
 	if err != nil {
 		return Volume{}, err
 	}
+	s.promoteOwnerTenantLocked(tenant, apiKey)
 	rec, ok := s.vols[id]
 	if !ok || rec.meta.Tenant != tenant {
 		return Volume{}, ErrNotFound
@@ -649,6 +1116,7 @@ func (s *Store) Delete(apiKey, id string) (Volume, error) {
 		s.mu.Unlock()
 		return Volume{}, err
 	}
+	s.promoteOwnerTenantLocked(tenant, apiKey)
 	rec, ok := s.vols[id]
 	if !ok || rec.meta.Tenant != tenant {
 		s.mu.Unlock()
@@ -714,30 +1182,68 @@ func (s *Store) LookupMounts(apiKey string, reqs []MountRequest) ([]PlannedMount
 	if err != nil {
 		return nil, err
 	}
+	s.promoteOwnerTenantLocked(tenant, apiKey)
 	seenPath := map[string]struct{}{}
+	blockCount := 0
 	out := make([]PlannedMount, 0, len(reqs))
 	for _, req := range reqs {
 		if !ValidName(req.Name) {
 			return nil, ErrInvalidName
 		}
-		mp, err := cleanMountPath(req.Path)
-		if err != nil {
-			return nil, err
+		id, ok := s.byName[nameKey(tenant, req.Name)]
+		if !ok {
+			// Preserve existing path-validation error ordering when volume is missing:
+			// validate path syntax so invalid paths still return ErrInvalidPath.
+			if _, perr := cleanMountPath(req.Path); perr != nil && path.Clean(strings.TrimSpace(req.Path)) != "/workspace" {
+				return nil, perr
+			}
+			return nil, ErrNotFound
+		}
+		rec, exists := s.vols[id]
+		if !exists {
+			return nil, ErrNotFound
+		}
+		var mp string
+		if rec.meta.IsBlock() {
+			if req.Path == "" || strings.ContainsRune(req.Path, 0) || strings.Contains(req.Path, `\`) || !strings.HasPrefix(req.Path, "/") {
+				return nil, ErrInvalidPath
+			}
+			for _, seg := range strings.Split(req.Path, "/") {
+				if seg == ".." {
+					return nil, ErrInvalidPath
+				}
+			}
+			mp = path.Clean(req.Path)
+			if mp != "/workspace" {
+				return nil, ErrInvalidPath
+			}
+			blockCount++
+			if blockCount > 1 {
+				return nil, ErrConflict
+			}
+		} else {
+			mp, err = cleanMountPath(req.Path)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if _, dup := seenPath[mp]; dup {
 			return nil, ErrConflict
 		}
 		seenPath[mp] = struct{}{}
-		id, ok := s.byName[nameKey(tenant, req.Name)]
-		if !ok {
-			return nil, ErrNotFound
-		}
-		out = append(out, PlannedMount{VolumeID: id, Name: req.Name, Path: mp})
+		out = append(out, PlannedMount{
+			VolumeID: id,
+			Name:     req.Name,
+			Type:     rec.meta.EffectiveType(),
+			PVCName:  rec.meta.PVCName,
+			Path:     mp,
+		})
 	}
 	return out, nil
 }
 
 // CommitMounts records sandbox mounts. The volume must still belong to tenantKey.
+// For type: "block" volumes, single-writer exclusivity is enforced atomically under Store.mu.
 func (s *Store) CommitMounts(sandboxID, apiKey string, planned []PlannedMount) error {
 	if sandboxID == "" || apiKey == "" {
 		return ErrInvalidPath
@@ -754,6 +1260,18 @@ func (s *Store) CommitMounts(sandboxID, apiKey string, planned []PlannedMount) e
 		if !ok || rec.meta.Tenant != tenant || rec.meta.Name != p.Name {
 			return ErrNotFound
 		}
+		if rec.meta.IsBlock() {
+			for otherSB, ms := range s.mounts {
+				if otherSB == sandboxID {
+					continue
+				}
+				for _, existing := range ms {
+					if existing.VolumeID == p.VolumeID {
+						return ErrInUse
+					}
+				}
+			}
+		}
 		recs = append(recs, mountRec{VolumeID: p.VolumeID, Name: p.Name, Path: p.Path, Tenant: tenant})
 	}
 	if len(recs) == 0 {
@@ -764,7 +1282,9 @@ func (s *Store) CommitMounts(sandboxID, apiKey string, planned []PlannedMount) e
 	return s.saveMounts()
 }
 
-// CopyMounts duplicates mount records onto another sandbox (fork).
+// CopyMounts duplicates shared mount records onto another sandbox (fork).
+// Exclusive type: "block" mounts are intentionally skipped because forked sandboxes
+// receive an independent CSI VolumeSnapshot clone of /workspace.
 func (s *Store) CopyMounts(fromID, toID string) error {
 	if fromID == "" || toID == "" {
 		return nil
@@ -775,7 +1295,16 @@ func (s *Store) CopyMounts(fromID, toID string) error {
 	if len(src) == 0 {
 		return nil
 	}
-	cp := append([]mountRec(nil), src...)
+	var cp []mountRec
+	for _, m := range src {
+		if rec, ok := s.vols[m.VolumeID]; ok && rec.meta.IsBlock() {
+			continue
+		}
+		cp = append(cp, m)
+	}
+	if len(cp) == 0 {
+		return nil
+	}
 	s.mounts[toID] = cp
 	return s.saveMounts()
 }
@@ -844,6 +1373,7 @@ func (s *Store) MountsForSandbox(sandboxID string) []MountSpec {
 		out = append(out, MountSpec{
 			VolumeName:    m.Name,
 			VolumeID:      m.VolumeID,
+			Type:          rec.meta.EffectiveType(),
 			ContainerPath: m.Path,
 			HostPath:      host,
 			LocalPath:     local,
@@ -1332,6 +1862,9 @@ func (s *Store) lookupVol(id, userPath string) (*volRec, string, string, error) 
 	if !ok {
 		return nil, "", "", ErrNotFound
 	}
+	if rec.meta.IsBlock() {
+		return nil, "", "", ErrUnsupportedType
+	}
 	return rec, abs, rel, nil
 }
 
@@ -1401,14 +1934,19 @@ func (s *Store) tenantQuotaLock(tenantID string) *sync.Mutex {
 func (s *Store) tenantUsedBytes(tenantID string) (int64, error) {
 	s.mu.Lock()
 	dirs := make([]string, 0, len(s.vols))
+	var blockBytes int64
 	for _, r := range s.vols {
 		if r.meta.Tenant == tenantID {
-			dirs = append(dirs, r.meta.DataDir)
+			if r.meta.IsBlock() {
+				blockBytes += r.meta.SizeBytes
+			} else {
+				dirs = append(dirs, r.meta.DataDir)
+			}
 		}
 	}
 	s.mu.Unlock()
 
-	var total int64
+	total := blockBytes
 	for _, d := range dirs {
 		n, err := sumDataRootBytes(d)
 		if err != nil {
@@ -1662,7 +2200,11 @@ func (s *Store) load() error {
 			}
 		}
 		s.vols[id] = rec
-		s.byName[nameKey(meta.Tenant, meta.Name)] = id
+		idxTenant := meta.Tenant
+		if idxTenant == "" && meta.OwnerTenantHash != "" {
+			idxTenant = "owner:" + meta.OwnerTenantHash
+		}
+		s.byName[nameKey(idxTenant, meta.Name)] = id
 		if wasLegacyPlaintext {
 			migratedLegacy = append(migratedLegacy, rec)
 		}

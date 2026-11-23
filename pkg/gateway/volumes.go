@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/cubeplexai/cubepod/api/v1alpha1"
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/volume"
 )
@@ -42,10 +44,16 @@ type VolumeConfig struct {
 	MaxBytesPerTenant int64
 	// KMS optionally envelope-encrypts volume content tokens in meta.json.
 	KMS volume.KMSProvider
-	// K8sVolumeMounts enables volumeMounts on live Kubernetes.
+	// K8sVolumeMounts enables shared RWX volumeMounts on live Kubernetes.
 	K8sVolumeMounts bool
 	// SharedPVCName is the cluster-wide RWX PVC shared between gateway and Kata pods.
 	SharedPVCName string
+	// AllowLazyLegacyClaim controls whether unmigrated legacy extension.volumeKey PVCs
+	// may be lazily adopted on first attach (defaults to true when nil).
+	AllowLazyLegacyClaim *bool
+	// AttachLeaseGracePeriod controls how long a NotFound PVC attach lease is protected
+	// before being treated as orphaned (defaults to 30s).
+	AttachLeaseGracePeriod time.Duration
 }
 
 // VolumeMount is the runtime attachment for one sandbox mount.
@@ -89,9 +97,18 @@ func (s *Server) ConfigureVolumes(cfg VolumeConfig) error {
 		s.featureGates[FeatureGateK8sVolumeMounts] = true
 	}
 	s.volumesSharedPVC = strings.TrimSpace(cfg.SharedPVCName)
+	if cfg.AllowLazyLegacyClaim != nil {
+		v := *cfg.AllowLazyLegacyClaim
+		s.allowLazyLegacyVolumeClaim = &v
+	}
+	if cfg.AttachLeaseGracePeriod > 0 {
+		s.attachLeaseGracePeriod = cfg.AttachLeaseGracePeriod
+	}
 	active := make(map[string]struct{}, len(s.sandboxes))
-	for id := range s.sandboxes {
-		active[id] = struct{}{}
+	for id, rec := range s.sandboxes {
+		if rec != nil && rec.State != string(v1alpha1.PodBoxPhaseTerminated) && rec.State != string(v1alpha1.PodBoxPhaseFailed) {
+			active[id] = struct{}{}
+		}
 	}
 	reconciler := s.reconciler
 	s.mu.Unlock()
@@ -105,7 +122,9 @@ func (s *Server) ConfigureVolumes(cfg VolumeConfig) error {
 			shouldReconcile = false
 		} else {
 			for _, box := range boxes {
-				if box.Metadata.Name != "" {
+				if box.Metadata.Name != "" &&
+					box.Status.Phase != v1alpha1.PodBoxPhaseTerminated &&
+					box.Status.Phase != v1alpha1.PodBoxPhaseFailed {
 					active[box.Metadata.Name] = struct{}{}
 				}
 			}
@@ -260,12 +279,25 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
 		Name string `json:"name"`
+		Type string `json:"type"`
+		Size string `json:"size"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	vol, err := st.Create(key, req.Name)
+	volType := strings.TrimSpace(req.Type)
+	if volType == "" {
+		volType = v1alpha1.VolumeTypeShared
+	}
+	if volType == v1alpha1.VolumeTypeBlock && !s.FeatureGateEnabled(FeatureGateBlockWorkspaceVolumes) {
+		writeError(w, http.StatusNotImplemented, "block workspace volumes feature gate is disabled")
+		return
+	}
+	vol, err := st.CreateWithOptions(key, req.Name, volume.CreateOpts{
+		Type: volType,
+		Size: req.Size,
+	})
 	if err != nil {
 		if errors.Is(err, volume.ErrLimitExceeded) {
 			s.VolumeQuotaRejectionsTotal.Add(1)
@@ -273,14 +305,27 @@ func (s *Server) handleCreateVolume(w http.ResponseWriter, r *http.Request) {
 		writeVolumeMgmtError(w, err, req.Name)
 		return
 	}
-	s.ensureVolumePVC(r.Context(), st, vol.VolumeID)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(map[string]string{
+	if vol.IsBlock() {
+		if err := s.ensureBlockVolumePVC(r.Context(), st, vol); err != nil {
+			_ = st.RollbackCreate(vol.VolumeID)
+			writeError(w, http.StatusInternalServerError, "failed to provision block volume PVC: "+err.Error())
+			return
+		}
+	} else {
+		s.ensureVolumePVC(r.Context(), st, vol.VolumeID)
+	}
+	resp := map[string]string{
 		"volumeID": vol.VolumeID,
 		"name":     vol.Name,
+		"type":     vol.EffectiveType(),
 		"token":    vol.Token,
-	})
+	}
+	if vol.Size != "" {
+		resp["size"] = vol.Size
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleRotateVolumeKey(w http.ResponseWriter, r *http.Request) {
@@ -338,10 +383,15 @@ func (s *Server) handleListVolumes(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]string, 0, len(vols))
 	for _, v := range vols {
-		out = append(out, map[string]string{
+		item := map[string]string{
 			"volumeID": v.VolumeID,
 			"name":     v.Name,
-		})
+			"type":     v.EffectiveType(),
+		}
+		if v.Size != "" {
+			item["size"] = v.Size
+		}
+		out = append(out, item)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(out)
@@ -361,12 +411,17 @@ func (s *Server) handleGetVolume(w http.ResponseWriter, r *http.Request) {
 		writeVolumeMgmtError(w, err, "")
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{
+	resp := map[string]string{
 		"volumeID": vol.VolumeID,
 		"name":     vol.Name,
+		"type":     vol.EffectiveType(),
 		"token":    vol.Token,
-	})
+	}
+	if vol.Size != "" {
+		resp["size"] = vol.Size
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
@@ -379,27 +434,53 @@ func (s *Server) handleDeleteVolume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("volumeID")
+	volMeta, hasVol := st.GetByID(id)
 	if s.reconciler != nil && s.reconciler.KubeClient() != nil {
 		boxes, listErr := s.reconciler.KubeClient().ListPodBoxes(r.Context(), s.reconciler.Namespace())
 		if listErr != nil {
 			writeError(w, http.StatusInternalServerError, "failed to verify active PodBox mounts")
 			return
 		}
+		boxPhaseByName := make(map[string]v1alpha1.PodBoxPhase, len(boxes))
 		for _, box := range boxes {
+			boxPhaseByName[box.Metadata.Name] = box.Status.Phase
+			if box.Status.Phase == v1alpha1.PodBoxPhaseTerminated || box.Status.Phase == v1alpha1.PodBoxPhaseFailed {
+				continue
+			}
 			for _, m := range box.Spec.VolumeMounts {
 				if m.VolumeID == id {
+					if hasVol && volMeta.IsBlock() {
+						s.BlockVolumeAttachConflictsTotal.Add(1)
+					}
 					writeError(w, http.StatusConflict, "volume is mounted by a sandbox")
 					return
 				}
 			}
 		}
+		// Evict stale mounts.json entries whose owner PodBox is already Terminated/Failed.
+		for _, owner := range st.ActiveMountOwners(id) {
+			if ph, ok := boxPhaseByName[owner]; ok && (ph == v1alpha1.PodBoxPhaseTerminated || ph == v1alpha1.PodBoxPhaseFailed) {
+				st.EvictMount(owner, id)
+			}
+		}
+		// For managed block volumes, also verify the K8s PVC attach lease is free or reclaimable.
+		if hasVol && volMeta.IsBlock() && volMeta.PVCName != "" {
+			if err := s.ensureBlockVolumeLeaseFreeForDelete(r.Context(), st, volMeta); err != nil {
+				s.BlockVolumeAttachConflictsTotal.Add(1)
+				writeError(w, http.StatusConflict, "volume is mounted by a sandbox")
+				return
+			}
+		}
 	}
 	vol, err := st.Delete(key, id)
 	if err != nil {
+		if errors.Is(err, volume.ErrInUse) && hasVol && volMeta.IsBlock() {
+			s.BlockVolumeAttachConflictsTotal.Add(1)
+		}
 		writeVolumeMgmtError(w, err, "")
 		return
 	}
-	s.deleteVolumePVC(r.Context(), vol.PVCNamespace, vol.PVCName, vol.VolumeID)
+	s.deleteVolumePVC(r.Context(), vol)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -407,6 +488,10 @@ func writeVolumeMgmtError(w http.ResponseWriter, err error, name string) {
 	switch {
 	case errors.Is(err, volume.ErrInvalidName):
 		writeError(w, http.StatusBadRequest, "invalid volume name")
+	case errors.Is(err, volume.ErrInvalidType):
+		writeError(w, http.StatusBadRequest, "invalid volume type (must be 'shared' or 'block')")
+	case errors.Is(err, volume.ErrInvalidSize):
+		writeError(w, http.StatusBadRequest, "invalid volume size")
 	case errors.Is(err, volume.ErrExists):
 		writeError(w, http.StatusBadRequest, "Volume with name '"+name+"' already exists")
 	case errors.Is(err, volume.ErrNotFound):
@@ -435,6 +520,10 @@ func (s *Server) authVolumeContent(w http.ResponseWriter, r *http.Request) (*vol
 	vol, err := st.Authenticate(r.PathValue("volumeID"), tok)
 	if err != nil {
 		writeContentError(w, http.StatusUnauthorized, "invalid volume token")
+		return nil, volume.Volume{}, false
+	}
+	if vol.IsBlock() {
+		writeContentError(w, http.StatusBadRequest, volume.ErrUnsupportedType.Error())
 		return nil, volume.Volume{}, false
 	}
 	return st, vol, true
@@ -629,6 +718,8 @@ func writeVolumeContentError(w http.ResponseWriter, err error) {
 		writeContentError(w, http.StatusTooManyRequests, "tenant volume storage quota exceeded")
 	case errors.Is(err, volume.ErrNotExist):
 		writeContentError(w, http.StatusNotFound, "path not found")
+	case errors.Is(err, volume.ErrUnsupportedType):
+		writeContentError(w, http.StatusBadRequest, volume.ErrUnsupportedType.Error())
 	case errors.Is(err, volume.ErrInvalidPath):
 		writeContentError(w, http.StatusBadRequest, "invalid path")
 	case errors.Is(err, volume.ErrNotDir):
@@ -715,18 +806,74 @@ func (s *Server) ensureVolumePVC(ctx context.Context, st *volume.Store, volumeID
 	}
 }
 
-func (s *Server) deleteVolumePVC(ctx context.Context, namespace, pvcName, volumeID string) {
+func (s *Server) ensureBlockVolumePVC(ctx context.Context, st *volume.Store, vol volume.Volume) error {
+	if s.reconciler == nil || s.reconciler.KubeClient() == nil || vol.VolumeID == "" {
+		return nil
+	}
+	ns := s.reconciler.Namespace()
+	name := volumePVCPrefix + vol.VolumeID
+	volMode := "Block"
+	if strings.EqualFold(s.reconciler.VolumeMode(), "Filesystem") {
+		volMode = "Filesystem"
+	}
+	size := vol.Size
+	if size == "" {
+		size = volume.DefaultBlockVolumeSize
+	}
+	pvc := controller.BlockPVCManifest{
+		Name:             name,
+		Namespace:        ns,
+		StorageClassName: s.reconciler.StorageClassName(),
+		VolumeMode:       volMode,
+		Size:             size,
+		AccessModes:      []string{"ReadWriteOnce"},
+		Labels: map[string]string{
+			"app.kubernetes.io/name":     "cubepod",
+			"pod.cubeplex.ai/vol-type":   "workspace",
+			controller.PVCLabelVolumeID:  vol.VolumeID,
+			controller.PVCLabelManagedBy: controller.PVCLabelManagedByVolumes,
+		},
+	}
+	if err := s.reconciler.KubeClient().EnsurePVC(ctx, pvc); err != nil {
+		return err
+	}
+	return st.NotePVC(vol.VolumeID, name, ns)
+}
+
+func (s *Server) deleteVolumePVC(ctx context.Context, vol volume.Volume) {
 	if s.reconciler == nil || s.reconciler.KubeClient() == nil {
 		return
 	}
-	if pvcName == "" || volumeID == "" {
+	pvcName := strings.TrimSpace(vol.PVCName)
+	namespace := strings.TrimSpace(vol.PVCNamespace)
+	if namespace == "" {
+		namespace = s.reconciler.Namespace()
+	}
+	if pvcName == "" || vol.VolumeID == "" {
 		return
 	}
 	if shared := s.sharedVolumePVC(); shared != "" && pvcName == shared {
 		return
 	}
-	if pvcName != volumePVCPrefix+volumeID || !strings.HasPrefix(pvcName, volumePVCPrefix) {
-		return
+	if vol.IsBlock() {
+		// Allow deleting both canonical vol-<id> and Mode 1 in-place adopted legacy PVCs,
+		// provided the PVC is verified to carry the matching cubepod-volumes ownership labels.
+		pvc, err := s.reconciler.KubeClient().GetPVCManifest(ctx, namespace, pvcName)
+		if err != nil {
+			if !errors.Is(err, controller.ErrKubeNotFound) {
+				slog.Warn("volume PVC ownership check failed", "pvc", pvcName, "err", err)
+			}
+			return
+		}
+		if pvc == nil || pvc.Labels[controller.PVCLabelManagedBy] != controller.PVCLabelManagedByVolumes ||
+			pvc.Labels[controller.PVCLabelVolumeID] != vol.VolumeID {
+			slog.Warn("skipping PVC delete: ownership labels do not match volume", "pvc", pvcName, "volumeID", vol.VolumeID)
+			return
+		}
+	} else {
+		if pvcName != volumePVCPrefix+vol.VolumeID || !strings.HasPrefix(pvcName, volumePVCPrefix) {
+			return
+		}
 	}
 	if err := s.reconciler.KubeClient().DeletePVC(ctx, namespace, pvcName); err != nil {
 		slog.Warn("volume PVC delete failed", "pvc", pvcName, "err", err)
@@ -738,10 +885,6 @@ func (s *Server) deleteVolumePVC(ctx context.Context, namespace, pvcName, volume
 func (s *Server) planSandboxVolumeMounts(r *http.Request, mounts []sandboxVolumeMountReq) ([]volume.PlannedMount, int, string) {
 	if len(mounts) == 0 {
 		return nil, 0, ""
-	}
-	if s.isKubeVolumeMountsUnsupported() {
-		s.VolumeMountErrorsTotal.Add(1)
-		return nil, http.StatusNotImplemented, "volumeMounts are not supported on the Kubernetes runtime"
 	}
 	key := managementAPIKey(r)
 	if key == "" {
@@ -773,6 +916,22 @@ func (s *Server) planSandboxVolumeMounts(r *http.Request, mounts []sandboxVolume
 			return nil, http.StatusNotFound, "volume not found"
 		default:
 			return nil, http.StatusInternalServerError, "volume mount lookup failed"
+		}
+	}
+	// Check runtime capability per volume type:
+	// - shared RWX mounts require K8sVolumeMounts + SharedPVCName on live K8s
+	// - block /workspace mounts work on pure-block clusters without SharedPVCName, gated by BlockWorkspaceVolumes
+	for _, p := range planned {
+		if p.Type == v1alpha1.VolumeTypeBlock {
+			if !s.FeatureGateEnabled(FeatureGateBlockWorkspaceVolumes) {
+				s.VolumeMountErrorsTotal.Add(1)
+				return nil, http.StatusNotImplemented, "block workspace volumes feature gate is disabled"
+			}
+		} else {
+			if s.isKubeVolumeMountsUnsupported() {
+				s.VolumeMountErrorsTotal.Add(1)
+				return nil, http.StatusNotImplemented, "volumeMounts are not supported on the Kubernetes runtime"
+			}
 		}
 	}
 	return planned, 0, ""
@@ -820,4 +979,309 @@ func (s *Server) mapVolumeMountPath(sandboxID, userPath string) (string, bool, e
 		return "", false, nil
 	}
 	return st.MapSandboxPath(sandboxID, userPath)
+}
+
+// isPVCLeaseReclaimable determines whether an existing cubepod.io/attached-sandbox lease
+// on a PVC may be preempted or cleared:
+// - free (empty holder), OR
+// - holder PodBox is Terminated or Failed, OR
+// - holder PodBox is NotFound AND now - attached-at > AttachLeaseGracePeriod.
+func (s *Server) isPVCLeaseReclaimable(ctx context.Context, pvc *controller.BlockPVCManifest) (reclaimable bool, holder string, err error) {
+	if pvc == nil || pvc.Annotations == nil {
+		return true, "", nil
+	}
+	holder = strings.TrimSpace(pvc.Annotations[controller.PVCAnnotationAttachedSandbox])
+	if holder == "" {
+		return true, "", nil
+	}
+	if s.reconciler == nil || s.reconciler.KubeClient() == nil {
+		return false, holder, nil
+	}
+	box, getErr := s.reconciler.KubeClient().GetPodBox(ctx, s.reconciler.Namespace(), holder)
+	if getErr != nil {
+		if errors.Is(getErr, controller.ErrKubeNotFound) || strings.Contains(strings.ToLower(getErr.Error()), "not found") {
+			attachedAtStr := strings.TrimSpace(pvc.Annotations[controller.PVCAnnotationAttachedAt])
+			if attachedAtStr == "" {
+				return true, holder, nil
+			}
+			attachedAt, parseErr := time.Parse(time.RFC3339Nano, attachedAtStr)
+			if parseErr != nil {
+				attachedAt, parseErr = time.Parse(time.RFC3339, attachedAtStr)
+			}
+			if parseErr != nil {
+				return true, holder, nil
+			}
+			if time.Since(attachedAt) > s.AttachLeaseGracePeriod() {
+				return true, holder, nil
+			}
+			return false, holder, nil
+		}
+		return false, holder, getErr
+	}
+	if box == nil || box.Status.Phase == v1alpha1.PodBoxPhaseTerminated || box.Status.Phase == v1alpha1.PodBoxPhaseFailed {
+		return true, holder, nil
+	}
+	return false, holder, nil
+}
+
+// acquireBlockVolumePVCLease atomically claims cubepod.io/attached-sandbox on the block volume PVC
+// via resourceVersion CAS. Returns volume.ErrInUse on contention.
+func (s *Server) acquireBlockVolumePVCLease(ctx context.Context, st *volume.Store, sandboxID string, pm volume.PlannedMount) error {
+	if s.reconciler == nil || s.reconciler.KubeClient() == nil || pm.Type != v1alpha1.VolumeTypeBlock {
+		return nil
+	}
+	pvcName := pm.PVCName
+	if pvcName == "" {
+		pvcName = volumePVCPrefix + pm.VolumeID
+	}
+	ns := s.reconciler.Namespace()
+	kc := s.reconciler.KubeClient()
+	for attempt := 0; attempt < 3; attempt++ {
+		pvc, err := kc.GetPVCManifest(ctx, ns, pvcName)
+		if err != nil {
+			return err
+		}
+		reclaimable, oldHolder, err := s.isPVCLeaseReclaimable(ctx, pvc)
+		if err != nil {
+			return err
+		}
+		if !reclaimable && oldHolder != sandboxID {
+			return volume.ErrInUse
+		}
+		if oldHolder != "" && oldHolder != sandboxID && st != nil {
+			st.EvictMount(oldHolder, pm.VolumeID)
+		}
+		_, err = kc.UpdatePVCAnnotationsCAS(ctx, ns, pvcName, pvc.ResourceVersion, map[string]string{
+			controller.PVCAnnotationAttachedSandbox: sandboxID,
+			controller.PVCAnnotationAttachedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+		})
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, controller.ErrCASConflict) {
+			continue
+		}
+		return err
+	}
+	return volume.ErrInUse
+}
+
+// ensureBlockVolumeLeaseFreeForDelete checks the PVC attach lease before DELETE /volumes/{id}
+// and clears stale (Terminated/Failed/grace-expired NotFound) leases via CAS.
+func (s *Server) ensureBlockVolumeLeaseFreeForDelete(ctx context.Context, st *volume.Store, vol volume.Volume) error {
+	if s.reconciler == nil || s.reconciler.KubeClient() == nil || vol.PVCName == "" {
+		return nil
+	}
+	ns := vol.PVCNamespace
+	if ns == "" {
+		ns = s.reconciler.Namespace()
+	}
+	pvc, err := s.reconciler.KubeClient().GetPVCManifest(ctx, ns, vol.PVCName)
+	if err != nil {
+		if errors.Is(err, controller.ErrKubeNotFound) {
+			return nil
+		}
+		return err
+	}
+	reclaimable, holder, err := s.isPVCLeaseReclaimable(ctx, pvc)
+	if err != nil {
+		return err
+	}
+	if !reclaimable {
+		return volume.ErrInUse
+	}
+	if holder != "" {
+		if st != nil {
+			st.EvictMount(holder, vol.VolumeID)
+		}
+		_, casErr := s.reconciler.KubeClient().UpdatePVCAnnotationsCAS(ctx, ns, vol.PVCName, pvc.ResourceVersion, map[string]string{
+			controller.PVCAnnotationAttachedSandbox: "",
+			controller.PVCAnnotationAttachedAt:      "",
+		})
+		if casErr != nil && !errors.Is(casErr, controller.ErrKubeNotFound) {
+			return volume.ErrInUse
+		}
+	}
+	return nil
+}
+
+// releaseSandboxBlockPVCLeases releases PVC attach leases for any block volumes held by sandboxID.
+func (s *Server) releaseSandboxBlockPVCLeases(ctx context.Context, sandboxID string) {
+	if s.reconciler == nil || s.reconciler.KubeClient() == nil || sandboxID == "" {
+		return
+	}
+	st := s.volumeStore.Load()
+	if st == nil {
+		return
+	}
+	specs := st.MountsForSandbox(sandboxID)
+	ns := s.reconciler.Namespace()
+	kc := s.reconciler.KubeClient()
+	for _, m := range specs {
+		if m.Type != v1alpha1.VolumeTypeBlock {
+			continue
+		}
+		vol, ok := st.GetByID(m.VolumeID)
+		if !ok || vol.PVCName == "" {
+			continue
+		}
+		pvc, err := kc.GetPVCManifest(ctx, ns, vol.PVCName)
+		if err != nil || pvc == nil || pvc.Annotations == nil {
+			continue
+		}
+		if strings.TrimSpace(pvc.Annotations[controller.PVCAnnotationAttachedSandbox]) != sandboxID {
+			continue
+		}
+		_, _ = kc.UpdatePVCAnnotationsCAS(ctx, ns, vol.PVCName, pvc.ResourceVersion, map[string]string{
+			controller.PVCAnnotationAttachedSandbox: "",
+			controller.PVCAnnotationAttachedAt:      "",
+		})
+	}
+}
+
+// autoAdoptLegacyPodBoxVolumes idempotently registers active legacy spec.VolumeKey PodBoxes
+// into volume.Store and backfills cubepod-volumes ownership labels onto their PVCs.
+func (s *Server) autoAdoptLegacyPodBoxVolumes(ctx context.Context, boxes []v1alpha1.PodBox) {
+	st := s.volumeStore.Load()
+	if st == nil || s.reconciler == nil || s.reconciler.KubeClient() == nil {
+		return
+	}
+	if !s.FeatureGateEnabled(FeatureGateBlockWorkspaceVolumes) {
+		return
+	}
+	ns := s.reconciler.Namespace()
+	kc := s.reconciler.KubeClient()
+	for _, box := range boxes {
+		if box.Spec.VolumeKey == "" || box.Spec.WorkspaceBlockMount() != nil {
+			continue
+		}
+		ownerTenant := ""
+		if box.Metadata.Annotations != nil {
+			ownerTenant = strings.TrimSpace(box.Metadata.Annotations["cubepod.io/owner-tenant"])
+		}
+		if ownerTenant == "" {
+			continue
+		}
+		pvcName := strings.TrimSpace(box.Status.WorkspacePVCName)
+		if pvcName == "" {
+			pvcName = controller.WorkspacePVCName(box.Metadata.Name, box.Spec)
+		}
+		size := volume.DefaultBlockVolumeSize
+		if pvc, err := kc.GetPVCManifest(ctx, ns, pvcName); err == nil && pvc != nil && pvc.Size != "" {
+			size = pvc.Size
+		}
+		vol, _, err := st.AdoptBlockVolume(volume.AdoptBlockVolumeOpts{
+			OwnerTenantHash: ownerTenant,
+			Name:            box.Spec.VolumeKey,
+			PVCName:         pvcName,
+			PVCNamespace:    ns,
+			Size:            size,
+			LegacyVolumeKey: box.Spec.VolumeKey,
+		})
+		if err != nil {
+			slog.Warn("auto-adopt legacy volumeKey failed", "podBox", box.Metadata.Name, "pvc", pvcName, "err", err)
+			continue
+		}
+		_ = kc.PatchPVCLabels(ctx, ns, pvcName, map[string]string{
+			controller.PVCLabelVolumeID:  vol.VolumeID,
+			controller.PVCLabelManagedBy: controller.PVCLabelManagedByVolumes,
+		})
+	}
+}
+
+// tryLazyAdoptLegacyVolumeKey implements the CEP-0030 lazy compatibility bridge for callers
+// passing extension.volumeKey on POST /sandboxes when an existing legacy PVC is present.
+// Returns (plannedMount, adopted, httpStatus, errMsg).
+func (s *Server) tryLazyAdoptLegacyVolumeKey(ctx context.Context, apiKey, ownerTenant, volumeKey string) (volume.PlannedMount, bool, int, string) {
+	if volumeKey == "" || apiKey == "" || !s.FeatureGateEnabled(FeatureGateBlockWorkspaceVolumes) || !s.AllowLazyLegacyVolumeClaim() {
+		return volume.PlannedMount{}, false, 0, ""
+	}
+	st := s.volumeStore.Load()
+	if st == nil || s.reconciler == nil || s.reconciler.KubeClient() == nil {
+		return volume.PlannedMount{}, false, 0, ""
+	}
+	ns := s.reconciler.Namespace()
+	kc := s.reconciler.KubeClient()
+	pvcName := controller.SanitizeVolumeKey(volumeKey) + "-workspace-pvc"
+
+	// Check if already adopted in store.
+	if existing, ok := st.FindByPVCName(pvcName); ok {
+		if _, err := st.Get(apiKey, existing.VolumeID); err != nil {
+			return volume.PlannedMount{}, false, http.StatusForbidden, "legacy workspace volume belongs to another tenant"
+		}
+		return volume.PlannedMount{
+			VolumeID: existing.VolumeID,
+			Name:     existing.Name,
+			Type:     v1alpha1.VolumeTypeBlock,
+			PVCName:  existing.PVCName,
+			Path:     "/workspace",
+		}, true, 0, ""
+	}
+
+	// Check whether the legacy PVC exists in Kubernetes.
+	pvc, err := kc.GetPVCManifest(ctx, ns, pvcName)
+	if err != nil {
+		if errors.Is(err, controller.ErrKubeNotFound) {
+			return volume.PlannedMount{}, false, 0, ""
+		}
+		return volume.PlannedMount{}, false, http.StatusInternalServerError, "failed to inspect legacy workspace PVC"
+	}
+
+	// Guard against cross-tenant takeover when an active PodBox owned by another tenant references this PVC.
+	boxes, listErr := kc.ListPodBoxes(ctx, ns)
+	if listErr == nil {
+		for _, box := range boxes {
+			if box.Status.Phase == v1alpha1.PodBoxPhaseTerminated || box.Status.Phase == v1alpha1.PodBoxPhaseFailed {
+				continue
+			}
+			boxPVC := box.Status.WorkspacePVCName
+			if boxPVC == "" {
+				boxPVC = controller.WorkspacePVCName(box.Metadata.Name, box.Spec)
+			}
+			if boxPVC != pvcName {
+				continue
+			}
+			boxTenant := ""
+			if box.Metadata.Annotations != nil {
+				boxTenant = strings.TrimSpace(box.Metadata.Annotations["cubepod.io/owner-tenant"])
+			}
+			if boxTenant != "" && ownerTenant != "" && boxTenant != ownerTenant {
+				s.BlockVolumeAttachConflictsTotal.Add(1)
+				return volume.PlannedMount{}, false, http.StatusForbidden, "legacy workspace PVC is actively owned by another tenant"
+			}
+			s.BlockVolumeAttachConflictsTotal.Add(1)
+			return volume.PlannedMount{}, false, http.StatusConflict, "legacy workspace PVC is already attached to an active sandbox"
+		}
+	}
+
+	size := volume.DefaultBlockVolumeSize
+	if pvc != nil && pvc.Size != "" {
+		size = pvc.Size
+	}
+	vol, _, err := st.AdoptBlockVolume(volume.AdoptBlockVolumeOpts{
+		APIKey:          apiKey,
+		Name:            volumeKey,
+		PVCName:         pvcName,
+		PVCNamespace:    ns,
+		Size:            size,
+		LegacyVolumeKey: volumeKey,
+	})
+	if err != nil {
+		if errors.Is(err, volume.ErrConflict) {
+			s.BlockVolumeAttachConflictsTotal.Add(1)
+			return volume.PlannedMount{}, false, http.StatusForbidden, "legacy workspace volume belongs to another tenant"
+		}
+		return volume.PlannedMount{}, false, http.StatusInternalServerError, "failed to adopt legacy workspace volume"
+	}
+	_ = kc.PatchPVCLabels(ctx, ns, pvcName, map[string]string{
+		controller.PVCLabelVolumeID:  vol.VolumeID,
+		controller.PVCLabelManagedBy: controller.PVCLabelManagedByVolumes,
+	})
+	return volume.PlannedMount{
+		VolumeID: vol.VolumeID,
+		Name:     vol.Name,
+		Type:     v1alpha1.VolumeTypeBlock,
+		PVCName:  vol.PVCName,
+		Path:     "/workspace",
+	}, true, 0, ""
 }
