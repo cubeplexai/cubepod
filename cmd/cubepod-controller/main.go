@@ -16,6 +16,7 @@ import (
 	"github.com/cubeplexai/cubepod/pkg/controller"
 	"github.com/cubeplexai/cubepod/pkg/egress"
 	"github.com/cubeplexai/cubepod/pkg/version"
+	"github.com/cubeplexai/cubepod/pkg/volumenfs"
 )
 
 func parseFeatureGates(raw string) map[string]bool {
@@ -117,6 +118,10 @@ func main() {
 		egressCACert         = flag.String("egress-ca-cert", os.Getenv("CUBEPOD_EGRESS_CA_CERT"), "Path to egress mTLS root CA certificate PEM")
 		egressCAKey          = flag.String("egress-ca-key", os.Getenv("CUBEPOD_EGRESS_CA_KEY"), "Path to egress mTLS root CA private key PEM")
 		egressUpstreamCAFile = flag.String("egress-upstream-ca-file", os.Getenv("CUBEPOD_EGRESS_UPSTREAM_CA_FILE"), "Optional path to upstream CA PEM mounted into egress sidecars")
+		volumeNFSService     = flag.String("volume-nfs-service", envOrDefault("CUBEPOD_VOLUME_NFS_SERVICE", "cubepod-volume-nfs"), "Kubernetes Service name for cubepod-volume-nfs")
+		volumeNFSNamespace   = flag.String("volume-nfs-namespace", os.Getenv("CUBEPOD_VOLUME_NFS_NAMESPACE"), "Namespace of the cubepod-volume-nfs Service (defaults to the controller namespace)")
+		volumeNFSLeaseURL    = flag.String("volume-nfs-lease-url", os.Getenv("CUBEPOD_VOLUME_NFS_LEASE_URL"), "Internal lease API URL (not the NFS port)")
+		volumeNFSPort        = flag.Int("volume-nfs-port", 2049, "NFS TCP port advertised to guests and egress exemptions")
 	)
 	flag.Parse()
 
@@ -131,6 +136,10 @@ func main() {
 	transparentEgressEnabled := *transparentEgress
 	if v, ok := gates["TransparentEgress"]; ok {
 		transparentEgressEnabled = v
+	}
+	firecrackerVolumeNFS := false
+	if v, ok := gates[controller.FeatureGateFirecrackerVolumeNFS]; ok {
+		firecrackerVolumeNFS = v
 	}
 	normalizedForkMode := strings.ToLower(strings.TrimSpace(*forkMode))
 	switch normalizedForkMode {
@@ -179,6 +188,9 @@ func main() {
 		"templatePullSecret", *templatePullSecret,
 		"imagePullSecrets", *imagePullSecrets,
 		"templateProbeTimeout", *templateProbeTimeout,
+		"firecrackerVolumeNFS", firecrackerVolumeNFS,
+		"volumeNFSService", *volumeNFSService,
+		"volumeNFSLeaseURL", *volumeNFSLeaseURL,
 	)
 
 	var kubeClient controller.KubeClient
@@ -254,6 +266,19 @@ func main() {
 		controller.WithDefaultImagePullSecrets(*imagePullSecrets),
 		controller.WithTemplateProbeTimeout(*templateProbeTimeout),
 	}
+	nfsSettings := controller.VolumeNFSSettings{
+		Enabled:     firecrackerVolumeNFS,
+		ServiceName: *volumeNFSService,
+		ServiceNS:   *volumeNFSNamespace,
+		NFSPort:     *volumeNFSPort,
+	}
+	if *volumeNFSLeaseURL != "" {
+		nfsSettings.LeaseClient = volumenfs.NewClient(*volumeNFSLeaseURL, nil)
+	}
+	if rest, ok := kubeClient.(*controller.RESTKubeClient); ok {
+		nfsSettings.Lookup = controller.RESTVolumeNFSLookup{Client: rest}
+	}
+	opts = append(opts, controller.WithVolumeNFS(nfsSettings))
 	if effectiveStateDir != "" {
 		opts = append(opts, controller.WithStateDir(effectiveStateDir))
 	}
