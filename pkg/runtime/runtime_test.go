@@ -482,6 +482,29 @@ func TestDockerBackend_EngineAPIVolumeMount(t *testing.T) {
 	}
 }
 
+func TestDockerBackend_WorkspaceHostPath(t *testing.T) {
+	docker := NewDockerBackend(DockerConfig{BaseDir: t.TempDir()})
+	args, err := docker.BuildRunArgs(SandboxSpec{
+		SandboxID:         "sb-block",
+		WorkspaceHostPath: "/var/lib/cubepod/volumes/vol123/data",
+	})
+	if err != nil {
+		t.Fatalf("BuildRunArgs failed: %v", err)
+	}
+	if !slices.Contains(args, "/var/lib/cubepod/volumes/vol123/data:/workspace") {
+		t.Fatalf("expected managed block workspace bind, got args: %v", args)
+	}
+	for _, bad := range []string{
+		"relative/data",
+		"/var/lib/cubepod/volumes/../escape/data",
+		"/var/lib/cubepod/volumes/not-data",
+	} {
+		if _, err := docker.BuildRunArgs(SandboxSpec{SandboxID: "sb-block", WorkspaceHostPath: bad}); err == nil {
+			t.Fatalf("expected error for invalid WorkspaceHostPath %q", bad)
+		}
+	}
+}
+
 func TestPoddProcessBackend_DeleteAndInspect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

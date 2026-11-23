@@ -212,6 +212,15 @@ func (d *DockerBackend) planRun(spec SandboxSpec) (dockerRunPlan, error) {
 	}
 	daemonDir := d.daemonSandboxDir(spec.SandboxID)
 	workspaceDir := filepath.Join(daemonDir, "workspace")
+	if ws := strings.TrimSpace(spec.WorkspaceHostPath); ws != "" {
+		if !filepath.IsAbs(ws) || hasDotDotSegment(ws) {
+			return dockerRunPlan{}, fmt.Errorf("invalid workspace host path %q", spec.WorkspaceHostPath)
+		}
+		if filepath.Base(ws) != "data" {
+			return dockerRunPlan{}, fmt.Errorf("workspace host path must be the data directory")
+		}
+		workspaceDir = ws
+	}
 	rootfsDir := filepath.Join(daemonDir, "rootfs")
 
 	binDir := d.cfg.BinDir

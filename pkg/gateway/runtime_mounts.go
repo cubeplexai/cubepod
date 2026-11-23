@@ -99,6 +99,9 @@ func (s *Server) runtimeVolumeMounts(sandboxID string) []runtime.SandboxVolumeMo
 	}
 	out := make([]runtime.SandboxVolumeMount, 0, len(specs))
 	for _, m := range specs {
+		if m.Type == v1alpha1.VolumeTypeBlock || m.ContainerPath == "/workspace" {
+			continue
+		}
 		out = append(out, runtime.SandboxVolumeMount{
 			HostPath:      m.HostPath,
 			ContainerPath: m.ContainerPath,
@@ -106,6 +109,15 @@ func (s *Server) runtimeVolumeMounts(sandboxID string) []runtime.SandboxVolumeMo
 		})
 	}
 	return out
+}
+
+func (s *Server) runtimeWorkspaceHostPath(sandboxID string) string {
+	for _, m := range s.VolumeMounts(sandboxID) {
+		if m.Type == v1alpha1.VolumeTypeBlock || m.ContainerPath == "/workspace" {
+			return m.HostPath
+		}
+	}
+	return ""
 }
 
 func (s *Server) rollbackCreatedSandbox(ctx context.Context, sandboxID string) {
@@ -135,13 +147,14 @@ func (s *Server) startRuntimeSandbox(ctx context.Context, rec *SandboxRecord, im
 		return nil
 	}
 	spec := runtime.SandboxSpec{
-		SandboxID:        rec.SandboxID,
-		TemplateID:       rec.TemplateID,
-		VolumeKey:        rec.VolumeKey,
-		RootfsGeneration: rec.RootfsGeneration,
-		Image:            image,
-		Env:              env,
-		VolumeMounts:     s.runtimeVolumeMounts(rec.SandboxID),
+		SandboxID:         rec.SandboxID,
+		TemplateID:        rec.TemplateID,
+		VolumeKey:         rec.VolumeKey,
+		WorkspaceHostPath: s.runtimeWorkspaceHostPath(rec.SandboxID),
+		RootfsGeneration:  rec.RootfsGeneration,
+		Image:             image,
+		Env:               env,
+		VolumeMounts:      s.runtimeVolumeMounts(rec.SandboxID),
 	}
 	info, err := s.runtime.EnsureRunning(ctx, spec)
 	if err != nil {

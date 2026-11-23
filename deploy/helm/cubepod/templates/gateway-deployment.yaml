@@ -147,9 +147,9 @@ spec:
               value: {{ ternary "1" "0" $k8sVolumeMounts | quote }}
             - name: CUBEPOD_VOLUMES_SHARED_PVC
               value: {{ .Values.volumes.pvcName | quote }}
+            {{- end }}
             - name: CUBEPOD_VOLUMES_ALLOW_LAZY_LEGACY_CLAIM
               value: {{ include "cubepod.boolDefaultTrue" .Values.volumes.allowLazyLegacyClaim | quote }}
-            {{- end }}
             {{- if $s3Env }}
             {{- $s3Env | nindent 12 }}
             {{- end }}

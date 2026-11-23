@@ -433,3 +433,47 @@ func TestStore_EvictMount_And_BlockVolumeCount(t *testing.T) {
 		t.Fatalf("commit after evict: %v", err)
 	}
 }
+
+func TestStore_PromoteOwnerTenant_NameCollisionAndRotateKey(t *testing.T) {
+	st := openTestStore(t, Config{})
+	const oldKey = "tenant-old-key"
+	const newKey = "tenant-new-key"
+
+	// Tenant already has a volume named "ws".
+	existing, err := st.CreateWithOptions(oldKey, "ws", CreateOpts{Type: "block"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Background sync auto-adopts a legacy PVC with the same name under OwnerTenantHash.
+	adopted, created, err := st.AdoptBlockVolume(AdoptBlockVolumeOpts{
+		OwnerTenantHash: ownerKeyHash(oldKey),
+		Name:            "ws",
+		PVCName:         "ws-legacy-workspace-pvc",
+		PVCNamespace:    "cubepod-workloads",
+	})
+	if err != nil || !created {
+		t.Fatalf("AdoptBlockVolume: created=%v err=%v", created, err)
+	}
+
+	// RotateAPIKey must promote and migrate both volumes without clobbering existing "ws".
+	rotated, err := st.RotateAPIKey(oldKey, newKey)
+	if err != nil {
+		t.Fatalf("RotateAPIKey failed: %v", err)
+	}
+	if rotated != 2 {
+		t.Fatalf("expected 2 rotated volumes, got %d", rotated)
+	}
+	// Original "ws" must still resolve by name under newKey.
+	planned, err := st.LookupMounts(newKey, []MountRequest{{Name: "ws", Path: "/workspace"}})
+	if err != nil || len(planned) != 1 || planned[0].VolumeID != existing.VolumeID {
+		t.Fatalf("original volume 'ws' lost after promotion: planned=%+v err=%v", planned, err)
+	}
+	// Adopted volume must also be accessible under newKey with a disambiguated name.
+	gotAdopted, err := st.Get(newKey, adopted.VolumeID)
+	if err != nil {
+		t.Fatalf("adopted volume not accessible after RotateAPIKey: %v", err)
+	}
+	if gotAdopted.Name == "ws" {
+		t.Fatalf("expected disambiguated name for colliding adopted volume, still got %q", gotAdopted.Name)
+	}
+}

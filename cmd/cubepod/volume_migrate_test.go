@@ -118,7 +118,11 @@ func TestMigrateLegacyWorkspaces_InPlaceLocalAndCloneModes(t *testing.T) {
 		t.Fatal(err)
 	}
 	foundLocal := false
+	foundActiveVK := false
 	for _, v := range volsA {
+		if v.Name == "active-vk" && v.PVCName == "active-vk-workspace-pvc" {
+			foundActiveVK = true
+		}
 		if v.Name == "local-proj" {
 			foundLocal = true
 			dir, ok := st.DataDir(v.VolumeID)
@@ -131,8 +135,14 @@ func TestMigrateLegacyWorkspaces_InPlaceLocalAndCloneModes(t *testing.T) {
 			}
 		}
 	}
+	if !foundActiveVK {
+		t.Fatalf("expected active-vk (adopted via PodBox cubepod.io/owner-tenant) in tenant A volumes: %+v", volsA)
+	}
 	if !foundLocal {
 		t.Fatalf("expected local-proj in tenant A volumes: %+v", volsA)
+	}
+	if pvc, ok := kc.GetPVC(ns, "active-vk-workspace-pvc"); !ok || pvc.Annotations[controller.PVCAnnotationAttachedSandbox] != "vk-box" {
+		t.Fatalf("expected active-vk-workspace-pvc to carry attach lease for vk-box, got ok=%v pvc=%+v", ok, pvc)
 	}
 
 	// Running MigrateLegacyWorkspaces a second time must skip already-labeled PVCs idempotently.
