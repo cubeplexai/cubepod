@@ -88,6 +88,12 @@ func (s *Server) podBoxVolumeMounts(sandboxID string) []v1alpha1.VolumeMount {
 func (s *Server) withVolumeMounts(spec v1alpha1.PodBoxSpec, sandboxID string) v1alpha1.PodBoxSpec {
 	if mounts := s.podBoxVolumeMounts(sandboxID); len(mounts) > 0 {
 		spec.VolumeMounts = mounts
+		return spec
+	}
+	if s.reconciler != nil {
+		if existing, ok := s.reconciler.GetBoxSpec(sandboxID); ok && len(existing.VolumeMounts) > 0 {
+			spec.VolumeMounts = append([]v1alpha1.VolumeMount(nil), existing.VolumeMounts...)
+		}
 	}
 	return spec
 }
