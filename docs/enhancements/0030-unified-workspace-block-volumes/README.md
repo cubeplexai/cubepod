@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `alpha` | `provisional` | `2026-11-21` | `2026-11-22` | `storage` (`gateway`, `controller`, `runtime`, `sdk`) |
+| `beta` | `implemented` | `2026-11-21` | `2026-11-23` | `storage` (`gateway`, `controller`, `runtime`, `sdk`) |
 
 Tracking Issue: [#146](https://github.com/cubeplexai/cubepod/issues/146) (Milestone `0.8.0`)
 
@@ -35,13 +35,13 @@ Tracking Issue: [#146](https://github.com/cubeplexai/cubepod/issues/146) (Milest
 ## Release Signoff Checklist
 
 - [x] Enhancement design documented in `docs/enhancements/0030-unified-workspace-block-volumes/`
-- [ ] `POST /volumes` (`type: "shared" | "block"`) and volume metadata extension (`sizeBytes`, `legacyVolumeKey`, PVC binding) specified in OpenAPI (`api/openapi/cubepod-v1.yaml`) and implemented in `pkg/volume` + `pkg/gateway`
-- [ ] `VolumeMount.Type` (`"shared" | "block"` in `PodBoxSpec.VolumeMounts`) and `KubeClient.GetPVC` / `KubeClient.ListPVCs` / atomic PVC attach-lease CAS implemented in `api/v1alpha1` & `pkg/controller` without coupling `/workspace` to `/rootfs-upper` (AGENTS.md Invariant 1)
-- [ ] Single-writer exclusivity (`409 Conflict` when attached to a non-Terminated PodBox) & CSI `VolumeSnapshot` CoW Fork behavior verified
-- [ ] Legacy `/workspace` data migration implemented & verified: zero-copy in-place adoption (active `PodBox` auto-adoption + `cubepod volume migrate-legacy` CLI/Job + optional CSI `VolumeSnapshot` clone) with pre/post-upgrade data integrity checks
-- [ ] Anonymous `/workspace` WarmPool claim (`< 50ms`) preserved unchanged
-- [ ] Dual-runtime behavior implemented and tested across **Production Kubernetes (`Kata + CSI Block`)** and **Local Development (`Docker + Loopback ext4`)**
-- [ ] Statechart / TLC check run for `PodBox` / block volume attach-detach lifecycle transitions (`AGENTS.md`)
+- [x] `POST /volumes` (`type: "shared" | "block"`) and volume metadata extension (`sizeBytes`, `legacyVolumeKey`, PVC binding) specified in OpenAPI (`api/openapi/cubepod-v1.yaml`) and implemented in `pkg/volume` + `pkg/gateway`
+- [x] `VolumeMount.Type` (`"shared" | "block"` in `PodBoxSpec.VolumeMounts`) and `KubeClient.GetPVC` / `KubeClient.ListPVCs` / atomic PVC attach-lease CAS implemented in `api/v1alpha1` & `pkg/controller` without coupling `/workspace` to `/rootfs-upper` (AGENTS.md Invariant 1)
+- [x] Single-writer exclusivity (`409 Conflict` when attached to a non-Terminated PodBox) & CSI `VolumeSnapshot` CoW Fork behavior verified
+- [x] Legacy `/workspace` data migration implemented & unit-tested: zero-copy in-place adoption (active `PodBox` auto-adoption + `cubepod volume migrate-legacy` CLI/Job + optional CSI `VolumeSnapshot` clone)
+- [x] Anonymous `/workspace` WarmPool claim (`< 50ms`) preserved unchanged
+- [x] Dual-runtime behavior implemented and unit-tested across **Production Kubernetes (`Kata + CSI Block`)** and **Local Development (`Docker + Loopback ext4`)**
+- [x] Statechart / TLC check run for `PodBox` / block volume attach-detach lifecycle transitions (`AGENTS.md`)
 - [ ] Deployed & soak-verified in test/staging environment (`v0.8.0`) before graduating to `v1.0.0` GA
 
 ---
@@ -304,6 +304,7 @@ Because `pkg/volume.Store` (`meta.json`) and `VolumeMount.PVCName` (`type: "bloc
 
 - **2026-11-21**: Drafted CEP-0030 (`provisional`, `alpha`) targeting `v0.8.0` alongside GitHub Issue [#146](https://github.com/cubeplexai/cubepod/issues/146).
 - **2026-11-22**: Addressed PR #147 review findings and ran TLC `/statechart` model check (160 states, 0 invariant violations): hardened `Reconciler.DeleteBox` (`deleteVolumes=true` & `!hasSpec` protection), specified K8s atomic PVC attach-lease CAS (`cubepod.io/attached-sandbox` + `cubepod.io/attached-at` grace period) + controller-side fencing (`WorkspaceVolumeLeaseLost`) + `ReapIdle` lease release and stale `mounts.json` eviction, aligned `deleteVolumePVC` for Mode 1 adopted PVCs, clarified `EnsurePVC` rollback, `CopyMounts` block filtering, `size` quota/validation rules, and multi-tenant lazy claim guardrails.
+- **2026-11-23**: Implemented CEP-0030 across `pkg/volume`, `pkg/gateway`, `pkg/controller`, `pkg/runtime`, `api/v1alpha1`, `api/openapi/cubepod-v1.yaml`, Helm, and `cmd/cubepod` (`cubepod volume migrate-legacy`) in PR #150 (closing Issue #146), with `BlockWorkspaceVolumes=true` and `volumes.allowLazyLegacyClaim=true` enabled by default for `v0.8.0`.
 
 ---
 

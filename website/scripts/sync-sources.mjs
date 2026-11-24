@@ -68,7 +68,8 @@ const CRD_FIELD_DESCRIPTIONS = {
   // PodBox
   'spec.volumeMounts': 'Persistent RWX volume mounts attached to the sandbox container.',
   'spec.volumeMounts[].volumeID': '32-character hexadecimal volume identifier.',
-  'spec.volumeMounts[].pvcName': 'Shared ReadWriteMany PVC name hosting persistent volumes.',
+  'spec.volumeMounts[].type': 'Volume backing mode: `"shared"` (RWX filesystem SubPath) or `"block"` (exclusive RWO Block PVC mapped to `/workspace`).',
+  'spec.volumeMounts[].pvcName': 'Shared ReadWriteMany PVC name (`"shared"`) or dedicated RWO block PVC name (`"block"`).',
   'spec.volumeMounts[].subPath': 'Subdirectory path inside the shared PVC for this volume.',
   'spec.volumeMounts[].path': 'Absolute mount path inside the sandbox container.',
   'spec.templateRef': 'Name of the `PodTemplate` defining runtime class, base OCI image, storage, and egress defaults.',
@@ -490,9 +491,17 @@ const HELM_VALUE_DESCRIPTIONS = {
     en: '*Added in v0.7.0.* Filesystem directory (`CUBEPOD_EVENTS_DIR`) used only when `events.backend` is `"file"`.',
     zh: '*v0.7.0 新增。* 仅当 `events.backend` 为 `"file"` 时使用的本地事件目录（`CUBEPOD_EVENTS_DIR`）。',
   },
+  'featureGates.blockWorkspaceVolumes': {
+    en: '*Added in v0.8.0.* Wired into `--feature-gate=BlockWorkspaceVolumes=...`; enables managing persistent `/workspace` block volumes through `/volumes` (`type: "block"`) and `PodBox` block `volumeMounts`.',
+    zh: '*v0.8.0 新增。* 注入 `--feature-gate=BlockWorkspaceVolumes=...`，允许通过 `/volumes`（`type: "block"`）统一管理持久化 `/workspace` 块卷与挂载。',
+  },
   'featureGates.k8sVolumeMounts': {
     en: '*Changed in v0.8.0.* Wired into `--feature-gate=K8sVolumeMounts=...`; auto-enabled whenever `volumes.enabled` is `true` or `volumes.rwxStorageClassName` is non-empty.',
     zh: '*v0.8.0 变更。* 注入 `--feature-gate=K8sVolumeMounts=...`；当 `volumes.enabled` 为 `true` 或 `volumes.rwxStorageClassName` 非空时会自动开启。',
+  },
+  'featureGates.firecrackerVolumeNFS': {
+    en: '*Added in v0.8.0.* Wired into `--feature-gate=FirecrackerVolumeNFS=...`; routes shared `/volumes` mounts on Kata Firecracker through `cubepod-volume-nfs` using guest kernel `libc::mount(2)` NFSv3.',
+    zh: '*v0.8.0 新增。* 注入 `--feature-gate=FirecrackerVolumeNFS=...`，开启后在 Kata Firecracker 运行时通过 `cubepod-volume-nfs` 与 Guest 内核 `libc::mount(2)` NFSv3 挂载共享 `/volumes` 卷。',
   },
   'volumes.enabled': {
     en: 'Mount the shared RWX persistent volumes PVC (`CUBEPOD_VOLUMES_DIR`) into `cubepod-gateway`. Automatically activated when `volumes.rwxStorageClassName` is set (*Changed in v0.8.0*).',
@@ -509,6 +518,42 @@ const HELM_VALUE_DESCRIPTIONS = {
   'volumes.size': {
     en: 'Capacity requested for the shared `ReadWriteMany` volumes PVC.',
     zh: '共享 `ReadWriteMany` 卷 PVC 申请的存储容量。',
+  },
+  'volumes.allowLazyLegacyClaim': {
+    en: '*Added in v0.8.0.* Allows `POST /sandboxes` requests with legacy `extension.volumeKey` to lazily adopt pre-existing `<sanitized>-workspace-pvc` claims (`CUBEPOD_ALLOW_LAZY_LEGACY_CLAIM`).',
+    zh: '*v0.8.0 新增。* 是否允许传入旧版 `extension.volumeKey` 的 `POST /sandboxes` 请求懒收编既有的 `<sanitized>-workspace-pvc` 持久卷（`CUBEPOD_ALLOW_LAZY_LEGACY_CLAIM`）。',
+  },
+  'volumes.nfs.enabled': {
+    en: '*Added in v0.8.0.* Deploy the `cubepod-volume-nfs` userspace NFSv3 lease proxy (`volume-nfs.yaml`) when persistent volumes are active (also auto-enabled when `featureGates.firecrackerVolumeNFS` is `true` and `volumes` are active).',
+    zh: '*v0.8.0 新增。* 在持久卷启用时部署 `cubepod-volume-nfs` 用户态 NFSv3 代理（`volume-nfs.yaml`；当 `featureGates.firecrackerVolumeNFS` 为 `true` 且 RWX 卷启用时也会自动部署）。',
+  },
+  'volumes.nfs.image.registry': {
+    en: '*Added in v0.8.0.* OCI registry hosting the `cubepod-volume-nfs` image.',
+    zh: '*v0.8.0 新增。* `cubepod-volume-nfs` 镜像所在的 OCI 仓库地址。',
+  },
+  'volumes.nfs.image.repository': {
+    en: '*Added in v0.8.0.* Image repository path for `cubepod-volume-nfs`.',
+    zh: '*v0.8.0 新增。* `cubepod-volume-nfs` 镜像仓库路径。',
+  },
+  'volumes.nfs.image.tag': {
+    en: '*Added in v0.8.0.* Image tag for `cubepod-volume-nfs`.',
+    zh: '*v0.8.0 新增。* `cubepod-volume-nfs` 镜像标签。',
+  },
+  'volumes.nfs.image.pullPolicy': {
+    en: '*Added in v0.8.0.* Kubernetes `imagePullPolicy` for `cubepod-volume-nfs`.',
+    zh: '*v0.8.0 新增。* `cubepod-volume-nfs` Pod 的镜像拉取策略。',
+  },
+  'volumes.nfs.port': {
+    en: '*Added in v0.8.0.* TCP port exposed by `cubepod-volume-nfs` for NFSv3 MOUNT/NFS RPCs (default `2049`).',
+    zh: '*v0.8.0 新增。* `cubepod-volume-nfs` 暴露的 NFSv3 MOUNT/NFS RPC 监听端口（默认 `2049`）。',
+  },
+  'volumes.nfs.leasePort': {
+    en: '*Added in v0.8.0.* Internal HTTP lease registration port exposed by `cubepod-volume-nfs` (must differ from `volumes.nfs.port`, default `8080`).',
+    zh: '*v0.8.0 新增。* `cubepod-volume-nfs` 内部 HTTP 租约注册端口（必须与 `volumes.nfs.port` 不同，默认 `8080`）。',
+  },
+  'volumes.nfs.replicaCount': {
+    en: '*Added in v0.8.0.* Replica count for `cubepod-volume-nfs` (must remain `1` in Alpha because in-memory `go-nfs` filehandles do not survive failover).',
+    zh: '*v0.8.0 新增。* `cubepod-volume-nfs` 副本数（Alpha 阶段必须为 `1`，因为内存态 `go-nfs` 文件句柄不支持多副本漂移）。',
   },
 };
 
@@ -550,6 +595,10 @@ function syncHelmValues() {
       isZh
         ? '> **v0.7.0 配置变更：** 新增 `events.*`（`events.enabled`、`events.backend`，默认 `"k8s"` 多副本 HA 后端，以及 `events.dir`），用于沙箱生命周期事件、Webhook 与死信。'
         : '> **Added in v0.7.0:** Added `events.*` (`events.enabled`, `events.backend` with the default `"k8s"` multi-replica HA backend, and `events.dir`) for sandbox lifecycle events, webhooks, and dead letters.',
+      '',
+      isZh
+        ? '> **v0.8.0 配置变更：** 将 `e2bVolumes.*` 与 `featureGates.k8sE2BVolumeMounts` 统一更名为 `volumes.*` 与 `featureGates.k8sVolumeMounts`；新增 `featureGates.blockWorkspaceVolumes`（默认 `true`）、`volumes.allowLazyLegacyClaim`（默认 `true`），以及默认开启的 Kata Firecracker NFSv3 代理配置 `featureGates.firecrackerVolumeNFS` 与 `volumes.nfs.*`（`volume-nfs.yaml`）。'
+        : '> **Changed / Added in v0.8.0:** Renamed `e2bVolumes.*` and `featureGates.k8sE2BVolumeMounts` to `volumes.*` and `featureGates.k8sVolumeMounts`; added `featureGates.blockWorkspaceVolumes` (default `true`), `volumes.allowLazyLegacyClaim` (default `true`), and `featureGates.firecrackerVolumeNFS` (default `true`) with `volumes.nfs.*` (`volume-nfs.yaml`).',
       '',
       isZh ? '## 参数列表' : '## Parameter Reference',
       '',
