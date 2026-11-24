@@ -40,6 +40,7 @@ values_podd=$(sed -nE 's/^[[:space:]]*poddInjectorImage: "ghcr\.io\/cubeplexai\/
 values_gateway=$(awk '/^gateway:/{s=1} s && /tag:/{gsub(/.*tag: "v|"/, ""); print; exit}' deploy/helm/cubepod/values.yaml)
 values_controller=$(awk '/^controller:/{s=1} s && /tag:/{gsub(/.*tag: "v|"/, ""); print; exit}' deploy/helm/cubepod/values.yaml)
 values_egress=$(awk '/^egress:/{s=1} s && /tag:/{gsub(/.*tag: "v|"/, ""); print; exit}' deploy/helm/cubepod/values.yaml)
+values_volume_nfs=$(awk '/^volumes:/{v=1} v && /^  nfs:/{n=1} v && n && /tag:/{gsub(/.*tag: "v|"/, ""); print; exit}' deploy/helm/cubepod/values.yaml)
 python_pyproject=$(awk '
   /^\[project\]/ { in_proj=1; next }
   /^\[/ { in_proj=0 }
@@ -64,6 +65,7 @@ declare -A versions=(
   [deploy/helm/cubepod/values.yaml:gateway.image.tag]="$values_gateway"
   [deploy/helm/cubepod/values.yaml:controller.image.tag]="$values_controller"
   [deploy/helm/cubepod/values.yaml:egress.image.tag]="$values_egress"
+  [deploy/helm/cubepod/values.yaml:volumes.nfs.image.tag]="$values_volume_nfs"
   [sdks/python/pyproject.toml]="$python_pyproject"
   [sdks/python/cubepod/__init__.py]="$python_init"
   [sdks/typescript/package.json]="$ts_pkg"

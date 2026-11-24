@@ -8,14 +8,14 @@ participating-areas:
   - "controller"
   - "runtime"
   - "sdk"
-status: "provisional"
+status: "implemented"
 creation-date: "2026-11-21"
-last-updated: "2026-11-22"
+last-updated: "2026-11-23"
 reviewers:
   - "@xfgong"
 approvers:
   - "@xfgong"
-stage: "alpha"
+stage: "beta"
 latest-milestone: "v0.8.0"
 milestone:
   alpha: "v0.8.0"

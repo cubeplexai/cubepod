@@ -2,7 +2,7 @@
 
 | Stage | Status | Created | Updated | Owning Area |
 | :--- | :--- | :--- | :--- | :--- |
-| `alpha` | `provisional` | `2026-11-22` | `2026-11-23` | `storage` (`controller`, `runtime`, `egress`, `gateway`) |
+| `beta` | `implemented` | `2026-11-22` | `2026-11-23` | `storage` (`controller`, `runtime`, `egress`, `gateway`) |
 
 ## Table of Contents
 
@@ -41,7 +41,7 @@
 ## Release Signoff Checklist
 
 - [x] Enhancement design documented in `docs/enhancements/0031-firecracker-volume-nfs/`
-- [ ] Enhancement scope, Goals, and Non-Goals are agreed upon (`provisional` -> `implementable`)
+- [x] Enhancement scope, Goals, and Non-Goals agreed upon and implemented (`PR #158`)
 - [x] API / CRD (`pod.cubeplex.ai/v1alpha1`) and E2B-superset OpenAPI changes are specified (no public volume API change; internal `CUBEPOD_VOLUME_MOUNTS` transport fields only)
 - [x] Dual-runtime behavior (Kubernetes Kata Firecracker NFS, Kubernetes `kata-qemu` / `kata-clh` virtio-fs, and Local Docker loopback) is defined
 - [x] Security boundary (MicroVM isolation, lease-scoped exports, egress exemption, `MS_NOSUID | MS_NODEV`) is reviewed
@@ -374,6 +374,7 @@ This documentation PR does not run those runtime tests.
 
 - **2026-11-22**: Proposal drafted after issue #122 analysis and a read of official E2B `nfsproxy` / `envd` NFS mount behavior. Target milestone `v0.8.0`. Status initially marked `implementable`.
 - **2026-11-23**: Returned status to `provisional` and addressed PR #149 review: lease pre-registration and `podIP` bind before Ready under synchronous `EnsurePod`; `volumeIDs` lease API; `libc::mount(2)` plus an explicit NFSv3 MOUNT/filehandle implementation gate (no user-image `mount.nfs`); destination-based egress exemption and `skuid 0`; source-IP / SNAT prerequisite; controller fail-closed with gateway JSON errors; honest Alpha `ESTALE` / single-replica limits.
+- **2026-11-24**: Implemented `pkg/volumenfs`, `cmd/cubepod-volume-nfs`, `images/volume-nfs/Dockerfile`, controller/egress/podd-init wiring, Helm `volume-nfs.yaml`, and verified the fail-closed CEP-0031 gate (`test/kata-e2e/verify_cep0031_gate.py`) against pinned guest kernel `6.18.62-cubepod-nfs1` on Kata Firecracker in draft PR #157; enabled `FirecrackerVolumeNFS=true` by default for `v0.8.0` in PR #158.
 
 ---
 

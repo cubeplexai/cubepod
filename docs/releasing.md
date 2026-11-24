@@ -45,7 +45,7 @@ One CubePod semver (example: `0.4.2`) across these committed fields.
 - `cmd/cubepod-controller/main.go` → `-podd-image` default (`ghcr.io/cubeplexai/cubepod-podd:v<semver>`)
 - `cmd/cubepod-gateway/main.go` → `-podd-image` default (`ghcr.io/cubeplexai/cubepod-podd:v<semver>`)
 - `deploy/helm/cubepod/Chart.yaml` → `version` and `appVersion`
-- `deploy/helm/cubepod/values.yaml` → `runtime.poddInjectorImage`, `gateway.image.tag`, `controller.image.tag`, `egress.image.tag`
+- `deploy/helm/cubepod/values.yaml` → `runtime.poddInjectorImage`, `gateway.image.tag`, `controller.image.tag`, `egress.image.tag`, `volumes.nfs.image.tag`
 - `sdks/python/pyproject.toml` → `[project].version`
 - `sdks/python/cubepod/__init__.py` → `__version__`
 - `sdks/typescript/package.json` → `version`
