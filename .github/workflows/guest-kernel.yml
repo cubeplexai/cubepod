@@ -14,7 +14,9 @@ concurrency:
 jobs:
   kernel:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 90
+    env:
+      UBUNTU_MIRROR: http://azure.archive.ubuntu.com/ubuntu
     permissions:
       contents: read
       packages: write

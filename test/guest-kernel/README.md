@@ -47,6 +47,7 @@ isolated CEP-0031 implementation gate.
 ## CI and publication
 
 Manually run **Experimental Firecracker guest kernel** (`guest-kernel.yml`).
+GitHub-hosted runs set `UBUNTU_MIRROR` to the Azure Ubuntu archive and use a 90-minute job timeout; local builds are unchanged unless that variable is set.
 `publish=false` is the default. An explicit `publish=true` publishes only after
 the real KVM preflight passes, using the workflow token with `packages:write`.
 The candidate is named `ghcr.io/<repository-owner>/cubepod-fc-kernel` and tagged

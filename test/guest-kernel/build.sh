@@ -34,7 +34,32 @@ cp "$K/tools/packaging/static-build/kernel/Dockerfile" "$CTX/Dockerfile"
 sed -i 's|^FROM ubuntu:22.04$|FROM ubuntu:22.04@sha256:f64b2ffc2f10ab8f8505aa56b2664bd846cbb9df87c7e2532e30f7667021c0e6|' "$CTX/Dockerfile"
 cp "$K/tools/packaging/static-build/kernel/install_yq.sh" "$CTX/install_yq.sh"
 printf '%s\n' 'RUN echo "638c4b251c49201fc94b598834b715f8f1c6e9b1854d2820772d2c79f0289002  /usr/local/bin/yq" | sha256sum -c -' >> "$CTX/Dockerfile"
-docker build -t "$TOOLS" "$CTX"
+# Optional Azure/CI Ubuntu mirror and short apt retries, inserted before Kata's apt-get.
+# Empty UBUNTU_MIRROR leaves the image's default archive.ubuntu.com sources in place.
+python3 - "$CTX/Dockerfile" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+anchor = "COPY install_yq.sh /usr/bin/install_yq.sh\n"
+if anchor not in text:
+    raise SystemExit("Kata compiler Dockerfile is missing the install_yq COPY; refusing to patch apt sources")
+if "99-ci-retries" in text:
+    raise SystemExit("compiler Dockerfile already has apt retry config; refusing to double-patch")
+insert = """ARG UBUNTU_MIRROR=""
+RUN if [ -n \"$UBUNTU_MIRROR\" ]; then \\
+      if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \\
+        sed -i -e \"s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g\" -e \"s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g\" /etc/apt/sources.list.d/ubuntu.sources; \\
+      fi; \\
+      if [ -f /etc/apt/sources.list ]; then \\
+        sed -i -e \"s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g\" -e \"s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g\" /etc/apt/sources.list; \\
+      fi; \\
+    fi && \\
+    printf 'Acquire::Retries \"3\";\\nAcquire::http::Timeout \"30\";\\nAcquire::https::Timeout \"30\";\\nAcquire::http::Pipeline-Depth \"0\";\\n' >/etc/apt/apt.conf.d/99-ci-retries
+"""
+path.write_text(text.replace(anchor, insert + "\n" + anchor, 1))
+PY
+docker build --build-arg UBUNTU_MIRROR="${UBUNTU_MIRROR:-}" -t "$TOOLS" "$CTX"
 printf '%s\n' "$TOOLS" > "$DEST/tools-image.txt"
 docker image inspect "$TOOLS" --format '{{.Id}}' > "$DEST/tools-image-id.txt"
 docker create --name "$NAME" --network none --cpus=4 --memory=5g --label io.cubepod.guest-kernel=compile \
