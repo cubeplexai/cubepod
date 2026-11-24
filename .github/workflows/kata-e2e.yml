@@ -32,6 +32,9 @@ jobs:
       GOMAXPROCS: "2"
       CARGO_BUILD_JOBS: "2"
       UBUNTU_MIRROR: http://azure.archive.ubuntu.com/ubuntu
+      # Only the Firecracker lane's private configuration-e2e.toml selects this
+      # immutable, checksum-verified guest kernel pin. CLH stays on Kata's stock kernel.
+      KATA_FC_KERNEL_LOCK: ${{ matrix.vmm == 'fc' && format('{0}/deploy/k8s/kata/guest-kernel/fc-nfs1.pin.json', github.workspace) || '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
