@@ -44,15 +44,19 @@ class ReportsTest(unittest.TestCase):
     def test_documented_fc_skips_allowed(self):
         body = (
             "<testcase name='a'/><testcase name='b'/><testcase name='c'/>"
-            "<testcase name='volume'><skipped message='https://github.com/cubeplexai/cubepod/issues/122: volume'/></testcase>"
+            "<testcase name='volume'><skipped message='https://github.com/cubeplexai/cubepod/issues/120: volume'/></testcase>"
             "<testcase name='create'><skipped message='https://github.com/cubeplexai/cubepod/issues/120: eio'/></testcase>"
         )
         self.assertEqual(self.run_check(body, env={"KATA_VMM": "fc"}), 0)
 
     def test_documented_skip_still_fails_off_firecracker(self):
-        body = "<testcase><skipped message='https://github.com/cubeplexai/cubepod/issues/122: volume'/></testcase>" + "<testcase/>" * 4
+        body = "<testcase><skipped message='https://github.com/cubeplexai/cubepod/issues/120: volume'/></testcase>" + "<testcase/>" * 4
         self.assertNotEqual(self.run_check(body), 0)
         self.assertNotEqual(self.run_check(body, env={"KATA_VMM": "clh"}), 0)
+
+    def test_stale_issue_122_skip_fails_on_firecracker(self):
+        body = "<testcase><skipped message='https://github.com/cubeplexai/cubepod/issues/122: volume'/></testcase>" + "<testcase/>" * 4
+        self.assertNotEqual(self.run_check(body, env={"KATA_VMM": "fc"}), 0)
 
     def test_unlabeled_skip_fails_on_firecracker(self):
         self.assertNotEqual(self.run_check("<testcase><skipped/></testcase>" + "<testcase/>" * 4, env={"KATA_VMM": "fc"}), 0)

@@ -20,3 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 curl ca
 # No CubePod binaries: podd and podd-init are injected by the real controller.
 FROM sandbox AS sandbox-block
 RUN apt-get update && apt-get install -y --no-install-recommends e2fsprogs util-linux && rm -rf /var/lib/apt/lists/*
+# Checkout-built userspace NFSv3 proxy (CEP-0031 FirecrackerVolumeNFS, default on).
+FROM base AS volume-nfs
+COPY cubepod-volume-nfs /usr/local/bin/cubepod-volume-nfs
+USER 1000:1000
+ENTRYPOINT ["/usr/local/bin/cubepod-volume-nfs"]

@@ -13,6 +13,7 @@ import dmsetup_node
 
 from cleanup_node import owned_files, validate_pool, validate_thin
 from verify_guest_log import guest_ready
+from verify_cep0031_gate import nfs_helper_findings
 from dmsetup_node import validate as validate_publication
 from collect_block_state import owned_thin as validate_diagnostic
 
@@ -47,13 +48,30 @@ class RuntimeProofTest(unittest.TestCase):
     def test_partial_or_empty_execution_fails(self):
         for count in (0,1,11):self.assertNotEqual(self.verify(count=count),0)
     def test_skipped_volume_tests_lower_expected_pod_count(self):
-        volume = "<testcase name='test_volume_mount_persistence'><skipped message='#122'/></testcase>"
-        volume_ts = "<testcase name='volume mounts survive destruction and recreation'><skipped message='#122'/></testcase>"
+        volume = "<testcase name='test_volume_mount_persistence'><skipped message='#120'/></testcase>"
+        volume_ts = "<testcase name='volume mounts survive destruction and recreation'><skipped message='#120'/></testcase>"
         others = "<testcase name='a'/><testcase name='b'/><testcase name='c'/><testcase name='d'/>"
         reports = [others + volume, others + volume_ts]
         self.assertEqual(self.verify(count=8, reports=reports), 0)
         self.assertNotEqual(self.verify(count=7, reports=reports), 0)
 
+
+
+class Cep0031HelperProbeTest(unittest.TestCase):
+    """CEP-0031 gate: dpkg status must be parsed, not treated as presence."""
+    def test_absent_states_pass(self):
+        for probe in ('', 'nfs-common unknown ok not-installed', 'nfs-common deinstall ok config-files',
+                      'dpkg-query: no packages found matching nfs-common', '\n'):
+            self.assertEqual(nfs_helper_findings(probe), [], probe)
+    def test_installed_package_fails(self):
+        for probe in ('nfs-common install ok installed', 'nfs-common install ok unpacked',
+                      'nfs-common install ok half-configured'):
+            self.assertTrue(nfs_helper_findings(probe), probe)
+    def test_mount_nfs_binary_fails(self):
+        for probe in ('/usr/sbin/mount.nfs', '/sbin/mount.nfs4\nnfs-common unknown ok not-installed'):
+            self.assertTrue(nfs_helper_findings(probe), probe)
+    def test_unrecognised_output_fails_closed(self):
+        self.assertTrue(nfs_helper_findings('nfs-common installed'))
 
 
 class DeviceOwnershipTest(unittest.TestCase):

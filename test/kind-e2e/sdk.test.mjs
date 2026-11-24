@@ -1,6 +1,7 @@
 // Official SDK, real remote gateway only. Patterns mirror test/e2b-compat-ts.
-// On Kata Firecracker only, failures caused by issue #120 or #122 are documented
-// skips and must be re-enabled when those issues are fixed. Other runtimes stay
+// On Kata Firecracker only, failures caused by issue #120 are documented skips.
+// The FC volume persistence test is skipped for #120 until the upstream Kata fix
+// lands; CEP0031_FC_NFS_GATE=1 re-enables it fail-closed. Other runtimes stay
 // fail-closed: a skip still fails the check.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -17,7 +18,6 @@ assert.equal(process.env.E2B_VOLUME_API_URL, process.env.E2B_API_URL);
 assert.equal(process.env.E2B_API_KEY, 'cpod_kind_test_only');
 
 const FC_ISSUE_120 = 'https://github.com/cubeplexai/cubepod/issues/120';
-const FC_ISSUE_122 = 'https://github.com/cubeplexai/cubepod/issues/122';
 const issue120Markers = [
   'failed to mount /dev/vdb',
   'EIO: I/O error',
@@ -50,12 +50,12 @@ function isIssue120(err) {
   return issue120Markers.some(marker => text.includes(marker));
 }
 
-async function withSandbox(t, fn, options = {}) {
+async function withSandbox(t, fn, { failClosed = false, ...options } = {}) {
   let sbx;
   try {
     sbx = await Sandbox.create('kind-e2e', { timeoutMs: 120000, requestTimeoutMs: 90000, ...options });
   } catch (err) {
-    if (isFirecracker() && isIssue120(err)) {
+    if (!failClosed && isFirecracker() && isIssue120(err)) {
       t.skip(`${FC_ISSUE_120}: Firecracker virtio-mmio hotplug race: ${err}`);
       return;
     }
@@ -135,19 +135,42 @@ test('outbound network and real exposed port', { timeout: 120000 }, async (t) =>
   });
 });
 
+// Opt-in CEP-0031 gate (off by default): CEP0031_FC_NFS_GATE=1 unskips the FC volume
+// persistence test and makes it fail closed (no #120 skip). Re-enable once #120 is fixed.
+const CEP0031_GATE = process.env.CEP0031_FC_NFS_GATE === '1' && isFirecracker();
+const GATE_PROBE = "uname -r; echo ---; awk '$2==\"/data\"' /proc/mounts; echo ---; " +
+  "(command -v mount.nfs mount.nfs4; ls /sbin/mount.nfs* /usr/sbin/mount.nfs* 2>/dev/null; " +
+  "dpkg-query -W -f='${Package} ${Status}\\n' nfs-common 2>/dev/null) || true";
+
+async function gateRecord(sbx, phase) {
+  const { appendFileSync } = await import('node:fs');
+  const out = (await sbx.commands.run(GATE_PROBE)).stdout;
+  const [release, mounts, helpers] = out.split('---').map(part => part.trim());
+  const record = { sdk: 'typescript', phase, sandbox_id: sbx.sandboxId, uname: release,
+    data_mounts: mounts.split('\n').filter(Boolean), nfs_helpers: helpers };
+  appendFileSync(`${process.env.ARTIFACTS}/cep0031-gate-typescript.jsonl`, JSON.stringify(record) + '\n');
+  assert.equal(release, process.env.E2E_GUEST_KERNEL, JSON.stringify(record));
+  const last = record.data_mounts.at(-1).split(/\s+/);
+  assert.ok(['nfs', 'nfs3'].includes(last[2]), JSON.stringify(record));
+  assert.ok(last[3].split(',').includes('nosuid') && last[3].split(',').includes('nodev'), JSON.stringify(record));
+  assert.ok(helpers === '' || helpers.includes('not-installed'), JSON.stringify(record));
+}
+
 test('volume mounts survive destruction and recreation', { timeout: 240000 }, async (t) => {
-  if (isFirecracker()) {
-    t.skip(`${FC_ISSUE_122}: E2B filesystem volume mounts do not persist on Kata Firecracker`);
+  if (isFirecracker() && !CEP0031_GATE) {
+    t.skip(`${FC_ISSUE_120}: Kata 4.4.0 Firecracker virtio-mmio hotplug /dev/vdb EIO race makes repeated volume sandbox creates flaky (waiting on upstream)`);
     return;
   }
   const volume = await Volume.create(`kind-ts-${Date.now()}`);
   try {
     await withSandbox(t, async sbx => {
+      if (CEP0031_GATE) await gateRecord(sbx, 'create');
       await sbx.files.write('/data/persist.txt', 'persisted-ts');
       assert.equal((await sbx.commands.run('cat /data/persist.txt')).stdout, 'persisted-ts');
-    }, { volumeMounts: { '/data': volume } });
+    }, { volumeMounts: { '/data': volume }, failClosed: CEP0031_GATE });
     await withSandbox(t, async sbx => {
+      if (CEP0031_GATE) await gateRecord(sbx, 'recreate');
       assert.equal(await sbx.files.read('/data/persist.txt'), 'persisted-ts');
-    }, { volumeMounts: { '/data': volume } });
+    }, { volumeMounts: { '/data': volume }, failClosed: CEP0031_GATE });
   } finally { await Volume.destroy(volume.volumeId); }
 });

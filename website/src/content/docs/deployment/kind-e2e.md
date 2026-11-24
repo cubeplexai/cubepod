@@ -98,10 +98,20 @@ published by workflow run 45314457814 and pinned by OCI digest). Only that lane'
 private `configuration-e2e.toml` selects it; the Cloud Hypervisor lane and default
 deployments keep Kata's stock kernel.
 
-These are **experimental kernel candidates, not a volume-persistence proof**.
-This option does not enable `FirecrackerVolumeNFS`, change production defaults or
-remove #120/#122 test skips. Built-in NFS is necessary but not sufficient: real
-helper-free mounting, preserved pod source IP and the official SDK's
-across-destroy/recreate persistence tests must all pass separately. See
+Changed after v0.7.1 (unreleased): `FirecrackerVolumeNFS` is on by default and every
+kind lane deploys a checkout-built `cubepod-volume-nfs`. The CEP-0031 gate (helper-free
+`mount(2)`, no `nfs-common`/`mount.nfs`, NFS source IP equal to the sandbox Pod IP,
+data surviving destroy/recreate, with both official SDKs) passed on this kernel in
+draft PR #157. On Kata Firecracker the official SDK volume persistence tests stay
+skipped for [issue #120](https://github.com/cubeplexai/cubepod/issues/120) (Kata 4.4.0
+virtio-mmio hotplug `/dev/vdb` EIO race, waiting on upstream). The opt-in gate re-enables
+them fail-closed and runs `test/kata-e2e/verify_cep0031_gate.py`:
+
+```bash
+KATA_VMM=fc CEP0031_FC_NFS_GATE=1 KATA_FC_KERNEL_LOCK=/absolute/path/to/pin.json \
+  CLUSTER_NAME=cubepod-private-fc bash test/kind-e2e/run.sh
+```
+
+In CI it is off by default; dispatch **Kata E2E** with `cep0031_gate=true`. See
 `test/guest-kernel/README.md` in the source tree for the full version contract,
 checksums, build commands and limitations.
