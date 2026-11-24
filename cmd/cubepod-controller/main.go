@@ -73,7 +73,7 @@ func defaultEgressImage() string {
 	if env := strings.TrimSpace(os.Getenv("CUBEPOD_EGRESS_IMAGE")); env != "" {
 		return env
 	}
-	return "ghcr.io/cubeplexai/cubepod-egress:v0.7.1"
+	return "ghcr.io/cubeplexai/cubepod-egress:v0.8.0"
 }
 
 func main() {
@@ -86,7 +86,7 @@ func main() {
 		storageClass         = flag.String("storage-class", "nfs-storage", "Default StorageClass name")
 		volumeMode           = flag.String("volume-mode", "Filesystem", "Storage volume mode (Block or Filesystem)")
 		runtimeClass         = flag.String("runtime-class", "", "Container runtime class name (empty for standard runc/containerd)")
-		poddImage            = flag.String("podd-image", "ghcr.io/cubeplexai/cubepod-podd:v0.7.1", "Image for podd-installer initContainer")
+		poddImage            = flag.String("podd-image", "ghcr.io/cubeplexai/cubepod-podd:v0.8.0", "Image for podd-installer initContainer")
 		sandboxImage         = flag.String("sandbox-image", "ubuntu:24.04", "Default sandbox image")
 		egressImage          = flag.String("egress-image", defaultEgressImage(), "Default cubepod-egress sidecar image when template egress.image is empty")
 		egressExchangeURL    = flag.String("egress-exchange-url", os.Getenv("CUBEPOD_EGRESS_EXCHANGE_URL"), "Default egress secret exchange URL when template egress.exchangeUrl is empty")
