@@ -92,6 +92,12 @@ authorized registry login. The helper at
 `deploy/k8s/kata/guest-kernel/fetch.sh` only fetches verified files; it never runs
 the artifact image or modifies host Kata/containerd services.
 
+Changed after v0.7.1 (unreleased): the CI **Kata Firecracker** lane uses the committed
+`deploy/k8s/kata/guest-kernel/fc-nfs1.pin.json` (release `6.18.62-cubepod-nfs1`,
+published by workflow run 45314457814 and pinned by OCI digest). Only that lane's
+private `configuration-e2e.toml` selects it; the Cloud Hypervisor lane and default
+deployments keep Kata's stock kernel.
+
 These are **experimental kernel candidates, not a volume-persistence proof**.
 This option does not enable `FirecrackerVolumeNFS`, change production defaults or
 remove #120/#122 test skips. Built-in NFS is necessary but not sufficient: real

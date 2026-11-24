@@ -72,6 +72,11 @@ KATA_VMM=fc KATA_FC_KERNEL_LOCK=/absolute/path/pin.json \
   CLUSTER_NAME=cubepod-my-private-fc bash test/kind-e2e/run.sh
 ```
 
+The committed `deploy/k8s/kata/guest-kernel/fc-nfs1.pin.json` is the reviewed pin from
+workflow run 45314457814 (OCI digest `sha256:df87007495c8c4f381f38028789b9688ec5aed993b8fa343ff989090a5cde05a`,
+kernel SHA256 `a7838b3b538ceab69f612bcd8e069d729acb5d72e61769e26710ddccafd0379b`). The
+`Kata E2E` workflow passes it only to the Firecracker lane via `KATA_FC_KERNEL_LOCK`.
+
 The consumer rejects mutable references, unsupported releases, missing/tampered
 kernel/config data, manifest mismatch and modular NFS. The e2e runner places
 `vmlinux-cubepod-custom` in its owned Kata volume, never `/opt/kata` on the host;
