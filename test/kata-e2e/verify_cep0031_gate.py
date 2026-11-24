@@ -22,6 +22,33 @@ VOLUME_TESTS = {
 }
 
 
+# dpkg status values that mean the package's files are NOT on disk.
+DPKG_ABSENT = {"not-installed", "config-files"}
+
+
+def nfs_helper_findings(probe):
+    """Return evidence of a userspace NFS helper in the guest probe output, or [].
+
+    The probe prints, per line, either a found mount.nfs* path (command -v / ls) or
+    dpkg-query's "<package> <want> <eflag> <status>" for nfs-common. Only a present
+    binary or an nfs-common status other than not-installed/config-files counts;
+    "unknown ok not-installed", "deinstall ok config-files" and "no packages found"
+    mean the helper is absent. Any unrecognised line fails closed.
+    """
+    findings = []
+    for line in probe.splitlines():
+        line = line.strip()
+        if not line or line.startswith("dpkg-query: no packages found matching"):
+            continue
+        fields = line.split()
+        if fields[0] == "nfs-common" and len(fields) == 4:
+            if fields[3] not in DPKG_ABSENT:
+                findings.append(f"nfs-common status {' '.join(fields[1:])}")
+            continue
+        findings.append(f"unexpected helper probe line {line!r}")
+    return findings
+
+
 def fail(message):
     raise SystemExit(f"CEP0031_GATE_FAIL: {message}")
 
@@ -34,7 +61,12 @@ def host(addr):
 
 
 def watch_pods(path):
-    text, decoder, ips = path.read_text(), json.JSONDecoder(), set()
+    return set(watch_pod_ips(path).values())
+
+
+def watch_pod_ips(path):
+    """Map SDK sandbox Pod name (== sandbox ID) to its API-server Pod IP."""
+    text, decoder, ips = path.read_text(), json.JSONDecoder(), {}
     while text.strip():
         text = text.lstrip()
         try:
@@ -42,11 +74,9 @@ def watch_pods(path):
         except json.JSONDecodeError:
             break
         text = text[end:]
-        status = event.get("object", {}).get("status", {})
-        for entry in status.get("podIPs") or []:
-            ips.add(entry["ip"])
-        if status.get("podIP"):
-            ips.add(status["podIP"])
+        obj = event.get("object", {})
+        if obj.get("status", {}).get("podIP"):
+            ips[obj["metadata"]["name"]] = obj["status"]["podIP"]
     return ips
 
 
@@ -74,8 +104,8 @@ def main(artifacts):
             fields = r["data_mounts"][-1].split()
             if fields[2] not in ("nfs", "nfs3") or not {"nosuid", "nodev"} <= set(fields[3].split(",")):
                 fail(f"{sdk}/{r['phase']}: /data is not a kernel nfs mount: {fields}")
-            if r["nfs_helpers"]:
-                fail(f"{sdk}/{r['phase']}: userspace NFS helper present: {r['nfs_helpers']!r}")
+            if findings := nfs_helper_findings(r["nfs_helpers"]):
+                fail(f"{sdk}/{r['phase']}: userspace NFS helper present: {findings}")
             sandboxes.append(r)
     pod_ips = watch_pods(artifacts / "sdk-pods-watch.json")
     node_ips = {a["address"] for n in json.loads((artifacts / "cep0031-nodes.json").read_text())["items"]
@@ -99,6 +129,18 @@ def main(artifacts):
         ipaddress.ip_address(source)
         if source in node_ips or source not in pod_ips:
             fail(f"NFS server saw {source}, not an SDK sandbox Pod IP (pods={sorted(pod_ips)}, nodes={sorted(node_ips)})")
+    # Per sandbox: the lease in its own /data export must have been admitted from
+    # exactly that sandbox Pod's IP (one-to-one, not merely "some pod IP").
+    by_name = watch_pod_ips(artifacts / "sdk-pods-watch.json")
+    by_lease = {}
+    for e in admitted:
+        by_lease.setdefault(e["leaseID"], set()).add(host(e["sourceIP"]))
+    for r in sandboxes:
+        lease = r["data_mounts"][-1].split()[0].split(":", 1)[1].strip("/").split("/")[0]
+        pod_ip = by_name.get(r["sandbox_id"])
+        if not pod_ip or by_lease.get(lease) != {pod_ip}:
+            fail(f"{r['sdk']}/{r['phase']}: lease {lease} admitted from {sorted(by_lease.get(lease, []))}, sandbox Pod IP {pod_ip}")
+        r["pod_ip"], r["lease"] = pod_ip, lease
     print(json.dumps({
         "CEP0031_GATE": "PASS",
         "guest_release": expected_release,
