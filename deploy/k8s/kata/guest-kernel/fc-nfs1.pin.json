@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "kernel_release": "6.18.62-cubepod-nfs1",
+  "kernel_sha256": "a7838b3b538ceab69f612bcd8e069d729acb5d72e61769e26710ddccafd0379b",
+  "config_sha256": "88352b16024fcc6823b7fe92dcc588ecffc54438f0617090078749d232e85a63",
+  "image": "ghcr.io/cubeplexai/cubepod-fc-kernel@sha256:df87007495c8c4f381f38028789b9688ec5aed993b8fa343ff989090a5cde05a"
+}

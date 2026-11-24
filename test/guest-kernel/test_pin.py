@@ -71,3 +71,11 @@ class KernelPinTest(unittest.TestCase):
         with self.assertRaises(ValueError): pin.verify(self.meta,self.root)
 
 if __name__=='__main__': unittest.main()
+
+class CommittedPinTest(unittest.TestCase):
+    """The committed FC e2e pin must stay an immutable, published GHCR digest."""
+    def test_committed_pin_is_immutable_digest(self):
+        committed=Path(source).parent/'fc-nfs1.pin.json'
+        meta=pin.read_pin(committed)
+        self.assertTrue(meta['image'].startswith('ghcr.io/cubeplexai/cubepod-fc-kernel@sha256:'))
+        self.assertEqual(meta['kernel_release'],pin.RELEASE)
