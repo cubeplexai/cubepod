@@ -8,6 +8,9 @@ export KIND_EXPERIMENTAL_PROVIDER=docker
 CLUSTER_NAME=${CLUSTER_NAME:-cubepod-e2e-$(date +%s)-$$}
 [[ "$CLUSTER_NAME" =~ ^cubepod-[a-z0-9-]+$ ]] || { echo 'CLUSTER_NAME must start with cubepod-'; exit 2; }
 STATE="$ROOT/.kind-e2e/$CLUSTER_NAME"
+# TEST-ONLY (CEP-0031 gate, do not merge): enable FirecrackerVolumeNFS only in a Kata FC run.
+CEP0031_FC_NFS_GATE=${CEP0031_FC_NFS_GATE:-0}
+if [[ $CEP0031_FC_NFS_GATE == 1 && ${KATA_VMM:-} != fc ]]; then echo 'CEP0031_FC_NFS_GATE requires KATA_VMM=fc'; exit 2; fi
 ARTIFACTS=${ARTIFACTS:-$STATE/artifacts}
 export KUBECONFIG="$STATE/kubeconfig"
 export GOMAXPROCS=${GOMAXPROCS:-2} CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
@@ -94,9 +97,12 @@ build_images() {
   mkdir -p "$BUILD"
   (cd "$ROOT"; timeout 600s env CGO_ENABLED=0 go build -p "$GOMAXPROCS" -trimpath -o "$BUILD/cubepod-gateway" ./cmd/cubepod-gateway
     timeout 600s env CGO_ENABLED=0 go build -p "$GOMAXPROCS" -trimpath -o "$BUILD/cubepod-controller" ./cmd/cubepod-controller
+    if [[ $CEP0031_FC_NFS_GATE == 1 ]]; then timeout 600s env CGO_ENABLED=0 go build -p "$GOMAXPROCS" -trimpath -o "$BUILD/cubepod-volume-nfs" ./cmd/cubepod-volume-nfs; fi
     timeout 600s cargo build --locked --release -p podd -p podd-init
     cp "${CARGO_TARGET_DIR:-target}/release/podd" "${CARGO_TARGET_DIR:-target}/release/podd-init" "$BUILD/")
-  for component in gateway controller injector sandbox; do
+  local components=(gateway controller injector sandbox)
+  [[ $CEP0031_FC_NFS_GATE != 1 ]] || components+=(volume-nfs)
+  for component in "${components[@]}"; do
     local image=$component
     [[ "$component" != injector ]] || image=podd
     local target=$component
@@ -128,6 +134,7 @@ EOF
   timeout 300s kind create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$STATE/kind.yaml" --kubeconfig "$KUBECONFIG" --wait 180s --retain
   chmod 600 "$KUBECONFIG"
   timeout 300s kind load docker-image --name "$CLUSTER_NAME" docker.io/cubepod-kind/{gateway,controller,podd,sandbox}:"$CLUSTER_NAME"
+  if [[ $CEP0031_FC_NFS_GATE == 1 ]]; then timeout 300s kind load docker-image --name "$CLUSTER_NAME" "docker.io/cubepod-kind/volume-nfs:$CLUSTER_NAME"; fi
   if [[ -n ${KATA_VMM:-} ]]; then kata_configure; fi
   k create namespace "$NS"
   k label namespace "$NS" app.kubernetes.io/managed-by=Helm
@@ -135,6 +142,7 @@ EOF
   k apply -f "$HERE/storage.yaml"
   local runtime_args=()
   if [[ -n ${KATA_VMM:-} ]]; then runtime_args=(--set "runtime.runtimeClassName=kata-$KATA_VMM-e2e" --set storage.volumeMode=Block --set storage.storageClassName=cubepod-block); fi
+  if [[ $CEP0031_FC_NFS_GATE == 1 ]]; then runtime_args+=(--set featureGates.firecrackerVolumeNFS=true --set volumes.nfs.image.registry=docker.io --set volumes.nfs.image.repository=cubepod-kind/volume-nfs --set "volumes.nfs.image.tag=$CLUSTER_NAME" --set volumes.nfs.image.pullPolicy=Never); fi
   timeout 240s helm upgrade --install cubepod "$ROOT/deploy/helm/cubepod" --namespace "$NS" --kube-context "kind-$CLUSTER_NAME" -f "$HERE/values.yaml" \
     --set gateway.image.tag="$CLUSTER_NAME" --set controller.image.tag="$CLUSTER_NAME" \
     --set runtime.poddInjectorImage="docker.io/cubepod-kind/podd:$CLUSTER_NAME" \
@@ -170,6 +178,12 @@ test_sdks() {
   k wait --for=delete pods -n "$NS" -l pod.cubeplex.ai/box --timeout=60s >"$ARTIFACTS/sandbox-cleanup.txt" 2>&1 || deleted=$?
   echo "SDK exit code=$sdk; sandbox deletion=$deleted"
   python3 "$HERE/check_reports.py" "$ARTIFACTS/python.xml" "$ARTIFACTS/typescript.xml" || return 1
+  if [[ $CEP0031_FC_NFS_GATE == 1 ]]; then
+    k get deployment cubepod-volume-nfs -n "$NS" -o yaml >"$ARTIFACTS/cep0031-volume-nfs-deployment.yaml" || return 1
+    k logs -n "$NS" deployment/cubepod-volume-nfs --all-containers --tail=-1 >"$ARTIFACTS/cep0031-volume-nfs.log" || return 1
+    k get nodes -o json >"$ARTIFACTS/cep0031-nodes.json" || return 1
+    python3 "$ROOT/test/kata-e2e/verify_cep0031_gate.py" "$ARTIFACTS" | tee "$ARTIFACTS/cep0031-gate.json" || return 1
+  fi
   (( sdk == 0 && deleted == 0 ))
 }
 if [[ -f "$STATE/kata-owned" ]]; then
