@@ -75,7 +75,7 @@ covered here. Runtime and guest diagnostics join the ordinary kind test artifact
 
 ### Experimental pinned Firecracker guest kernel
 
-Added after v0.7.1 (unreleased). The optional `KATA_FC_KERNEL_LOCK` input selects a
+Added in v0.8.0. The optional `KATA_FC_KERNEL_LOCK` input selects a
 custom kernel **only in the isolated Firecracker lane's private Kata config**:
 
 ```bash
@@ -92,13 +92,13 @@ authorized registry login. The helper at
 `deploy/k8s/kata/guest-kernel/fetch.sh` only fetches verified files; it never runs
 the artifact image or modifies host Kata/containerd services.
 
-Changed after v0.7.1 (unreleased): the CI **Kata Firecracker** lane uses the committed
+Changed in v0.8.0: the CI **Kata Firecracker** lane uses the committed
 `deploy/k8s/kata/guest-kernel/fc-nfs1.pin.json` (release `6.18.62-cubepod-nfs1`,
 published by workflow run 45314457814 and pinned by OCI digest). Only that lane's
 private `configuration-e2e.toml` selects it; the Cloud Hypervisor lane and default
 deployments keep Kata's stock kernel.
 
-Changed after v0.7.1 (unreleased): `FirecrackerVolumeNFS` is on by default and every
+Changed in v0.8.0: `FirecrackerVolumeNFS` is on by default and every
 kind lane deploys a checkout-built `cubepod-volume-nfs`. The CEP-0031 gate (helper-free
 `mount(2)`, no `nfs-common`/`mount.nfs`, NFS source IP equal to the sandbox Pod IP,
 data surviving destroy/recreate, with both official SDKs) passed on this kernel in

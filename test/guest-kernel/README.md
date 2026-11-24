@@ -1,6 +1,6 @@
 # Experimental Kata Firecracker NFSv3 guest kernel
 
-Added after v0.7.1 (unreleased). This is **kernel infrastructure**, not proof that
+Added in v0.8.0. This is **kernel infrastructure**, not proof that
 CEP-0031 passes on a Kata Firecracker pod. Production defaults and #120/#122 skips
 are unchanged. No kernel has been promoted by this change.
 

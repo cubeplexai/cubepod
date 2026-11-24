@@ -1,6 +1,6 @@
 [project]
 name = "cubepod"
-version = "0.7.1"
+version = "0.8.0"
 description = "Async-first Python SDK for CubePod (E2B-compatible persistent MicroVM sandboxes)"
 readme = "README.md"
 license = "Apache-2.0"
