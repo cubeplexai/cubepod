@@ -8,6 +8,10 @@ export KIND_EXPERIMENTAL_PROVIDER=docker
 CLUSTER_NAME=${CLUSTER_NAME:-cubepod-e2e-$(date +%s)-$$}
 [[ "$CLUSTER_NAME" =~ ^cubepod-[a-z0-9-]+$ ]] || { echo 'CLUSTER_NAME must start with cubepod-'; exit 2; }
 STATE="$ROOT/.kind-e2e/$CLUSTER_NAME"
+# Opt-in CEP-0031 gate (off by default): on Kata FC only, unskip the official SDK volume
+# persistence tests (skipped for #120) and fail closed via verify_cep0031_gate.py.
+CEP0031_FC_NFS_GATE=${CEP0031_FC_NFS_GATE:-0}
+if [[ $CEP0031_FC_NFS_GATE == 1 && ${KATA_VMM:-} != fc ]]; then echo 'CEP0031_FC_NFS_GATE requires KATA_VMM=fc'; exit 2; fi
 ARTIFACTS=${ARTIFACTS:-$STATE/artifacts}
 export KUBECONFIG="$STATE/kubeconfig"
 export GOMAXPROCS=${GOMAXPROCS:-2} CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2}
@@ -94,9 +98,10 @@ build_images() {
   mkdir -p "$BUILD"
   (cd "$ROOT"; timeout 600s env CGO_ENABLED=0 go build -p "$GOMAXPROCS" -trimpath -o "$BUILD/cubepod-gateway" ./cmd/cubepod-gateway
     timeout 600s env CGO_ENABLED=0 go build -p "$GOMAXPROCS" -trimpath -o "$BUILD/cubepod-controller" ./cmd/cubepod-controller
+    timeout 600s env CGO_ENABLED=0 go build -p "$GOMAXPROCS" -trimpath -o "$BUILD/cubepod-volume-nfs" ./cmd/cubepod-volume-nfs
     timeout 600s cargo build --locked --release -p podd -p podd-init
     cp "${CARGO_TARGET_DIR:-target}/release/podd" "${CARGO_TARGET_DIR:-target}/release/podd-init" "$BUILD/")
-  for component in gateway controller injector sandbox; do
+  for component in gateway controller injector sandbox volume-nfs; do
     local image=$component
     [[ "$component" != injector ]] || image=podd
     local target=$component
@@ -127,7 +132,7 @@ EOF
   if [[ -n ${KATA_VMM:-} ]]; then kata_kind_config; fi
   timeout 300s kind create cluster --name "$CLUSTER_NAME" --image "$KIND_NODE_IMAGE" --config "$STATE/kind.yaml" --kubeconfig "$KUBECONFIG" --wait 180s --retain
   chmod 600 "$KUBECONFIG"
-  timeout 300s kind load docker-image --name "$CLUSTER_NAME" docker.io/cubepod-kind/{gateway,controller,podd,sandbox}:"$CLUSTER_NAME"
+  timeout 300s kind load docker-image --name "$CLUSTER_NAME" docker.io/cubepod-kind/{gateway,controller,podd,sandbox,volume-nfs}:"$CLUSTER_NAME"
   if [[ -n ${KATA_VMM:-} ]]; then kata_configure; fi
   k create namespace "$NS"
   k label namespace "$NS" app.kubernetes.io/managed-by=Helm
@@ -136,7 +141,7 @@ EOF
   local runtime_args=()
   if [[ -n ${KATA_VMM:-} ]]; then runtime_args=(--set "runtime.runtimeClassName=kata-$KATA_VMM-e2e" --set storage.volumeMode=Block --set storage.storageClassName=cubepod-block); fi
   timeout 240s helm upgrade --install cubepod "$ROOT/deploy/helm/cubepod" --namespace "$NS" --kube-context "kind-$CLUSTER_NAME" -f "$HERE/values.yaml" \
-    --set gateway.image.tag="$CLUSTER_NAME" --set controller.image.tag="$CLUSTER_NAME" \
+    --set gateway.image.tag="$CLUSTER_NAME" --set controller.image.tag="$CLUSTER_NAME" --set volumes.nfs.image.tag="$CLUSTER_NAME" \
     --set runtime.poddInjectorImage="docker.io/cubepod-kind/podd:$CLUSTER_NAME" \
     --set runtime.defaultSandboxImage="docker.io/cubepod-kind/sandbox:$CLUSTER_NAME" "${runtime_args[@]}" --wait --timeout 180s
   local runtime=none storage=standard
@@ -170,6 +175,12 @@ test_sdks() {
   k wait --for=delete pods -n "$NS" -l pod.cubeplex.ai/box --timeout=60s >"$ARTIFACTS/sandbox-cleanup.txt" 2>&1 || deleted=$?
   echo "SDK exit code=$sdk; sandbox deletion=$deleted"
   python3 "$HERE/check_reports.py" "$ARTIFACTS/python.xml" "$ARTIFACTS/typescript.xml" || return 1
+  if [[ $CEP0031_FC_NFS_GATE == 1 ]]; then
+    k get deployment cubepod-volume-nfs -n "$NS" -o yaml >"$ARTIFACTS/cep0031-volume-nfs-deployment.yaml" || return 1
+    k logs -n "$NS" deployment/cubepod-volume-nfs --all-containers --tail=-1 >"$ARTIFACTS/cep0031-volume-nfs.log" || return 1
+    k get nodes -o json >"$ARTIFACTS/cep0031-nodes.json" || return 1
+    python3 "$ROOT/test/kata-e2e/verify_cep0031_gate.py" "$ARTIFACTS" | tee "$ARTIFACTS/cep0031-gate.json" || return 1
+  fi
   (( sdk == 0 && deleted == 0 ))
 }
 if [[ -f "$STATE/kata-owned" ]]; then

@@ -4,6 +4,11 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      cep0031_gate:
+        description: 'Run the opt-in CEP-0031 FC NFS gate (unskips FC volume persistence; flaky until #120 is fixed upstream)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -35,6 +40,9 @@ jobs:
       # Only the Firecracker lane's private configuration-e2e.toml selects this
       # immutable, checksum-verified guest kernel pin. CLH stays on Kata's stock kernel.
       KATA_FC_KERNEL_LOCK: ${{ matrix.vmm == 'fc' && format('{0}/deploy/k8s/kata/guest-kernel/fc-nfs1.pin.json', github.workspace) || '' }}
+      # Opt-in CEP-0031 gate, off by default (pull_request runs never set it). Enable via
+      # workflow_dispatch once #120 (Kata FC virtio-mmio hotplug EIO) is fixed upstream.
+      CEP0031_FC_NFS_GATE: ${{ matrix.vmm == 'fc' && inputs.cep0031_gate && '1' || '0' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5

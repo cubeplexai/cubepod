@@ -1,7 +1,7 @@
 """Fail closed: both real SDK suites must execute every scenario without silent skips.
 
-On Kata Firecracker only, a skip is allowed when its reason cites issue #120 or
-#122. Any other skip, and every failure or error, still fails the check. kind,
+On Kata Firecracker only, a skip is allowed when its reason cites issue #120
+(#122 is fixed by CEP-0031 FirecrackerVolumeNFS). Any other skip, and every failure or error, still fails the check. kind,
 Compose and Cloud Hypervisor continue to reject every skip.
 """
 import os
@@ -11,7 +11,7 @@ import xml.etree.ElementTree as ET
 if len(sys.argv) != 3:
     raise SystemExit("Expected Python and TypeScript report paths")
 
-ALLOWED_FC_SKIP_MARKERS = ("#120", "#122", "issues/120", "issues/122")
+ALLOWED_FC_SKIP_MARKERS = ("#120", "issues/120")
 
 
 def skip_reason(case):

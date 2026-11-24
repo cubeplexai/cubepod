@@ -47,3 +47,10 @@ volumes:
   enabled: true
   pvcName: cubepod-volumes
   rwxStorageClassName: ""
+  # FirecrackerVolumeNFS is on by default; deploy the checkout-built proxy image.
+  nfs:
+    image:
+      registry: docker.io
+      repository: cubepod-kind/volume-nfs
+      tag: e2e
+      pullPolicy: Never

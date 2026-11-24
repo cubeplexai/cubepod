@@ -2,8 +2,9 @@
 Scenarios derive from test/e2b-compat/test_official_e2b_extended.py.
 
 On Kata Firecracker only, failures caused by issue #120 (virtio-mmio hotplug EIO)
-or issue #122 (E2B volume mounts do not persist) are reported as documented skips
-and must be re-enabled when those issues are fixed. kind, Compose and Cloud
+are reported as documented skips. The FC volume persistence test is skipped for
+#120 until the upstream Kata fix lands; CEP0031_FC_NFS_GATE=1 re-enables it
+fail-closed. kind, Compose and Cloud
 Hypervisor still fail closed on any skip.
 """
 import os
@@ -25,7 +26,6 @@ if (_parsed.scheme != "http" or _parsed.hostname != "127.0.0.1"
     raise RuntimeError("Use the kind runner: all SDK URLs must be its loopback endpoint and dummy key")
 
 _FC_ISSUE_120 = "https://github.com/cubeplexai/cubepod/issues/120"
-_FC_ISSUE_122 = "https://github.com/cubeplexai/cubepod/issues/122"
 _ISSUE_120_MARKERS = (
     "failed to mount /dev/vdb",
     "EIO: I/O error",
@@ -144,9 +144,39 @@ def test_network_and_service_port(sandbox):
         sandbox.commands.kill(server.pid)
 
 
+# Opt-in CEP-0031 gate (off by default): CEP0031_FC_NFS_GATE=1 unskips the FC volume
+# persistence test and makes it fail closed (no #120 skip). Re-enable once #120 is fixed.
+_CEP0031_GATE = os.environ.get("CEP0031_FC_NFS_GATE") == "1" and _is_firecracker()
+
+# Read-only guest probe: kernel release, the /data mount entry, and proof that no
+# userspace NFS helper exists in the sandbox image.
+_GATE_PROBE = (
+    "uname -r; echo ---; awk '$2==\"/data\"' /proc/mounts; echo ---; "
+    "(command -v mount.nfs mount.nfs4; ls /sbin/mount.nfs* /usr/sbin/mount.nfs* 2>/dev/null; "
+    "dpkg-query -W -f='${Package} ${Status}\\n' nfs-common 2>/dev/null) || true"
+)
+
+
+def _gate_record(sbx, phase):
+    import json
+    out = sbx.commands.run(_GATE_PROBE).stdout
+    release, mounts, helpers = (part.strip() for part in out.split("---", 2))
+    record = {"sdk": "python", "phase": phase, "sandbox_id": sbx.sandbox_id,
+              "uname": release, "data_mounts": mounts.splitlines(), "nfs_helpers": helpers}
+    path = os.path.join(os.environ["ARTIFACTS"], "cep0031-gate-python.jsonl")
+    with open(path, "a") as file:
+        file.write(json.dumps(record) + "\n")
+    assert release == os.environ["E2E_GUEST_KERNEL"], record
+    last = mounts.splitlines()[-1].split()
+    assert last[2] in ("nfs", "nfs3"), record
+    assert "nosuid" in last[3].split(",") and "nodev" in last[3].split(","), record
+    assert helpers == "" or "not-installed" in helpers, record
+
+
 @pytest.mark.skipif(
-    os.environ.get("KATA_VMM") == "fc",
-    reason=f"{_FC_ISSUE_122}: E2B filesystem volume mounts do not persist on Kata Firecracker",
+    os.environ.get("KATA_VMM") == "fc" and not _CEP0031_GATE,
+    reason=f"{_FC_ISSUE_120}: Kata 4.4.0 Firecracker virtio-mmio hotplug /dev/vdb EIO race "
+    "makes repeated volume sandbox creates flaky (waiting on upstream)",
 )
 def test_volume_mount_persistence():
     volume = Volume.create("kind-python-" + uuid.uuid4().hex)
@@ -155,9 +185,12 @@ def test_volume_mount_persistence():
             try:
                 sbx = Sandbox.create("kind-e2e", timeout=120, request_timeout=90, volume_mounts={"/data": volume})
             except Exception as exc:
-                _skip_fc_issue_120(exc)
+                if not _CEP0031_GATE:
+                    _skip_fc_issue_120(exc)
                 raise
             try:
+                if _CEP0031_GATE:
+                    _gate_record(sbx, "recreate" if expected else "create")
                 if expected:
                     assert sbx.files.read("/data/persist.txt") == expected
                 else:
