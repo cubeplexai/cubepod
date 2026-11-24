@@ -137,7 +137,8 @@ func main() {
 	if v, ok := gates["TransparentEgress"]; ok {
 		transparentEgressEnabled = v
 	}
-	firecrackerVolumeNFS := false
+	// CEP-0031 FirecrackerVolumeNFS is default on; --feature-gate=FirecrackerVolumeNFS=false opts out.
+	firecrackerVolumeNFS := true
 	if v, ok := gates[controller.FeatureGateFirecrackerVolumeNFS]; ok {
 		firecrackerVolumeNFS = v
 	}

@@ -137,9 +137,10 @@ featureGates:
   sandboxEventsAndWebhooks: true
   blockWorkspaceVolumes: true
   k8sVolumeMounts: false
-  # Firecracker official volume NFS transport (CEP-0031). Default off until the
-  # implementation gate (real Firecracker guest kernel mount without nfs-common) is proven.
-  firecrackerVolumeNFS: false
+  # Firecracker official volume NFS transport (CEP-0031). Default on: the gate was
+  # proven on real Kata Firecracker with both official SDKs. Kata FC guests need a
+  # kernel with built-in NFSv3 (see deploy/k8s/kata/guest-kernel/fc-nfs1.pin.json).
+  firecrackerVolumeNFS: true
 
 templateBuild:
   enabled: false
