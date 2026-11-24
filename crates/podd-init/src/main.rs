@@ -25,7 +25,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitConfig {
@@ -641,11 +642,78 @@ const VOLUME_RESERVED_PATHS: &[&str] = &[
     "/boot",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VolumeTransport {
+    #[default]
+    Bind,
+    Nfs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VolumeMountSpec {
     pub volume_id: String,
     pub staging_path: String,
     pub target_path: String,
+    pub transport: VolumeTransport,
+    pub nfs_target: String,
+}
+
+const NFS_MOUNT_DEADLINE: Duration = Duration::from_secs(30);
+const NFS_MOUNT_RETRY: Duration = Duration::from_millis(250);
+const NFS_FSTYPE: &str = "nfs";
+const NFS_DEFAULT_PORT: u16 = 2049;
+
+/// Kernel NFSv3 text options for libc::mount(2). Do not pass fg/bg/retry=.
+pub fn nfs_mount_data(addr: &str, port: u16) -> String {
+    format!(
+        "addr={addr},vers=3,proto=tcp,port={port},mountproto=tcp,mountport={port},hard,sync,rsize=1048576,wsize=1048576,nolock,noacl,noac,lookupcache=none"
+    )
+}
+
+/// Parse `<clusterIP>:/<leaseID>/<volumeID>` (IPv4 or bracketed IPv6).
+pub fn parse_nfs_target(target: &str, volume_id: &str) -> Result<(String, String), String> {
+    let target = target.trim();
+    let (addr, rest) = if let Some(rest) = target.strip_prefix('[') {
+        let close = rest.find("]:/").ok_or_else(|| {
+            format!("invalid nfs_target {target:?}: expected [ipv6]:/<leaseID>/<volumeID>")
+        })?;
+        let addr = rest[..close].to_string();
+        let path = &rest[close + 3..];
+        (addr, path)
+    } else {
+        let Some((addr, path)) = target.split_once(":/") else {
+            return Err(format!(
+                "invalid nfs_target {target:?}: expected <clusterIP>:/<leaseID>/<volumeID>"
+            ));
+        };
+        if addr.is_empty() || addr.contains('/') {
+            return Err(format!("invalid nfs_target {target:?}: missing cluster IP"));
+        }
+        (addr.to_string(), path)
+    };
+    let mut parts = rest.split('/');
+    let lease = parts.next().unwrap_or("");
+    let vol = parts.next().unwrap_or("");
+    if lease.is_empty()
+        || vol.is_empty()
+        || parts.next().is_some()
+        || !is_hex_len(lease, 32)
+        || vol != volume_id
+    {
+        return Err(format!(
+            "invalid nfs_target {target:?}: expected /<leaseID>/{volume_id}"
+        ));
+    }
+    if addr.parse::<std::net::IpAddr>().is_err() {
+        return Err(format!(
+            "invalid nfs_target {target:?}: addr must be an IP literal, not {addr:?}"
+        ));
+    }
+    Ok((addr, lease.to_string()))
+}
+
+fn is_hex_len(s: &str, n: usize) -> bool {
+    s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn load_volume_mounts(workspace_dir: &str) -> Result<Vec<VolumeMountSpec>, String> {
@@ -696,6 +764,8 @@ pub fn parse_and_validate_volume_mounts(
         let mut volume_id: Option<String> = None;
         let mut staging_path: Option<String> = None;
         let mut target_path: Option<String> = None;
+        let mut transport: Option<String> = None;
+        let mut nfs_target: Option<String> = None;
 
         for (k, v) in fields {
             match k.as_str() {
@@ -708,14 +778,18 @@ pub fn parse_and_validate_volume_mounts(
                 "target_path" => {
                     target_path = Some(expect_json_string(v, idx, "target_path")?);
                 }
+                "transport" => {
+                    transport = Some(expect_json_string(v, idx, "transport")?);
+                }
+                "nfs_target" => {
+                    nfs_target = Some(expect_json_string(v, idx, "nfs_target")?);
+                }
                 _ => {}
             }
         }
 
         let volume_id =
             volume_id.ok_or_else(|| format!("volume mount entry {idx} missing volume_id"))?;
-        let staging_path =
-            staging_path.ok_or_else(|| format!("volume mount entry {idx} missing staging_path"))?;
         let target_path =
             target_path.ok_or_else(|| format!("volume mount entry {idx} missing target_path"))?;
 
@@ -725,12 +799,41 @@ pub fn parse_and_validate_volume_mounts(
             ));
         }
 
-        let expected_staging = format!("/run/cubepod/volumes/{volume_id}");
-        if staging_path != expected_staging {
-            return Err(format!(
-                "volume mount entry {idx} has invalid staging_path {staging_path:?}: expected {expected_staging:?}"
-            ));
-        }
+        let transport = match transport.as_deref().unwrap_or("").trim() {
+            "" | "bind" => VolumeTransport::Bind,
+            "nfs" => VolumeTransport::Nfs,
+            other => {
+                return Err(format!(
+                    "volume mount entry {idx} has unknown transport {other:?}"
+                ));
+            }
+        };
+
+        let (staging_path, nfs_target) = match transport {
+            VolumeTransport::Nfs => {
+                let target = nfs_target
+                    .ok_or_else(|| format!("volume mount entry {idx} missing nfs_target"))?;
+                if staging_path.is_some() {
+                    return Err(format!(
+                        "volume mount entry {idx} with transport nfs must not set staging_path"
+                    ));
+                }
+                parse_nfs_target(&target, &volume_id)
+                    .map_err(|e| format!("volume mount entry {idx} {e}"))?;
+                (String::new(), target)
+            }
+            VolumeTransport::Bind => {
+                let staging_path = staging_path
+                    .ok_or_else(|| format!("volume mount entry {idx} missing staging_path"))?;
+                let expected_staging = format!("/run/cubepod/volumes/{volume_id}");
+                if staging_path != expected_staging {
+                    return Err(format!(
+                        "volume mount entry {idx} has invalid staging_path {staging_path:?}: expected {expected_staging:?}"
+                    ));
+                }
+                (staging_path, String::new())
+            }
+        };
 
         let norm_target = normalize_abs_path(&target_path, "target_path")?;
 
@@ -765,6 +868,8 @@ pub fn parse_and_validate_volume_mounts(
             volume_id,
             staging_path,
             target_path: norm_target,
+            transport,
+            nfs_target,
         });
     }
 
@@ -779,6 +884,15 @@ pub fn mount_volumes(
     no_pivot: bool,
 ) -> Result<(), String> {
     for mount in mounts {
+        let dst = root.join(mount.target_path.trim_start_matches('/'));
+        if mount.transport == VolumeTransport::Nfs {
+            fs::create_dir_all(&dst)
+                .map_err(|e| format!("mkdir volume target {}: {e}", dst.display()))?;
+            chown_path(&dst, default_uid, default_gid)?;
+            mount_nfs_volume(mount, &dst)?;
+            continue;
+        }
+
         let src_path = Path::new(&mount.staging_path);
         if !src_path.is_dir() {
             return Err(format!(
@@ -787,7 +901,6 @@ pub fn mount_volumes(
             ));
         }
 
-        let dst = root.join(mount.target_path.trim_start_matches('/'));
         fs::create_dir_all(&dst)
             .map_err(|e| format!("mkdir volume target {}: {e}", dst.display()))?;
         chown_path(&dst, default_uid, default_gid)?;
@@ -846,6 +959,143 @@ pub fn mount_volumes(
         }
     }
     Ok(())
+}
+
+fn nfs_port_from_env() -> u16 {
+    match std::env::var("CUBEPOD_VOLUME_NFS_PORT") {
+        Ok(raw) => raw
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p > 0)
+            .unwrap_or(NFS_DEFAULT_PORT),
+        Err(_) => NFS_DEFAULT_PORT,
+    }
+}
+
+fn retry_until<F, C>(
+    mut attempt: F,
+    deadline: Instant,
+    confirm: C,
+    what: &str,
+) -> Result<(), String>
+where
+    F: FnMut() -> std::io::Result<()>,
+    C: FnOnce() -> Result<(), String>,
+{
+    loop {
+        match attempt() {
+            Ok(()) => return confirm(),
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    return Err(format!("{what} failed after retries: {err}"));
+                }
+                thread::sleep(NFS_MOUNT_RETRY);
+            }
+        }
+    }
+}
+
+fn mount_nfs_volume(mount: &VolumeMountSpec, dst: &Path) -> Result<(), String> {
+    let (addr, _lease) = parse_nfs_target(&mount.nfs_target, &mount.volume_id)?;
+    let port = nfs_port_from_env();
+    let data = nfs_mount_data(&addr, port);
+    let c_src = CString::new(mount.nfs_target.as_bytes())
+        .map_err(|e| format!("invalid nfs_target {}: {e}", mount.nfs_target))?;
+    let c_dst = CString::new(dst.to_string_lossy().as_bytes())
+        .map_err(|e| format!("invalid target_path {}: {e}", dst.display()))?;
+    let c_fstype = CString::new(NFS_FSTYPE).map_err(|e| format!("invalid nfs fstype: {e}"))?;
+    let c_data =
+        CString::new(data.as_bytes()).map_err(|e| format!("invalid nfs mount data: {e}"))?;
+    let flags = (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong;
+
+    let deadline = Instant::now() + NFS_MOUNT_DEADLINE;
+    retry_until(
+        || {
+            let rc = unsafe {
+                libc::mount(
+                    c_src.as_ptr(),
+                    c_dst.as_ptr(),
+                    c_fstype.as_ptr(),
+                    flags,
+                    c_data.as_ptr().cast(),
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        },
+        deadline,
+        || confirm_nfs_mount(dst),
+        &format!("nfs mount {} -> {}", mount.nfs_target, dst.display()),
+    )
+}
+
+fn confirm_nfs_mount(target: &Path) -> Result<(), String> {
+    let raw = fs::read_to_string("/proc/mounts").map_err(|e| format!("read /proc/mounts: {e}"))?;
+    confirm_nfs_mount_from(target, &raw)
+}
+
+/// Validate that the topmost (last) /proc/mounts entry for target is nfs/nfs3
+/// with nosuid,nodev. nfs4 is rejected.
+pub fn confirm_nfs_mount_from(target: &Path, raw: &str) -> Result<(), String> {
+    let want = target.to_string_lossy();
+    let mut last: Option<(String, String)> = None;
+    for line in raw.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(_src) = fields.next() else { continue };
+        let Some(mountpoint) = fields.next() else {
+            continue;
+        };
+        let Some(fstype) = fields.next() else {
+            continue;
+        };
+        let opts = fields.next().unwrap_or("");
+        let mp = unescape_mount_path(mountpoint);
+        if mp == want {
+            last = Some((fstype.to_string(), opts.to_string()));
+        }
+    }
+    let Some((fstype, opts)) = last else {
+        return Err(format!(
+            "volume target {} is not listed as an nfs mount in /proc/mounts",
+            want
+        ));
+    };
+    if fstype != "nfs" && fstype != "nfs3" {
+        return Err(format!(
+            "volume target {} is mounted as {fstype}, expected nfs or nfs3",
+            want
+        ));
+    }
+    if !opts.split(',').any(|o| o == "nosuid") || !opts.split(',').any(|o| o == "nodev") {
+        return Err(format!(
+            "volume target {} nfs mount missing nosuid,nodev (opts={opts})",
+            want
+        ));
+    }
+    Ok(())
+}
+
+fn unescape_mount_path(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let oct = &raw[i + 1..i + 4];
+            if let Ok(v) = u8::from_str_radix(oct, 8) {
+                out.push(char::from(v));
+                i += 4;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 fn expect_json_string(val: JsonValue, idx: usize, field: &str) -> Result<String, String> {
@@ -1402,11 +1652,15 @@ mod tests {
                     volume_id: vid1.to_string(),
                     staging_path: format!("/run/cubepod/volumes/{vid1}"),
                     target_path: "/mnt/dataset".to_string(),
+                    transport: VolumeTransport::Bind,
+                    nfs_target: String::new(),
                 },
                 VolumeMountSpec {
                     volume_id: vid2.to_string(),
                     staging_path: format!("/run/cubepod/volumes/{vid2}"),
                     target_path: "/mnt/models".to_string(),
+                    transport: VolumeTransport::Bind,
+                    nfs_target: String::new(),
                 },
             ]
         );
@@ -1563,6 +1817,8 @@ mod tests {
             volume_id: vid.to_string(),
             staging_path: format!("/run/cubepod/volumes/{vid}-nonexistent"),
             target_path: "/mnt/dataset".to_string(),
+            transport: VolumeTransport::Bind,
+            nfs_target: String::new(),
         };
         let err = mount_volumes(&[spec], Path::new("/"), 1000, 1000, false).unwrap_err();
         assert!(err.contains("does not exist"), "unexpected error: {err}");
@@ -1577,6 +1833,8 @@ mod tests {
             volume_id: "0123456789abcdef0123456789abcdef".into(),
             staging_path: target.to_string_lossy().into_owned(),
             target_path: "/data".into(),
+            transport: VolumeTransport::Bind,
+            nfs_target: String::new(),
         };
         mount_volumes(
             &[mount],
@@ -1591,5 +1849,136 @@ mod tests {
             "real-volume"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nfs_mount_parses_transport_and_rejects_staging_or_missing_target() {
+        let vid = "0123456789abcdef0123456789abcdef";
+        let lease = "00112233445566778899aabbccddeeff";
+        let ok = format!(
+            r#"[{{"volume_id":"{vid}","target_path":"/data","transport":"nfs","nfs_target":"10.96.10.20:/{lease}/{vid}"}}]"#
+        );
+        let specs = parse_and_validate_volume_mounts(&ok, "/workspace").expect("valid nfs");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].transport, VolumeTransport::Nfs);
+        assert!(specs[0].staging_path.is_empty());
+        assert_eq!(specs[0].nfs_target, format!("10.96.10.20:/{lease}/{vid}"));
+
+        let missing =
+            format!(r#"[{{"volume_id":"{vid}","target_path":"/data","transport":"nfs"}}]"#);
+        let err = parse_and_validate_volume_mounts(&missing, "/workspace").unwrap_err();
+        assert!(err.contains("nfs_target"), "{err}");
+
+        let with_staging = format!(
+            r#"[{{"volume_id":"{vid}","target_path":"/data","transport":"nfs","nfs_target":"10.96.10.20:/{lease}/{vid}","staging_path":"/run/cubepod/volumes/{vid}"}}]"#
+        );
+        let err = parse_and_validate_volume_mounts(&with_staging, "/workspace").unwrap_err();
+        assert!(err.contains("staging_path"), "{err}");
+
+        let unknown = format!(
+            r#"[{{"volume_id":"{vid}","target_path":"/data","transport":"virtio","staging_path":"/run/cubepod/volumes/{vid}"}}]"#
+        );
+        let err = parse_and_validate_volume_mounts(&unknown, "/workspace").unwrap_err();
+        assert!(err.contains("unknown transport"), "{err}");
+    }
+
+    #[test]
+    fn bind_entries_without_transport_still_work() {
+        let vid = "0123456789abcdef0123456789abcdef";
+        let raw = format!(
+            r#"[{{"volume_id":"{vid}","staging_path":"/run/cubepod/volumes/{vid}","target_path":"/mnt/data"}}]"#
+        );
+        let specs = parse_and_validate_volume_mounts(&raw, "/workspace").unwrap();
+        assert_eq!(specs[0].transport, VolumeTransport::Bind);
+    }
+
+    #[test]
+    fn nfs_mount_data_is_kernel_text_options_without_userspace_policy() {
+        let data = nfs_mount_data("10.96.10.20", 2049);
+        assert!(data.starts_with("addr=10.96.10.20,"));
+        assert!(data.contains("vers=3"));
+        assert!(data.contains("proto=tcp"));
+        assert!(data.contains("port=2049"));
+        assert!(data.contains("mountproto=tcp"));
+        assert!(data.contains("mountport=2049"));
+        assert!(data.contains("hard"));
+        assert!(data.contains("nolock"));
+        assert!(!data.contains("fg"));
+        assert!(!data.contains("retry="));
+        assert!(!data.contains("bg,") && !data.ends_with("bg"));
+    }
+
+    #[test]
+    fn nfs_reserved_path_still_fails() {
+        let vid = "0123456789abcdef0123456789abcdef";
+        let lease = "00112233445566778899aabbccddeeff";
+        let raw = format!(
+            r#"[{{"volume_id":"{vid}","target_path":"/workspace","transport":"nfs","nfs_target":"10.96.10.20:/{lease}/{vid}"}}]"#
+        );
+        let err = parse_and_validate_volume_mounts(&raw, "/workspace").unwrap_err();
+        assert!(err.contains("overlaps workspace_dir"), "{err}");
+    }
+
+    #[test]
+    fn parse_nfs_target_requires_ip_literal() {
+        let vid = "0123456789abcdef0123456789abcdef";
+        let lease = "00112233445566778899aabbccddeeff";
+        parse_nfs_target(&format!("10.96.10.20:/{lease}/{vid}"), vid).unwrap();
+        parse_nfs_target(&format!("[2001:db8::20]:/{lease}/{vid}"), vid).unwrap();
+        let err = parse_nfs_target(&format!("nfs.internal:/{lease}/{vid}"), vid).unwrap_err();
+        assert!(err.contains("IP literal"), "{err}");
+        let err = parse_nfs_target(&format!("10.0.0.1,vers=4:/{lease}/{vid}"), vid).unwrap_err();
+        assert!(
+            err.contains("IP literal") || err.contains("invalid"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn confirm_nfs_mount_uses_topmost_and_rejects_nfs4() {
+        let ok = "src /data ext4 rw 0 0\n1.2.3.4:/lease/vol /data nfs4 rw,nosuid,nodev 0 0\n1.2.3.4:/lease/vol /data nfs rw,nosuid,nodev 0 0\n";
+        confirm_nfs_mount_from(Path::new("/data"), ok).unwrap();
+
+        let nfs4_top = "1.2.3.4:/l/v /data nfs rw,nosuid,nodev 0 0\n1.2.3.4:/l/v /data nfs4 rw,nosuid,nodev 0 0\n";
+        let err = confirm_nfs_mount_from(Path::new("/data"), nfs4_top).unwrap_err();
+        assert!(err.contains("nfs4"), "{err}");
+
+        let missing = "1.2.3.4:/l/v /data nfs rw,nosuid 0 0\n";
+        let err = confirm_nfs_mount_from(Path::new("/data"), missing).unwrap_err();
+        assert!(err.contains("nosuid,nodev"), "{err}");
+
+        let absent = "src /other nfs rw,nosuid,nodev 0 0\n";
+        let err = confirm_nfs_mount_from(Path::new("/data"), absent).unwrap_err();
+        assert!(err.contains("not listed"), "{err}");
+    }
+
+    #[test]
+    fn nfs_mount_retry_fails_closed_after_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(80);
+        let mut attempts = 0;
+        let err = retry_until(
+            || {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            },
+            deadline,
+            || Ok(()),
+            "nfs mount test -> /data",
+        )
+        .unwrap_err();
+        assert!(attempts >= 1, "attempts={attempts}");
+        assert!(err.contains("failed after retries"), "{err}");
+    }
+
+    #[test]
+    fn nfs_mount_retry_runs_confirm_after_success() {
+        let err = retry_until(
+            || Ok(()),
+            Instant::now() + Duration::from_secs(1),
+            || Err("volume target /data is mounted as ext4, expected nfs or nfs3".into()),
+            "nfs mount test -> /data",
+        )
+        .unwrap_err();
+        assert!(err.contains("expected nfs"), "{err}");
     }
 }

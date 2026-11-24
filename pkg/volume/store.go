@@ -3,7 +3,9 @@
 //
 // Data and metadata live on disk under a store directory so they survive a
 // gateway process restart. The store root and each {id} directory are mode
-// 0700. Only {id}/data is mounted into a sandbox. When Docker volume
+// 0710 (owner rwx, group exec) so cubepod-volume-nfs can traverse into
+// {id}/data without listing siblings or reading 0600 metadata. Only {id}/data
+// is mounted into a sandbox. When Docker volume
 // provisioning is enabled, each volume is also exposed as a named volume
 // whose local driver bind-mounts that data directory. The name must start
 // with cubepod-vol- (product) or cpod-test- (tests) and must match this
@@ -44,9 +46,12 @@ const (
 	maxListDepth               = 64
 	defaultMaxVolumesPerTenant = 64
 	// defaultDataUID is the sandbox user (ubuntu) that must be able to write
-	// the mounted data directory. The store root stays root-owned and 0700.
+	// the mounted data directory. The store root and per-volume dirs are
+	// 0710 with group defaultDataGID so cubepod-volume-nfs (1000:1000)
+	// can traverse into data/ without listing siblings or reading 0600 metadata.
 	defaultDataUID = 1000
 	defaultDataGID = 1000
+	volumeDirPerm  = os.FileMode(0o710)
 )
 
 var (
@@ -274,6 +279,18 @@ type Store struct {
 	docker       dockerClient
 }
 
+// tightenVolumeDir sets mode 0710 and, best-effort, gid defaultDataGID on a
+// store or per-volume directory. Group search (+x) lets cubepod-volume-nfs
+// reach <volumeID>/data; missing group-read keeps the directory unlistable.
+// meta.json / attrs.json / mounts.json / tenants.json stay 0600.
+func tightenVolumeDir(dir string) error {
+	if err := os.Chmod(dir, volumeDirPerm); err != nil {
+		return err
+	}
+	_ = os.Chown(dir, -1, defaultDataGID)
+	return nil
+}
+
 // Open loads an existing store directory or creates it.
 func Open(dir string, cfg Config) (*Store, error) {
 	if dir == "" {
@@ -283,10 +300,10 @@ func Open(dir string, cfg Config) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(abs, 0o700); err != nil {
+	if err := os.MkdirAll(abs, volumeDirPerm); err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(abs, 0o700); err != nil {
+	if err := tightenVolumeDir(abs); err != nil {
 		return nil, err
 	}
 	if cfg.DockerPrefix == "" {
@@ -602,13 +619,14 @@ func (s *Store) CreateWithOptions(apiKey, name string, opts CreateOpts) (Volume,
 		attrs: map[string]fileAttr{},
 	}
 	volDir := filepath.Join(s.dir, id)
-	// Parent holds metadata and stays 0700 so a sandbox user cannot walk
-	// sibling volumes. Only data/ is mounted, and it is owned by uid 1000.
-	if err := os.MkdirAll(volDir, 0o700); err != nil {
+	// Parent holds metadata and stays 0710 (owner rwx, group --x) so a
+	// sandbox user cannot list sibling volumes, while cubepod-volume-nfs
+	// (gid 1000) can traverse into data/. Only data/ is mounted, owned by uid 1000.
+	if err := os.MkdirAll(volDir, volumeDirPerm); err != nil {
 		s.mu.Unlock()
 		return Volume{}, err
 	}
-	if err := os.Chmod(volDir, 0o700); err != nil {
+	if err := tightenVolumeDir(volDir); err != nil {
 		_ = os.RemoveAll(volDir)
 		s.mu.Unlock()
 		return Volume{}, err
@@ -2206,7 +2224,7 @@ func (s *Store) load() error {
 		if err := os.MkdirAll(meta.DataDir, 0o755); err != nil {
 			return err
 		}
-		if err := os.Chmod(volDir, 0o700); err != nil {
+		if err := tightenVolumeDir(volDir); err != nil {
 			return err
 		}
 		if err := ownPath(meta.DataDir, WriteOpts{}, true); err != nil {
@@ -2266,7 +2284,7 @@ func (s *Store) load() error {
 	}
 	_ = os.Chmod(filepath.Join(s.dir, "mounts.json"), 0o600)
 	_ = os.Chmod(s.keyringPath(), 0o600)
-	if err := os.Chmod(s.dir, 0o700); err != nil {
+	if err := tightenVolumeDir(s.dir); err != nil {
 		return err
 	}
 	return nil
@@ -2345,10 +2363,10 @@ func atomicWriteJSON(path string, v any) error {
 
 func atomicWrite(dest string, data []byte) error {
 	dir := filepath.Dir(dest)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(dir, volumeDirPerm); err != nil {
 		return err
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := tightenVolumeDir(dir); err != nil {
 		return err
 	}
 	f, err := os.CreateTemp(dir, ".tmp-*")

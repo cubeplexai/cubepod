@@ -333,6 +333,8 @@ type Reconciler struct {
 	forkMetrics              forkMetricsCollector
 	egressCA                 *egress.CA
 	egressUpstreamCAPEM      []byte
+	volumeNFS                VolumeNFSSettings
+	volumeNFSLeases          map[string]string
 }
 
 // ForkMetricsSnapshot holds Prometheus-ready sandbox fork counters and duration histogram buckets.
@@ -490,6 +492,7 @@ func NewReconciler(opts ...ReconcilerOption) *Reconciler {
 		specs:                make(map[string]v1alpha1.PodBoxSpec),
 		resolvedImages:       make(map[string]string),
 		boxAnnotations:       make(map[string]map[string]string),
+		volumeNFSLeases:      make(map[string]string),
 		templates:            make(map[string]v1alpha1.PodTemplateSpec),
 		warmPools:            make(map[string]*warmPoolState),
 		kubeClient:           NewMemoryKubeClient(),
@@ -1497,6 +1500,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 
 		// Delete old compute Pod first so it unmounts the old RootFS PVC and allows a new Pod to be created
 		if status.PodName != "" {
+			r.revokeVolumeNFSLease(ctx, name, "")
 			_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
 			status.PodName = ""
 			status.PodIP = ""
@@ -1513,6 +1517,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 
 	switch spec.DesiredState {
 	case v1alpha1.DesiredStatePaused:
+		r.revokeVolumeNFSLease(ctx, name, "")
 		if status.PodName != "" {
 			_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
 			if status.PodName != name {
@@ -1550,10 +1555,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 				return nil, fmt.Errorf("failed to ensure egress secrets: %w", err)
 			}
 		}
-		status.Phase = v1alpha1.PodBoxPhaseRunning
-		if status.PodName == "" {
-			status.PodName = name
-		}
+		// CEP-0030 fencing runs before any CEP-0031 NFS lease is minted so a lost
+		// block lease cannot leak an NFS lease or mark the box Running.
 		if blockMount := spec.WorkspaceBlockMount(); blockMount != nil && r.kubeClient != nil {
 			if fenceErr := r.verifyWorkspaceBlockLeaseLocked(ctx, name, blockMount.PVCName); fenceErr != nil {
 				status.Phase = v1alpha1.PodBoxPhaseFailed
@@ -1582,38 +1585,139 @@ func (r *Reconciler) Reconcile(ctx context.Context, name string, spec v1alpha1.P
 			}
 		}
 		pullSecrets := append([]string{r.templatePullSecret}, r.defaultImagePullSecrets...)
-		podManifest := BuildPodManifest(name, tpl, spec, *status, PodBuildOptions{
-			VolumeMode:        r.volumeMode,
-			ImagePullSecrets:  pullSecrets,
-			TransparentEgress: r.transparentEgress,
-		})
-		podManifest.Namespace = r.namespace
-		podIP, err := r.kubeClient.EnsurePod(ctx, podManifest)
-		podConflictUnconfirmed := false
-		if err != nil {
-			errStr := strings.ToLower(err.Error())
-			if strings.Contains(errStr, "409") || strings.Contains(errStr, "already exists") || strings.Contains(errStr, "conflict") {
-				err = nil
-				podConflictUnconfirmed = podIP == ""
-			} else {
+		existingLease := r.volumeNFSLeases[name]
+		if existingLease == "" && r.boxAnnotations[name] != nil {
+			existingLease = r.boxAnnotations[name][VolumeNFSLeaseAnnotation]
+		}
+		targetPodName := status.PodName
+		if targetPodName == "" {
+			targetPodName = name
+		}
+		// One leaseID per sandbox start (create or resume). Re-reconciling an
+		// already-running Pod must not mint a replacement lease.
+		// Run hypervisor / lease checks before mutating status.Phase so a
+		// failed resume cannot leave a Paused box marked Running with no Pod.
+		// Only shared (non-block) official volumes use the CEP-0031 NFS transport.
+		sharedMounts := spec.SharedVolumeMounts()
+		var fc bool
+		var fcErr error
+		if len(sharedMounts) > 0 {
+			fc, fcErr = r.usesFirecrackerRuntime(ctx, tpl)
+			if fcErr != nil {
 				if createdCold {
-					r.rollbackColdCreateLocked(ctx, name, spec, status, podManifest.Name)
-				} else {
-					r.persistFailedTransitionLocked(ctx, name, spec, status, podManifest.Name, effectiveImage, now)
+					r.rollbackColdCreateLocked(ctx, name, spec, status, "")
+				} else if didResetRootFS {
+					r.persistFailedTransitionLocked(ctx, name, spec, status, status.PodName, effectiveImage, now)
 				}
-				return nil, fmt.Errorf("failed to ensure Pod: %w", err)
+				return nil, fcErr
 			}
 		}
-		if podIP != "" {
-			status.PodIP = podIP
+		reusingPod := !createdCold && !didResetRootFS && strings.TrimSpace(status.PodName) != "" && strings.TrimSpace(status.PodIP) != ""
+		if reusingPod && r.kubeClient != nil {
+			phase, err := r.kubeClient.GetPodPhase(ctx, r.namespace, status.PodName)
+			if err != nil && !errors.Is(err, ErrPodNotFound) {
+				return nil, fmt.Errorf("failed to inspect pod phase: %w", err)
+			}
+			if errors.Is(err, ErrPodNotFound) || phase == "Failed" || phase == "Succeeded" {
+				r.revokeVolumeNFSLease(ctx, name, existingLease)
+				existingLease = ""
+				if status.PodName != "" {
+					cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+					_ = r.kubeClient.DeletePod(cleanupCtx, r.namespace, status.PodName)
+					cleanupCancel()
+				}
+				status.PodIP = ""
+				reusingPod = false
+			}
 		}
-		if podConflictUnconfirmed && status.PodIP == "" {
-			status.Phase = v1alpha1.PodBoxPhaseProvisioning
-		} else {
+		var nfsOpts VolumeNFSOptions
+		var leaseID string
+		var nfsErr error
+		if !reusingPod {
+			nfsOpts, leaseID, nfsErr = r.prepareVolumeNFS(ctx, name, targetPodName, tpl, sharedMounts)
+		}
+		if nfsErr != nil {
+			if createdCold {
+				r.rollbackColdCreateLocked(ctx, name, spec, status, "")
+			} else if didResetRootFS {
+				r.persistFailedTransitionLocked(ctx, name, spec, status, status.PodName, effectiveImage, now)
+			}
+			return nil, nfsErr
+		}
+		if fc && len(sharedMounts) > 0 && leaseID == "" && !reusingPod {
+			err := fmt.Errorf("Firecracker official volumeMounts require a volume NFS lease")
+			if createdCold {
+				r.rollbackColdCreateLocked(ctx, name, spec, status, "")
+			} else if didResetRootFS {
+				r.persistFailedTransitionLocked(ctx, name, spec, status, status.PodName, effectiveImage, now)
+			}
+			return nil, err
+		}
+		podConflictUnconfirmed := false
+		if reusingPod {
+			// The live Pod already has official-volume NFS mounts and a bound
+			// lease. Do not POST a volume-stripped manifest (TOCTOU / 409).
 			status.Phase = v1alpha1.PodBoxPhaseRunning
+			status.LastActivityAt = &now
+			status.PausedAt = nil
+		} else {
+			if leaseID != "" {
+				r.rememberVolumeNFSLease(name, leaseID)
+			}
+			status.Phase = v1alpha1.PodBoxPhaseRunning
+			if status.PodName == "" {
+				status.PodName = name
+			}
+			podManifest := BuildPodManifest(name, tpl, spec, *status, PodBuildOptions{
+				VolumeMode:        r.volumeMode,
+				ImagePullSecrets:  pullSecrets,
+				TransparentEgress: r.transparentEgress,
+				VolumeNFS:         nfsOpts,
+				IsFirecracker:     fc,
+			})
+			podManifest.Namespace = r.namespace
+			podIP, err := r.ensurePodMaybeWithNFS(ctx, podManifest, leaseID, sharedMounts, name)
+			if err != nil {
+				errStr := strings.ToLower(err.Error())
+				if strings.Contains(errStr, "409") || strings.Contains(errStr, "already exists") || strings.Contains(errStr, "conflict") {
+					if leaseID != "" {
+						r.revokeVolumeNFSLeaseID(ctx, name, leaseID)
+						if existingLease != "" {
+							r.rememberVolumeNFSLease(name, existingLease)
+						}
+						leaseID = existingLease
+					}
+					err = nil
+					podConflictUnconfirmed = podIP == ""
+				} else {
+					r.revokeVolumeNFSLease(ctx, name, leaseID)
+					if !createdCold && podManifest.Name != "" && r.kubeClient != nil {
+						cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
+						_ = r.kubeClient.DeletePod(cleanupCtx, r.namespace, podManifest.Name)
+						cleanupCancel()
+						status.PodName = ""
+						status.PodIP = ""
+					}
+					if createdCold {
+						r.rollbackColdCreateLocked(ctx, name, spec, status, podManifest.Name)
+					} else {
+						r.persistFailedTransitionLocked(ctx, name, spec, status, "", effectiveImage, now)
+					}
+					return nil, fmt.Errorf("failed to ensure Pod: %w", err)
+				}
+			}
+			if podIP != "" {
+				status.PodIP = podIP
+			}
+			if podConflictUnconfirmed && status.PodIP == "" {
+				status.Phase = v1alpha1.PodBoxPhaseProvisioning
+			} else {
+				status.Phase = v1alpha1.PodBoxPhaseRunning
+			}
+			status.PodName = podManifest.Name
+			status.LastActivityAt = &now
+			status.PausedAt = nil
 		}
-		status.PodName = podManifest.Name
-		status.LastActivityAt = &now
 		status.PausedAt = nil
 		if len(createdForkSnapshots) > 0 && !podConflictUnconfirmed {
 			r.cleanupForkSnapshotsLocked(ctx, createdForkSnapshots...)
@@ -1990,6 +2094,7 @@ func (r *Reconciler) rollbackColdCreateLocked(ctx context.Context, name string, 
 	if r.kubeClient != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cancel()
+		r.revokeVolumeNFSLease(cleanupCtx, name, "")
 
 		targetPod := podName
 		if targetPod == "" && status != nil {
@@ -2021,6 +2126,7 @@ func (r *Reconciler) rollbackColdCreateLocked(ctx context.Context, name string, 
 	delete(r.specs, name)
 	delete(r.resolvedImages, name)
 	delete(r.boxAnnotations, name)
+	delete(r.volumeNFSLeases, name)
 }
 
 func forkSnapshotName(boxName, suffix string) string {
@@ -2214,6 +2320,14 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 		ctx = context.Background()
 	}
 
+	if r.kubeClient != nil && r.volumeNFS.LeaseClient != nil {
+		if box, err := r.kubeClient.GetPodBox(ctx, r.namespace, name); err == nil && box != nil && box.Metadata.Annotations != nil {
+			if id := box.Metadata.Annotations[VolumeNFSLeaseAnnotation]; id != "" {
+				r.revokeVolumeNFSLease(ctx, name, id)
+			}
+		}
+	}
+	r.revokeVolumeNFSLease(ctx, name, "")
 	_ = r.kubeClient.DeletePodBox(ctx, r.namespace, name)
 	r.deleteEgressSecretsLocked(ctx, name)
 	if spec, hasSpec := r.specs[name]; hasSpec && spec.ForkFrom != nil && spec.ForkFrom.PodBoxName != "" {
@@ -2282,6 +2396,7 @@ func (r *Reconciler) DeleteBox(ctx context.Context, name string, deleteVolumes b
 	delete(r.specs, name)
 	delete(r.resolvedImages, name)
 	delete(r.boxAnnotations, name)
+	delete(r.volumeNFSLeases, name)
 	r.recordPodBoxEventLocked(ctx, name, PodBoxEventReasonDeleted, KubeEventTypeNormal, "PodBox deleted", time.Now().UTC())
 	return nil
 }
@@ -2367,6 +2482,21 @@ func (r *Reconciler) SyncFromKube(ctx context.Context) (int, error) {
 			r.mergeBoxAnnotationsLocked(name, box.Metadata.Annotations)
 			if img := box.Metadata.Annotations["cubepod.io/resolved-image"]; img != "" {
 				r.resolvedImages[name] = img
+			}
+		}
+		if r.volumeNFSLeases == nil {
+			r.volumeNFSLeases = make(map[string]string)
+		}
+		leaseFromBox := ""
+		if box.Metadata.Annotations != nil {
+			leaseFromBox = box.Metadata.Annotations[VolumeNFSLeaseAnnotation]
+		}
+		if leaseFromBox != "" {
+			r.volumeNFSLeases[name] = leaseFromBox
+		} else {
+			delete(r.volumeNFSLeases, name)
+			if r.boxAnnotations[name] != nil {
+				delete(r.boxAnnotations[name], VolumeNFSLeaseAnnotation)
 			}
 		}
 		if idx := parseWarmIndex(box.Status.PodName); idx > r.warmCounter {
@@ -2583,13 +2713,17 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 						statusWithPaused.Message = "Paused due to idle timeout"
 
 						if r.kubeClient != nil {
+							anns := r.podBoxAnnotationsLocked(name, "")
+							if anns != nil {
+								delete(anns, VolumeNFSLeaseAnnotation)
+							}
 							err := r.kubeClient.UpsertPodBox(ctx, v1alpha1.PodBox{
 								APIVersion: "cubepod.io/v1alpha1",
 								Kind:       "PodBox",
 								Metadata: v1alpha1.ObjectMeta{
 									Name:        name,
 									Namespace:   r.namespace,
-									Annotations: r.podBoxAnnotationsLocked(name, ""),
+									Annotations: anns,
 								},
 								Spec:   specWithPaused,
 								Status: statusWithPaused,
@@ -2600,8 +2734,11 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 							}
 						}
 
-						if status.PodName != "" && r.kubeClient != nil {
-							_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
+						if r.kubeClient != nil {
+							r.revokeVolumeNFSLease(ctx, name, "")
+							if status.PodName != "" {
+								_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
+							}
 						}
 						r.deleteEgressSecretsLocked(ctx, name)
 						status.Phase = v1alpha1.PodBoxPhasePaused
@@ -2648,6 +2785,7 @@ func (r *Reconciler) ReapIdle(ctx context.Context, now time.Time) (paused []stri
 					}
 
 					if status.PodName != "" && r.kubeClient != nil {
+						r.revokeVolumeNFSLease(ctx, name, "")
 						_ = r.kubeClient.DeletePod(ctx, r.namespace, status.PodName)
 					}
 					if blockMount := spec.WorkspaceBlockMount(); blockMount != nil {

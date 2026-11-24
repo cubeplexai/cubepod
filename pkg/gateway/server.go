@@ -79,6 +79,7 @@ const (
 	FeatureGateE2BSecretsAPI            = "E2BSecretsAPI"
 	FeatureGateSandboxEventsAndWebhooks = "SandboxEventsAndWebhooks"
 	FeatureGateBlockWorkspaceVolumes    = "BlockWorkspaceVolumes"
+	FeatureGateFirecrackerVolumeNFS     = "FirecrackerVolumeNFS"
 )
 
 // FeatureGates holds gateway feature gate enablement flags.
@@ -96,6 +97,7 @@ func DefaultFeatureGates() FeatureGates {
 		FeatureGateE2BSecretsAPI:            true,
 		FeatureGateSandboxEventsAndWebhooks: true,
 		FeatureGateBlockWorkspaceVolumes:    true,
+		FeatureGateFirecrackerVolumeNFS:     false,
 	}
 }
 

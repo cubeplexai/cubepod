@@ -1,0 +1,174 @@
+{{- /* CEP-0031 cubepod-volume-nfs: userspace NFSv3 proxy + internal lease API. Alpha is single-replica. */ -}}
+{{- $nfsEnabled := eq (include "cubepod.firecrackerVolumeNFSEnabled" .) "true" }}
+{{- $volumesActive := eq (include "cubepod.volumesActive" .) "true" }}
+{{- if and $nfsEnabled $volumesActive }}
+{{- $nfs := .Values.volumes.nfs | default dict }}
+{{- $img := $nfs.image | default dict }}
+{{- $registry := default .Values.global.imageRegistry $img.registry }}
+{{- $repo := default "cubeplexai/cubepod-volume-nfs" $img.repository }}
+{{- $tag := default .Values.controller.image.tag $img.tag }}
+{{- $nfsPort := default 2049 $nfs.port }}
+{{- $leasePort := default 8080 $nfs.leasePort }}
+{{- if and (hasKey $nfs "replicaCount") (ne (int $nfs.replicaCount) 1) }}
+{{- fail "volumes.nfs.replicaCount must be 1 in Alpha: go-nfs filehandles are in-memory and do not survive scale-out or rolling updates" }}
+{{- end }}
+{{- if eq (int $nfsPort) (int $leasePort) }}
+{{- fail "volumes.nfs.port and volumes.nfs.leasePort must be different ports" }}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "cubepod.fullname" . }}-volume-nfs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: volume-nfs
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cubepod.fullname" . }}-volume-nfs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: volume-nfs
+spec:
+  # Alpha: a process restart ESTALEs in-memory go-nfs filehandles. Do not scale out.
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "cubepod.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: volume-nfs
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        {{- include "cubepod.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: volume-nfs
+    spec:
+      serviceAccountName: {{ include "cubepod.fullname" . }}-volume-nfs
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+      {{- include "cubepod.podImagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: volume-nfs
+          image: "{{ $registry }}/{{ $repo }}:{{ $tag }}"
+          imagePullPolicy: {{ default "IfNotPresent" $img.pullPolicy }}
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              {{- if or (lt (int $nfsPort) 1024) (lt (int $leasePort) 1024) }}
+              add: ["NET_BIND_SERVICE"]
+              {{- end }}
+          args:
+            - "--volumes-dir=/var/lib/cubepod/volumes"
+            - "--nfs-addr=:{{ $nfsPort }}"
+            - "--lease-addr=:{{ $leasePort }}"
+            - "--unbound-lease-ttl=60s"
+          env:
+            - name: CUBEPOD_VOLUMES_DIR
+              value: /var/lib/cubepod/volumes
+          ports:
+            - name: nfs
+              containerPort: {{ $nfsPort }}
+              protocol: TCP
+            - name: lease
+              containerPort: {{ $leasePort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: lease
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: lease
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          volumeMounts:
+            - name: volumes
+              mountPath: /var/lib/cubepod/volumes
+          resources:
+            {{- toYaml (default dict $nfs.resources) | nindent 12 }}
+      volumes:
+        - name: volumes
+          persistentVolumeClaim:
+            claimName: {{ .Values.volumes.pvcName | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cubepod.fullname" . }}-volume-nfs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: volume-nfs
+spec:
+  type: ClusterIP
+  ports:
+    - name: nfs
+      port: {{ $nfsPort }}
+      targetPort: nfs
+      protocol: TCP
+    - name: lease
+      port: {{ $leasePort }}
+      targetPort: lease
+      protocol: TCP
+  selector:
+    {{- include "cubepod.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: volume-nfs
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "cubepod.fullname" . }}-volume-nfs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: volume-nfs
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "cubepod.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: volume-nfs
+  policyTypes:
+    - Ingress
+  ingress:
+    # Sandbox Pods may speak NFSv3 on the NFS port only.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ default .Release.Namespace .Values.controller.workloadNamespace | quote }}
+          podSelector:
+            matchExpressions:
+              - key: pod.cubeplex.ai/box
+                operator: Exists
+      ports:
+        - protocol: TCP
+          port: {{ $nfsPort }}
+    # The controller and gateway use the lease API on a different port, never 2049.
+    # In the Kubernetes deployment the gateway reconciler also issues and revokes leases.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "cubepod.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: controller
+        - podSelector:
+            matchLabels:
+              {{- include "cubepod.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: gateway
+      ports:
+        - protocol: TCP
+          port: {{ $leasePort }}
+{{- end }}
