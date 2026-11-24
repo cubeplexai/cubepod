@@ -144,8 +144,37 @@ def test_network_and_service_port(sandbox):
         sandbox.commands.kill(server.pid)
 
 
+# TEST-ONLY (CEP-0031 gate, do not merge): CEP0031_FC_NFS_GATE=1 unskips #122 in the
+# Kata Firecracker lane only and makes this test fail closed (no #120 skip either).
+_CEP0031_GATE = os.environ.get("CEP0031_FC_NFS_GATE") == "1" and _is_firecracker()
+
+# Read-only guest probe: kernel release, the /data mount entry, and proof that no
+# userspace NFS helper exists in the sandbox image.
+_GATE_PROBE = (
+    "uname -r; echo ---; awk '$2==\"/data\"' /proc/mounts; echo ---; "
+    "(command -v mount.nfs mount.nfs4; ls /sbin/mount.nfs* /usr/sbin/mount.nfs* 2>/dev/null; "
+    "dpkg-query -W -f='${Package} ${Status}\\n' nfs-common 2>/dev/null) || true"
+)
+
+
+def _gate_record(sbx, phase):
+    import json
+    out = sbx.commands.run(_GATE_PROBE).stdout
+    release, mounts, helpers = (part.strip() for part in out.split("---", 2))
+    record = {"sdk": "python", "phase": phase, "sandbox_id": sbx.sandbox_id,
+              "uname": release, "data_mounts": mounts.splitlines(), "nfs_helpers": helpers}
+    path = os.path.join(os.environ["ARTIFACTS"], "cep0031-gate-python.jsonl")
+    with open(path, "a") as file:
+        file.write(json.dumps(record) + "\n")
+    assert release == os.environ["E2E_GUEST_KERNEL"], record
+    last = mounts.splitlines()[-1].split()
+    assert last[2] in ("nfs", "nfs3"), record
+    assert "nosuid" in last[3].split(",") and "nodev" in last[3].split(","), record
+    assert helpers == "" or "not-installed" in helpers, record
+
+
 @pytest.mark.skipif(
-    os.environ.get("KATA_VMM") == "fc",
+    os.environ.get("KATA_VMM") == "fc" and not _CEP0031_GATE,
     reason=f"{_FC_ISSUE_122}: E2B filesystem volume mounts do not persist on Kata Firecracker",
 )
 def test_volume_mount_persistence():
@@ -155,9 +184,12 @@ def test_volume_mount_persistence():
             try:
                 sbx = Sandbox.create("kind-e2e", timeout=120, request_timeout=90, volume_mounts={"/data": volume})
             except Exception as exc:
-                _skip_fc_issue_120(exc)
+                if not _CEP0031_GATE:
+                    _skip_fc_issue_120(exc)
                 raise
             try:
+                if _CEP0031_GATE:
+                    _gate_record(sbx, "recreate" if expected else "create")
                 if expected:
                     assert sbx.files.read("/data/persist.txt") == expected
                 else:

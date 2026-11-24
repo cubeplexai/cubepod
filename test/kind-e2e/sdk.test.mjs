@@ -50,12 +50,12 @@ function isIssue120(err) {
   return issue120Markers.some(marker => text.includes(marker));
 }
 
-async function withSandbox(t, fn, options = {}) {
+async function withSandbox(t, fn, { failClosed = false, ...options } = {}) {
   let sbx;
   try {
     sbx = await Sandbox.create('kind-e2e', { timeoutMs: 120000, requestTimeoutMs: 90000, ...options });
   } catch (err) {
-    if (isFirecracker() && isIssue120(err)) {
+    if (!failClosed && isFirecracker() && isIssue120(err)) {
       t.skip(`${FC_ISSUE_120}: Firecracker virtio-mmio hotplug race: ${err}`);
       return;
     }
@@ -135,19 +135,42 @@ test('outbound network and real exposed port', { timeout: 120000 }, async (t) =>
   });
 });
 
+// TEST-ONLY (CEP-0031 gate, do not merge): CEP0031_FC_NFS_GATE=1 unskips #122 in the
+// Kata Firecracker lane only and makes this test fail closed (no #120 skip either).
+const CEP0031_GATE = process.env.CEP0031_FC_NFS_GATE === '1' && isFirecracker();
+const GATE_PROBE = "uname -r; echo ---; awk '$2==\"/data\"' /proc/mounts; echo ---; " +
+  "(command -v mount.nfs mount.nfs4; ls /sbin/mount.nfs* /usr/sbin/mount.nfs* 2>/dev/null; " +
+  "dpkg-query -W -f='${Package} ${Status}\\n' nfs-common 2>/dev/null) || true";
+
+async function gateRecord(sbx, phase) {
+  const { appendFileSync } = await import('node:fs');
+  const out = (await sbx.commands.run(GATE_PROBE)).stdout;
+  const [release, mounts, helpers] = out.split('---').map(part => part.trim());
+  const record = { sdk: 'typescript', phase, sandbox_id: sbx.sandboxId, uname: release,
+    data_mounts: mounts.split('\n').filter(Boolean), nfs_helpers: helpers };
+  appendFileSync(`${process.env.ARTIFACTS}/cep0031-gate-typescript.jsonl`, JSON.stringify(record) + '\n');
+  assert.equal(release, process.env.E2E_GUEST_KERNEL, JSON.stringify(record));
+  const last = record.data_mounts.at(-1).split(/\s+/);
+  assert.ok(['nfs', 'nfs3'].includes(last[2]), JSON.stringify(record));
+  assert.ok(last[3].split(',').includes('nosuid') && last[3].split(',').includes('nodev'), JSON.stringify(record));
+  assert.ok(helpers === '' || helpers.includes('not-installed'), JSON.stringify(record));
+}
+
 test('volume mounts survive destruction and recreation', { timeout: 240000 }, async (t) => {
-  if (isFirecracker()) {
+  if (isFirecracker() && !CEP0031_GATE) {
     t.skip(`${FC_ISSUE_122}: E2B filesystem volume mounts do not persist on Kata Firecracker`);
     return;
   }
   const volume = await Volume.create(`kind-ts-${Date.now()}`);
   try {
     await withSandbox(t, async sbx => {
+      if (CEP0031_GATE) await gateRecord(sbx, 'create');
       await sbx.files.write('/data/persist.txt', 'persisted-ts');
       assert.equal((await sbx.commands.run('cat /data/persist.txt')).stdout, 'persisted-ts');
-    }, { volumeMounts: { '/data': volume } });
+    }, { volumeMounts: { '/data': volume }, failClosed: CEP0031_GATE });
     await withSandbox(t, async sbx => {
+      if (CEP0031_GATE) await gateRecord(sbx, 'recreate');
       assert.equal(await sbx.files.read('/data/persist.txt'), 'persisted-ts');
-    }, { volumeMounts: { '/data': volume } });
+    }, { volumeMounts: { '/data': volume }, failClosed: CEP0031_GATE });
   } finally { await Volume.destroy(volume.volumeId); }
 });
