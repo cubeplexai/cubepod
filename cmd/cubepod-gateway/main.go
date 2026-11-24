@@ -114,7 +114,8 @@ func main() {
 		}
 	})
 	e2bAPIEnabled := resolveE2BTemplateAPIFlag(e2bFlagSet, *e2bTemplateAPI, gates)
-	firecrackerVolumeNFS := false
+	// CEP-0031 FirecrackerVolumeNFS is default on; --feature-gate=FirecrackerVolumeNFS=false opts out.
+	firecrackerVolumeNFS := true
 	if v, ok := gates[controller.FeatureGateFirecrackerVolumeNFS]; ok {
 		firecrackerVolumeNFS = v
 	}

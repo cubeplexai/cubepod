@@ -97,7 +97,7 @@ func DefaultFeatureGates() FeatureGates {
 		FeatureGateE2BSecretsAPI:            true,
 		FeatureGateSandboxEventsAndWebhooks: true,
 		FeatureGateBlockWorkspaceVolumes:    true,
-		FeatureGateFirecrackerVolumeNFS:     false,
+		FeatureGateFirecrackerVolumeNFS:     true,
 	}
 }
 
