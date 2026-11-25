@@ -11,12 +11,79 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cubeplexai/cubepod/pkg/client"
 )
+
+func TestClient_CreateSandboxVolumeMounts(t *testing.T) {
+	mounts := []client.SandboxVolumeMount{
+		{Name: "datasets", Path: "/data"},
+		{Name: "assets", Path: "/mnt/assets"},
+	}
+	tests := []struct {
+		name      string
+		mounts    []client.SandboxVolumeMount
+		volumeKey string
+		wantJSON  string
+	}{
+		{
+			name:     "named mounts",
+			mounts:   mounts,
+			wantJSON: `{"templateID":"base","metadata":null,"volumeMounts":[{"name":"datasets","path":"/data"},{"name":"assets","path":"/mnt/assets"}]}`,
+		},
+		{
+			name:      "legacy volume key",
+			volumeKey: "legacy",
+			wantJSON:  `{"templateID":"base","metadata":null,"extension":{"volumeKey":"legacy"}}`,
+		},
+		{
+			name:     "empty slice omitted",
+			mounts:   []client.SandboxVolumeMount{},
+			wantJSON: `{"templateID":"base","metadata":null}`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var want map[string]any
+			if err := json.Unmarshal([]byte(tt.wantJSON), &want); err != nil {
+				t.Fatal(err)
+			}
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("POST /sandboxes", func(w http.ResponseWriter, r *http.Request) {
+				var got map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+					t.Errorf("decode create request: %v", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				if !reflect.DeepEqual(got, want) {
+					t.Errorf("create request = %#v, want %#v", got, want)
+				}
+				w.WriteHeader(http.StatusCreated)
+				_, _ = io.WriteString(w, `{"sandboxID":"cpod-123"}`)
+			})
+			server := httptest.NewServer(mux)
+			defer server.Close()
+
+			record, err := client.New(server.URL).CreateSandbox(context.Background(), client.CreateSandboxRequest{
+				TemplateID:   "base",
+				VolumeKey:    tt.volumeKey,
+				VolumeMounts: tt.mounts,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if record.SandboxID != "cpod-123" {
+				t.Errorf("sandbox ID = %q, want cpod-123", record.SandboxID)
+			}
+		})
+	}
+}
 
 func TestClient_AllMethods(t *testing.T) {
 	mux := http.NewServeMux()

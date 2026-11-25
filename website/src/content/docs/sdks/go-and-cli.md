@@ -64,6 +64,21 @@ Available constructor options:
 - `client.WithTimeout(timeout time.Duration)`: Overrides the default `60s` `http.Client.Timeout`.
 - `client.WithHTTPClient(httpClient *http.Client)`: Supplies a custom `*http.Client`.
 
+### Named Volume Mounts *(Unreleased)*
+
+Set `CreateSandboxRequest.VolumeMounts` to mount an existing named volume. Each entry contains the volume name and the absolute path inside the sandbox.
+
+```go
+req := client.CreateSandboxRequest{
+    TemplateID: "base",
+    VolumeMounts: []client.SandboxVolumeMount{
+        {Name: "datasets", Path: "/data"},
+    },
+}
+```
+
+This option sets only the request body. The gateway still requires its existing `X-API-Key` header for named mounts; `WithAPIKey` continues to set the bearer header only. Legacy `VolumeKey` requests are unchanged. Do not combine `VolumeKey` with a block volume mount at `/workspace`.
+
 ### Sandbox Lifecycle, Reset & CoW Fork
 
 ```go

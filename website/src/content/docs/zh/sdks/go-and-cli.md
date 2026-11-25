@@ -64,6 +64,21 @@ func main() {
 - `client.WithTimeout(timeout time.Duration)`：覆盖默认的 `60s` `http.Client.Timeout`。
 - `client.WithHTTPClient(httpClient *http.Client)`：传入自定义 `*http.Client`。
 
+### 命名卷挂载（尚未发布）
+
+通过 `CreateSandboxRequest.VolumeMounts` 挂载已有的命名卷。每项包含卷名及沙箱内的绝对挂载路径。
+
+```go
+req := client.CreateSandboxRequest{
+    TemplateID: "base",
+    VolumeMounts: []client.SandboxVolumeMount{
+        {Name: "datasets", Path: "/data"},
+    },
+}
+```
+
+此选项只设置请求体。网关仍要求命名卷挂载请求带上现有的 `X-API-Key` 请求头；`WithAPIKey` 仍仅设置 Bearer 请求头。旧版 `VolumeKey` 请求不变。请勿同时传入 `VolumeKey` 和挂载到 `/workspace` 的块卷。
+
 ### 沙箱生命周期、重置与 CoW Fork
 
 ```go
