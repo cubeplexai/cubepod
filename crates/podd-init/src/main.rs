@@ -152,13 +152,13 @@ impl InitState {
     }
 }
 
-/// Ensures `device` has a valid `ext4` filesystem; formats with `mkfs.ext4` if blank,
-/// or runs `e2fsck -p` to auto-heal after unclean VM shutdowns.
-pub fn ensure_ext4(device: &Path, label: &str) -> Result<VolumeAction, String> {
-    if !device.exists() {
-        return Err(format!("block device {} does not exist", device.display()));
-    }
+const MKFS_EXT4_EXTENDED_OPTS: &str = "lazy_itable_init=1,lazy_journal_init=1,nodiscard";
 
+fn mkfs_ext4_args(label: &str) -> [&str; 7] {
+    ["-F", "-L", label, "-m", "0", "-E", MKFS_EXT4_EXTENDED_OPTS]
+}
+
+fn is_blank_or_unformatted(device: &Path) -> Result<bool, String> {
     let blkid = Command::new("blkid")
         .args(["-o", "value", "-s", "TYPE"])
         .arg(device)
@@ -166,36 +166,32 @@ pub fn ensure_ext4(device: &Path, label: &str) -> Result<VolumeAction, String> {
         .map_err(|e| format!("failed to run blkid on {}: {e}", device.display()))?;
 
     let fstype = String::from_utf8_lossy(&blkid.stdout).trim().to_string();
-    if !blkid.status.success() || fstype.is_empty() {
-        eprintln!(
-            "[podd-init] formatting fresh raw block volume {} as ext4 (label={})",
-            device.display(),
-            label
-        );
-        let status = Command::new("mkfs.ext4")
-            .args([
-                "-F",
-                "-L",
-                label,
-                "-m",
-                "0",
-                "-E",
-                "lazy_itable_init=0,lazy_journal_init=0",
-            ])
-            .arg(device)
-            .status()
-            .map_err(|e| format!("failed to spawn mkfs.ext4: {e}"))?;
+    Ok(!blkid.status.success() || fstype.is_empty())
+}
 
-        if !status.success() {
-            return Err(format!(
-                "mkfs.ext4 exited with {} on {}",
-                status,
-                device.display()
-            ));
-        }
-        return Ok(VolumeAction::Formatted);
+fn format_ext4(device: &Path, label: &str) -> Result<(), String> {
+    eprintln!(
+        "[podd-init] formatting fresh raw block volume {} as ext4 (label={})",
+        device.display(),
+        label
+    );
+    let status = Command::new("mkfs.ext4")
+        .args(mkfs_ext4_args(label))
+        .arg(device)
+        .status()
+        .map_err(|e| format!("failed to spawn mkfs.ext4: {e}"))?;
+
+    if !status.success() {
+        return Err(format!(
+            "mkfs.ext4 exited with {} on {}",
+            status,
+            device.display()
+        ));
     }
+    Ok(())
+}
 
+fn e2fsck_heal(device: &Path) -> Result<VolumeAction, String> {
     eprintln!(
         "[podd-init] verifying existing ext4 volume {} with e2fsck -p",
         device.display()
@@ -240,6 +236,69 @@ pub fn ensure_ext4(device: &Path, label: &str) -> Result<VolumeAction, String> {
         device.display(),
         last_code
     ))
+}
+
+/// Ensures `device` has a valid `ext4` filesystem; formats with `mkfs.ext4` if blank,
+/// or runs `e2fsck -p` to auto-heal after unclean VM shutdowns.
+pub fn ensure_ext4(device: &Path, label: &str) -> Result<VolumeAction, String> {
+    if !device.exists() {
+        return Err(format!("block device {} does not exist", device.display()));
+    }
+
+    if is_blank_or_unformatted(device)? {
+        format_ext4(device, label)?;
+        return Ok(VolumeAction::Formatted);
+    }
+
+    e2fsck_heal(device)
+}
+
+/// Ensures `device` has a valid `ext4` filesystem and mounts it at `target`.
+///
+/// For existing ext4 volumes (wake/resume), attempts a direct `mount(2)` first so the
+/// kernel can replay the journal without spawning `e2fsck -p`. Falls back to `e2fsck -p`
+/// and retries `mount(2)` only if direct mounting fails or mounts read-only due to errors.
+pub fn ensure_and_mount_ext4(
+    device: &Path,
+    target: &Path,
+    label: &str,
+) -> Result<VolumeAction, String> {
+    ensure_and_mount_ext4_with(device, target, label, mount_ext4_rw, e2fsck_heal)
+}
+
+fn ensure_and_mount_ext4_with<M, C>(
+    device: &Path,
+    target: &Path,
+    label: &str,
+    mut mount_fn: M,
+    mut fsck_fn: C,
+) -> Result<VolumeAction, String>
+where
+    M: FnMut(&Path, &Path) -> Result<(), String>,
+    C: FnMut(&Path) -> Result<VolumeAction, String>,
+{
+    if !device.exists() {
+        return Err(format!("block device {} does not exist", device.display()));
+    }
+
+    if is_blank_or_unformatted(device)? {
+        format_ext4(device, label)?;
+        mount_fn(device, target)?;
+        return Ok(VolumeAction::Formatted);
+    }
+
+    match mount_fn(device, target) {
+        Ok(()) => Ok(VolumeAction::Mounted),
+        Err(mount_err) => {
+            eprintln!(
+                "[podd-init] direct mount of {} failed ({mount_err}); falling back to e2fsck -p",
+                device.display()
+            );
+            let action = fsck_fn(device)?;
+            mount_fn(device, target)?;
+            Ok(action)
+        }
+    }
 }
 
 pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
@@ -292,13 +351,12 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
     // Set root mount propagation to MS_PRIVATE | MS_REC before assembling mounts to allow pivot_root.
     make_mount_private(Path::new("/"))?;
 
-    // 1. Heal or format RootFS Upper block device.
-    let rootfs_action = ensure_ext4(&cfg.rootfs_device, "cubepod-rootfs")?;
-
-    // 2. Mount RootFS Upper block device and create upper/ and work/ directories.
+    // 1 & 2. Mount RootFS Upper block device (direct mount on wake, format or e2fsck fallback)
+    // and create upper/ and work/ directories.
     fs::create_dir_all(&cfg.upper_mount_path)
         .map_err(|e| format!("mkdir {}: {e}", cfg.upper_mount_path.display()))?;
-    mount_ext4(&cfg.rootfs_device, &cfg.upper_mount_path)?;
+    let rootfs_action =
+        ensure_and_mount_ext4(&cfg.rootfs_device, &cfg.upper_mount_path, "cubepod-rootfs")?;
 
     let upper_dir = cfg.upper_mount_path.join("upper");
     let work_dir = cfg.upper_mount_path.join("work");
@@ -307,24 +365,7 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
     }
 
     // 3. Assemble OverlayFS combining Base Image (/) as lowerdir and block PVC as upperdir.
-    let overlay_opts = format!(
-        "lowerdir=/,upperdir={},workdir={}",
-        upper_dir.display(),
-        work_dir.display()
-    );
-    eprintln!(
-        "[podd-init] mounting persistent OverlayFS at {} ({})",
-        cfg.merged_root_path.display(),
-        overlay_opts
-    );
-    let status = Command::new("mount")
-        .args(["-t", "overlay", "overlay", "-o", &overlay_opts])
-        .arg(&cfg.merged_root_path)
-        .status()
-        .map_err(|e| format!("failed to spawn mount overlay: {e}"))?;
-    if !status.success() {
-        return Err(format!("overlayfs mount failed with status {status}"));
-    }
+    mount_overlay(Path::new("/"), &upper_dir, &work_dir, &cfg.merged_root_path)?;
 
     // 4. Mount Workspace block device at <merged>/workspace and chown to default_uid:default_gid.
     let rel_ws = cfg
@@ -336,9 +377,7 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         .map_err(|e| format!("mkdir {}: {e}", merged_workspace.display()))?;
 
     let workspace_action = if cfg.workspace_device.exists() {
-        let action = ensure_ext4(&cfg.workspace_device, "cubepod-ws")?;
-        mount_ext4(&cfg.workspace_device, &merged_workspace)?;
-        action
+        ensure_and_mount_ext4(&cfg.workspace_device, &merged_workspace, "cubepod-ws")?
     } else {
         VolumeAction::Skipped
     };
@@ -352,11 +391,9 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
         if src.exists() {
             let dst = cfg.merged_root_path.join(sys_dir);
             let _ = fs::create_dir_all(&dst);
-            let _ = Command::new("mount")
-                .arg("--rbind")
-                .arg(&src)
-                .arg(&dst)
-                .status();
+            if let Err(err) = mount_bind(&src, &dst, true) {
+                eprintln!("[podd-init] warning: {err}");
+            }
         }
     }
 
@@ -372,11 +409,9 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
                 .truncate(false)
                 .write(true)
                 .open(&dst);
-            let _ = Command::new("mount")
-                .arg("--bind")
-                .arg(&src)
-                .arg(&dst)
-                .status();
+            if let Err(err) = mount_bind(&src, &dst, false) {
+                eprintln!("[podd-init] warning: {err}");
+            }
         }
     }
 
@@ -398,11 +433,9 @@ pub fn setup_and_pivot(cfg: &InitConfig) -> Result<(), String> {
                     .write(true)
                     .open(&ca_bundle_dst);
             }
-            let _ = Command::new("mount")
-                .arg("--bind")
-                .arg(composed_ca)
-                .arg(&ca_bundle_dst)
-                .status();
+            if let Err(err) = mount_bind(composed_ca, &ca_bundle_dst, false) {
+                eprintln!("[podd-init] warning: {err}");
+            }
         }
         Ok(false) => {}
         Err(err) => {
@@ -494,21 +527,125 @@ fn make_mount_private(target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn mount_ext4(device: &Path, target: &Path) -> Result<(), String> {
-    let status = Command::new("mount")
-        .args(["-t", "ext4", "-o", "noatime"])
-        .arg(device)
-        .arg(target)
-        .status()
-        .map_err(|e| format!("failed to spawn mount ext4: {e}"))?;
-    if !status.success() {
-        return Err(format!(
-            "mount ext4 {} -> {} failed with {status}",
-            device.display(),
-            target.display()
-        ));
+fn path_to_cstring(path: &Path, label: &str) -> Result<CString, String> {
+    use std::os::unix::ffi::OsStrExt;
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| format!("invalid {label} path {}: {e}", path.display()))
+}
+
+fn sys_mount(
+    source: Option<&CString>,
+    target: &Path,
+    fstype: Option<&CString>,
+    flags: libc::c_ulong,
+    data: Option<&CString>,
+) -> Result<(), String> {
+    let c_target = path_to_cstring(target, "mount target")?;
+    let src_ptr = source.map_or(std::ptr::null(), |s| s.as_ptr());
+    let fs_ptr = fstype.map_or(std::ptr::null(), |f| f.as_ptr());
+    let data_ptr = data.map_or(std::ptr::null(), |d| d.as_ptr().cast::<libc::c_void>());
+    let rc = unsafe { libc::mount(src_ptr, c_target.as_ptr(), fs_ptr, flags, data_ptr) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(())
+}
+
+fn mount_ext4(device: &Path, target: &Path) -> Result<(), String> {
+    let c_dev = path_to_cstring(device, "device")?;
+    let c_fs = CString::new("ext4").map_err(|e| format!("invalid fstype: {e}"))?;
+    sys_mount(
+        Some(&c_dev),
+        target,
+        Some(&c_fs),
+        libc::MS_NOATIME as libc::c_ulong,
+        None,
+    )
+    .map_err(|e| {
+        format!(
+            "mount ext4 {} -> {} failed: {e}",
+            device.display(),
+            target.display()
+        )
+    })
+}
+
+fn is_mounted_readonly(target: &Path) -> Result<bool, String> {
+    let c_target = path_to_cstring(target, "statvfs target")?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_target.as_ptr(), &mut stat) };
+    if rc != 0 {
+        return Err(format!(
+            "statvfs {} failed: {}",
+            target.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((stat.f_flag & libc::ST_RDONLY) != 0)
+}
+
+fn mount_ext4_rw(device: &Path, target: &Path) -> Result<(), String> {
+    mount_ext4(device, target)?;
+    match is_mounted_readonly(target) {
+        Ok(true) => {
+            if let Ok(c_target) = path_to_cstring(target, "umount target") {
+                let rc = unsafe { libc::umount2(c_target.as_ptr(), 0) };
+                if rc != 0 {
+                    let _ = unmount_lazy(target);
+                }
+            }
+            Err(format!(
+                "ext4 {} mounted read-only at {} (filesystem errors detected)",
+                device.display(),
+                target.display()
+            ))
+        }
+        Ok(false) => Ok(()),
+        Err(err) => {
+            eprintln!("[podd-init] warning: {err}");
+            Ok(())
+        }
+    }
+}
+
+fn overlay_mount_options(lower: &Path, upper: &Path, work: &Path) -> String {
+    format!(
+        "lowerdir={},upperdir={},workdir={}",
+        lower.display(),
+        upper.display(),
+        work.display()
+    )
+}
+
+fn mount_overlay(lower: &Path, upper: &Path, work: &Path, target: &Path) -> Result<(), String> {
+    let overlay_opts = overlay_mount_options(lower, upper, work);
+    eprintln!(
+        "[podd-init] mounting persistent OverlayFS at {} ({})",
+        target.display(),
+        overlay_opts
+    );
+    let c_src = CString::new("overlay").map_err(|e| format!("invalid overlay source: {e}"))?;
+    let c_fs = CString::new("overlay").map_err(|e| format!("invalid overlay fstype: {e}"))?;
+    let c_opts = CString::new(overlay_opts).map_err(|e| format!("invalid overlay options: {e}"))?;
+    sys_mount(Some(&c_src), target, Some(&c_fs), 0, Some(&c_opts))
+        .map_err(|e| format!("overlayfs mount at {} failed: {e}", target.display()))
+}
+
+fn mount_bind(src: &Path, dst: &Path, recursive: bool) -> Result<(), String> {
+    let c_src = path_to_cstring(src, "bind source")?;
+    let flags = if recursive {
+        (libc::MS_BIND | libc::MS_REC) as libc::c_ulong
+    } else {
+        libc::MS_BIND as libc::c_ulong
+    };
+    sys_mount(Some(&c_src), dst, None, flags, None).map_err(|e| {
+        format!(
+            "{} {} -> {} failed: {e}",
+            if recursive { "rbind" } else { "bind mount" },
+            src.display(),
+            dst.display()
+        )
+    })
 }
 
 fn chown_path(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
@@ -1980,5 +2117,161 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("expected nfs"), "{err}");
+    }
+
+    #[test]
+    fn mkfs_ext4_args_uses_lazy_init_and_nodiscard() {
+        let args = mkfs_ext4_args("cubepod-rootfs");
+        assert_eq!(
+            args,
+            [
+                "-F",
+                "-L",
+                "cubepod-rootfs",
+                "-m",
+                "0",
+                "-E",
+                "lazy_itable_init=1,lazy_journal_init=1,nodiscard",
+            ]
+        );
+    }
+
+    #[test]
+    fn overlay_mount_options_formats_expected_string() {
+        let opts = overlay_mount_options(
+            Path::new("/"),
+            Path::new("/mnt/cubepod-upper/upper"),
+            Path::new("/mnt/cubepod-upper/work"),
+        );
+        assert_eq!(
+            opts,
+            "lowerdir=/,upperdir=/mnt/cubepod-upper/upper,workdir=/mnt/cubepod-upper/work"
+        );
+    }
+
+    #[test]
+    fn ensure_and_mount_ext4_formats_blank_image_and_skips_fsck() {
+        let img_path = unique_temp_path("test-mount-fresh", "img");
+        let _guard = TempFileGuard(img_path.clone());
+        let file = fs::File::create(&img_path).expect("create sparse file");
+        file.set_len(64 * 1024 * 1024).expect("truncate to 64MB");
+        drop(file);
+
+        let target = Path::new("/mnt/test-upper");
+        let mut mount_calls = 0usize;
+        let mut fsck_calls = 0usize;
+
+        let action = ensure_and_mount_ext4_with(
+            &img_path,
+            target,
+            "cubepod-test",
+            |_, _| {
+                mount_calls += 1;
+                Ok(())
+            },
+            |_| {
+                fsck_calls += 1;
+                Ok(VolumeAction::Mounted)
+            },
+        )
+        .expect("fresh image should format and mount");
+
+        assert_eq!(action, VolumeAction::Formatted);
+        assert_eq!(mount_calls, 1);
+        assert_eq!(fsck_calls, 0);
+    }
+
+    #[test]
+    fn ensure_and_mount_ext4_direct_mount_skips_e2fsck_on_wake() {
+        let img_path = unique_temp_path("test-mount-wake", "img");
+        let _guard = TempFileGuard(img_path.clone());
+        let file = fs::File::create(&img_path).expect("create sparse file");
+        file.set_len(64 * 1024 * 1024).expect("truncate to 64MB");
+        drop(file);
+
+        format_ext4(&img_path, "cubepod-test").expect("format ext4");
+
+        let target = Path::new("/mnt/test-upper");
+        let mut mount_calls = 0usize;
+        let mut fsck_calls = 0usize;
+
+        let action = ensure_and_mount_ext4_with(
+            &img_path,
+            target,
+            "cubepod-test",
+            |_, _| {
+                mount_calls += 1;
+                Ok(())
+            },
+            |_| {
+                fsck_calls += 1;
+                Ok(VolumeAction::Healed)
+            },
+        )
+        .expect("existing ext4 should direct-mount without fsck");
+
+        assert_eq!(action, VolumeAction::Mounted);
+        assert_eq!(mount_calls, 1);
+        assert_eq!(fsck_calls, 0);
+    }
+
+    #[test]
+    fn ensure_and_mount_ext4_falls_back_to_e2fsck_when_direct_mount_fails() {
+        let img_path = unique_temp_path("test-mount-fallback", "img");
+        let _guard = TempFileGuard(img_path.clone());
+        let file = fs::File::create(&img_path).expect("create sparse file");
+        file.set_len(64 * 1024 * 1024).expect("truncate to 64MB");
+        drop(file);
+
+        format_ext4(&img_path, "cubepod-test").expect("format ext4");
+
+        let target = Path::new("/mnt/test-upper");
+        let mut mount_calls = 0usize;
+        let mut fsck_calls = 0usize;
+
+        let action = ensure_and_mount_ext4_with(
+            &img_path,
+            target,
+            "cubepod-test",
+            |_, _| {
+                mount_calls += 1;
+                if mount_calls == 1 {
+                    Err("Structure needs cleaning (EUCLEAN)".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                fsck_calls += 1;
+                Ok(VolumeAction::Healed)
+            },
+        )
+        .expect("should heal with fsck and retry mount");
+
+        assert_eq!(action, VolumeAction::Healed);
+        assert_eq!(mount_calls, 2);
+        assert_eq!(fsck_calls, 1);
+    }
+
+    #[test]
+    fn ensure_and_mount_ext4_propagates_fsck_failure() {
+        let img_path = unique_temp_path("test-mount-fsck-err", "img");
+        let _guard = TempFileGuard(img_path.clone());
+        let file = fs::File::create(&img_path).expect("create sparse file");
+        file.set_len(64 * 1024 * 1024).expect("truncate to 64MB");
+        drop(file);
+
+        format_ext4(&img_path, "cubepod-test").expect("format ext4");
+
+        let err = ensure_and_mount_ext4_with(
+            &img_path,
+            Path::new("/mnt/test-upper"),
+            "cubepod-test",
+            |_, _| Err("mount failed".to_string()),
+            |_| Err("e2fsck -p failed with exit code Some(4)".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("e2fsck -p failed"), "{err}");
     }
 }
