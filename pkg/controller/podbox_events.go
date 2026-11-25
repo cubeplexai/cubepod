@@ -78,10 +78,23 @@ func isLabelValue(v string) bool {
 	return true
 }
 
-// recordPodBoxEventLocked emits a labeled core/v1 Event attached to the PodBox. It is
-// best-effort: failures are logged and never fail the lifecycle operation. Callers hold r.mu.
+// recordPodBoxEvent emits a labeled core/v1 Event attached to the PodBox without holding r.mu.
+func (r *Reconciler) recordPodBoxEvent(ctx context.Context, box, reason, eventType, message string, at time.Time) {
+	r.mu.RLock()
+	disabled := r.podBoxEventsDisabled
+	kc := r.kubeClient
+	ns := r.namespace
+	r.mu.RUnlock()
+	emitPodBoxEvent(ctx, kc, ns, disabled, box, reason, eventType, message, at)
+}
+
+// recordPodBoxEventLocked emits a labeled core/v1 Event attached to the PodBox. Callers hold r.mu.
 func (r *Reconciler) recordPodBoxEventLocked(ctx context.Context, box, reason, eventType, message string, at time.Time) {
-	if r.podBoxEventsDisabled || r.kubeClient == nil || box == "" {
+	emitPodBoxEvent(ctx, r.kubeClient, r.namespace, r.podBoxEventsDisabled, box, reason, eventType, message, at)
+}
+
+func emitPodBoxEvent(ctx context.Context, kc KubeClient, ns string, disabled bool, box, reason, eventType, message string, at time.Time) {
+	if disabled || kc == nil || box == "" {
 		return
 	}
 	if ctx == nil {
@@ -103,14 +116,14 @@ func (r *Reconciler) recordPodBoxEventLocked(ctx context.Context, box, reason, e
 		Kind:       "Event",
 		Metadata: v1alpha1.ObjectMeta{
 			Name:      podBoxEventName(box, reason, at),
-			Namespace: r.namespace,
+			Namespace: ns,
 			Labels:    labels,
 		},
 		InvolvedObject: KubeObjectReference{
 			APIVersion: "cubepod.io/v1alpha1",
 			Kind:       "PodBox",
 			Name:       box,
-			Namespace:  r.namespace,
+			Namespace:  ns,
 		},
 		Reason:         reason,
 		Message:        message,
@@ -122,8 +135,34 @@ func (r *Reconciler) recordPodBoxEventLocked(ctx context.Context, box, reason, e
 	}
 	evCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), podBoxEventTimeout)
 	defer cancel()
-	if err := r.kubeClient.CreateKubeEvent(evCtx, ev); err != nil && !errors.Is(err, ErrKubeAlreadyExists) {
+	if err := kc.CreateKubeEvent(evCtx, ev); err != nil && !errors.Is(err, ErrKubeAlreadyExists) {
 		slog.Debug("failed to emit PodBox lifecycle Event", "podbox", box, "reason", reason, "err", err)
+	}
+}
+
+// recordPhaseTransition emits a PodBox Event when Reconcile changed the observed phase without holding r.mu.
+func (r *Reconciler) recordPhaseTransition(ctx context.Context, box string, prevPhase v1alpha1.PodBoxPhase, status v1alpha1.PodBoxStatus) {
+	if prevPhase == status.Phase {
+		return
+	}
+	switch status.Phase {
+	case v1alpha1.PodBoxPhaseRunning:
+		msg := "PodBox is running"
+		if prevPhase == v1alpha1.PodBoxPhasePaused {
+			msg = "PodBox resumed from Paused"
+		}
+		at := time.Time{}
+		if status.LastActivityAt != nil {
+			at = *status.LastActivityAt
+		}
+		r.recordPodBoxEvent(ctx, box, PodBoxEventReasonRunning, KubeEventTypeNormal, msg, at)
+	case v1alpha1.PodBoxPhasePaused:
+		at := time.Time{}
+		if status.PausedAt != nil {
+			at = *status.PausedAt
+		}
+		r.recordPodBoxEvent(ctx, box, PodBoxEventReasonPaused, KubeEventTypeNormal,
+			"PodBox paused: compute Pod deleted, RootFS and Workspace PVCs retained", at)
 	}
 }
 

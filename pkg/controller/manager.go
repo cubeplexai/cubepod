@@ -145,9 +145,20 @@ func (m *ControllerManager) handleMetrics(w http.ResponseWriter, r *http.Request
 	tplCounts, showTemplates := m.templateStatusCounts()
 	buildMetrics := m.reconciler.TemplateBuildMetrics()
 	forkMetrics := m.reconciler.ForkMetrics()
+	phaseMetrics := m.reconciler.ReconcilePhaseMetrics()
 
 	if strings.Contains(r.Header.Get("Accept"), "application/json") {
 		w.Header().Set("Content-Type", "application/json")
+		phaseSummary := make(map[string]map[string]any)
+		for _, s := range phaseMetrics {
+			if phaseSummary[s.Operation] == nil {
+				phaseSummary[s.Operation] = make(map[string]any)
+			}
+			phaseSummary[s.Operation][s.Phase] = map[string]any{
+				"count": s.Count,
+				"sum":   s.Sum,
+			}
+		}
 		payload := map[string]any{
 			"cubepod_active_sandboxes":                      active,
 			"cubepod_paused_sandboxes":                      paused,
@@ -159,6 +170,7 @@ func (m *ControllerManager) handleMetrics(w http.ResponseWriter, r *http.Request
 			"cubepod_sandbox_forks_total":                   forkMetrics.ForksTotal,
 			"cubepod_sandbox_fork_duration_seconds_sum":     forkMetrics.ForkDurationSum,
 			"cubepod_sandbox_fork_duration_seconds_count":   forkMetrics.ForkDurationCount,
+			"cubepod_reconcile_phase_duration_seconds":      phaseSummary,
 		}
 		if showTemplates {
 			payload["cubepod_templates"] = tplCounts
@@ -247,6 +259,19 @@ func (m *ControllerManager) handleMetrics(w http.ResponseWriter, r *http.Request
 	}
 	fmt.Fprintf(w, "cubepod_sandbox_fork_duration_seconds_sum %g\n", forkMetrics.ForkDurationSum)
 	fmt.Fprintf(w, "cubepod_sandbox_fork_duration_seconds_count %d\n", forkMetrics.ForkDurationCount)
+
+	if len(phaseMetrics) > 0 {
+		fmt.Fprintf(w, "# HELP cubepod_reconcile_phase_duration_seconds Latency histogram of controller reconciliation phases in seconds\n")
+		fmt.Fprintf(w, "# TYPE cubepod_reconcile_phase_duration_seconds histogram\n")
+		for _, s := range phaseMetrics {
+			for i, upper := range s.Buckets {
+				fmt.Fprintf(w, "cubepod_reconcile_phase_duration_seconds_bucket{operation=%q,phase=%q,le=\"%g\"} %d\n", s.Operation, s.Phase, upper, s.Counts[i])
+			}
+			fmt.Fprintf(w, "cubepod_reconcile_phase_duration_seconds_bucket{operation=%q,phase=%q,le=\"+Inf\"} %d\n", s.Operation, s.Phase, s.Count)
+			fmt.Fprintf(w, "cubepod_reconcile_phase_duration_seconds_sum{operation=%q,phase=%q} %g\n", s.Operation, s.Phase, s.Sum)
+			fmt.Fprintf(w, "cubepod_reconcile_phase_duration_seconds_count{operation=%q,phase=%q} %d\n", s.Operation, s.Phase, s.Count)
+		}
+	}
 }
 
 func (m *ControllerManager) handleInternalHeadContext(w http.ResponseWriter, r *http.Request) {
@@ -428,10 +453,83 @@ func (m *ControllerManager) ReconcileOnce(ctx context.Context) {
 	}
 
 	pools := m.reconciler.GetWarmPoolSpecs()
-	for poolName, poolSpec := range pools {
-		if _, err := m.reconciler.ReconcileWarmPool(ctx, poolName, poolSpec); err != nil {
-			slog.Warn("warmpool replenishment failed", "pool", poolName, "err", err)
+	if len(pools) > 0 {
+		var wg sync.WaitGroup
+		wg.Add(len(pools))
+		for poolName, poolSpec := range pools {
+			go func(name string, spec v1alpha1.PodWarmPoolSpec) {
+				defer wg.Done()
+				if _, err := m.reconciler.ReconcileWarmPool(ctx, name, spec); err != nil {
+					slog.Warn("warmpool replenishment failed", "pool", name, "err", err)
+				}
+			}(poolName, poolSpec)
 		}
+		wg.Wait()
+	}
+}
+
+func (m *ControllerManager) replenishWarmPool(ctx context.Context, poolName string) {
+	if m.reconciler == nil || poolName == "" || ctx.Err() != nil {
+		return
+	}
+	specs := m.reconciler.GetWarmPoolSpecs()
+	poolSpec, ok := specs[poolName]
+	if !ok {
+		if err := m.reconciler.SyncWarmPoolsFromKube(ctx, ""); err == nil {
+			specs = m.reconciler.GetWarmPoolSpecs()
+			poolSpec, ok = specs[poolName]
+		}
+	}
+	if !ok {
+		return
+	}
+	if _, err := m.reconciler.ReconcileWarmPool(ctx, poolName, poolSpec); err != nil && ctx.Err() == nil {
+		slog.Warn("async warmpool replenishment failed", "pool", poolName, "err", err)
+	}
+}
+
+func (m *ControllerManager) watchWarmPoolPodsLoop(ctx context.Context) {
+	if m.reconciler == nil {
+		return
+	}
+	type podWatcher interface {
+		WatchPods(ctx context.Context, namespace, labelSelector, resourceVersion string, onEvent func(eventType string, pod PodManifest)) (string, error)
+	}
+	watcher, ok := m.reconciler.KubeClient().(podWatcher)
+	if !ok || watcher == nil {
+		return
+	}
+	ns := m.reconciler.Namespace()
+	var rv string
+	for ctx.Err() == nil {
+		nextRV, err := watcher.WatchPods(ctx, ns, "cubepod.io/warmpool", rv, func(eventType string, pod PodManifest) {
+			if pod.Labels == nil {
+				return
+			}
+			poolName := pod.Labels["cubepod.io/warmpool"]
+			if poolName == "" {
+				return
+			}
+			if eventType == "DELETED" || (eventType == "MODIFIED" && pod.Labels["cubepod.io/claimed"] == "true") {
+				_ = m.reconciler.SyncWarmPoolsFromKube(ctx, "")
+				m.reconciler.notifyWarmPoolReplenish(poolName)
+			}
+		})
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			rv = ""
+			timer := time.NewTimer(m.interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+		rv = nextRV
 	}
 }
 
@@ -468,6 +566,17 @@ func (m *ControllerManager) Start(ctx context.Context) error {
 	// Initial reconciliation pass.
 	m.ReconcileOnce(ctx)
 
+	var workersWG sync.WaitGroup
+	var replenishCh <-chan string
+	if m.reconciler != nil {
+		replenishCh = m.reconciler.WarmPoolReplenishChan()
+		workersWG.Add(1)
+		go func() {
+			defer workersWG.Done()
+			m.watchWarmPoolPodsLoop(ctx)
+		}()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -479,9 +588,34 @@ func (m *ControllerManager) Start(ctx context.Context) error {
 			if srv != nil {
 				_ = srv.Shutdown(shutdownCtx)
 			}
+			workersWG.Wait()
 			return nil
 		case err := <-errCh:
+			workersWG.Wait()
 			return err
+		case poolName := <-replenishCh:
+			pending := map[string]struct{}{poolName: {}}
+		drainLoop:
+			for {
+				select {
+				case extra := <-replenishCh:
+					if extra != "" {
+						pending[extra] = struct{}{}
+					}
+				default:
+					break drainLoop
+				}
+			}
+			for name := range pending {
+				if name == "" {
+					continue
+				}
+				workersWG.Add(1)
+				go func(p string) {
+					defer workersWG.Done()
+					m.replenishWarmPool(ctx, p)
+				}(name)
+			}
 		case <-ticker.C:
 			m.ReconcileOnce(ctx)
 		}

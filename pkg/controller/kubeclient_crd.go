@@ -34,6 +34,34 @@ func (c *RESTKubeClient) UpsertPodBox(ctx context.Context, box v1alpha1.PodBox) 
 		box.Kind = "PodBox"
 	}
 
+	if box.Metadata.ResourceVersion != "" {
+		putURL := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podboxes/%s", c.baseURL, ns, name)
+		putPayload, err := json.Marshal(box)
+		if err != nil {
+			return fmt.Errorf("failed to marshal PodBox JSON for update: %w", err)
+		}
+		putResp, err := c.doRequest(ctx, http.MethodPut, putURL, bytes.NewReader(putPayload))
+		if err != nil {
+			return fmt.Errorf("UpsertPodBox PUT failed: %w", err)
+		}
+		defer putResp.Body.Close()
+		if putResp.StatusCode == http.StatusOK || putResp.StatusCode == http.StatusCreated {
+			var updatedBox v1alpha1.PodBox
+			if err := json.NewDecoder(putResp.Body).Decode(&updatedBox); err == nil && updatedBox.Metadata.ResourceVersion != "" {
+				box.Metadata.ResourceVersion = updatedBox.Metadata.ResourceVersion
+			}
+			return c.putPodBoxStatus(ctx, ns, name, box)
+		}
+		if putResp.StatusCode != http.StatusConflict && putResp.StatusCode != http.StatusNotFound {
+			putBody, _ := io.ReadAll(putResp.Body)
+			return fmt.Errorf("UpsertPodBox PUT failed: status %d (%s)", putResp.StatusCode, string(putBody))
+		}
+		// Fall through to POST/GET+PUT path on 404 or stale ResourceVersion 409.
+		if putResp.StatusCode == http.StatusNotFound {
+			box.Metadata.ResourceVersion = ""
+		}
+	}
+
 	url := fmt.Sprintf("%s/apis/cubepod.io/v1alpha1/namespaces/%s/podboxes", c.baseURL, ns)
 	payload, err := json.Marshal(box)
 	if err != nil {
@@ -897,10 +925,6 @@ func (c *RESTKubeClient) WaitVolumeSnapshotReady(ctx context.Context, namespace,
 		ctx = context.Background()
 	}
 	ns := c.resolveNamespace(namespace)
-	interval := c.pollInterval
-	if interval <= 0 {
-		interval = 500 * time.Millisecond
-	}
 	timeout := c.pollTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -909,9 +933,7 @@ func (c *RESTKubeClient) WaitVolumeSnapshotReady(ctx context.Context, namespace,
 	pollCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
+	var backoff time.Duration
 	for {
 		snap, err := c.GetVolumeSnapshot(pollCtx, ns, name)
 		if err == nil && snap != nil {
@@ -923,10 +945,9 @@ func (c *RESTKubeClient) WaitVolumeSnapshotReady(ctx context.Context, namespace,
 			}
 		}
 
-		select {
-		case <-pollCtx.Done():
+		backoff = c.nextPollBackoff(backoff)
+		if !sleepWithContext(pollCtx, backoff) {
 			return fmt.Errorf("timed out waiting for volumesnapshot %s/%s readyToUse (last err=%v)", ns, name, err)
-		case <-ticker.C:
 		}
 	}
 }

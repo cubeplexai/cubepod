@@ -1,12 +1,14 @@
 package controller_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2045,18 +2047,18 @@ func TestReconcile_EgressSecretLifecycle(t *testing.T) {
 		}
 	}
 
-	// 4. Pause garbage-collects both Secrets
+	// 4. Pause retains valid (non-expiring) egress Secrets across Pause/Resume
 	if _, err := r.Pause(ctx, boxName); err != nil {
 		t.Fatalf("Pause failed: %v", err)
 	}
-	if _, err := memKube.GetSecret(ctx, "cubepod-workloads", boxName+"-egress-mtls"); err == nil {
-		t.Fatal("expected egress-mtls secret to be deleted on Pause")
+	if _, err := memKube.GetSecret(ctx, "cubepod-workloads", boxName+"-egress-mtls"); err != nil {
+		t.Fatalf("expected egress-mtls secret to be retained on Pause: %v", err)
 	}
-	if _, err := memKube.GetSecret(ctx, "cubepod-workloads", boxName+"-egress-ca"); err == nil {
-		t.Fatal("expected egress-ca secret to be deleted on Pause")
+	if _, err := memKube.GetSecret(ctx, "cubepod-workloads", boxName+"-egress-ca"); err != nil {
+		t.Fatalf("expected egress-ca secret to be retained on Pause: %v", err)
 	}
 
-	// 5. Resume re-creates Secrets with nil NetworkPolicy defaulting to "{}"
+	// 5. Resume reuses valid certs while updating policy.json when NetworkPolicy changes
 	spec.DesiredState = v1alpha1.DesiredStateRunning
 	spec.NetworkPolicy = nil
 	if _, err := r.Reconcile(ctx, boxName, spec); err != nil {
@@ -2064,13 +2066,19 @@ func TestReconcile_EgressSecretLifecycle(t *testing.T) {
 	}
 	mtlsResumed, err := memKube.GetSecret(ctx, "cubepod-workloads", boxName+"-egress-mtls")
 	if err != nil {
-		t.Fatalf("expected egress-mtls secret recreated on resume: %v", err)
+		t.Fatalf("expected egress-mtls secret present on resume: %v", err)
 	}
 	if string(mtlsResumed.Data["policy.json"]) != "{}" {
 		t.Fatalf("expected default policy.json {}, got %q", string(mtlsResumed.Data["policy.json"]))
 	}
+	if !bytes.Equal(mtlsResumed.Data["tls.crt"], mtlsSec.Data["tls.crt"]) {
+		t.Fatal("expected valid tls.crt to be reused across Pause/Resume")
+	}
+	if !bytes.Equal(mtlsResumed.Data["mitm-ca.crt"], mtlsSec.Data["mitm-ca.crt"]) {
+		t.Fatal("expected valid mitm-ca.crt to be reused across Pause/Resume")
+	}
 	if _, err := memKube.GetSecret(ctx, "cubepod-workloads", boxName+"-egress-ca"); err != nil {
-		t.Fatalf("expected egress-ca secret recreated on resume: %v", err)
+		t.Fatalf("expected egress-ca secret present on resume: %v", err)
 	}
 
 	// 6. DeleteBox garbage-collects both Secrets even when deleteVolumes is false
@@ -2307,6 +2315,7 @@ func TestReconciler_VolumeKeyPersistenceAndWarmPoolSkip(t *testing.T) {
 
 type failingEnsurePodKubeClient struct {
 	*controller.MemoryKubeClient
+	mu               sync.Mutex
 	cancelOnEnsure   context.CancelFunc
 	onEnsurePod      func(pod controller.PodManifest)
 	createdPVCs      []string
@@ -2317,29 +2326,37 @@ type failingEnsurePodKubeClient struct {
 }
 
 func (f *failingEnsurePodKubeClient) EnsurePVC(ctx context.Context, pvc controller.BlockPVCManifest) error {
+	f.mu.Lock()
 	f.createdPVCs = append(f.createdPVCs, pvc.Name)
+	f.mu.Unlock()
 	return f.MemoryKubeClient.EnsurePVC(ctx, pvc)
 }
 
 func (f *failingEnsurePodKubeClient) DeletePVC(ctx context.Context, ns, name string) error {
+	f.mu.Lock()
 	if ctx.Err() != nil {
 		f.deleteCtxExpired = true
 	}
 	f.deletedPVCs = append(f.deletedPVCs, name)
+	f.mu.Unlock()
 	return f.MemoryKubeClient.DeletePVC(ctx, ns, name)
 }
 
 func (f *failingEnsurePodKubeClient) DeletePod(ctx context.Context, ns, name string) error {
+	f.mu.Lock()
 	if ctx.Err() != nil {
 		f.deleteCtxExpired = true
 	}
 	f.deletedPods = append(f.deletedPods, name)
+	f.mu.Unlock()
 	return f.MemoryKubeClient.DeletePod(ctx, ns, name)
 }
 
 func (f *failingEnsurePodKubeClient) EnsurePod(_ context.Context, pod controller.PodManifest) (string, error) {
 	_, _ = f.MemoryKubeClient.EnsurePod(context.Background(), pod)
+	f.mu.Lock()
 	f.createdPods = append(f.createdPods, pod.Name)
+	f.mu.Unlock()
 	if f.onEnsurePod != nil {
 		f.onEnsurePod(pod)
 	}
@@ -2500,11 +2517,11 @@ func TestReconciler_WarmPoolEnsurePodFailureStopsWhenPoolDeleted(t *testing.T) {
 	if _, err := r.ReconcileWarmPool(ctx, "warm-del-pool", poolSpec); err != nil {
 		t.Fatalf("ReconcileWarmPool returned unexpected error: %v", err)
 	}
-	if len(fk.createdPods) != 1 {
-		t.Fatalf("expected ReconcileWarmPool to stop after pool deletion (1 EnsurePod attempt), got %d (%v)", len(fk.createdPods), fk.createdPods)
+	if len(fk.createdPods) == 0 || len(fk.createdPods) > int(poolSpec.Replicas) {
+		t.Fatalf("expected ReconcileWarmPool to stop after pool deletion without retrying (<=%d EnsurePod attempts), got %d (%v)", poolSpec.Replicas, len(fk.createdPods), fk.createdPods)
 	}
-	if len(fk.deletedPods) != 1 || len(fk.deletedPVCs) != len(fk.createdPVCs) {
-		t.Fatalf("expected failed attempt pod+PVCs deleted, got deletedPods=%v createdPVCs=%v deletedPVCs=%v", fk.deletedPods, fk.createdPVCs, fk.deletedPVCs)
+	if len(fk.deletedPods) != len(fk.createdPods) || len(fk.deletedPVCs) != len(fk.createdPVCs) {
+		t.Fatalf("expected failed attempt pod+PVCs deleted, got createdPods=%v deletedPods=%v createdPVCs=%v deletedPVCs=%v", fk.createdPods, fk.deletedPods, fk.createdPVCs, fk.deletedPVCs)
 	}
 }
 
@@ -2866,6 +2883,7 @@ func TestWarmPoolClaim_SkipsRedundantEnsurePodAndSetsReadinessProbe(t *testing.T
 
 type snapshotRecordingKubeClient struct {
 	*controller.MemoryKubeClient
+	mu            sync.Mutex
 	createdSnaps  []controller.VolumeSnapshot
 	waitedSnaps   []string
 	deletedSnaps  []string
@@ -2874,12 +2892,16 @@ type snapshotRecordingKubeClient struct {
 }
 
 func (s *snapshotRecordingKubeClient) EnsureVolumeSnapshot(ctx context.Context, snap controller.VolumeSnapshot) error {
+	s.mu.Lock()
 	s.createdSnaps = append(s.createdSnaps, snap)
+	s.mu.Unlock()
 	return s.MemoryKubeClient.EnsureVolumeSnapshot(ctx, snap)
 }
 
 func (s *snapshotRecordingKubeClient) WaitVolumeSnapshotReady(ctx context.Context, ns, name string) error {
+	s.mu.Lock()
 	s.waitedSnaps = append(s.waitedSnaps, name)
+	s.mu.Unlock()
 	if s.failWaitName != "" && name == s.failWaitName {
 		return fmt.Errorf("injected snapshot wait error for %s", name)
 	}
@@ -2887,7 +2909,9 @@ func (s *snapshotRecordingKubeClient) WaitVolumeSnapshotReady(ctx context.Contex
 }
 
 func (s *snapshotRecordingKubeClient) DeleteVolumeSnapshot(ctx context.Context, ns, name string) error {
+	s.mu.Lock()
 	s.deletedSnaps = append(s.deletedSnaps, name)
+	s.mu.Unlock()
 	return s.MemoryKubeClient.DeleteVolumeSnapshot(ctx, ns, name)
 }
 
@@ -2934,11 +2958,15 @@ func TestReconcile_ForkFrom_SnapshotMode_LifecycleAndCleanup(t *testing.T) {
 	if len(recKC.createdSnaps) != 2 {
 		t.Fatalf("expected 2 VolumeSnapshots created, got %d", len(recKC.createdSnaps))
 	}
-	if recKC.createdSnaps[0].Spec.Source.PersistentVolumeClaimName != "parent-snap-rootfs-gen2-pvc" {
-		t.Fatalf("expected rootfs snapshot source parent-snap-rootfs-gen2-pvc, got %q", recKC.createdSnaps[0].Spec.Source.PersistentVolumeClaimName)
+	snapSources := make(map[string]string, len(recKC.createdSnaps))
+	for _, sn := range recKC.createdSnaps {
+		snapSources[sn.Metadata.Name] = sn.Spec.Source.PersistentVolumeClaimName
 	}
-	if recKC.createdSnaps[1].Spec.Source.PersistentVolumeClaimName != "parent-snap-workspace-pvc" {
-		t.Fatalf("expected workspace snapshot source parent-snap-workspace-pvc, got %q", recKC.createdSnaps[1].Spec.Source.PersistentVolumeClaimName)
+	if snapSources["child-snap-rootfs-snap"] != "parent-snap-rootfs-gen2-pvc" {
+		t.Fatalf("expected rootfs snapshot source parent-snap-rootfs-gen2-pvc, got %q", snapSources["child-snap-rootfs-snap"])
+	}
+	if snapSources["child-snap-workspace-snap"] != "parent-snap-workspace-pvc" {
+		t.Fatalf("expected workspace snapshot source parent-snap-workspace-pvc, got %q", snapSources["child-snap-workspace-snap"])
 	}
 	for _, sn := range recKC.createdSnaps {
 		if sn.Spec.VolumeSnapshotClassName == nil || *sn.Spec.VolumeSnapshotClassName != "longhorn-v2-snapclass" {
@@ -3994,5 +4022,212 @@ func TestReconciler_BlockWorkspaceVolume_FencingDeleteProtectionForkAndReapIdle(
 	}
 	if _, err := kc.GetPVCManifest(ctx, "cubepod-workloads", adoptedPVC); err != nil {
 		t.Fatalf("adopted legacy PVC %s with cubepod-volumes label must survive DeleteBox(!hasSpec, deleteVolumes=true): %v", adoptedPVC, err)
+	}
+}
+
+type blockingBoxEnsurePodClient struct {
+	*controller.MemoryKubeClient
+	slowPodName string
+	enteredSlow chan struct{}
+	releaseSlow chan struct{}
+	once        sync.Once
+}
+
+func (b *blockingBoxEnsurePodClient) EnsurePod(ctx context.Context, pod controller.PodManifest) (string, error) {
+	if pod.Name == b.slowPodName {
+		b.once.Do(func() { close(b.enteredSlow) })
+		select {
+		case <-b.releaseSlow:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return b.MemoryKubeClient.EnsurePod(ctx, pod)
+}
+
+func TestReconcile_ConcurrentDistinctBoxesNoGlobalLock(t *testing.T) {
+	client := &blockingBoxEnsurePodClient{
+		MemoryKubeClient: controller.NewMemoryKubeClient(),
+		slowPodName:      "box-slow",
+		enteredSlow:      make(chan struct{}),
+		releaseSlow:      make(chan struct{}),
+	}
+	r := controller.NewReconciler(
+		controller.WithKubeClient(client),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	r.RegisterTemplate("tpl-concurrent", sampleTemplate())
+	spec := v1alpha1.PodBoxSpec{
+		TemplateRef:      "tpl-concurrent",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}
+
+	var slowErr error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, slowErr = r.Reconcile(context.Background(), "box-slow", spec)
+	}()
+
+	select {
+	case <-client.enteredSlow:
+	case <-time.After(2 * time.Second):
+		t.Fatal("box-slow did not enter EnsurePod in time")
+	}
+
+	// box-fast must finish reconciling without waiting for box-slow's EnsurePod I/O.
+	fastDone := make(chan error, 1)
+	go func() {
+		_, err := r.Reconcile(context.Background(), "box-fast", spec)
+		fastDone <- err
+	}()
+	select {
+	case err := <-fastDone:
+		if err != nil {
+			t.Fatalf("box-fast Reconcile failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		close(client.releaseSlow)
+		t.Fatal("box-fast Reconcile blocked behind box-slow's K8s I/O (global lock regression)")
+	}
+
+	close(client.releaseSlow)
+	wg.Wait()
+	if slowErr != nil {
+		t.Fatalf("box-slow Reconcile failed: %v", slowErr)
+	}
+}
+
+type parallelPrepareProbeClient struct {
+	*controller.MemoryKubeClient
+	inflight atomic.Int32
+	peak     atomic.Int32
+	barrier  chan struct{}
+	once     sync.Once
+}
+
+func (p *parallelPrepareProbeClient) recordOverlap() {
+	cur := p.inflight.Add(1)
+	defer p.inflight.Add(-1)
+	for {
+		prev := p.peak.Load()
+		if cur <= prev || p.peak.CompareAndSwap(prev, cur) {
+			break
+		}
+	}
+	if cur >= 2 {
+		p.once.Do(func() { close(p.barrier) })
+	} else {
+		select {
+		case <-p.barrier:
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func (p *parallelPrepareProbeClient) EnsurePVC(ctx context.Context, pvc controller.BlockPVCManifest) error {
+	p.recordOverlap()
+	return p.MemoryKubeClient.EnsurePVC(ctx, pvc)
+}
+
+func (p *parallelPrepareProbeClient) EnsureSecret(ctx context.Context, secret controller.KubeSecret) error {
+	p.recordOverlap()
+	return p.MemoryKubeClient.EnsureSecret(ctx, secret)
+}
+
+func (p *parallelPrepareProbeClient) CreateSecret(ctx context.Context, secret controller.KubeSecret) error {
+	p.recordOverlap()
+	return p.MemoryKubeClient.CreateSecret(ctx, secret)
+}
+
+func TestReconcile_ParallelPreparePVCsAndSecrets(t *testing.T) {
+	ca, err := egress.NewCA()
+	if err != nil {
+		t.Fatalf("NewCA failed: %v", err)
+	}
+	client := &parallelPrepareProbeClient{
+		MemoryKubeClient: controller.NewMemoryKubeClient(),
+		barrier:          make(chan struct{}),
+	}
+	r := controller.NewReconciler(
+		controller.WithKubeClient(client),
+		controller.WithNamespace("cubepod-workloads"),
+		controller.WithEgressCA(ca),
+	)
+	tpl := sampleTemplate()
+	tpl.Egress.Enabled = true
+	r.RegisterTemplate("tpl-parallel", tpl)
+	spec := v1alpha1.PodBoxSpec{
+		TemplateRef:      "tpl-parallel",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}
+
+	if _, err := r.Reconcile(context.Background(), "box-parallel", spec); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+	if peak := client.peak.Load(); peak < 2 {
+		t.Fatalf("expected PVC and Secret preparation to run in parallel (peak inflight >= 2), got %d", peak)
+	}
+}
+
+func TestReconcile_EgressCertRotationWhenNearExpiry(t *testing.T) {
+	ca, err := egress.NewCA()
+	if err != nil {
+		t.Fatalf("NewCA failed: %v", err)
+	}
+	memKube := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(memKube),
+		controller.WithNamespace("cubepod-workloads"),
+		controller.WithEgressCA(ca),
+	)
+	tpl := sampleTemplate()
+	tpl.Egress.Enabled = true
+	r.RegisterTemplate("tpl-rotate", tpl)
+	spec := v1alpha1.PodBoxSpec{
+		TemplateRef:      "tpl-rotate",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}
+
+	ctx := context.Background()
+	boxName := "box-cert-rotate"
+	if _, err := r.Reconcile(ctx, boxName, spec); err != nil {
+		t.Fatalf("initial Reconcile failed: %v", err)
+	}
+	if _, err := r.Pause(ctx, boxName); err != nil {
+		t.Fatalf("Pause failed: %v", err)
+	}
+
+	// Replace tls.crt/tls.key with a short-lived cert (10m TTL < 1h rotation margin).
+	shortCert, shortKey, err := ca.MintSandboxCert(boxName, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("MintSandboxCert failed: %v", err)
+	}
+	sec, err := memKube.GetSecret(ctx, "cubepod-workloads", boxName+"-egress-mtls")
+	if err != nil {
+		t.Fatalf("GetSecret failed: %v", err)
+	}
+	sec.Data["tls.crt"] = shortCert
+	sec.Data["tls.key"] = shortKey
+	if err := memKube.DeleteSecret(ctx, "cubepod-workloads", boxName+"-egress-mtls"); err != nil {
+		t.Fatalf("DeleteSecret failed: %v", err)
+	}
+	if err := memKube.CreateSecret(ctx, *sec); err != nil {
+		t.Fatalf("CreateSecret failed: %v", err)
+	}
+
+	if _, err := r.Reconcile(ctx, boxName, spec); err != nil {
+		t.Fatalf("Resume Reconcile failed: %v", err)
+	}
+	rotated, err := memKube.GetSecret(ctx, "cubepod-workloads", boxName+"-egress-mtls")
+	if err != nil {
+		t.Fatalf("GetSecret after resume failed: %v", err)
+	}
+	if bytes.Equal(rotated.Data["tls.crt"], shortCert) {
+		t.Fatal("expected near-expiry tls.crt (<1h remaining) to be rotated on Resume")
 	}
 }
