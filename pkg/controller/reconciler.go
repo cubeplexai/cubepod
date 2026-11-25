@@ -102,6 +102,28 @@ func WithPoddInjectorImage(img string) ReconcilerOption {
 	}
 }
 
+// WithPoddInjectionMode configures how podd-init and podd are injected into sandbox Pods
+// ("initContainer" default or "hostPath" for DaemonSet-staged read-only hostPath mounts).
+func WithPoddInjectionMode(mode string) ReconcilerOption {
+	return func(r *Reconciler) {
+		mode = strings.TrimSpace(mode)
+		if mode != "" {
+			r.poddInjectionMode = mode
+		}
+	}
+}
+
+// WithPoddHostPath configures the host directory mounted read-only at /opt/cubepod/bin
+// when poddInjectionMode is "hostPath".
+func WithPoddHostPath(path string) ReconcilerOption {
+	return func(r *Reconciler) {
+		path = strings.TrimSpace(path)
+		if path != "" {
+			r.poddHostPath = path
+		}
+	}
+}
+
 // WithDefaultSandboxImage configures the default workload container image.
 func WithDefaultSandboxImage(img string) ReconcilerOption {
 	return func(r *Reconciler) {
@@ -316,6 +338,8 @@ type Reconciler struct {
 	defaultRuntimeClass      string // default "kata-qemu"
 	runtimeClassSet          bool
 	poddInjectorImage        string // default "cubepod-podd:latest"
+	poddInjectionMode        string // "initContainer" (default) or "hostPath"
+	poddHostPath             string // default "/var/lib/cubepod/bin/active"
 	defaultSandboxImage      string // default "ubuntu:24.04"
 	defaultEgressImage       string
 	defaultEgressExchangeURL string
@@ -516,6 +540,8 @@ func NewReconciler(opts ...ReconcilerOption) *Reconciler {
 		defaultStorageClass:  "standard",
 		defaultRuntimeClass:  "kata-qemu",
 		poddInjectorImage:    "cubepod-podd:latest",
+		poddInjectionMode:    PoddInjectionModeInitContainer,
+		poddHostPath:         DefaultPoddHostPath,
 		defaultSandboxImage:  "ubuntu:24.04",
 		transparentEgress:    true,
 		forkMode:             "pvc-clone",
@@ -971,6 +997,9 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 		ns                string
 		volumeMode        string
 		transparentEgress bool
+		poddInjectionMode string
+		poddHostPath      string
+		defaultPoddImage  string
 		pullSecrets       []string
 		egressCA          *egress.CA
 		upstreamCAPEM     []byte
@@ -1166,6 +1195,9 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 			ns:                r.namespace,
 			volumeMode:        r.volumeMode,
 			transparentEgress: r.transparentEgress,
+			poddInjectionMode: r.poddInjectionMode,
+			poddHostPath:      r.poddHostPath,
+			defaultPoddImage:  r.poddInjectorImage,
 			pullSecrets:       pullSecrets,
 			egressCA:          r.egressCA,
 			upstreamCAPEM:     append([]byte(nil), r.egressUpstreamCAPEM...),
@@ -1241,6 +1273,9 @@ func (r *Reconciler) ReconcileWarmPool(ctx context.Context, poolName string, spe
 			VolumeMode:        snap.volumeMode,
 			ImagePullSecrets:  snap.pullSecrets,
 			TransparentEgress: snap.transparentEgress,
+			PoddInjectionMode: snap.poddInjectionMode,
+			PoddHostPath:      snap.poddHostPath,
+			DefaultPoddImage:  snap.defaultPoddImage,
 		})
 		podManifest.Namespace = snap.ns
 		if podManifest.Labels == nil {
@@ -1667,6 +1702,9 @@ func (r *Reconciler) ReconcileWithTimings(ctx context.Context, name string, spec
 	volumeSnapshotClass := r.volumeSnapshotClass
 	pullSecrets := append([]string{r.templatePullSecret}, r.defaultImagePullSecrets...)
 	transparentEgress := r.transparentEgress
+	poddInjectionMode := r.poddInjectionMode
+	poddHostPath := r.poddHostPath
+	defaultPoddImage := r.poddInjectorImage
 	if r.egressCA == nil {
 		if ca, caErr := egress.NewCA(); caErr == nil {
 			r.egressCA = ca
@@ -2268,6 +2306,9 @@ func (r *Reconciler) ReconcileWithTimings(ctx context.Context, name string, spec
 				TransparentEgress: transparentEgress,
 				VolumeNFS:         nfsOpts,
 				IsFirecracker:     fc,
+				PoddInjectionMode: poddInjectionMode,
+				PoddHostPath:      poddHostPath,
+				DefaultPoddImage:  defaultPoddImage,
 			})
 			podManifest.Namespace = ns
 

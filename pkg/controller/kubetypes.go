@@ -152,6 +152,12 @@ type coreV1EnvVar struct {
 // coreV1EmptyDirVolumeSource represents an emptyDir volume.
 type coreV1EmptyDirVolumeSource struct{}
 
+// coreV1HostPathVolumeSource represents a host directory/file mounted into a Pod.
+type coreV1HostPathVolumeSource struct {
+	Path string `json:"path"`
+	Type string `json:"type,omitempty"`
+}
+
 // coreV1PersistentVolumeClaimVolumeSource references a PVC in the same namespace.
 type coreV1PersistentVolumeClaimVolumeSource struct {
 	ClaimName string `json:"claimName"`
@@ -166,6 +172,7 @@ type coreV1SecretVolumeSource struct {
 type coreV1Volume struct {
 	Name                  string                                   `json:"name"`
 	EmptyDir              *coreV1EmptyDirVolumeSource              `json:"emptyDir,omitempty"`
+	HostPath              *coreV1HostPathVolumeSource              `json:"hostPath,omitempty"`
 	PersistentVolumeClaim *coreV1PersistentVolumeClaimVolumeSource `json:"persistentVolumeClaim,omitempty"`
 	Secret                *coreV1SecretVolumeSource                `json:"secret,omitempty"`
 }
@@ -220,15 +227,28 @@ type coreV1Container struct {
 	ReadinessProbe  *coreV1Probe                `json:"readinessProbe,omitempty"`
 }
 
+type coreV1ContainerState struct {
+	Running *struct {
+		StartedAt string `json:"startedAt,omitempty"`
+	} `json:"running,omitempty"`
+}
+
+type coreV1ContainerStatus struct {
+	Name  string               `json:"name"`
+	Ready bool                 `json:"ready,omitempty"`
+	State coreV1ContainerState `json:"state,omitempty"`
+}
+
 type coreV1PodCondition struct {
 	Type   string `json:"type"`
 	Status string `json:"status"`
 }
 
 type coreV1PodStatus struct {
-	Phase      string               `json:"phase,omitempty"`
-	PodIP      string               `json:"podIP,omitempty"`
-	Conditions []coreV1PodCondition `json:"conditions,omitempty"`
+	Phase             string                  `json:"phase,omitempty"`
+	PodIP             string                  `json:"podIP,omitempty"`
+	Conditions        []coreV1PodCondition    `json:"conditions,omitempty"`
+	ContainerStatuses []coreV1ContainerStatus `json:"containerStatuses,omitempty"`
 }
 
 // coreV1PodSpec is a description of a pod.
@@ -421,6 +441,12 @@ func toCoreV1Volume(v VolumeManifest) coreV1Volume {
 	}
 	if v.EmptyDir {
 		vol.EmptyDir = &coreV1EmptyDirVolumeSource{}
+	}
+	if v.HostPath != "" {
+		vol.HostPath = &coreV1HostPathVolumeSource{
+			Path: v.HostPath,
+			Type: v.HostPathType,
+		}
 	}
 	if v.PersistentVolumeClaim != "" {
 		vol.PersistentVolumeClaim = &coreV1PersistentVolumeClaimVolumeSource{

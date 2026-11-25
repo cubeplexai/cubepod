@@ -73,6 +73,8 @@ func main() {
 		volumeMode            = flag.String("volume-mode", "Filesystem", "Storage volume mode (Block or Filesystem)")
 		runtimeClass          = flag.String("runtime-class", "", "Container runtime class name (empty for standard runc/containerd)")
 		poddImage             = flag.String("podd-image", "ghcr.io/cubeplexai/cubepod-podd:v0.8.0", "Image for podd-installer initContainer")
+		poddInjectionMode     = flag.String("podd-injection-mode", envOrDefault("CUBEPOD_PODD_INJECTION_MODE", controller.PoddInjectionModeInitContainer), "How podd binaries are injected into sandboxes (initContainer or hostPath)")
+		poddHostPath          = flag.String("podd-host-path", envOrDefault("CUBEPOD_PODD_HOST_PATH", controller.DefaultPoddHostPath), "Host directory mounted read-only at /opt/cubepod/bin when --podd-injection-mode=hostPath")
 		sandboxImage          = flag.String("sandbox-image", "ubuntu:24.04", "Default sandbox image")
 		egressImage           = flag.String("egress-image", defaultEgressImage(), "Default cubepod-egress sidecar image when template egress.image is empty")
 		livePodRouting        = flag.Bool("live-pod-routing", true, "Route commands and files to live in-cluster Pod IP")
@@ -133,6 +135,8 @@ func main() {
 		"storageClass", *storageClass,
 		"runtimeClass", *runtimeClass,
 		"poddImage", *poddImage,
+		"poddInjectionMode", *poddInjectionMode,
+		"poddHostPath", *poddHostPath,
 		"sandboxImage", *sandboxImage,
 		"egressImage", *egressImage,
 		"livePodRouting", *livePodRouting,
@@ -150,9 +154,16 @@ func main() {
 	var kubeClient controller.KubeClient
 	hasKube := false
 	if *kubeAPI != "" {
-		kubeClient = controller.NewRESTKubeClient(*kubeAPI, *namespace, *kubeToken, nil, controller.WithWaitForRunning(true))
+		kubeClient = controller.NewRESTKubeClient(*kubeAPI, *namespace, *kubeToken, nil,
+			controller.WithWaitForRunning(true),
+			controller.WithDirectPodHealth(*livePodRouting),
+		)
 		hasKube = true
-	} else if client, err := controller.NewRESTKubeClientFromEnv(controller.WithKubeClientNamespace(*namespace), controller.WithWaitForRunning(true)); err == nil {
+	} else if client, err := controller.NewRESTKubeClientFromEnv(
+		controller.WithKubeClientNamespace(*namespace),
+		controller.WithWaitForRunning(true),
+		controller.WithDirectPodHealth(*livePodRouting),
+	); err == nil {
 		kubeClient = client
 		hasKube = true
 	} else {
@@ -166,6 +177,8 @@ func main() {
 		controller.WithDefaultStorageClass(*storageClass),
 		controller.WithDefaultRuntimeClass(*runtimeClass),
 		controller.WithPoddInjectorImage(*poddImage),
+		controller.WithPoddInjectionMode(*poddInjectionMode),
+		controller.WithPoddHostPath(*poddHostPath),
 		controller.WithDefaultSandboxImage(*sandboxImage),
 		controller.WithDefaultEgressImage(*egressImage),
 		controller.WithE2BTemplateAPI(e2bAPIEnabled),

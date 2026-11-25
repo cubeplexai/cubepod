@@ -1431,3 +1431,174 @@ func TestRESTKubeClient_UpsertPodBox_ResourceVersionFastPath(t *testing.T) {
 		t.Fatalf("expected exactly 2 HTTP calls (PUT + PUT /status), got %v", calls)
 	}
 }
+
+func TestRESTKubeClient_DirectPodHealthFastPath(t *testing.T) {
+	var healthHits int
+	var mu sync.Mutex
+	poddSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			mu.Lock()
+			healthHits++
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer poddSrv.Close()
+	poddAddr := strings.TrimPrefix(poddSrv.URL, "http://")
+
+	var serializedPod map[string]any
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods":
+			_ = json.NewDecoder(r.Body).Decode(&serializedPod)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{"name": "fast-pod"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods/fast-pod":
+			// Kubelet has NOT set Ready=True yet, but Pod is Running with PodIP and egress is Running.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"name": "fast-pod", "resourceVersion": "10"},
+				"status": map[string]any{
+					"phase":      "Running",
+					"podIP":      poddAddr,
+					"conditions": []map[string]any{{"type": "Ready", "status": "False"}},
+					"containerStatuses": []map[string]any{
+						{"name": "sandbox", "ready": false, "state": map[string]any{"running": map[string]any{"startedAt": "2026-11-25T00:00:00Z"}}},
+						{"name": "egress", "ready": true, "state": map[string]any{"running": map[string]any{"startedAt": "2026-11-25T00:00:00Z"}}},
+					},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods" && r.URL.Query().Get("watch") == "true":
+			// Hold watch open without ever sending Ready=True; direct health must unblock EnsurePod.
+			w.Header().Set("Content-Type", "application/json")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			<-r.Context().Done()
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer kubeSrv.Close()
+
+	client := controller.NewRESTKubeClient(
+		kubeSrv.URL,
+		"cubepod-workloads",
+		"",
+		kubeSrv.Client(),
+		controller.WithWaitForRunning(true),
+		controller.WithDirectPodHealth(true),
+		controller.WithDirectPodHealthClient(poddSrv.Client()),
+		controller.WithPollTimeout(3*time.Second),
+	)
+
+	start := time.Now()
+	ip, err := client.EnsurePod(context.Background(), controller.PodManifest{
+		Name:      "fast-pod",
+		Namespace: "cubepod-workloads",
+		Containers: []controller.ContainerManifest{
+			{Name: "sandbox", Image: "ubuntu:24.04"},
+			{Name: "egress", Image: "cubepod-egress:v0.8.0"},
+		},
+		Volumes: []controller.VolumeManifest{
+			{Name: "cubepod-bin", HostPath: "/var/lib/cubepod/bin/active", HostPathType: "Directory"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("EnsurePod direct health fast-path failed: %v", err)
+	}
+	if ip != poddAddr {
+		t.Fatalf("ip = %q; want %q", ip, poddAddr)
+	}
+	if time.Since(start) > 1500*time.Millisecond {
+		t.Fatalf("expected direct health fast-path to return quickly, took %v", time.Since(start))
+	}
+	mu.Lock()
+	hits := healthHits
+	mu.Unlock()
+	if hits == 0 {
+		t.Fatalf("expected direct /health probe to be hit")
+	}
+
+	// Verify hostPath volume serialization in toCoreV1Pod.
+	specMap, _ := serializedPod["spec"].(map[string]any)
+	vols, _ := specMap["volumes"].([]any)
+	if len(vols) != 1 {
+		t.Fatalf("expected 1 serialized volume, got %v", vols)
+	}
+	hp, _ := vols[0].(map[string]any)["hostPath"].(map[string]any)
+	if hp["path"] != "/var/lib/cubepod/bin/active" || hp["type"] != "Directory" {
+		t.Fatalf("unexpected serialized hostPath: %v", hp)
+	}
+}
+
+func TestRESTKubeClient_DirectPodHealthSkippedForWarmStandby(t *testing.T) {
+	var healthHits int
+	var mu sync.Mutex
+	poddSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		healthHits++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer poddSrv.Close()
+	poddAddr := strings.TrimPrefix(poddSrv.URL, "http://")
+
+	var getCalls int
+	kubeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{"name": "warm-pod"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods/warm-pod":
+			getCalls++
+			readyStatus := "False"
+			if getCalls >= 2 {
+				readyStatus = "True"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"name": "warm-pod", "resourceVersion": "20"},
+				"status": map[string]any{
+					"phase":      "Running",
+					"podIP":      poddAddr,
+					"conditions": []map[string]any{{"type": "Ready", "status": readyStatus}},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer kubeSrv.Close()
+
+	client := controller.NewRESTKubeClient(
+		kubeSrv.URL,
+		"cubepod-workloads",
+		"",
+		kubeSrv.Client(),
+		controller.WithWaitForRunning(true),
+		controller.WithDirectPodHealth(true),
+		controller.WithDirectPodHealthClient(poddSrv.Client()),
+		controller.WithPollInterval(10*time.Millisecond),
+		controller.WithPollTimeout(2*time.Second),
+	)
+
+	ip, err := client.EnsurePod(context.Background(), controller.PodManifest{
+		Name:      "warm-pod",
+		Namespace: "cubepod-workloads",
+		Labels:    map[string]string{"cubepod.io/claimed": "false"},
+	})
+	if err != nil {
+		t.Fatalf("EnsurePod warm standby failed: %v", err)
+	}
+	if ip != poddAddr {
+		t.Fatalf("ip = %q; want %q", ip, poddAddr)
+	}
+	mu.Lock()
+	hits := healthHits
+	mu.Unlock()
+	if hits != 0 {
+		t.Fatalf("warm standby pod should wait for Kubelet Ready=True, not direct /health (hits=%d)", hits)
+	}
+}

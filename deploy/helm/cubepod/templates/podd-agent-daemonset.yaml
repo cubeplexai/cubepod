@@ -1,0 +1,72 @@
+{{- if eq (default "initContainer" .Values.runtime.poddInjectionMode) "hostPath" }}
+{{- $hostPath := default "/var/lib/cubepod/bin/active" .Values.runtime.poddHostPath }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "cubepod.fullname" . }}-podd-agent
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubepod.labels" . | nindent 4 }}
+    app.kubernetes.io/component: podd-agent
+spec:
+  selector:
+    matchLabels:
+      {{- include "cubepod.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: podd-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        {{- include "cubepod.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: podd-agent
+    spec:
+      {{- include "cubepod.podImagePullSecrets" . | nindent 6 }}
+      containers:
+        - name: podd-agent
+          image: {{ .Values.runtime.poddInjectorImage | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              set -eu
+              mkdir -p /host/cubepod/bin
+              if [ -f /opt/cubepod/dist/podd-init ] && [ -f /opt/cubepod/dist/podd ]; then
+                SRC=/opt/cubepod/dist
+              elif [ -f /podd-init ] && [ -f /podd ]; then
+                SRC=
+              else
+                SRC=/usr/local/bin
+              fi
+              cp -f "${SRC}/podd-init" /host/cubepod/bin/.podd-init.new
+              cp -f "${SRC}/podd" /host/cubepod/bin/.podd.new
+              chmod 0755 /host/cubepod/bin/.podd-init.new /host/cubepod/bin/.podd.new
+              mv -f /host/cubepod/bin/.podd-init.new /host/cubepod/bin/podd-init
+              mv -f /host/cubepod/bin/.podd.new /host/cubepod/bin/podd
+              trap 'exit 0' TERM INT
+              while true; do sleep 3600 & wait $!; done
+          readinessProbe:
+            exec:
+              command:
+                - "/bin/sh"
+                - "-c"
+                - "test -x /host/cubepod/bin/podd-init && test -x /host/cubepod/bin/podd"
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "64Mi"
+          volumeMounts:
+            - name: cubepod-host-bin
+              mountPath: /host/cubepod/bin
+      volumes:
+        - name: cubepod-host-bin
+          hostPath:
+            path: {{ $hostPath | quote }}
+            type: DirectoryOrCreate
+{{- end }}

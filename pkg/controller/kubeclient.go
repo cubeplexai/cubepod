@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -1387,16 +1388,46 @@ func WithPollTimeout(d time.Duration) RESTKubeClientOption {
 	}
 }
 
+// WithDirectPodHealth enables probing http://<podIP>:<port>/health directly once
+// a non-warmpool Pod reaches Running with a PodIP (and egress Running if present),
+// bypassing the Kubelet ReadinessProbe -> APIServer round-trip on cold-start/resume.
+func WithDirectPodHealth(enabled bool) RESTKubeClientOption {
+	return func(c *RESTKubeClient) {
+		c.directPodHealth = enabled
+	}
+}
+
+// WithDirectPodHealthPort overrides the podd health port used by WithDirectPodHealth (default 49983).
+func WithDirectPodHealthPort(port int) RESTKubeClientOption {
+	return func(c *RESTKubeClient) {
+		if port > 0 {
+			c.directPodHealthPort = port
+		}
+	}
+}
+
+// WithDirectPodHealthClient overrides the HTTP client used by WithDirectPodHealth.
+func WithDirectPodHealthClient(client *http.Client) RESTKubeClientOption {
+	return func(c *RESTKubeClient) {
+		if client != nil {
+			c.directPodHealthClient = client
+		}
+	}
+}
+
 // RESTKubeClient communicates with standard Kubernetes v1 JSON REST endpoints.
 type RESTKubeClient struct {
-	baseURL            string
-	defaultNamespace   string
-	token              string
-	httpClient         *http.Client
-	waitForRunning     bool
-	pollInterval       time.Duration
-	pollIntervalCustom bool
-	pollTimeout        time.Duration
+	baseURL               string
+	defaultNamespace      string
+	token                 string
+	httpClient            *http.Client
+	waitForRunning        bool
+	pollInterval          time.Duration
+	pollIntervalCustom    bool
+	pollTimeout           time.Duration
+	directPodHealth       bool
+	directPodHealthPort   int
+	directPodHealthClient *http.Client
 }
 
 // NewRESTKubeClient creates a new RESTKubeClient targeting a Kubernetes APIServer.
@@ -1731,11 +1762,21 @@ func (c *RESTKubeClient) ensurePod(ctx context.Context, pod PodManifest, hook Po
 	defer resp.Body.Close()
 
 	wait := c.waitForRunning || hook != nil
+	isWarmStandby := pod.Labels != nil && pod.Labels["cubepod.io/claimed"] == "false"
+	hasEgress := false
+	for _, cn := range pod.Containers {
+		if cn.Name == "egress" {
+			hasEgress = true
+			break
+		}
+	}
+	useDirectHealth := c.directPodHealth && !isWarmStandby
+
 	if resp.StatusCode == http.StatusConflict {
 		var podIP string
 		if wait {
 			// Do not bind a newly minted lease to an already-running Pod.
-			podIP, _ = c.waitForPodRunning(ctx, ns, pod.Name, nil, requireReady)
+			podIP, _ = c.waitForPodRunning(ctx, ns, pod.Name, nil, requireReady, useDirectHealth, hasEgress)
 		} else {
 			podIP, _ = c.getPodIP(ctx, ns, pod.Name)
 		}
@@ -1748,7 +1789,7 @@ func (c *RESTKubeClient) ensurePod(ctx context.Context, pod PodManifest, hook Po
 	}
 
 	if wait {
-		return c.waitForPodRunning(ctx, ns, pod.Name, hook, requireReady)
+		return c.waitForPodRunning(ctx, ns, pod.Name, hook, requireReady, useDirectHealth, hasEgress)
 	}
 
 	var podResp struct {
@@ -1801,7 +1842,59 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name string, hook PodIPHook, requireReady bool) (string, error) {
+func (c *RESTKubeClient) directHealthURL(podIP string) string {
+	if _, _, err := net.SplitHostPort(podIP); err == nil {
+		return "http://" + podIP + "/health"
+	}
+	port := c.directPodHealthPort
+	if port <= 0 {
+		port = 49983
+	}
+	return fmt.Sprintf("http://%s/health", net.JoinHostPort(podIP, strconv.Itoa(port)))
+}
+
+func (c *RESTKubeClient) probeDirectPodHealth(ctx context.Context, podIP string, readyCh chan<- string, onReady func()) {
+	client := c.directPodHealthClient
+	if client == nil {
+		client = &http.Client{Timeout: 1 * time.Second}
+	}
+	healthURL := c.directHealthURL(podIP)
+	backoff := 25 * time.Millisecond
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+		if err == nil {
+			resp, err := client.Do(req)
+			if err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					select {
+					case readyCh <- podIP:
+					default:
+					}
+					if onReady != nil {
+						onReady()
+					}
+					return
+				}
+			}
+		}
+		if !sleepWithContext(ctx, backoff) {
+			return
+		}
+		if backoff < 100*time.Millisecond {
+			backoff *= 2
+			if backoff > 100*time.Millisecond {
+				backoff = 100 * time.Millisecond
+			}
+		}
+	}
+}
+
+func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name string, hook PodIPHook, requireReady, useDirectHealth, hasEgress bool) (string, error) {
 	timeout := c.pollTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -1810,11 +1903,25 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 	pollCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	watchCtx, cancelWatch := context.WithCancel(pollCtx)
+	defer cancelWatch()
+
+	var (
+		probeCancel    context.CancelFunc
+		probeStartedIP string
+		directReadyCh  = make(chan string, 1)
+	)
+	defer func() {
+		if probeCancel != nil {
+			probeCancel()
+		}
+	}()
+
 	hooked := false
 	var lastIP, lastPhase, lastRV string
 	var lastErr error
 
-	checkState := func(ip, phase string, ready bool, err error) (string, bool, error) {
+	checkState := func(ip, phase string, ready, egressRunning bool, err error) (string, bool, error) {
 		lastIP, lastPhase, lastErr = ip, phase, err
 		if ip != "" && hook != nil && !hooked {
 			if hookErr := hook(pollCtx, namespace, name, ip); hookErr != nil {
@@ -1828,18 +1935,34 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 		if phase == "Failed" {
 			return "", true, fmt.Errorf("pod %s/%s entered Failed phase", namespace, name)
 		}
+		if useDirectHealth && err == nil && phase == "Running" && ip != "" && (!hasEgress || egressRunning) {
+			if probeStartedIP != ip {
+				if probeCancel != nil {
+					probeCancel()
+				}
+				probeStartedIP = ip
+				var pCtx context.Context
+				pCtx, probeCancel = context.WithCancel(pollCtx)
+				go c.probeDirectPodHealth(pCtx, ip, directReadyCh, cancelWatch)
+			}
+		}
 		return "", false, nil
 	}
 
-	ip, phase, ready, rv, err := c.getPodState(pollCtx, namespace, name)
+	ip, phase, ready, egressRunning, rv, err := c.getPodState(watchCtx, namespace, name)
 	lastRV = rv
-	if outIP, done, checkErr := checkState(ip, phase, ready, err); done {
+	if outIP, done, checkErr := checkState(ip, phase, ready, egressRunning, err); done {
 		return outIP, checkErr
 	}
 
 	watchDisabled := false
 	var backoff time.Duration
 	for {
+		select {
+		case readyIP := <-directReadyCh:
+			return readyIP, nil
+		default:
+		}
 		if pollCtx.Err() != nil {
 			if requireReady {
 				return lastIP, fmt.Errorf("timed out waiting for pod %s/%s to become Ready (last phase=%q, ip=%q, err=%v)", namespace, name, lastPhase, lastIP, lastErr)
@@ -1851,7 +1974,12 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 		}
 
 		if !watchDisabled {
-			outIP, done, sawWatch, resetRV, watchErr := c.watchPodUntilReady(pollCtx, namespace, name, &lastRV, checkState)
+			outIP, done, sawWatch, resetRV, watchErr := c.watchPodUntilReady(watchCtx, namespace, name, &lastRV, checkState)
+			select {
+			case readyIP := <-directReadyCh:
+				return readyIP, nil
+			default:
+			}
 			if done {
 				return outIP, watchErr
 			}
@@ -1860,11 +1988,11 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 			}
 			if sawWatch {
 				// Re-check current state after watch stream ended/errored before re-watching.
-				ip, phase, ready, rv, err = c.getPodState(pollCtx, namespace, name)
+				ip, phase, ready, egressRunning, rv, err = c.getPodState(watchCtx, namespace, name)
 				if rv != "" {
 					lastRV = rv
 				}
-				if outIP, done, checkErr := checkState(ip, phase, ready, err); done {
+				if outIP, done, checkErr := checkState(ip, phase, ready, egressRunning, err); done {
 					return outIP, checkErr
 				}
 				if err == nil {
@@ -1876,15 +2004,15 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 		}
 
 		backoff = c.nextPollBackoff(backoff)
-		if !sleepWithContext(pollCtx, backoff) {
+		if !sleepWithContext(watchCtx, backoff) {
 			continue
 		}
 
-		ip, phase, ready, rv, err = c.getPodState(pollCtx, namespace, name)
+		ip, phase, ready, egressRunning, rv, err = c.getPodState(watchCtx, namespace, name)
 		if rv != "" {
 			lastRV = rv
 		}
-		if outIP, done, checkErr := checkState(ip, phase, ready, err); done {
+		if outIP, done, checkErr := checkState(ip, phase, ready, egressRunning, err); done {
 			return outIP, checkErr
 		}
 	}
@@ -1894,7 +2022,7 @@ func (c *RESTKubeClient) watchPodUntilReady(
 	ctx context.Context,
 	namespace, name string,
 	rv *string,
-	checkState func(ip, phase string, ready bool, err error) (string, bool, error),
+	checkState func(ip, phase string, ready, egressRunning bool, err error) (string, bool, error),
 ) (podIP string, done bool, sawWatch bool, resetRV bool, err error) {
 	secs := int64(30)
 	if dl, ok := ctx.Deadline(); ok {
@@ -1968,7 +2096,7 @@ func (c *RESTKubeClient) watchPodUntilReady(
 			if ev.Type == "BOOKMARK" || p.Status == nil {
 				continue
 			}
-			if outIP, finished, checkErr := checkState(p.Status.PodIP, p.Status.Phase, isPodStatusReady(p.Status), nil); finished {
+			if outIP, finished, checkErr := checkState(p.Status.PodIP, p.Status.Phase, isPodStatusReady(p.Status), isContainerRunning(p.Status, "egress"), nil); finished {
 				return outIP, true, true, false, checkErr
 			}
 		}
@@ -1998,25 +2126,37 @@ func isPodStatusReady(status *coreV1PodStatus) bool {
 	return true
 }
 
+func isContainerRunning(status *coreV1PodStatus, name string) bool {
+	if status == nil {
+		return false
+	}
+	for _, cs := range status.ContainerStatuses {
+		if cs.Name == name {
+			return cs.Ready || cs.State.Running != nil
+		}
+	}
+	return false
+}
+
 func (c *RESTKubeClient) getPodStatus(ctx context.Context, namespace, name string) (string, string, bool, error) {
-	ip, phase, ready, _, err := c.getPodState(ctx, namespace, name)
+	ip, phase, ready, _, _, err := c.getPodState(ctx, namespace, name)
 	return ip, phase, ready, err
 }
 
-func (c *RESTKubeClient) getPodState(ctx context.Context, namespace, name string) (string, string, bool, string, error) {
+func (c *RESTKubeClient) getPodState(ctx context.Context, namespace, name string) (string, string, bool, bool, string, error) {
 	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s", c.baseURL, namespace, name)
 	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", "", false, "", fmt.Errorf("getPodStatus request failed: %w", err)
+		return "", "", false, false, "", fmt.Errorf("getPodStatus request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusNotFound {
-			return "", "", false, "", fmt.Errorf("getPodStatus failed: status %d (%s): %w", resp.StatusCode, string(respBody), ErrPodNotFound)
+			return "", "", false, false, "", fmt.Errorf("getPodStatus failed: status %d (%s): %w", resp.StatusCode, string(respBody), ErrPodNotFound)
 		}
-		return "", "", false, "", fmt.Errorf("getPodStatus failed: status %d (%s)", resp.StatusCode, string(respBody))
+		return "", "", false, false, "", fmt.Errorf("getPodStatus failed: status %d (%s)", resp.StatusCode, string(respBody))
 	}
 
 	var podResp struct {
@@ -2026,9 +2166,9 @@ func (c *RESTKubeClient) getPodState(ctx context.Context, namespace, name string
 		Status coreV1PodStatus `json:"status"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&podResp); err != nil {
-		return "", "", false, "", fmt.Errorf("failed to decode pod status: %w", err)
+		return "", "", false, false, "", fmt.Errorf("failed to decode pod status: %w", err)
 	}
-	return podResp.Status.PodIP, podResp.Status.Phase, isPodStatusReady(&podResp.Status), podResp.Metadata.ResourceVersion, nil
+	return podResp.Status.PodIP, podResp.Status.Phase, isPodStatusReady(&podResp.Status), isContainerRunning(&podResp.Status, "egress"), podResp.Metadata.ResourceVersion, nil
 }
 
 func (c *RESTKubeClient) getPodIP(ctx context.Context, namespace, name string) (string, error) {
@@ -2130,7 +2270,7 @@ func (c *RESTKubeClient) DeletePod(ctx context.Context, namespace, name string) 
 		pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
 		defer cancel()
 
-		_, _, _, rv, err := c.getPodState(pollCtx, ns, name)
+		_, _, _, _, rv, err := c.getPodState(pollCtx, ns, name)
 		if err != nil {
 			// Pod is gone
 			return nil
@@ -2151,7 +2291,7 @@ func (c *RESTKubeClient) DeletePod(ctx context.Context, namespace, name string) 
 					rv = ""
 				}
 				if sawWatch {
-					_, _, _, nextRV, err := c.getPodState(pollCtx, ns, name)
+					_, _, _, _, nextRV, err := c.getPodState(pollCtx, ns, name)
 					if err != nil {
 						return nil
 					}
@@ -2166,7 +2306,7 @@ func (c *RESTKubeClient) DeletePod(ctx context.Context, namespace, name string) 
 			if !sleepWithContext(pollCtx, backoff) {
 				return nil
 			}
-			_, _, _, nextRV, err := c.getPodState(pollCtx, ns, name)
+			_, _, _, _, nextRV, err := c.getPodState(pollCtx, ns, name)
 			if err != nil {
 				// Pod is gone
 				return nil
