@@ -598,3 +598,77 @@ func TestBuildPodManifest_BlockWorkspaceAndSharedMountsCoexist(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildPodManifest_HostPathPoddInjection(t *testing.T) {
+	tpl := v1alpha1.PodTemplateSpec{
+		RuntimeClassName: "kata-clh",
+		Image:            "ubuntu:24.04",
+		PoddImage:        "ghcr.io/cubeplexai/cubepod-podd:v0.9.0",
+	}
+	spec := v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu-24-04",
+		RootfsGeneration: 1,
+	}
+	status := v1alpha1.PodBoxStatus{PodName: "hp-box"}
+
+	pod := controller.BuildPodManifest("hp-box", tpl, spec, status, controller.PodBuildOptions{
+		VolumeMode:        "Block",
+		PoddInjectionMode: controller.PoddInjectionModeHostPath,
+		PoddHostPath:      "/var/lib/cubepod/bin/active",
+		DefaultPoddImage:  "ghcr.io/cubeplexai/cubepod-podd:v0.9.0",
+	})
+
+	if len(pod.InitContainers) != 0 {
+		t.Fatalf("expected 0 initContainers in hostPath mode, got %+v", pod.InitContainers)
+	}
+	var binVol *controller.VolumeManifest
+	for i := range pod.Volumes {
+		if pod.Volumes[i].Name == "cubepod-bin" {
+			binVol = &pod.Volumes[i]
+			break
+		}
+	}
+	if binVol == nil {
+		t.Fatal("cubepod-bin volume missing")
+	}
+	if binVol.EmptyDir || binVol.HostPath != "/var/lib/cubepod/bin/active" || binVol.HostPathType != "Directory" {
+		t.Fatalf("unexpected cubepod-bin volume: %+v", *binVol)
+	}
+	var binMount *controller.VolumeMount
+	for i := range pod.Containers[0].VolumeMounts {
+		if pod.Containers[0].VolumeMounts[i].Name == "cubepod-bin" {
+			binMount = &pod.Containers[0].VolumeMounts[i]
+			break
+		}
+	}
+	if binMount == nil || binMount.MountPath != "/opt/cubepod/bin" || !binMount.ReadOnly {
+		t.Fatalf("expected read-only /opt/cubepod/bin mount, got %+v", binMount)
+	}
+}
+
+func TestBuildPodManifest_HostPathFallsBackOnCustomPoddImage(t *testing.T) {
+	tpl := v1alpha1.PodTemplateSpec{
+		RuntimeClassName: "kata-clh",
+		Image:            "ubuntu:24.04",
+		PoddImage:        "custom.registry/my-podd:dev",
+	}
+	spec := v1alpha1.PodBoxSpec{TemplateRef: "custom", RootfsGeneration: 1}
+	status := v1alpha1.PodBoxStatus{PodName: "custom-box"}
+
+	pod := controller.BuildPodManifest("custom-box", tpl, spec, status, controller.PodBuildOptions{
+		VolumeMode:        "Block",
+		PoddInjectionMode: controller.PoddInjectionModeHostPath,
+		PoddHostPath:      "/var/lib/cubepod/bin/active",
+		DefaultPoddImage:  "ghcr.io/cubeplexai/cubepod-podd:v0.9.0",
+	})
+
+	if len(pod.InitContainers) != 1 || pod.InitContainers[0].Name != "podd-installer" || pod.InitContainers[0].Image != "custom.registry/my-podd:dev" {
+		t.Fatalf("expected fallback to podd-installer initContainer, got %+v", pod.InitContainers)
+	}
+	if !pod.Volumes[0].EmptyDir || pod.Volumes[0].HostPath != "" {
+		t.Fatalf("expected emptyDir volume on fallback, got %+v", pod.Volumes[0])
+	}
+	if pod.Containers[0].VolumeMounts[0].ReadOnly {
+		t.Fatalf("expected writable mount on initContainer fallback")
+	}
+}

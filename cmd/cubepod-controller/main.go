@@ -87,6 +87,8 @@ func main() {
 		volumeMode           = flag.String("volume-mode", "Filesystem", "Storage volume mode (Block or Filesystem)")
 		runtimeClass         = flag.String("runtime-class", "", "Container runtime class name (empty for standard runc/containerd)")
 		poddImage            = flag.String("podd-image", "ghcr.io/cubeplexai/cubepod-podd:v0.8.0", "Image for podd-installer initContainer")
+		poddInjectionMode    = flag.String("podd-injection-mode", envOrDefault("CUBEPOD_PODD_INJECTION_MODE", controller.PoddInjectionModeInitContainer), "How podd binaries are injected into sandboxes (initContainer or hostPath)")
+		poddHostPath         = flag.String("podd-host-path", envOrDefault("CUBEPOD_PODD_HOST_PATH", controller.DefaultPoddHostPath), "Host directory mounted read-only at /opt/cubepod/bin when --podd-injection-mode=hostPath")
 		sandboxImage         = flag.String("sandbox-image", "ubuntu:24.04", "Default sandbox image")
 		egressImage          = flag.String("egress-image", defaultEgressImage(), "Default cubepod-egress sidecar image when template egress.image is empty")
 		egressExchangeURL    = flag.String("egress-exchange-url", os.Getenv("CUBEPOD_EGRESS_EXCHANGE_URL"), "Default egress secret exchange URL when template egress.exchangeUrl is empty")
@@ -168,6 +170,8 @@ func main() {
 		"storageClass", *storageClass,
 		"runtimeClass", *runtimeClass,
 		"poddImage", *poddImage,
+		"poddInjectionMode", *poddInjectionMode,
+		"poddHostPath", *poddHostPath,
 		"sandboxImage", *sandboxImage,
 		"egressImage", *egressImage,
 		"egressExchangeURL", *egressExchangeURL,
@@ -250,6 +254,8 @@ func main() {
 		controller.WithDefaultStorageClass(*storageClass),
 		controller.WithDefaultRuntimeClass(*runtimeClass),
 		controller.WithPoddInjectorImage(*poddImage),
+		controller.WithPoddInjectionMode(*poddInjectionMode),
+		controller.WithPoddHostPath(*poddHostPath),
 		controller.WithDefaultSandboxImage(*sandboxImage),
 		controller.WithDefaultEgressImage(*egressImage),
 		controller.WithDefaultEgressExchangeURL(*egressExchangeURL),

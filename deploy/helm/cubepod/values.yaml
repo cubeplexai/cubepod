@@ -9,6 +9,10 @@ runtime:
   defaultTemplate: "cubeplex-ubuntu24-desktop"
   # Lightweight initContainer image that injects /opt/cubepod/bin/{podd-init,podd} at Pod startup
   poddInjectorImage: "ghcr.io/cubeplexai/cubepod-podd:v0.8.0"
+  # How podd binaries are injected into sandbox Pods: "initContainer" (default) or "hostPath" (DaemonSet-staged read-only hostPath, Added in v0.9.0)
+  poddInjectionMode: "initContainer"
+  # Host directory mounted read-only at /opt/cubepod/bin when runtime.poddInjectionMode is "hostPath" (Added in v0.9.0)
+  poddHostPath: "/var/lib/cubepod/bin/active"
   # Default workload sandbox image (clean OS/tooling image without podd baked in)
   defaultSandboxImage: "ghcr.io/cubeplexai/cubeplex-sandbox:v0.4.0"
   # Optional single imagePullSecret name attached to sandbox Pods (when templateBuild.registry.pullSecret is unset)

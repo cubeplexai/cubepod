@@ -17,6 +17,13 @@ const (
 	maxWorkspacePVCNameLen = 63
 	maxWorkspacePrefixLen  = maxWorkspacePVCNameLen - len(workspacePVCSuffix) // 49
 	workspaceHashHexLen    = 8
+
+	// PoddInjectionModeInitContainer copies podd-init and podd via a per-pod initContainer into emptyDir (default).
+	PoddInjectionModeInitContainer = "initContainer"
+	// PoddInjectionModeHostPath mounts node-staged podd binaries read-only via hostPath, eliminating the initContainer.
+	PoddInjectionModeHostPath = "hostPath"
+	// DefaultPoddHostPath is the default host directory populated by the cubepod-podd-agent DaemonSet.
+	DefaultPoddHostPath = "/var/lib/cubepod/bin/active"
 )
 
 // SanitizeVolumeKey normalizes a user-supplied volumeKey into a valid DNS-1123
@@ -209,6 +216,8 @@ type ContainerManifest struct {
 type VolumeManifest struct {
 	Name                  string `json:"name"`
 	EmptyDir              bool   `json:"emptyDir,omitempty"`
+	HostPath              string `json:"hostPath,omitempty"`
+	HostPathType          string `json:"hostPathType,omitempty"`
 	PersistentVolumeClaim string `json:"persistentVolumeClaim,omitempty"`
 	SecretName            string `json:"secretName,omitempty"`
 }
@@ -513,6 +522,9 @@ type PodBuildOptions struct {
 	TransparentEgress bool
 	VolumeNFS         VolumeNFSOptions
 	IsFirecracker     bool
+	PoddInjectionMode string
+	PoddHostPath      string
+	DefaultPoddImage  string
 }
 
 // BuildKataPod synthesizes the complete Kubernetes Pod manifest for running a Kata or container sandbox.
@@ -576,11 +588,47 @@ func BuildPodManifest(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha
 		workspacePVC = WorkspacePVCName(boxName, spec)
 	}
 
+	useHostPathPodd := strings.EqualFold(strings.TrimSpace(opts.PoddInjectionMode), PoddInjectionModeHostPath) &&
+		(tpl.PoddImage == "" || opts.DefaultPoddImage == "" || tpl.PoddImage == opts.DefaultPoddImage)
+
+	poddBinVol := VolumeManifest{
+		Name:     "cubepod-bin",
+		EmptyDir: true,
+	}
+	var initContainers []ContainerManifest
+	if useHostPathPodd {
+		hostPath := strings.TrimSpace(opts.PoddHostPath)
+		if hostPath == "" {
+			hostPath = DefaultPoddHostPath
+		}
+		poddBinVol = VolumeManifest{
+			Name:         "cubepod-bin",
+			HostPath:     hostPath,
+			HostPathType: "Directory",
+		}
+	} else {
+		initContainers = []ContainerManifest{
+			{
+				Name:            "podd-installer",
+				Image:           poddImg,
+				ImagePullPolicy: "IfNotPresent",
+				Command: []string{
+					"/bin/sh",
+					"-c",
+					"cp -f /opt/cubepod/dist/podd-init /opt/cubepod/dist/podd /opt/cubepod/bin/ 2>/dev/null || cp -f /podd-init /podd /opt/cubepod/bin/ 2>/dev/null || cp -f /usr/local/bin/podd* /opt/cubepod/bin/ 2>/dev/null || true; chmod 0755 /opt/cubepod/bin/podd-init /opt/cubepod/bin/podd 2>/dev/null || true",
+				},
+				VolumeMounts: []VolumeMount{
+					{
+						Name:      "cubepod-bin",
+						MountPath: "/opt/cubepod/bin",
+					},
+				},
+			},
+		}
+	}
+
 	volumes := []VolumeManifest{
-		{
-			Name:     "cubepod-bin",
-			EmptyDir: true,
-		},
+		poddBinVol,
 		{
 			Name:                  "rootfs-volume",
 			PersistentVolumeClaim: rootfsPVC,
@@ -588,25 +636,6 @@ func BuildPodManifest(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha
 		{
 			Name:                  "workspace-volume",
 			PersistentVolumeClaim: workspacePVC,
-		},
-	}
-
-	initContainers := []ContainerManifest{
-		{
-			Name:            "podd-installer",
-			Image:           poddImg,
-			ImagePullPolicy: "IfNotPresent",
-			Command: []string{
-				"/bin/sh",
-				"-c",
-				"cp -f /opt/cubepod/dist/podd-init /opt/cubepod/dist/podd /opt/cubepod/bin/ 2>/dev/null || cp -f /podd-init /podd /opt/cubepod/bin/ 2>/dev/null || cp -f /usr/local/bin/podd* /opt/cubepod/bin/ 2>/dev/null || true; chmod 0755 /opt/cubepod/bin/podd-init /opt/cubepod/bin/podd 2>/dev/null || true",
-			},
-			VolumeMounts: []VolumeMount{
-				{
-					Name:      "cubepod-bin",
-					MountPath: "/opt/cubepod/bin",
-				},
-			},
 		},
 	}
 
@@ -622,6 +651,7 @@ func BuildPodManifest(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha
 			{
 				Name:      "cubepod-bin",
 				MountPath: "/opt/cubepod/bin",
+				ReadOnly:  useHostPathPodd,
 			},
 		},
 		Resources: tpl.Resources,

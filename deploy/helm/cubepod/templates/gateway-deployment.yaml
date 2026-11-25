@@ -52,6 +52,8 @@ spec:
             - "--volume-mode={{ .Values.storage.volumeMode }}"
             - "--runtime-class={{ .Values.runtime.runtimeClassName }}"
             - "--podd-image={{ .Values.runtime.poddInjectorImage }}"
+            - "--podd-injection-mode={{ .Values.runtime.poddInjectionMode | default "initContainer" }}"
+            - "--podd-host-path={{ .Values.runtime.poddHostPath | default "/var/lib/cubepod/bin/active" }}"
             - "--sandbox-image={{ .Values.runtime.defaultSandboxImage }}"
             - "--egress-image={{ include "cubepod.egressImage" . }}"
             - "--live-pod-routing={{ .Values.gateway.livePodRouting }}"
