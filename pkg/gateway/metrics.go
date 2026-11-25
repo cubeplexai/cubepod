@@ -127,6 +127,106 @@ func (h *promHistogram) Snapshot() (uint64, float64) {
 	return h.total, h.sum
 }
 
+var defaultPhaseDurationBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
+
+type phaseHistogramSnapshot struct {
+	Phase   string
+	Buckets []float64
+	Counts  []uint64
+	Sum     float64
+	Total   uint64
+}
+
+type labeledPromHistogram struct {
+	mu     sync.Mutex
+	phases map[string]*promHistogram
+}
+
+func (h *labeledPromHistogram) Observe(phase string, seconds float64) {
+	if phase == "" {
+		return
+	}
+	if seconds < 0 {
+		seconds = 0
+	}
+	h.mu.Lock()
+	if h.phases == nil {
+		h.phases = make(map[string]*promHistogram)
+	}
+	entry := h.phases[phase]
+	if entry == nil {
+		entry = &promHistogram{
+			buckets: defaultPhaseDurationBuckets,
+			counts:  make([]uint64, len(defaultPhaseDurationBuckets)),
+		}
+		h.phases[phase] = entry
+	}
+	h.mu.Unlock()
+	entry.Observe(seconds)
+}
+
+func (h *labeledPromHistogram) Snapshot() []phaseHistogramSnapshot {
+	h.mu.Lock()
+	names := make([]string, 0, len(h.phases))
+	entries := make(map[string]*promHistogram, len(h.phases))
+	for k, v := range h.phases {
+		names = append(names, k)
+		entries[k] = v
+	}
+	h.mu.Unlock()
+
+	sort.Strings(names)
+	out := make([]phaseHistogramSnapshot, 0, len(names))
+	for _, name := range names {
+		p := entries[name]
+		p.mu.Lock()
+		buckets := p.buckets
+		if buckets == nil {
+			buckets = defaultPhaseDurationBuckets
+		}
+		counts := make([]uint64, len(buckets))
+		copy(counts, p.counts)
+		out = append(out, phaseHistogramSnapshot{
+			Phase:   name,
+			Buckets: buckets,
+			Counts:  counts,
+			Sum:     p.sum,
+			Total:   p.total,
+		})
+		p.mu.Unlock()
+	}
+	return out
+}
+
+func (h *labeledPromHistogram) WritePrometheus(buf *bytes.Buffer, name, help string) {
+	snaps := h.Snapshot()
+	if len(snaps) == 0 {
+		return
+	}
+	fmt.Fprintf(buf, "# HELP %s %s\n", name, help)
+	fmt.Fprintf(buf, "# TYPE %s histogram\n", name)
+	for _, s := range snaps {
+		for i, upper := range s.Buckets {
+			fmt.Fprintf(buf, "%s_bucket{phase=%q,le=\"%g\"} %d\n", name, s.Phase, upper, s.Counts[i])
+		}
+		fmt.Fprintf(buf, "%s_bucket{phase=%q,le=\"+Inf\"} %d\n", name, s.Phase, s.Total)
+		fmt.Fprintf(buf, "%s_sum{phase=%q} %g\n", name, s.Phase, s.Sum)
+		fmt.Fprintf(buf, "%s_count{phase=%q} %d\n", name, s.Phase, s.Total)
+	}
+}
+
+func (h *labeledPromHistogram) JSONSummary() map[string]interface{} {
+	snaps := h.Snapshot()
+	out := make(map[string]interface{}, len(snaps))
+	for _, s := range snaps {
+		out[s.Phase] = map[string]interface{}{
+			"count": s.Total,
+			"sum":   s.Sum,
+		}
+	}
+	return out
+}
+
 // Metrics encapsulates Prometheus counters, gauges, and histograms for CubePod Gateway observability.
 type Metrics struct {
 	HTTPRequestsTotal             atomic.Uint64
@@ -150,6 +250,8 @@ type Metrics struct {
 	secretOperations   labeledCounterMap
 	sandboxForks       labeledCounterMap
 	sandboxForkDur     promHistogram
+	coldStartPhaseDur  labeledPromHistogram
+	resumePhaseDur     labeledPromHistogram
 
 	SandboxMetricsSamplesOK    atomic.Uint64
 	SandboxMetricsSamplesError atomic.Uint64
@@ -195,6 +297,16 @@ func (m *Metrics) RecordVolumeQuotaRejection() {
 func (m *Metrics) RecordSandboxFork(mode, result string, dur time.Duration) {
 	m.sandboxForks.Inc(mode, result)
 	m.sandboxForkDur.Observe(dur.Seconds())
+}
+
+// RecordColdStartPhase records a latency observation for a sandbox cold-start phase.
+func (m *Metrics) RecordColdStartPhase(phase string, dur time.Duration) {
+	m.coldStartPhaseDur.Observe(phase, dur.Seconds())
+}
+
+// RecordResumePhase records a latency observation for a sandbox wake/resume phase.
+func (m *Metrics) RecordResumePhase(phase string, dur time.Duration) {
+	m.resumePhaseDur.Observe(phase, dur.Seconds())
 }
 
 // RecordCRDResync increments the CRD resync counter.
@@ -607,6 +719,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 				"count": forkCount,
 				"sum":   forkSum,
 			},
+			"cubepod_sandbox_cold_start_phase_duration_seconds": m.coldStartPhaseDur.JSONSummary(),
+			"cubepod_sandbox_resume_phase_duration_seconds":     m.resumePhaseDur.JSONSummary(),
 			"cubepod_sandbox_metrics_samples_total": map[string]uint64{
 				"ok":    m.SandboxMetricsSamplesOK.Load(),
 				"error": m.SandboxMetricsSamplesError.Load(),
@@ -712,6 +826,8 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	m.sandboxForkDur.WritePrometheus(&buf, "cubepod_sandbox_fork_duration_seconds", "Latency histogram of sandbox CoW fork operations in seconds")
+	m.coldStartPhaseDur.WritePrometheus(&buf, "cubepod_sandbox_cold_start_phase_duration_seconds", "Phase-level latency histogram of sandbox cold start in seconds")
+	m.resumePhaseDur.WritePrometheus(&buf, "cubepod_sandbox_resume_phase_duration_seconds", "Phase-level latency histogram of sandbox resume/wake in seconds")
 
 	fmt.Fprintf(&buf, "# HELP cubepod_gateway_crd_resyncs_total Total PodBox/PodWarmPool CRD resyncs executed by the gateway\n")
 	fmt.Fprintf(&buf, "# TYPE cubepod_gateway_crd_resyncs_total counter\n")

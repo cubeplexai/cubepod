@@ -254,6 +254,14 @@ func (s *Server) syncFromKube(ctx context.Context) (int, error) {
 	return n, err
 }
 
+func (s *Server) syncWarmPoolsFromKube(ctx context.Context, templateRef string) error {
+	if s.reconciler == nil {
+		return nil
+	}
+	s.crdResyncsTotal.Add(1)
+	return s.reconciler.SyncWarmPoolsFromKube(ctx, templateRef)
+}
+
 // CRDResyncsTotal returns the number of Kubernetes CRD resyncs performed by the gateway.
 func (s *Server) CRDResyncsTotal() uint64 {
 	return s.crdResyncsTotal.Load()
@@ -651,14 +659,13 @@ func waitForPoddReady(ctx context.Context, poddURL string, timeout time.Duration
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{Timeout: 1 * time.Second}
 	healthURL := strings.TrimSuffix(poddURL, "/") + "/health"
+	backoff := 25 * time.Millisecond
 	for {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("health check timed out for %s", poddURL)
 		}
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
-		default:
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
 		if err == nil {
@@ -670,7 +677,19 @@ func waitForPoddReady(ctx context.Context, poddURL string, timeout time.Duration
 				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		if backoff < 100*time.Millisecond {
+			backoff *= 2
+			if backoff > 100*time.Millisecond {
+				backoff = 100 * time.Millisecond
+			}
+		}
 	}
 }
 
@@ -679,6 +698,7 @@ func pollPoddHealth(ctx context.Context, poddURL string, timeout time.Duration) 
 }
 
 func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
+	createTotalStart := time.Now()
 	var req createSandboxReq
 	_ = json.NewDecoder(r.Body).Decode(&req)
 
@@ -687,6 +707,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 	var diskSizeMB = 10240
 	var resolvedReadyCmd string
 
+	tplSyncStart := time.Now()
 	if s.E2BTemplateAPIEnabled() {
 		if s.reconciler.KubeClient() != nil {
 			_ = s.reconciler.SyncTemplatesFromKube(r.Context())
@@ -725,6 +746,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 			req.TemplateID = "cubeplex-ubuntu24-desktop"
 		}
 	}
+	templateSyncDur := time.Since(tplSyncStart)
 
 	timeoutSecs := req.Timeout
 	if timeoutSecs <= 0 {
@@ -818,17 +840,19 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 
 	// Automatic WarmPool Claim: skip when deterministic VolumeKey, volume mounts,
 	// or custom network/secret policies are requested.
+	warmLookupStart := time.Now()
 	if spec.WarmPoolRef == "" && volumeKey == "" && len(plannedMounts) == 0 && netPolicy == nil {
 		warmPoolName := s.reconciler.FindAvailableWarmPool(req.TemplateID)
 		if warmPoolName == "" {
-			// Run a quick SyncFromKube to discover any newly added standby pods from the controller before falling back to cold start
-			_, _ = s.syncFromKube(r.Context())
+			// Run a lightweight warmpool sync to discover any newly added standby pods before falling back to cold start
+			_ = s.syncWarmPoolsFromKube(r.Context(), req.TemplateID)
 			warmPoolName = s.reconciler.FindAvailableWarmPool(req.TemplateID)
 		}
 		if warmPoolName != "" {
 			spec.WarmPoolRef = warmPoolName
 		}
 	}
+	warmLookupDur := time.Since(warmLookupStart)
 
 	var acquiredBlockMount *volume.PlannedMount
 	if hasPlannedBlockMount {
@@ -892,28 +916,30 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		s.reconciler.SetBoxAnnotations(id, map[string]string{"cubepod.io/owner-tenant": ownerTenant})
 	}
 
-	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
+	reconcileStart := time.Now()
+	status, recTimings, err := s.reconciler.ReconcileWithTimings(r.Context(), id, spec)
 	if err != nil && spec.WarmPoolRef != "" {
-		slog.Warn("warmpool claim failed, refreshing standbys from Kubernetes via SyncFromKube and retrying", "sandboxID", id, "pool", spec.WarmPoolRef, "err", err)
-		if _, syncErr := s.syncFromKube(r.Context()); syncErr != nil {
-			slog.Warn("SyncFromKube failed during claim retry", "err", syncErr)
+		slog.Warn("warmpool claim failed, refreshing standbys from Kubernetes and retrying", "sandboxID", id, "pool", spec.WarmPoolRef, "err", err)
+		if syncErr := s.syncWarmPoolsFromKube(r.Context(), req.TemplateID); syncErr != nil {
+			slog.Warn("SyncWarmPoolsFromKube failed during claim retry", "err", syncErr)
 			// do not fall through to find on stale map; fall back to cold start immediately
 			spec.WarmPoolRef = ""
-			status, err = s.reconciler.Reconcile(r.Context(), id, spec)
+			status, recTimings, err = s.reconciler.ReconcileWithTimings(r.Context(), id, spec)
 		} else {
 			if req.WarmPoolRef == "" {
 				spec.WarmPoolRef = s.reconciler.FindAvailableWarmPool(req.TemplateID)
 			}
 			if spec.WarmPoolRef != "" {
-				status, err = s.reconciler.Reconcile(r.Context(), id, spec)
+				status, recTimings, err = s.reconciler.ReconcileWithTimings(r.Context(), id, spec)
 			}
 			if err != nil || spec.WarmPoolRef == "" {
 				slog.Warn("warmpool claim retry failed, falling back to cold start", "sandboxID", id, "pool", spec.WarmPoolRef, "err", err)
 				spec.WarmPoolRef = ""
-				status, err = s.reconciler.Reconcile(r.Context(), id, spec)
+				status, recTimings, err = s.reconciler.ReconcileWithTimings(r.Context(), id, spec)
 			}
 		}
 	}
+	reconcileDur := time.Since(reconcileStart)
 	if err != nil {
 		s.rollbackCreatedSandbox(r.Context(), id)
 		if errors.Is(err, controller.ErrTemplateNotReady) {
@@ -972,6 +998,7 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 		lastEmittedLifecycleState: events.EventCreated,
 	}
 
+	poddReadyStart := time.Now()
 	if s.LivePodRouting() && status.PodIP != "" && status.PodIP != "10.244.0.42" {
 		if _, _, splitErr := net.SplitHostPort(status.PodIP); splitErr == nil {
 			rec.PoddURL = "http://" + status.PodIP
@@ -1018,6 +1045,19 @@ func (s *Server) handleCreateSandbox(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+	}
+	poddReadyDur := time.Since(poddReadyStart)
+
+	if status.Reason != "WarmPoolClaimed" {
+		m := s.Metrics()
+		m.RecordColdStartPhase("template_sync", templateSyncDur)
+		m.RecordColdStartPhase("warmpool_lookup", warmLookupDur)
+		m.RecordColdStartPhase("pvc_egress_prepare", recTimings.PrepareDur)
+		m.RecordColdStartPhase("ensure_pod", recTimings.EnsurePodDur)
+		m.RecordColdStartPhase("podbox_upsert", recTimings.UpsertBoxDur)
+		m.RecordColdStartPhase("reconcile", reconcileDur)
+		m.RecordColdStartPhase("podd_ready", poddReadyDur)
+		m.RecordColdStartPhase("total", time.Since(createTotalStart))
 	}
 
 	s.mu.Lock()
@@ -1182,11 +1222,14 @@ func (s *Server) handlePauseSandbox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
+	resumeTotalStart := time.Now()
 	id := r.PathValue("sandboxID")
 	unlock := s.acquireSandboxLock(id)
 	defer unlock()
 
+	resolveStart := time.Now()
 	rec, ok := s.resolveSandbox(r.Context(), id)
+	resolveDur := time.Since(resolveStart)
 	if !ok {
 		writeError(w, http.StatusNotFound, "sandbox not found")
 		return
@@ -1215,7 +1258,9 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 		VolumeKey:        recCopy.VolumeKey,
 		NetworkPolicy:    cloneNetworkPolicy(recCopy.NetworkPolicy),
 	}, id)
-	status, err := s.reconciler.Reconcile(r.Context(), id, spec)
+	reconcileStart := time.Now()
+	status, recTimings, err := s.reconciler.ReconcileWithTimings(r.Context(), id, spec)
+	reconcileDur := time.Since(reconcileStart)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1233,6 +1278,7 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	poddReadyStart := time.Now()
 	if liveRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
 		recCopy.PoddURL = formatPoddURL(status.PodIP, recCopy.EnvdPort)
 		_ = waitForPoddReady(r.Context(), recCopy.PoddURL, 30*time.Second)
@@ -1247,6 +1293,18 @@ func (s *Server) handleConnectSandbox(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	poddReadyDur := time.Since(poddReadyStart)
+
+	if wasPaused {
+		m := s.Metrics()
+		m.RecordResumePhase("resolve_sandbox", resolveDur)
+		m.RecordResumePhase("pvc_egress_prepare", recTimings.PrepareDur)
+		m.RecordResumePhase("ensure_pod", recTimings.EnsurePodDur)
+		m.RecordResumePhase("podbox_upsert", recTimings.UpsertBoxDur)
+		m.RecordResumePhase("reconcile", reconcileDur)
+		m.RecordResumePhase("podd_ready", poddReadyDur)
+		m.RecordResumePhase("total", time.Since(resumeTotalStart))
 	}
 
 	s.mu.Lock()
@@ -1782,6 +1840,7 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 	resumed := false
 	var wireRec *SandboxRecord
 	if recCopy.State == string(v1alpha1.PodBoxPhasePaused) || recCopy.State == "Paused" {
+		resumeTotalStart := time.Now()
 		spec := s.withVolumeMounts(v1alpha1.PodBoxSpec{
 			TemplateRef:      recCopy.TemplateID,
 			DesiredState:     v1alpha1.DesiredStateRunning,
@@ -1789,7 +1848,9 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 			VolumeKey:        recCopy.VolumeKey,
 			NetworkPolicy:    cloneNetworkPolicy(recCopy.NetworkPolicy),
 		}, recCopy.SandboxID)
-		status, err := s.reconciler.Reconcile(ctx, recCopy.SandboxID, spec)
+		reconcileStart := time.Now()
+		status, recTimings, err := s.reconciler.ReconcileWithTimings(ctx, recCopy.SandboxID, spec)
+		reconcileDur := time.Since(reconcileStart)
 		if err != nil {
 			return err
 		}
@@ -1800,6 +1861,7 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 			s.mu.Unlock()
 			return fmt.Errorf("sandbox %s is terminated", recCopy.SandboxID)
 		}
+		poddReadyStart := time.Now()
 		if liveRouting && status.PodIP != "" && status.PodIP != "10.244.0.42" {
 			recCopy.PoddURL = formatPoddURL(status.PodIP, recCopy.EnvdPort)
 			_ = waitForPoddReady(ctx, recCopy.PoddURL, 45*time.Second)
@@ -1814,6 +1876,15 @@ func (s *Server) ensureRunning(ctx context.Context, rec *SandboxRecord) error {
 			s.mu.Unlock()
 			return err
 		}
+		poddReadyDur := time.Since(poddReadyStart)
+
+		m := s.Metrics()
+		m.RecordResumePhase("pvc_egress_prepare", recTimings.PrepareDur)
+		m.RecordResumePhase("ensure_pod", recTimings.EnsurePodDur)
+		m.RecordResumePhase("podbox_upsert", recTimings.UpsertBoxDur)
+		m.RecordResumePhase("reconcile", reconcileDur)
+		m.RecordResumePhase("podd_ready", poddReadyDur)
+		m.RecordResumePhase("total", time.Since(resumeTotalStart))
 		s.mu.Lock()
 		rec.State = string(status.Phase)
 		rec.Reason = status.Reason

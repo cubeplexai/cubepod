@@ -208,9 +208,11 @@ curl -s -X POST -H "X-API-Key: $CUBEPOD_API_KEY" \
 | **Gateway** | `cubepod_webhook_deliveries_total` / `cubepod_webhook_queue_depth` | Counter / Gauge | Webhook 投递结果（`result`：`ok`、`failed`、`dropped`）与队列深度 |
 | **Gateway** | `cubepod_webhook_dead_letters_total` / `cubepod_webhook_dead_letters_pending` | Counter / Gauge | *v0.7.0 新增。* 已记录与当前待处理的死信数量（告警见 `deploy/monitoring/webhook-alerts.yaml`） |
 | **Gateway & Controller** | `cubepod_sandbox_forks_total` / `cubepod_sandbox_fork_duration_seconds` | Counter / Histogram | CoW Fork 次数（`mode`、`result`）与耗时分布 |
+| **Gateway** | `cubepod_sandbox_cold_start_phase_duration_seconds` / `cubepod_sandbox_resume_phase_duration_seconds` *(v0.9.0 新增)* | Histogram | 沙箱冷启动（`template_sync`、`warmpool_lookup`、`pvc_egress_prepare`、`ensure_pod`、`podbox_upsert`、`reconcile`、`podd_ready`、`total`）与唤醒（`resolve_sandbox`、`pvc_egress_prepare`、`ensure_pod`、`podbox_upsert`、`reconcile`、`podd_ready`、`total`）分阶段耗时直方图（按 `phase` 标签区分） |
 | **Gateway & Controller** | `cubepod_templates` / `cubepod_gateway_templates_total` | Gauge | 按 `status` 统计的模板数（开启 `E2BTemplateAPI` 时）或模板总数 |
 | **Controller** | `cubepod_active_sandboxes` / `cubepod_paused_sandboxes` | Gauge | 控制器调谐的 `Running` 与 `Paused` `PodBox` 数量 |
 | **Controller** | `cubepod_warmpool_ready` / `cubepod_warmpool_available_replicas` | Gauge | WarmPool 就绪及未被认领的待命副本数 |
+| **Controller** | `cubepod_reconcile_phase_duration_seconds` *(v0.9.0 新增)* | Histogram | 控制器调谐分阶段耗时直方图，按 `operation`（`cold_start`、`resume`、`warm_claim`、`pause`、`warmpool_scale_up`）与 `phase`（`pvc_egress_prepare`、`ensure_pod`、`delete_pod`、`podbox_upsert`、`total`）区分 |
 | **Controller** | `cubepod_template_builds_total` / `cubepod_template_build_duration_seconds` | Counter / Histogram | 模板构建完成数（`result`）与构建耗时 |
 | **Egress** | `cubepod_egress_requests_total` | Counter | 出站请求计数（`mode`、`decision`） |
 | **Egress** | `cubepod_egress_secret_exchanges_total` | Counter | 单沙箱 mTLS `cpodref_` 交换次数（`result`） |

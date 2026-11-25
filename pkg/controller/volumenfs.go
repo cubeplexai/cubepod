@@ -200,6 +200,7 @@ func (r *Reconciler) revokeVolumeNFSLease(ctx context.Context, boxName, leaseID 
 	if strings.TrimSpace(leaseID) != "" {
 		ids[leaseID] = struct{}{}
 	}
+	r.mu.Lock()
 	if boxName != "" {
 		if id := r.volumeNFSLeases[boxName]; id != "" {
 			ids[id] = struct{}{}
@@ -210,49 +211,65 @@ func (r *Reconciler) revokeVolumeNFSLease(ctx context.Context, boxName, leaseID 
 			}
 		}
 	}
-	if len(ids) == 0 || r.volumeNFS.LeaseClient == nil {
+	leaseClient := r.volumeNFS.LeaseClient
+	if len(ids) == 0 || leaseClient == nil {
 		if boxName != "" {
 			delete(r.volumeNFSLeases, boxName)
 		}
+		r.mu.Unlock()
 		return
 	}
+	r.mu.Unlock()
+
 	revokeCtx, cancel := volumeNFSRevokeContext(ctx)
 	defer cancel()
 	for id := range ids {
-		if err := r.volumeNFS.LeaseClient.Delete(revokeCtx, id); err != nil {
+		if err := leaseClient.Delete(revokeCtx, id); err != nil {
 			slog.Warn("failed to revoke volume NFS lease", "leaseID", id, "box", boxName, "err", err)
 		} else {
 			slog.Info("revoked volume NFS lease", "leaseID", id, "box", boxName)
 		}
 	}
 	if boxName != "" {
+		r.mu.Lock()
 		if _, ok := ids[r.volumeNFSLeases[boxName]]; ok || r.volumeNFSLeases[boxName] == "" {
 			delete(r.volumeNFSLeases, boxName)
 		}
 		if r.boxAnnotations[boxName] != nil {
 			delete(r.boxAnnotations[boxName], VolumeNFSLeaseAnnotation)
 		}
+		r.mu.Unlock()
 	}
 }
 
 // revokeVolumeNFSLeaseID revokes a single lease without clearing a different
 // stored ID for the same box (used when a superseded start lease must be dropped).
 func (r *Reconciler) revokeVolumeNFSLeaseID(ctx context.Context, boxName, leaseID string) {
-	if strings.TrimSpace(leaseID) == "" || r.volumeNFS.LeaseClient == nil {
+	if strings.TrimSpace(leaseID) == "" {
+		return
+	}
+	r.mu.RLock()
+	leaseClient := r.volumeNFS.LeaseClient
+	r.mu.RUnlock()
+	if leaseClient == nil {
 		return
 	}
 	revokeCtx, cancel := volumeNFSRevokeContext(ctx)
 	defer cancel()
-	if err := r.volumeNFS.LeaseClient.Delete(revokeCtx, leaseID); err != nil {
+	if err := leaseClient.Delete(revokeCtx, leaseID); err != nil {
 		slog.Warn("failed to revoke volume NFS lease", "leaseID", leaseID, "box", boxName, "err", err)
 	} else {
 		slog.Info("revoked volume NFS lease", "leaseID", leaseID, "box", boxName)
 	}
-	if boxName != "" && r.volumeNFSLeases[boxName] == leaseID {
-		delete(r.volumeNFSLeases, boxName)
-	}
-	if boxName != "" && r.boxAnnotations[boxName] != nil && r.boxAnnotations[boxName][VolumeNFSLeaseAnnotation] == leaseID {
-		delete(r.boxAnnotations[boxName], VolumeNFSLeaseAnnotation)
+	if boxName != "" {
+		r.mu.Lock()
+		if r.volumeNFSLeases[boxName] == leaseID {
+			delete(r.volumeNFSLeases, boxName)
+		}
+		if r.boxAnnotations[boxName] != nil && r.boxAnnotations[boxName][VolumeNFSLeaseAnnotation] == leaseID {
+			delete(r.boxAnnotations[boxName], VolumeNFSLeaseAnnotation)
+		}
+		r.mu.Unlock()
 	}
 }
 
@@ -260,6 +277,8 @@ func (r *Reconciler) rememberVolumeNFSLease(boxName, leaseID string) {
 	if boxName == "" || leaseID == "" {
 		return
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.volumeNFSLeases == nil {
 		r.volumeNFSLeases = make(map[string]string)
 	}

@@ -1235,3 +1235,199 @@ func TestRESTKubeClient_WaitForPodRunning_WaitsForReadyCondition(t *testing.T) {
 		t.Fatalf("expected warm-not-ready to have PodIP=10.1.2.11 and NotReady=true, got %+v", pods[1])
 	}
 }
+
+func TestRESTKubeClient_WaitForPodRunning_WatchStreamAnd410Recovery(t *testing.T) {
+	var getPodCalls int
+	var watchCalls int
+	var mu sync.Mutex
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods":
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"metadata": map[string]any{"name": "watch-pod"}})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods/watch-pod":
+			mu.Lock()
+			getPodCalls++
+			gc := getPodCalls
+			mu.Unlock()
+			rv := "100"
+			if gc > 1 {
+				rv = "105"
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"name": "watch-pod", "resourceVersion": rv},
+				"status": map[string]any{
+					"phase":      "Pending",
+					"conditions": []map[string]any{{"type": "Ready", "status": "False"}},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/namespaces/cubepod-workloads/pods" && r.URL.Query().Get("watch") == "true":
+			mu.Lock()
+			watchCalls++
+			wc := watchCalls
+			mu.Unlock()
+			rv := r.URL.Query().Get("resourceVersion")
+			if wc == 1 {
+				if rv != "100" {
+					t.Errorf("first watch resourceVersion = %q; want 100", rv)
+				}
+				// Simulate 410 Gone so watch resets RV, refreshes state, and retries without polling.
+				w.WriteHeader(http.StatusGone)
+				return
+			}
+			if rv != "105" {
+				t.Errorf("second watch after 410 should use refreshed resourceVersion 105, got %q", rv)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			flusher, _ := w.(http.Flusher)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type": "MODIFIED",
+				"object": map[string]any{
+					"metadata": map[string]any{"name": "watch-pod", "resourceVersion": "101"},
+					"status": map[string]any{
+						"phase":      "Running",
+						"podIP":      "10.9.8.7",
+						"conditions": []map[string]any{{"type": "Ready", "status": "False"}},
+					},
+				},
+			})
+			if flusher != nil {
+				flusher.Flush()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type": "MODIFIED",
+				"object": map[string]any{
+					"metadata": map[string]any{"name": "watch-pod", "resourceVersion": "102"},
+					"status": map[string]any{
+						"phase":      "Running",
+						"podIP":      "10.9.8.7",
+						"conditions": []map[string]any{{"type": "Ready", "status": "True"}},
+					},
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(
+		ts.URL,
+		"cubepod-workloads",
+		"test-token",
+		ts.Client(),
+		controller.WithWaitForRunning(true),
+		controller.WithPollTimeout(2*time.Second),
+	)
+	ip, err := client.EnsurePod(context.Background(), controller.PodManifest{
+		Name:      "watch-pod",
+		Namespace: "cubepod-workloads",
+	})
+	if err != nil {
+		t.Fatalf("EnsurePod via watch failed: %v", err)
+	}
+	if ip != "10.9.8.7" {
+		t.Fatalf("ip = %q; want 10.9.8.7", ip)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if watchCalls != 2 {
+		t.Fatalf("watchCalls = %d; want 2", watchCalls)
+	}
+	if getPodCalls != 2 {
+		t.Fatalf("expected 2 GET calls (initial + post-410 recovery before re-watch), got %d GETs", getPodCalls)
+	}
+}
+
+func TestRESTKubeClient_WatchPods(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("watch") != "true" {
+			t.Fatalf("expected watch=true query param, got %q", r.URL.RawQuery)
+		}
+		if r.URL.Query().Get("labelSelector") != "app=cubepod" {
+			t.Fatalf("expected labelSelector=app=cubepod, got %q", r.URL.Query().Get("labelSelector"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type": "ADDED",
+			"object": map[string]any{
+				"metadata": map[string]any{"name": "p1", "namespace": "cubepod-workloads", "resourceVersion": "55"},
+				"status":   map[string]any{"phase": "Running", "podIP": "10.0.0.1", "conditions": []map[string]any{{"type": "Ready", "status": "True"}}},
+			},
+		})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type": "BOOKMARK",
+			"object": map[string]any{
+				"metadata": map[string]any{"resourceVersion": "56"},
+			},
+		})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type": "DELETED",
+			"object": map[string]any{
+				"metadata": map[string]any{"name": "p1", "namespace": "cubepod-workloads", "resourceVersion": "57"},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "", ts.Client())
+	var events []string
+	nextRV, err := client.WatchPods(context.Background(), "cubepod-workloads", "app=cubepod", "50", func(evType string, pod controller.PodManifest) {
+		events = append(events, fmt.Sprintf("%s:%s:%s:%v", evType, pod.Name, pod.PodIP, pod.NotReady))
+	})
+	if err != nil {
+		t.Fatalf("WatchPods failed: %v", err)
+	}
+	if nextRV != "57" {
+		t.Fatalf("nextRV = %q; want 57", nextRV)
+	}
+	if len(events) != 2 || events[0] != "ADDED:p1:10.0.0.1:false" || events[1] != "DELETED:p1::false" {
+		t.Fatalf("unexpected events: %v", events)
+	}
+}
+
+func TestRESTKubeClient_UpsertPodBox_ResourceVersionFastPath(t *testing.T) {
+	var calls []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/apis/cubepod.io/v1alpha1/namespaces/cubepod-workloads/podboxes/box-fast":
+			var box v1alpha1.PodBox
+			if err := json.NewDecoder(r.Body).Decode(&box); err != nil {
+				t.Fatalf("decode PUT body: %v", err)
+			}
+			box.Metadata.ResourceVersion = "42"
+			_ = json.NewEncoder(w).Encode(box)
+		case r.Method == http.MethodPut && r.URL.Path == "/apis/cubepod.io/v1alpha1/namespaces/cubepod-workloads/podboxes/box-fast/status":
+			var box v1alpha1.PodBox
+			if err := json.NewDecoder(r.Body).Decode(&box); err != nil {
+				t.Fatalf("decode status PUT body: %v", err)
+			}
+			if box.Metadata.ResourceVersion != "42" {
+				t.Errorf("status PUT ResourceVersion = %q; want 42", box.Metadata.ResourceVersion)
+			}
+			_ = json.NewEncoder(w).Encode(box)
+		default:
+			t.Errorf("unexpected request %s %s (fast path should not POST or GET)", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	client := controller.NewRESTKubeClient(ts.URL, "cubepod-workloads", "", ts.Client())
+	err := client.UpsertPodBox(context.Background(), v1alpha1.PodBox{
+		Metadata: v1alpha1.ObjectMeta{
+			Name:            "box-fast",
+			Namespace:       "cubepod-workloads",
+			ResourceVersion: "41",
+		},
+		Spec: v1alpha1.PodBoxSpec{TemplateRef: "ubuntu:24.04"},
+	})
+	if err != nil {
+		t.Fatalf("UpsertPodBox fast path failed: %v", err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("expected exactly 2 HTTP calls (PUT + PUT /status), got %v", calls)
+	}
+}

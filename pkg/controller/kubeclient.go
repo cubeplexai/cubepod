@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -647,6 +648,11 @@ func (m *MemoryKubeClient) DeletePVC(_ context.Context, namespace, name string) 
 
 // EnsurePod records the Pod manifest in memory and returns a mock Pod IP.
 // If the Pod already exists, it preserves existing labels and returns ErrPodAlreadyExists.
+func clonePodManifest(pod PodManifest) PodManifest {
+	pod.Labels = maps.Clone(pod.Labels)
+	return pod
+}
+
 func (m *MemoryKubeClient) EnsurePod(_ context.Context, pod PodManifest) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -659,7 +665,7 @@ func (m *MemoryKubeClient) EnsurePod(_ context.Context, pod PodManifest) (string
 		}
 		return ip, fmt.Errorf("%w: pod %s/%s already exists (409 Conflict)", ErrPodAlreadyExists, pod.Namespace, pod.Name)
 	}
-	m.Pods[key] = pod
+	m.Pods[key] = clonePodManifest(pod)
 	ip, ok := m.IPs[key]
 	if !ok {
 		ip = "10.244.0.42"
@@ -1222,7 +1228,10 @@ func (m *MemoryKubeClient) GetPod(namespace, name string) (PodManifest, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	pod, ok := m.Pods[podKey(namespace, name)]
-	return pod, ok
+	if !ok {
+		return PodManifest{}, false
+	}
+	return clonePodManifest(pod), true
 }
 
 // ListPVCs returns all PVC manifests recorded in memory.
@@ -1284,7 +1293,7 @@ func (m *MemoryKubeClient) ListPods(_ context.Context, namespace string, labelSe
 		if pod.PodIP == "" {
 			pod.PodIP = m.IPs[podKey(podNs, pod.Name)]
 		}
-		res = append(res, pod)
+		res = append(res, clonePodManifest(pod))
 	}
 	return res, nil
 }
@@ -1365,6 +1374,7 @@ func WithPollInterval(d time.Duration) RESTKubeClientOption {
 	return func(c *RESTKubeClient) {
 		if d > 0 {
 			c.pollInterval = d
+			c.pollIntervalCustom = true
 		}
 	}
 }
@@ -1379,13 +1389,14 @@ func WithPollTimeout(d time.Duration) RESTKubeClientOption {
 
 // RESTKubeClient communicates with standard Kubernetes v1 JSON REST endpoints.
 type RESTKubeClient struct {
-	baseURL          string
-	defaultNamespace string
-	token            string
-	httpClient       *http.Client
-	waitForRunning   bool
-	pollInterval     time.Duration
-	pollTimeout      time.Duration
+	baseURL            string
+	defaultNamespace   string
+	token              string
+	httpClient         *http.Client
+	waitForRunning     bool
+	pollInterval       time.Duration
+	pollIntervalCustom bool
+	pollTimeout        time.Duration
 }
 
 // NewRESTKubeClient creates a new RESTKubeClient targeting a Kubernetes APIServer.
@@ -1433,8 +1444,11 @@ func NewRESTKubeClientWithConfig(cfg RESTKubeClientConfig) (*RESTKubeClient, err
 	}
 
 	pollInterval := cfg.PollInterval
+	pollIntervalCustom := false
 	if pollInterval <= 0 {
 		pollInterval = 500 * time.Millisecond
+	} else {
+		pollIntervalCustom = true
 	}
 	pollTimeout := cfg.PollTimeout
 	if pollTimeout <= 0 {
@@ -1447,13 +1461,14 @@ func NewRESTKubeClientWithConfig(cfg RESTKubeClientConfig) (*RESTKubeClient, err
 	}
 
 	return &RESTKubeClient{
-		baseURL:          strings.TrimRight(cfg.APIServerURL, "/"),
-		defaultNamespace: ns,
-		token:            cfg.BearerToken,
-		httpClient:       client,
-		waitForRunning:   cfg.WaitForRunning,
-		pollInterval:     pollInterval,
-		pollTimeout:      pollTimeout,
+		baseURL:            strings.TrimRight(cfg.APIServerURL, "/"),
+		defaultNamespace:   ns,
+		token:              cfg.BearerToken,
+		httpClient:         client,
+		waitForRunning:     cfg.WaitForRunning,
+		pollInterval:       pollInterval,
+		pollIntervalCustom: pollIntervalCustom,
+		pollTimeout:        pollTimeout,
 	}, nil
 }
 
@@ -1745,11 +1760,48 @@ func (c *RESTKubeClient) ensurePod(ctx context.Context, pod PodManifest, hook Po
 	return podResp.Status.PodIP, nil
 }
 
-func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name string, hook PodIPHook, requireReady bool) (string, error) {
-	interval := c.pollInterval
-	if interval <= 0 {
-		interval = 500 * time.Millisecond
+type kubeWatchEvent struct {
+	Type   string          `json:"type"`
+	Object json.RawMessage `json:"object"`
+}
+
+func (c *RESTKubeClient) watchHTTPClient() *http.Client {
+	if c.httpClient == nil {
+		return &http.Client{}
 	}
+	cp := *c.httpClient
+	cp.Timeout = 0
+	return &cp
+}
+
+func (c *RESTKubeClient) nextPollBackoff(cur time.Duration) time.Duration {
+	if c.pollIntervalCustom && c.pollInterval > 0 {
+		return c.pollInterval
+	}
+	if cur <= 0 {
+		return 50 * time.Millisecond
+	}
+	if cur < 100*time.Millisecond {
+		return 100 * time.Millisecond
+	}
+	return 200 * time.Millisecond
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name string, hook PodIPHook, requireReady bool) (string, error) {
 	timeout := c.pollTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -1758,30 +1810,37 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 	pollCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
 	hooked := false
-	var lastIP, lastPhase string
+	var lastIP, lastPhase, lastRV string
 	var lastErr error
-	for {
-		ip, phase, ready, err := c.getPodStatus(pollCtx, namespace, name)
+
+	checkState := func(ip, phase string, ready bool, err error) (string, bool, error) {
 		lastIP, lastPhase, lastErr = ip, phase, err
 		if ip != "" && hook != nil && !hooked {
 			if hookErr := hook(pollCtx, namespace, name, ip); hookErr != nil {
-				return ip, fmt.Errorf("onPodIP hook failed for pod %s/%s: %w", namespace, name, hookErr)
+				return ip, true, fmt.Errorf("onPodIP hook failed for pod %s/%s: %w", namespace, name, hookErr)
 			}
 			hooked = true
 		}
 		if err == nil && ((phase == "Running" && ip != "" && ready) || phase == "Succeeded") {
-			return ip, nil
+			return ip, true, nil
 		}
 		if phase == "Failed" {
-			return "", fmt.Errorf("pod %s/%s entered Failed phase", namespace, name)
+			return "", true, fmt.Errorf("pod %s/%s entered Failed phase", namespace, name)
 		}
+		return "", false, nil
+	}
 
-		select {
-		case <-pollCtx.Done():
+	ip, phase, ready, rv, err := c.getPodState(pollCtx, namespace, name)
+	lastRV = rv
+	if outIP, done, checkErr := checkState(ip, phase, ready, err); done {
+		return outIP, checkErr
+	}
+
+	watchDisabled := false
+	var backoff time.Duration
+	for {
+		if pollCtx.Err() != nil {
 			if requireReady {
 				return lastIP, fmt.Errorf("timed out waiting for pod %s/%s to become Ready (last phase=%q, ip=%q, err=%v)", namespace, name, lastPhase, lastIP, lastErr)
 			}
@@ -1789,9 +1848,132 @@ func (c *RESTKubeClient) waitForPodRunning(ctx context.Context, namespace, name 
 				return lastIP, nil
 			}
 			return "", fmt.Errorf("timed out waiting for pod %s/%s to reach Running phase (last phase=%q, err=%v)", namespace, name, lastPhase, lastErr)
-		case <-ticker.C:
+		}
+
+		if !watchDisabled {
+			outIP, done, sawWatch, resetRV, watchErr := c.watchPodUntilReady(pollCtx, namespace, name, &lastRV, checkState)
+			if done {
+				return outIP, watchErr
+			}
+			if resetRV {
+				lastRV = ""
+			}
+			if sawWatch {
+				// Re-check current state after watch stream ended/errored before re-watching.
+				ip, phase, ready, rv, err = c.getPodState(pollCtx, namespace, name)
+				if rv != "" {
+					lastRV = rv
+				}
+				if outIP, done, checkErr := checkState(ip, phase, ready, err); done {
+					return outIP, checkErr
+				}
+				if err == nil {
+					continue
+				}
+			} else {
+				watchDisabled = true
+			}
+		}
+
+		backoff = c.nextPollBackoff(backoff)
+		if !sleepWithContext(pollCtx, backoff) {
+			continue
+		}
+
+		ip, phase, ready, rv, err = c.getPodState(pollCtx, namespace, name)
+		if rv != "" {
+			lastRV = rv
+		}
+		if outIP, done, checkErr := checkState(ip, phase, ready, err); done {
+			return outIP, checkErr
 		}
 	}
+}
+
+func (c *RESTKubeClient) watchPodUntilReady(
+	ctx context.Context,
+	namespace, name string,
+	rv *string,
+	checkState func(ip, phase string, ready bool, err error) (string, bool, error),
+) (podIP string, done bool, sawWatch bool, resetRV bool, err error) {
+	secs := int64(30)
+	if dl, ok := ctx.Deadline(); ok {
+		rem := int64(time.Until(dl).Seconds()) + 1
+		if rem < 1 {
+			rem = 1
+		}
+		if rem < secs {
+			secs = rem
+		}
+	}
+	watchURL := fmt.Sprintf("%s/api/v1/namespaces/%s/pods?watch=true&fieldSelector=%s&allowWatchBookmarks=true&timeoutSeconds=%d",
+		c.baseURL, namespace, url.QueryEscape("metadata.name="+name), secs)
+	if rv != nil && *rv != "" {
+		watchURL += "&resourceVersion=" + url.QueryEscape(*rv)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, watchURL, nil)
+	if err != nil {
+		return "", false, false, false, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.watchHTTPClient().Do(req)
+	if err != nil {
+		return "", false, false, false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusGone {
+		return "", false, true, true, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", false, false, false, fmt.Errorf("watch status %d", resp.StatusCode)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var ev kubeWatchEvent
+		if err := json.Unmarshal(line, &ev); err != nil || ev.Type == "" {
+			return "", false, sawWatch, false, nil
+		}
+		sawWatch = true
+
+		switch ev.Type {
+		case "ERROR":
+			return "", false, true, true, nil
+		case "DELETED":
+			return "", false, true, false, ErrPodNotFound
+		case "ADDED", "MODIFIED", "BOOKMARK":
+			var p struct {
+				Metadata struct {
+					ResourceVersion string `json:"resourceVersion"`
+				} `json:"metadata"`
+				Status *coreV1PodStatus `json:"status"`
+			}
+			if err := json.Unmarshal(ev.Object, &p); err != nil {
+				continue
+			}
+			if rv != nil && p.Metadata.ResourceVersion != "" {
+				*rv = p.Metadata.ResourceVersion
+			}
+			if ev.Type == "BOOKMARK" || p.Status == nil {
+				continue
+			}
+			if outIP, finished, checkErr := checkState(p.Status.PodIP, p.Status.Phase, isPodStatusReady(p.Status), nil); finished {
+				return outIP, true, true, false, checkErr
+			}
+		}
+	}
+	return "", false, sawWatch, false, scanner.Err()
 }
 
 // GetPodPhase returns the current status.phase of a Pod.
@@ -1817,28 +1999,36 @@ func isPodStatusReady(status *coreV1PodStatus) bool {
 }
 
 func (c *RESTKubeClient) getPodStatus(ctx context.Context, namespace, name string) (string, string, bool, error) {
+	ip, phase, ready, _, err := c.getPodState(ctx, namespace, name)
+	return ip, phase, ready, err
+}
+
+func (c *RESTKubeClient) getPodState(ctx context.Context, namespace, name string) (string, string, bool, string, error) {
 	url := fmt.Sprintf("%s/api/v1/namespaces/%s/pods/%s", c.baseURL, namespace, name)
 	resp, err := c.doRequest(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", "", false, fmt.Errorf("getPodStatus request failed: %w", err)
+		return "", "", false, "", fmt.Errorf("getPodStatus request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusNotFound {
-			return "", "", false, fmt.Errorf("getPodStatus failed: status %d (%s): %w", resp.StatusCode, string(respBody), ErrPodNotFound)
+			return "", "", false, "", fmt.Errorf("getPodStatus failed: status %d (%s): %w", resp.StatusCode, string(respBody), ErrPodNotFound)
 		}
-		return "", "", false, fmt.Errorf("getPodStatus failed: status %d (%s)", resp.StatusCode, string(respBody))
+		return "", "", false, "", fmt.Errorf("getPodStatus failed: status %d (%s)", resp.StatusCode, string(respBody))
 	}
 
 	var podResp struct {
+		Metadata struct {
+			ResourceVersion string `json:"resourceVersion"`
+		} `json:"metadata"`
 		Status coreV1PodStatus `json:"status"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&podResp); err != nil {
-		return "", "", false, fmt.Errorf("failed to decode pod status: %w", err)
+		return "", "", false, "", fmt.Errorf("failed to decode pod status: %w", err)
 	}
-	return podResp.Status.PodIP, podResp.Status.Phase, isPodStatusReady(&podResp.Status), nil
+	return podResp.Status.PodIP, podResp.Status.Phase, isPodStatusReady(&podResp.Status), podResp.Metadata.ResourceVersion, nil
 }
 
 func (c *RESTKubeClient) getPodIP(ctx context.Context, namespace, name string) (string, error) {
@@ -1926,8 +2116,11 @@ func (c *RESTKubeClient) DeletePod(ctx context.Context, namespace, name string) 
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted &&
-		resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		resp.StatusCode != http.StatusNoContent {
 		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("DeletePod failed: status %d (%s)", resp.StatusCode, string(respBody))
 	}
@@ -1936,22 +2129,206 @@ func (c *RESTKubeClient) DeletePod(ctx context.Context, namespace, name string) 
 		pollTimeout := 15 * time.Second
 		pollCtx, cancel := context.WithTimeout(ctx, pollTimeout)
 		defer cancel()
-		ticker := time.NewTicker(c.pollInterval)
-		defer ticker.Stop()
+
+		_, _, _, rv, err := c.getPodState(pollCtx, ns, name)
+		if err != nil {
+			// Pod is gone
+			return nil
+		}
+
+		watchDisabled := false
+		var backoff time.Duration
 		for {
-			_, _, _, err := c.getPodStatus(pollCtx, ns, name)
+			if pollCtx.Err() != nil {
+				return nil
+			}
+			if !watchDisabled {
+				deleted, sawWatch, resetRV := c.watchPodDeleted(pollCtx, ns, name, &rv)
+				if deleted {
+					return nil
+				}
+				if resetRV {
+					rv = ""
+				}
+				if sawWatch {
+					_, _, _, nextRV, err := c.getPodState(pollCtx, ns, name)
+					if err != nil {
+						return nil
+					}
+					if nextRV != "" {
+						rv = nextRV
+					}
+					continue
+				}
+				watchDisabled = true
+			}
+			backoff = c.nextPollBackoff(backoff)
+			if !sleepWithContext(pollCtx, backoff) {
+				return nil
+			}
+			_, _, _, nextRV, err := c.getPodState(pollCtx, ns, name)
 			if err != nil {
 				// Pod is gone
-				break
-			}
-			select {
-			case <-pollCtx.Done():
 				return nil
-			case <-ticker.C:
+			}
+			if nextRV != "" {
+				rv = nextRV
 			}
 		}
 	}
 	return nil
+}
+
+func (c *RESTKubeClient) watchPodDeleted(ctx context.Context, namespace, name string, rv *string) (deleted bool, sawWatch bool, resetRV bool) {
+	secs := int64(15)
+	if dl, ok := ctx.Deadline(); ok {
+		rem := int64(time.Until(dl).Seconds()) + 1
+		if rem < 1 {
+			rem = 1
+		}
+		if rem < secs {
+			secs = rem
+		}
+	}
+	watchURL := fmt.Sprintf("%s/api/v1/namespaces/%s/pods?watch=true&fieldSelector=%s&allowWatchBookmarks=true&timeoutSeconds=%d",
+		c.baseURL, namespace, url.QueryEscape("metadata.name="+name), secs)
+	if rv != nil && *rv != "" {
+		watchURL += "&resourceVersion=" + url.QueryEscape(*rv)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, watchURL, nil)
+	if err != nil {
+		return false, false, false
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	resp, err := c.watchHTTPClient().Do(req)
+	if err != nil {
+		return false, false, false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusGone {
+		return false, true, true
+	}
+	if resp.StatusCode != http.StatusOK {
+		return false, false, false
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var ev kubeWatchEvent
+		if err := json.Unmarshal(line, &ev); err != nil || ev.Type == "" {
+			return false, sawWatch, false
+		}
+		sawWatch = true
+		if ev.Type == "ERROR" {
+			return false, true, true
+		}
+		if ev.Type == "DELETED" {
+			return true, true, false
+		}
+		var p struct {
+			Metadata struct {
+				ResourceVersion string `json:"resourceVersion"`
+			} `json:"metadata"`
+		}
+		if err := json.Unmarshal(ev.Object, &p); err == nil && rv != nil && p.Metadata.ResourceVersion != "" {
+			*rv = p.Metadata.ResourceVersion
+		}
+	}
+	return false, sawWatch, false
+}
+
+// WatchPods streams Pod watch events matching labelSelector until ctx is cancelled or the watch stream closes.
+func (c *RESTKubeClient) WatchPods(ctx context.Context, namespace, labelSelector string, resourceVersion string, onEvent func(eventType string, pod PodManifest)) (string, error) {
+	ns := c.resolveNamespace(namespace)
+	watchURL := fmt.Sprintf("%s/api/v1/namespaces/%s/pods?watch=true&allowWatchBookmarks=true&timeoutSeconds=60", c.baseURL, ns)
+	if labelSelector != "" {
+		watchURL += "&labelSelector=" + url.QueryEscape(labelSelector)
+	}
+	if resourceVersion != "" {
+		watchURL += "&resourceVersion=" + url.QueryEscape(resourceVersion)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, watchURL, nil)
+	if err != nil {
+		return resourceVersion, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+
+	resp, err := c.watchHTTPClient().Do(req)
+	if err != nil {
+		return resourceVersion, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusGone {
+		return "", fmt.Errorf("watch expired (410 Gone)")
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return resourceVersion, fmt.Errorf("WatchPods status %d: %s", resp.StatusCode, string(body))
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	sawEvent := false
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		var ev kubeWatchEvent
+		if err := json.Unmarshal(line, &ev); err != nil || ev.Type == "" {
+			return resourceVersion, fmt.Errorf("WatchPods unexpected non-watch response")
+		}
+		sawEvent = true
+		if ev.Type == "ERROR" {
+			return "", fmt.Errorf("WatchPods received ERROR event")
+		}
+		var p coreV1Pod
+		if err := json.Unmarshal(ev.Object, &p); err != nil {
+			continue
+		}
+		if p.Metadata.ResourceVersion != "" {
+			resourceVersion = p.Metadata.ResourceVersion
+		}
+		if ev.Type == "BOOKMARK" || onEvent == nil {
+			continue
+		}
+		itemNs := p.Metadata.Namespace
+		if itemNs == "" {
+			itemNs = ns
+		}
+		pm := PodManifest{
+			Name:             p.Metadata.Name,
+			Namespace:        itemNs,
+			Labels:           p.Metadata.Labels,
+			RuntimeClassName: p.Spec.RuntimeClassName,
+		}
+		if p.Status != nil {
+			pm.PodIP = p.Status.PodIP
+			pm.NotReady = !isPodStatusReady(p.Status)
+		}
+		onEvent(ev.Type, pm)
+	}
+	if err := scanner.Err(); err != nil {
+		return resourceVersion, err
+	}
+	if !sawEvent {
+		return resourceVersion, fmt.Errorf("WatchPods closed without watch events")
+	}
+	return resourceVersion, nil
 }
 
 // ClaimPod atomically claims a standby pod using RFC 6902 JSON Patch with conditional CAS.

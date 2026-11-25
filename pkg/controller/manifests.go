@@ -699,7 +699,7 @@ func BuildPodManifest(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha
 			Path: "/health",
 			Port: 49983,
 		},
-		InitialDelaySeconds: 1,
+		InitialDelaySeconds: 0,
 		PeriodSeconds:       1,
 		TimeoutSeconds:      1,
 		FailureThreshold:    60,
@@ -798,8 +798,9 @@ func BuildPodManifest(boxName string, tpl v1alpha1.PodTemplateSpec, spec v1alpha
 		}
 
 		egressContainer := ContainerManifest{
-			Name:  "egress",
-			Image: egressImg,
+			Name:            "egress",
+			Image:           egressImg,
+			ImagePullPolicy: "IfNotPresent",
 			VolumeMounts: []VolumeMount{
 				{
 					Name:      "egress-mtls",

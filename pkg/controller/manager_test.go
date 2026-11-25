@@ -579,3 +579,116 @@ func TestControllerManager_Metrics_WarmPoolAvailableAndForkMetrics(t *testing.T)
 		t.Fatalf("expected cubepod_sandbox_fork_duration_seconds_count=1, got %v", parsed["cubepod_sandbox_fork_duration_seconds_count"])
 	}
 }
+
+func TestControllerManager_WarmPoolImmediateReplenishOnClaim(t *testing.T) {
+	kc := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(kc),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if _, err := r.ReconcileWarmPool(ctx, "fast-replenish-pool", v1alpha1.PodWarmPoolSpec{
+		TemplateRef: "ubuntu:24.04",
+		Replicas:    2,
+	}); err != nil {
+		t.Fatalf("ReconcileWarmPool failed: %v", err)
+	}
+	if got := r.WarmPoolReadyCount(); got != 2 {
+		t.Fatalf("initial WarmPoolReadyCount = %d; want 2", got)
+	}
+
+	// Long ticker interval (30s) proves replenishment comes from immediate async trigger, not ticker.
+	mgr := controller.NewControllerManager(r, "127.0.0.1:0", 30*time.Second)
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- mgr.Start(ctx)
+	}()
+
+	// Claim one warm pod and verify the pool replenishes back to 2 replicas well before 30s.
+	entry, err := r.ClaimWarmPod(ctx, "fast-replenish-pool", "sb-claimed-1")
+	if err != nil {
+		t.Fatalf("ClaimWarmPod failed: %v", err)
+	}
+	if entry == nil || entry.PodName == "" {
+		t.Fatalf("expected valid claimed WarmPodEntry, got %+v", entry)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if r.WarmPoolReadyCount() == 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := r.WarmPoolReadyCount(); got != 2 {
+		t.Fatalf("expected WarmPoolReadyCount to immediately replenish back to 2 after claim, got %d", got)
+	}
+
+	cancel()
+	select {
+	case err := <-doneCh:
+		if err != nil {
+			t.Fatalf("ControllerManager.Start returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("ControllerManager.Start did not exit cleanly after cancel")
+	}
+}
+
+func TestControllerManager_ReconcilePhaseDurationMetrics(t *testing.T) {
+	kc := controller.NewMemoryKubeClient()
+	r := controller.NewReconciler(
+		controller.WithKubeClient(kc),
+		controller.WithNamespace("cubepod-workloads"),
+	)
+	ctx := context.Background()
+
+	if _, err := r.Reconcile(ctx, "box-phase-metrics", v1alpha1.PodBoxSpec{
+		TemplateRef:      "ubuntu:24.04",
+		DesiredState:     v1alpha1.DesiredStateRunning,
+		RootfsGeneration: 1,
+	}); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	mgr := controller.NewControllerManager(r, ":0", time.Second)
+	srv := httptest.NewServer(mgr.Handler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics failed: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	body := string(raw)
+
+	for _, want := range []string{
+		`cubepod_reconcile_phase_duration_seconds_bucket{operation="cold_start",phase="pvc_egress_prepare",le="+Inf"} 1`,
+		`cubepod_reconcile_phase_duration_seconds_bucket{operation="cold_start",phase="ensure_pod",le="+Inf"} 1`,
+		`cubepod_reconcile_phase_duration_seconds_bucket{operation="cold_start",phase="podbox_upsert",le="+Inf"} 1`,
+		`cubepod_reconcile_phase_duration_seconds_bucket{operation="cold_start",phase="total",le="+Inf"} 1`,
+		`cubepod_reconcile_phase_duration_seconds_count{operation="cold_start",phase="total"} 1`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("controller /metrics missing %q;\ngot:\n%s", want, body)
+		}
+	}
+
+	reqJSON, _ := http.NewRequest(http.MethodGet, srv.URL+"/metrics", nil)
+	reqJSON.Header.Set("Accept", "application/json")
+	respJSON, err := http.DefaultClient.Do(reqJSON)
+	if err != nil {
+		t.Fatalf("GET /metrics JSON failed: %v", err)
+	}
+	defer respJSON.Body.Close()
+	var parsed map[string]any
+	if err := json.NewDecoder(respJSON.Body).Decode(&parsed); err != nil {
+		t.Fatalf("decode JSON metrics failed: %v", err)
+	}
+	if _, ok := parsed["cubepod_reconcile_phase_duration_seconds"]; !ok {
+		t.Fatalf("expected JSON metrics key cubepod_reconcile_phase_duration_seconds, got keys %v", parsed)
+	}
+}

@@ -510,3 +510,83 @@ func TestMetricsCEPAlignmentAndPanelGauge(t *testing.T) {
 		}
 	}
 }
+
+func TestColdStartAndResumePhaseHistograms(t *testing.T) {
+	reconciler := controller.NewReconciler()
+	srv := gateway.NewServer(reconciler)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	// 1. Cold start via POST /sandboxes
+	createResp, err := ts.Client().Post(ts.URL+"/sandboxes", "application/json", bytes.NewReader([]byte(`{"templateID":"cubeplex-ubuntu24-desktop"}`)))
+	if err != nil {
+		t.Fatalf("POST /sandboxes failed: %v", err)
+	}
+	var rec gateway.SandboxRecord
+	if err := json.NewDecoder(createResp.Body).Decode(&rec); err != nil {
+		_ = createResp.Body.Close()
+		t.Fatalf("decode create response: %v", err)
+	}
+	_ = createResp.Body.Close()
+	if createResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 from POST /sandboxes, got %d", createResp.StatusCode)
+	}
+
+	// 2. Pause sandbox
+	pauseResp, err := ts.Client().Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/pause", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /pause failed: %v", err)
+	}
+	_ = pauseResp.Body.Close()
+	if pauseResp.StatusCode != http.StatusNoContent && pauseResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 204/200 from pause, got %d", pauseResp.StatusCode)
+	}
+
+	// 3. Resume via POST /sandboxes/{id}/connect
+	connResp, err := ts.Client().Post(ts.URL+"/sandboxes/"+rec.SandboxID+"/connect", "application/json", bytes.NewReader([]byte(`{"timeout":300}`)))
+	if err != nil {
+		t.Fatalf("POST /connect failed: %v", err)
+	}
+	_ = connResp.Body.Close()
+	if connResp.StatusCode != http.StatusOK && connResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 200/201 from connect, got %d", connResp.StatusCode)
+	}
+
+	body := getMetricsText(t, ts.Client(), ts.URL)
+	for _, sub := range []string{
+		`cubepod_sandbox_cold_start_phase_duration_seconds_bucket{phase="template_sync",le="+Inf"} 1`,
+		`cubepod_sandbox_cold_start_phase_duration_seconds_bucket{phase="warmpool_lookup",le="+Inf"} 1`,
+		`cubepod_sandbox_cold_start_phase_duration_seconds_bucket{phase="reconcile",le="+Inf"} 1`,
+		`cubepod_sandbox_cold_start_phase_duration_seconds_bucket{phase="total",le="+Inf"} 1`,
+		`cubepod_sandbox_cold_start_phase_duration_seconds_count{phase="total"} 1`,
+		`cubepod_sandbox_resume_phase_duration_seconds_bucket{phase="resolve_sandbox",le="+Inf"} 1`,
+		`cubepod_sandbox_resume_phase_duration_seconds_bucket{phase="reconcile",le="+Inf"} 1`,
+		`cubepod_sandbox_resume_phase_duration_seconds_bucket{phase="total",le="+Inf"} 1`,
+		`cubepod_sandbox_resume_phase_duration_seconds_count{phase="total"} 1`,
+	} {
+		if !strings.Contains(body, sub) {
+			t.Fatalf("expected %q in Prometheus /metrics:\n%s", sub, body)
+		}
+	}
+
+	// Verify JSON /metrics export too
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/metrics", nil)
+	req.Header.Set("Accept", "application/json")
+	jsonResp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatalf("GET /metrics JSON failed: %v", err)
+	}
+	defer jsonResp.Body.Close()
+	var parsed map[string]any
+	if err := json.NewDecoder(jsonResp.Body).Decode(&parsed); err != nil {
+		t.Fatalf("decode JSON /metrics: %v", err)
+	}
+	for _, key := range []string{
+		"cubepod_sandbox_cold_start_phase_duration_seconds",
+		"cubepod_sandbox_resume_phase_duration_seconds",
+	} {
+		if _, ok := parsed[key]; !ok {
+			t.Fatalf("expected key %q in JSON /metrics, got %v", key, parsed)
+		}
+	}
+}

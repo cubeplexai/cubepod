@@ -208,9 +208,11 @@ Both `cubepod-gateway` and `cubepod-controller` accept `--feature-gate=GateA=tru
 | **Gateway** | `cubepod_webhook_deliveries_total` / `cubepod_webhook_queue_depth` | Counter / Gauge | Webhook delivery outcomes (`result`: `ok`, `failed`, `dropped`) and queue depth |
 | **Gateway** | `cubepod_webhook_dead_letters_total` / `cubepod_webhook_dead_letters_pending` | Counter / Gauge | *Added in v0.7.0.* Dead letters recorded and currently pending (alerts in `deploy/monitoring/webhook-alerts.yaml`) |
 | **Gateway & Controller** | `cubepod_sandbox_forks_total` / `cubepod_sandbox_fork_duration_seconds` | Counter / Histogram | CoW fork attempts (`mode`, `result`) and provisioning duration |
+| **Gateway** | `cubepod_sandbox_cold_start_phase_duration_seconds` / `cubepod_sandbox_resume_phase_duration_seconds` *(Added in v0.9.0)* | Histogram | Per-phase latency breakdown for sandbox cold start (`template_sync`, `warmpool_lookup`, `pvc_egress_prepare`, `ensure_pod`, `podbox_upsert`, `reconcile`, `podd_ready`, `total`) and resume (`resolve_sandbox`, `pvc_egress_prepare`, `ensure_pod`, `podbox_upsert`, `reconcile`, `podd_ready`, `total`) via `phase` label |
 | **Gateway & Controller** | `cubepod_templates` / `cubepod_gateway_templates_total` | Gauge | Templates by `status` (when `E2BTemplateAPI=true`) or total templates |
 | **Controller** | `cubepod_active_sandboxes` / `cubepod_paused_sandboxes` | Gauge | Reconciled `Running` and `Paused` `PodBox` counts |
 | **Controller** | `cubepod_warmpool_ready` / `cubepod_warmpool_available_replicas` | Gauge | Ready and unclaimed standby WarmPool replicas |
+| **Controller** | `cubepod_reconcile_phase_duration_seconds` *(Added in v0.9.0)* | Histogram | Per-phase controller reconciliation latency by `operation` (`cold_start`, `resume`, `warm_claim`, `pause`, `warmpool_scale_up`) and `phase` (`pvc_egress_prepare`, `ensure_pod`, `delete_pod`, `podbox_upsert`, `total`) |
 | **Controller** | `cubepod_template_builds_total` / `cubepod_template_build_duration_seconds` | Counter / Histogram | Template build completions (`result`) and duration |
 | **Egress** | `cubepod_egress_requests_total` | Counter | Outbound requests (`mode`, `decision`) |
 | **Egress** | `cubepod_egress_secret_exchanges_total` | Counter | Per-pod mTLS `cpodref_` exchanges (`result`: `ok`, `denied`, `error`) |
