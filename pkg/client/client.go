@@ -33,10 +33,17 @@ type SandboxRecord struct {
 	Reason           string            `json:"reason,omitempty"`
 }
 
+// SandboxVolumeMount identifies a named volume and its mount path inside a sandbox.
+type SandboxVolumeMount struct {
+	Name string `json:"name"`
+	Path string `json:"path"` // Absolute path inside the sandbox.
+}
+
 // CreateSandboxRequest specifies the parameters for provisioning a sandbox.
 type CreateSandboxRequest struct {
 	TemplateID    string                 `json:"templateID"`
 	VolumeKey     string                 `json:"volumeKey,omitempty"`
+	VolumeMounts  []SandboxVolumeMount   `json:"volumeMounts,omitempty"`
 	Metadata      map[string]string      `json:"metadata,omitempty"`
 	NetworkPolicy map[string]interface{} `json:"networkPolicy,omitempty"`
 }
@@ -365,6 +372,9 @@ func (c *Client) CreateSandbox(ctx context.Context, createReq CreateSandboxReque
 	}
 	if createReq.VolumeKey != "" {
 		payload["extension"] = map[string]string{"volumeKey": createReq.VolumeKey}
+	}
+	if len(createReq.VolumeMounts) > 0 {
+		payload["volumeMounts"] = createReq.VolumeMounts
 	}
 	if createReq.NetworkPolicy != nil {
 		payload["networkPolicy"] = createReq.NetworkPolicy
