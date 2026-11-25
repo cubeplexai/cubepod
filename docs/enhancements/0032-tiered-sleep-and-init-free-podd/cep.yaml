@@ -1,0 +1,43 @@
+title: "CEP-0032: Two-Tier Sandbox Sleep (L1 Light Freeze + L2 Scale-to-Zero) and InitContainer-Free podd Runtime Injection"
+cep-number: "0032"
+authors:
+  - "@xfgong"
+owning-area: "controller"
+participating-areas:
+  - "runtime"
+  - "gateway"
+  - "storage"
+status: "provisional"
+creation-date: "2026-11-25"
+last-updated: "2026-11-25"
+reviewers:
+  - "@xfgong"
+approvers:
+  - "@xfgong"
+stage: "alpha"
+latest-milestone: "v0.9.0"
+milestone:
+  alpha: "v0.9.0"
+  beta: "v0.9.0"
+  stable: "v1.0.0"
+feature-gates:
+  - name: "TieredSleep"
+    components:
+      - "podd"
+      - "podd-init"
+      - "cubepod-controller"
+      - "cubepod-gateway"
+  - name: "InitFreePoddInjection"
+    components:
+      - "cubepod-controller"
+      - "cubepod-podd-agent"
+disable-supported: true
+metrics:
+  - "cubepod_active_sandboxes"
+  - "cubepod_light_paused_sandboxes"
+  - "cubepod_deep_paused_sandboxes"
+  - "cubepod_paused_sandboxes"
+  - "cubepod_gateway_sandboxes_active"
+  - "cubepod_sandbox_sleep_transitions_total"
+  - "cubepod_sandbox_wake_duration_seconds"
+  - "cubepod_podd_injection_mode_total"
