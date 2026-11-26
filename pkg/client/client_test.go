@@ -26,12 +26,14 @@ func TestClient_CreateSandboxVolumeMounts(t *testing.T) {
 	}
 	tests := []struct {
 		name      string
+		apiKey    string
 		mounts    []client.SandboxVolumeMount
 		volumeKey string
 		wantJSON  string
 	}{
 		{
 			name:     "named mounts",
+			apiKey:   "test-api-key",
 			mounts:   mounts,
 			wantJSON: `{"templateID":"base","metadata":null,"volumeMounts":[{"name":"datasets","path":"/data"},{"name":"assets","path":"/mnt/assets"}]}`,
 		},
@@ -55,6 +57,16 @@ func TestClient_CreateSandboxVolumeMounts(t *testing.T) {
 
 			mux := http.NewServeMux()
 			mux.HandleFunc("POST /sandboxes", func(w http.ResponseWriter, r *http.Request) {
+				wantAuth := ""
+				if tt.apiKey != "" {
+					wantAuth = "Bearer " + tt.apiKey
+				}
+				if gotAuth := r.Header.Get("Authorization"); gotAuth != wantAuth {
+					t.Errorf("Authorization header = %q, want %q", gotAuth, wantAuth)
+				}
+				if gotAPIKey := r.Header.Get("X-API-KEY"); gotAPIKey != tt.apiKey {
+					t.Errorf("X-API-KEY header = %q, want %q", gotAPIKey, tt.apiKey)
+				}
 				var got map[string]any
 				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 					t.Errorf("decode create request: %v", err)
@@ -70,7 +82,11 @@ func TestClient_CreateSandboxVolumeMounts(t *testing.T) {
 			server := httptest.NewServer(mux)
 			defer server.Close()
 
-			record, err := client.New(server.URL).CreateSandbox(context.Background(), client.CreateSandboxRequest{
+			var opts []client.Option
+			if tt.apiKey != "" {
+				opts = append(opts, client.WithAPIKey(tt.apiKey))
+			}
+			record, err := client.New(server.URL, opts...).CreateSandbox(context.Background(), client.CreateSandboxRequest{
 				TemplateID:   "base",
 				VolumeKey:    tt.volumeKey,
 				VolumeMounts: tt.mounts,
@@ -90,6 +106,12 @@ func TestClient_AllMethods(t *testing.T) {
 
 	// 1. Health
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer secret-token" {
+			t.Errorf("Authorization header = %q, want %q", got, "Bearer secret-token")
+		}
+		if got := r.Header.Get("X-API-KEY"); got != "secret-token" {
+			t.Errorf("X-API-KEY header = %q, want %q", got, "secret-token")
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "cubepod-gateway"})
 	})
