@@ -60,15 +60,16 @@ func main() {
 ```
 
 Available constructor options:
-- `client.WithAPIKey(apiKey string)`: Attaches `Authorization: Bearer <apiKey>`.
+- `client.WithAPIKey(apiKey string)`: Attaches `Authorization: Bearer <apiKey>` and `X-API-KEY: <apiKey>` (*Changed in v0.9.0* to also send `X-API-KEY`).
 - `client.WithTimeout(timeout time.Duration)`: Overrides the default `60s` `http.Client.Timeout`.
 - `client.WithHTTPClient(httpClient *http.Client)`: Supplies a custom `*http.Client`.
 
-### Named Volume Mounts *(Unreleased)*
+### Named Volume Mounts *(Added in v0.9.0)*
 
-Set `CreateSandboxRequest.VolumeMounts` to mount an existing named volume. Each entry contains the volume name and the absolute path inside the sandbox.
+Set `CreateSandboxRequest.VolumeMounts` to mount an existing named volume. Each entry contains the volume name and the absolute path inside the sandbox. Configure `client.WithAPIKey(...)` so requests include the `X-API-KEY` header required by the gateway for named mounts.
 
 ```go
+c := client.New("http://localhost:8080", client.WithAPIKey("your-api-key"))
 req := client.CreateSandboxRequest{
     TemplateID: "base",
     VolumeMounts: []client.SandboxVolumeMount{
@@ -77,7 +78,7 @@ req := client.CreateSandboxRequest{
 }
 ```
 
-This option sets only the request body. The gateway still requires its existing `X-API-Key` header for named mounts; `WithAPIKey` continues to set the bearer header only. Legacy `VolumeKey` requests are unchanged. Do not combine `VolumeKey` with a block volume mount at `/workspace`.
+Legacy `VolumeKey` requests are unchanged. Do not combine `VolumeKey` with a block volume mount at `/workspace`.
 
 ### Sandbox Lifecycle, Reset & CoW Fork
 

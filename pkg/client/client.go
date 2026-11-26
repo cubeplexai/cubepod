@@ -33,6 +33,7 @@ type SandboxRecord struct {
 	Reason           string            `json:"reason,omitempty"`
 }
 
+// SandboxVolumeMount identifies a named volume and its mount path inside a sandbox.
 type SandboxVolumeMount struct {
 	Name string `json:"name"`
 	Path string `json:"path"`
@@ -260,7 +261,8 @@ type BuildTemplateRequest struct {
 // Option configures a Client instance.
 type Option func(*Client)
 
-// WithAPIKey sets the Bearer authorization token.
+// WithAPIKey configures API key authentication via both Authorization Bearer
+// and X-API-KEY headers.
 func WithAPIKey(apiKey string) Option {
 	return func(c *Client) {
 		c.apiKey = apiKey
@@ -327,6 +329,7 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body io.Re
 	}
 	if c.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("X-API-KEY", c.apiKey)
 	}
 	req.Header.Set("Accept", "application/json")
 	return req, nil
