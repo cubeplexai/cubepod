@@ -33,10 +33,9 @@ type SandboxRecord struct {
 	Reason           string            `json:"reason,omitempty"`
 }
 
-// SandboxVolumeMount identifies a named volume and its mount path inside a sandbox.
 type SandboxVolumeMount struct {
 	Name string `json:"name"`
-	Path string `json:"path"` // Absolute path inside the sandbox.
+	Path string `json:"path"`
 }
 
 // CreateSandboxRequest specifies the parameters for provisioning a sandbox.
