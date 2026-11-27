@@ -10,7 +10,7 @@ Use this skill when preparing or publishing a CubePod release. Exact version sou
 ## Required sequence
 
 1. Inspect the current branch, working tree, `origin/main`, and existing `v*` tags.
-2. Prepare a version-bump PR that updates all version sources in `docs/releasing.md` (Rust, Go, OpenAPI, Helm, Python/TS SDKs, and EN/ZH docs), adds `website/src/content/docs/changelog/<semver>.md` and `website/src/content/docs/zh/changelog/<semver>.md`, and registers the version at the top of `Changelog` in `website/astro.config.mjs`. Put upgrade instructions (especially CRD updates) after features and fixes.
+2. Prepare a version-bump PR that updates all version sources in `docs/releasing.md` (Rust, Go, OpenAPI, Helm, Python/TS SDKs, and EN/ZH docs), adds `website/src/content/docs/changelog/<semver>.md` and `website/src/content/docs/zh/changelog/<semver>.md`, and registers the version at the top of `Changelog` in `website/astro.config.mjs`. Run `python3 scripts/resolve-vnext.py v<semver>` to replace unreleased `vNEXT` docs markers with the release version. Put upgrade instructions (especially CRD updates) after features and fixes.
 3. Run `./scripts/check-version-consistency.sh v<semver>`, `python3 -m unittest discover -s scripts/tests`, `python3 scripts/release-notes.py v<semver>`, `make fmt && make vet && make test`, SDK tests, `helm lint`, and `make docs-build`. Review the rendered release notes output.
 4. Merge the PR into `main`.
 5. Create an annotated tag `v<semver>` on the merged commit and push it to trigger `.github/workflows/release.yml`.
@@ -19,5 +19,6 @@ Use this skill when preparing or publishing a CubePod release. Exact version sou
 ## Guardrails
 
 - Never overwrite an existing `v<semver>` tag.
+- Never ship with unresolved `vNEXT` markers; `check-version-consistency.sh` (run by `release.yml`) rejects them.
 - Never publish developer release checklists inside `website/src/content/docs/`.
 - If a release workflow image or package publish fails, fix the cause and cut the next patch release rather than mutating an existing tag.
