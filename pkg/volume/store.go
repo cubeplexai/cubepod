@@ -1230,11 +1230,14 @@ func (s *Store) LookupMounts(apiKey string, reqs []MountRequest) ([]PlannedMount
 		if !ValidName(req.Name) {
 			return nil, ErrInvalidName
 		}
+		// Leading/trailing whitespace in a mount path is never intentional and would
+		// otherwise mount at a surprising directory such as "/data ".
+		req.Path = strings.TrimSpace(req.Path)
 		id, ok := s.byName[nameKey(tenant, req.Name)]
 		if !ok {
 			// Preserve existing path-validation error ordering when volume is missing:
 			// validate path syntax so invalid paths still return ErrInvalidPath.
-			if _, perr := cleanMountPath(req.Path); perr != nil && path.Clean(strings.TrimSpace(req.Path)) != "/workspace" {
+			if _, perr := cleanMountPath(req.Path); perr != nil && path.Clean(req.Path) != "/workspace" {
 				return nil, perr
 			}
 			return nil, ErrNotFound
@@ -2426,6 +2429,7 @@ func tokenMatch(got, want string) bool {
 }
 
 func cleanMountPath(p string) (string, error) {
+	p = strings.TrimSpace(p)
 	if p == "" || strings.ContainsRune(p, 0) || strings.Contains(p, `\`) {
 		return "", ErrInvalidPath
 	}
