@@ -94,7 +94,7 @@ var mcpTools = []MCPTool{
 				},
 				"volumeMounts": {
 					Type:        "array",
-					Description: "Optional named volumes to mount; requires the MCP server to be started with an API key",
+					Description: "Optional existing named volumes to mount at absolute paths; requires the MCP server to be started with an API key. Block volumes may only be mounted at /workspace and cannot be combined with volumeKey",
 					Items: &MCPInputSchema{
 						Type: "object",
 						Properties: map[string]MCPProperty{
@@ -238,8 +238,14 @@ var mcpTools = []MCPTool{
 	},
 }
 
+// MCPOptions carries CLI configuration that the MCP server cannot read from the client.
+type MCPOptions struct {
+	// HasAPIKey reports whether a non-blank API key was configured.
+	HasAPIKey bool
+}
+
 // ServeMCP serves Model Context Protocol JSON-RPC 2.0 requests over an in/out stdio stream.
-func ServeMCP(ctx context.Context, c *client.Client, in io.Reader, out io.Writer) error {
+func ServeMCP(ctx context.Context, c *client.Client, in io.Reader, out io.Writer, opts MCPOptions) error {
 	reader := bufio.NewReader(in)
 	var writeMu sync.Mutex
 
@@ -323,7 +329,7 @@ func ServeMCP(ctx context.Context, c *client.Client, in io.Reader, out io.Writer
 			}
 
 		case "tools/call":
-			resp.Result = handleToolCall(ctx, c, req.Params)
+			resp.Result = handleToolCall(ctx, c, opts, req.Params)
 
 		default:
 			resp.Error = &jsonRPCError{
@@ -338,7 +344,7 @@ func ServeMCP(ctx context.Context, c *client.Client, in io.Reader, out io.Writer
 	}
 }
 
-func handleToolCall(ctx context.Context, c *client.Client, rawParams json.RawMessage) *CallToolResult {
+func handleToolCall(ctx context.Context, c *client.Client, opts MCPOptions, rawParams json.RawMessage) *CallToolResult {
 	var p ToolCallParams
 	if err := json.Unmarshal(rawParams, &p); err != nil {
 		return &CallToolResult{
@@ -367,8 +373,8 @@ func handleToolCall(ctx context.Context, c *client.Client, rawParams json.RawMes
 		if err := validateVolumeMounts(args.VolumeMounts); err != nil {
 			return &CallToolResult{Content: []MCPContent{{Type: "text", Text: fmt.Sprintf("invalid arguments: %v", err)}}, IsError: true}
 		}
-		if len(args.VolumeMounts) > 0 && !c.HasAPIKey() {
-			return &CallToolResult{Content: []MCPContent{{Type: "text", Text: errVolumeMountsRequireAPIKey.Error()}}, IsError: true}
+		if err := checkVolumeMountAuth(args.VolumeMounts, opts.HasAPIKey); err != nil {
+			return &CallToolResult{Content: []MCPContent{{Type: "text", Text: err.Error()}}, IsError: true}
 		}
 		tpl := args.TemplateID
 		if tpl == "" {

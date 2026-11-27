@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"flag"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -47,12 +49,56 @@ func TestParseVolumeMount(t *testing.T) {
 	}
 }
 
+// errAny marks test cases that only require a non-nil error.
+var errAny = errors.New("any error")
+
+func TestVolumeMountsFlagString(t *testing.T) {
+	var f volumeMountsFlag
+	if got := f.String(); got != "" {
+		t.Errorf("empty String() = %q, want empty", got)
+	}
+	for _, v := range []string{"a:/x", "b:/y"} {
+		if err := f.Set(v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := f.String(); got != "a:/x,b:/y" {
+		t.Errorf("String() = %q, want a:/x,b:/y", got)
+	}
+}
+
+func TestCheckVolumeMountAuth(t *testing.T) {
+	mounts := []client.SandboxVolumeMount{{Name: "datasets", Path: "/data"}}
+	tests := []struct {
+		name    string
+		mounts  []client.SandboxVolumeMount
+		apiKey  string
+		wantErr bool
+	}{
+		{name: "no mounts without key", apiKey: ""},
+		{name: "mounts with key", mounts: mounts, apiKey: "k"},
+		{name: "mounts without key", mounts: mounts, apiKey: "", wantErr: true},
+		{name: "mounts with blank key", mounts: mounts, apiKey: "  \t", wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := checkVolumeMountAuth(tt.mounts, hasAPIKey(tt.apiKey))
+			if tt.wantErr != (err != nil) {
+				t.Fatalf("checkVolumeMountAuth error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err != nil && !errors.Is(err, errVolumeMountsRequireAPIKey) {
+				t.Fatalf("error = %v, want errVolumeMountsRequireAPIKey", err)
+			}
+		})
+	}
+}
+
 func TestParseSandboxCreateArgs(t *testing.T) {
 	tests := []struct {
 		name    string
 		args    []string
 		want    client.CreateSandboxRequest
-		wantErr bool
+		wantErr error
 	}{
 		{
 			name: "defaults",
@@ -77,15 +123,23 @@ func TestParseSandboxCreateArgs(t *testing.T) {
 		{
 			name:    "invalid volume mount",
 			args:    []string{"--volume-mount", "datasets:data"},
-			wantErr: true,
+			wantErr: errAny,
+		},
+		{
+			name:    "help",
+			args:    []string{"-h"},
+			wantErr: flag.ErrHelp,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := parseSandboxCreateArgs(tt.args, io.Discard)
-			if tt.wantErr {
+			if tt.wantErr != nil {
 				if err == nil {
 					t.Fatalf("expected error, got request %+v", got)
+				}
+				if tt.wantErr != errAny && !errors.Is(err, tt.wantErr) {
+					t.Fatalf("error = %v, want %v", err, tt.wantErr)
 				}
 				return
 			}
@@ -138,7 +192,7 @@ func TestMCP_CreateSandboxVolumeMounts(t *testing.T) {
 		defer server.Close()
 		c := client.New(server.URL, client.WithAPIKey("test-key"), client.WithTimeout(5*time.Second))
 
-		responses := runMCPExchange(t, c, call(`{"templateID":"base","volumeKey":"legacy","volumeMounts":[{"name":" datasets","path":"/data "}]}`))
+		responses := runMCPExchangeWithOptions(t, c, MCPOptions{HasAPIKey: true}, call(`{"templateID":"base","volumeKey":"legacy","volumeMounts":[{"name":" datasets","path":"/data "}]}`))
 		if len(responses) != 1 {
 			t.Fatalf("expected 1 response, got %d", len(responses))
 		}
@@ -200,7 +254,7 @@ func TestMCP_CreateSandboxVolumeMounts(t *testing.T) {
 			}
 			c := client.New(server.URL, opts...)
 
-			responses := runMCPExchange(t, c, call(tt.args))
+			responses := runMCPExchangeWithOptions(t, c, MCPOptions{HasAPIKey: tt.apiKey != ""}, call(tt.args))
 			res := decodeResult(t, responses[0])
 			if !res.IsError || len(res.Content) == 0 || !strings.Contains(res.Content[0].Text, tt.wantSub) {
 				t.Fatalf("expected tool error containing %q, got %+v", tt.wantSub, res)
