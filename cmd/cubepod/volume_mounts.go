@@ -67,6 +67,15 @@ func validateVolumeMount(m client.SandboxVolumeMount) error {
 	return nil
 }
 
+// normalizeVolumeMounts trims surrounding whitespace from names and paths in
+// place, matching the gateway's mount path normalization.
+func normalizeVolumeMounts(mounts []client.SandboxVolumeMount) {
+	for i := range mounts {
+		mounts[i].Name = strings.TrimSpace(mounts[i].Name)
+		mounts[i].Path = strings.TrimSpace(mounts[i].Path)
+	}
+}
+
 func validateVolumeMounts(mounts []client.SandboxVolumeMount) error {
 	for i, m := range mounts {
 		if err := validateVolumeMount(m); err != nil {

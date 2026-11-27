@@ -22,6 +22,7 @@ func TestParseVolumeMount(t *testing.T) {
 		{spec: "datasets:/data", want: client.SandboxVolumeMount{Name: "datasets", Path: "/data"}},
 		{spec: "ws:/workspace", want: client.SandboxVolumeMount{Name: "ws", Path: "/workspace"}},
 		{spec: "a:/mnt/with:colon", want: client.SandboxVolumeMount{Name: "a", Path: "/mnt/with:colon"}},
+		{spec: " datasets : /data ", want: client.SandboxVolumeMount{Name: "datasets", Path: "/data"}},
 		{spec: "foo", wantErr: "expected NAME:PATH"},
 		{spec: ":/data", wantErr: "volume name must not be empty"},
 		{spec: "foo:", wantErr: "mount path must not be empty"},
@@ -137,7 +138,7 @@ func TestMCP_CreateSandboxVolumeMounts(t *testing.T) {
 		defer server.Close()
 		c := client.New(server.URL, client.WithAPIKey("test-key"), client.WithTimeout(5*time.Second))
 
-		responses := runMCPExchange(t, c, call(`{"templateID":"base","volumeKey":"legacy","volumeMounts":[{"name":"datasets","path":"/data"}]}`))
+		responses := runMCPExchange(t, c, call(`{"templateID":"base","volumeKey":"legacy","volumeMounts":[{"name":" datasets","path":"/data "}]}`))
 		if len(responses) != 1 {
 			t.Fatalf("expected 1 response, got %d", len(responses))
 		}

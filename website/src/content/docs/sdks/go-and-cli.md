@@ -252,7 +252,7 @@ cubepod mcp    # Starts MCP JSON-RPC 2.0 server over stdio
 | `cubepod sandbox fork <id>` | Create a ~1s CoW clone of both volumes. |
 | `cubepod sandbox delete <id>` | Terminate and delete a sandbox. |
 
-Named volume mounts (*Added in v0.9.0*) require an API key (`--api-key` or `CUBEPOD_API_KEY`); the CLI exits with an error before calling the gateway when none is configured. Each `--volume-mount` value is `NAME:PATH`, split on the first `:`, and `PATH` must be absolute. Volume existence, duplicate paths, and combining `--volume-key` with a block volume at `/workspace` are validated by the gateway:
+Named volume mounts (*Added in v0.9.0*) require an API key (`--api-key` or `CUBEPOD_API_KEY`); the CLI exits with an error before calling the gateway when none is configured. Each `--volume-mount` value is `NAME:PATH`, split on the first `:`; surrounding whitespace is trimmed and `PATH` must be absolute. Volume existence, duplicate paths, and combining `--volume-key` with a block volume at `/workspace` are validated by the gateway:
 
 ```bash
 cubepod --api-key "$CUBEPOD_API_KEY" sandbox create --template base \

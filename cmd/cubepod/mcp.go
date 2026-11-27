@@ -363,6 +363,7 @@ func handleToolCall(ctx context.Context, c *client.Client, rawParams json.RawMes
 		if err := json.Unmarshal(argsJSON, &args); err != nil {
 			return &CallToolResult{Content: []MCPContent{{Type: "text", Text: fmt.Sprintf("invalid arguments: %v", err)}}, IsError: true}
 		}
+		normalizeVolumeMounts(args.VolumeMounts)
 		if err := validateVolumeMounts(args.VolumeMounts); err != nil {
 			return &CallToolResult{Content: []MCPContent{{Type: "text", Text: fmt.Sprintf("invalid arguments: %v", err)}}, IsError: true}
 		}

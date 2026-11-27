@@ -253,7 +253,7 @@ cubepod mcp    # 通过 stdio 启动 MCP JSON-RPC 2.0 服务端
 | `cubepod sandbox delete <id>` | 终止并删除沙箱。 |
 
 
-命名卷挂载（*v0.9.0 新增*）需要 API key（`--api-key` 或 `CUBEPOD_API_KEY`）；未配置时 CLI 会在调用网关前直接报错。每个 `--volume-mount` 的取值为 `NAME:PATH`，按第一个 `:` 拆分，`PATH` 必须为绝对路径。卷是否存在、挂载路径是否重复、`--volume-key` 是否与 `/workspace` 块卷冲突等由网关校验：
+命名卷挂载（*v0.9.0 新增*）需要 API key（`--api-key` 或 `CUBEPOD_API_KEY`）；未配置时 CLI 会在调用网关前直接报错。每个 `--volume-mount` 的取值为 `NAME:PATH`，按第一个 `:` 拆分，首尾空白会被去除，`PATH` 必须为绝对路径。卷是否存在、挂载路径是否重复、`--volume-key` 是否与 `/workspace` 块卷冲突等由网关校验：
 
 ```bash
 cubepod --api-key "$CUBEPOD_API_KEY" sandbox create --template base \
