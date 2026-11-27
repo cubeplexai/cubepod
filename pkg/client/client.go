@@ -269,6 +269,11 @@ func WithAPIKey(apiKey string) Option {
 	}
 }
 
+// HasAPIKey reports whether the client was configured with a non-empty API key.
+func (c *Client) HasAPIKey() bool {
+	return c.apiKey != ""
+}
+
 // WithHTTPClient customizes the underlying http.Client.
 func WithHTTPClient(httpClient *http.Client) Option {
 	return func(c *Client) {

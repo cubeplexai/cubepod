@@ -30,8 +30,9 @@ type MCPInputSchema struct {
 
 // MCPProperty describes a single parameter property in MCPInputSchema.
 type MCPProperty struct {
-	Type        string `json:"type"`
-	Description string `json:"description"`
+	Type        string          `json:"type"`
+	Description string          `json:"description"`
+	Items       *MCPInputSchema `json:"items,omitempty"`
 }
 
 // ToolCallParams represents incoming arguments for tools/call.
@@ -86,6 +87,22 @@ var mcpTools = []MCPTool{
 				"timeout": {
 					Type:        "integer",
 					Description: "Optional idle timeout in seconds before auto-pause",
+				},
+				"volumeKey": {
+					Type:        "string",
+					Description: "Optional deterministic legacy workspace volume key",
+				},
+				"volumeMounts": {
+					Type:        "array",
+					Description: "Optional named volumes to mount; requires the MCP server to be started with an API key",
+					Items: &MCPInputSchema{
+						Type: "object",
+						Properties: map[string]MCPProperty{
+							"name": {Type: "string", Description: "Existing volume name"},
+							"path": {Type: "string", Description: "Absolute mount path inside the sandbox"},
+						},
+						Required: []string{"name", "path"},
+					},
 				},
 			},
 		},
@@ -338,18 +355,28 @@ func handleToolCall(ctx context.Context, c *client.Client, rawParams json.RawMes
 	switch p.Name {
 	case "cubepod_create_sandbox":
 		var args struct {
-			TemplateID string `json:"templateID"`
-			Timeout    int    `json:"timeout"`
+			TemplateID   string                      `json:"templateID"`
+			Timeout      int                         `json:"timeout"`
+			VolumeKey    string                      `json:"volumeKey"`
+			VolumeMounts []client.SandboxVolumeMount `json:"volumeMounts"`
 		}
 		if err := json.Unmarshal(argsJSON, &args); err != nil {
 			return &CallToolResult{Content: []MCPContent{{Type: "text", Text: fmt.Sprintf("invalid arguments: %v", err)}}, IsError: true}
+		}
+		if err := validateVolumeMounts(args.VolumeMounts); err != nil {
+			return &CallToolResult{Content: []MCPContent{{Type: "text", Text: fmt.Sprintf("invalid arguments: %v", err)}}, IsError: true}
+		}
+		if len(args.VolumeMounts) > 0 && !c.HasAPIKey() {
+			return &CallToolResult{Content: []MCPContent{{Type: "text", Text: errVolumeMountsRequireAPIKey.Error()}}, IsError: true}
 		}
 		tpl := args.TemplateID
 		if tpl == "" {
 			tpl = "cubeplex-ubuntu24-desktop"
 		}
 		sb, err := c.CreateSandbox(ctx, client.CreateSandboxRequest{
-			TemplateID: tpl,
+			TemplateID:   tpl,
+			VolumeKey:    args.VolumeKey,
+			VolumeMounts: args.VolumeMounts,
 		})
 		if err != nil {
 			return &CallToolResult{Content: []MCPContent{{Type: "text", Text: err.Error()}}, IsError: true}
