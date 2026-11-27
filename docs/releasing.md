@@ -12,7 +12,8 @@ Agents: load `.agent/skills/release/SKILL.md`, then follow this guide.
 2. From a feature branch off latest `origin/main`, prepare a **version-bump PR** that:
    - Updates every committed version source listed below.
    - Adds the English and Simplified Chinese changelog pages for the version and registers the version at the top of the `Changelog` sidebar in `website/astro.config.mjs`.
-3. Verify locally before pushing:
+   - Resolves unreleased docs markers: `python3 scripts/resolve-vnext.py v<semver>` replaces every `vNEXT` (e.g. `*Added in vNEXT*`, `*vNEXT 新增*`) under `website/src/content/docs/` and in `deploy/helm/cubepod/values.yaml` with the release version. Run `make docs-build` afterwards so generated pages such as `reference/helm-values.md` pick up the change.
+3. Verify locally before pushing (`check-version-consistency.sh` also fails if any `vNEXT` remains):
    ```bash
    ./scripts/check-version-consistency.sh v<semver>
    python3 -m unittest discover -s scripts/tests

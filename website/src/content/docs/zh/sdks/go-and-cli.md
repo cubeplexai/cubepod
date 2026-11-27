@@ -60,11 +60,11 @@ func main() {
 ```
 
 可用的构造选项：
-- `client.WithAPIKey(apiKey string)`：附加 `Authorization: Bearer <apiKey>` 与 `X-API-KEY: <apiKey>` 请求头（*v0.9.0 变更*：同步发送 `X-API-KEY`）。
+- `client.WithAPIKey(apiKey string)`：附加 `Authorization: Bearer <apiKey>` 与 `X-API-KEY: <apiKey>` 请求头（*vNEXT 变更*：同步发送 `X-API-KEY`）。
 - `client.WithTimeout(timeout time.Duration)`：覆盖默认的 `60s` `http.Client.Timeout`。
 - `client.WithHTTPClient(httpClient *http.Client)`：传入自定义 `*http.Client`。
 
-### 命名卷挂载 *(v0.9.0 新增)*
+### 命名卷挂载 *(vNEXT 新增)*
 
 通过 `CreateSandboxRequest.VolumeMounts` 挂载已有的命名卷。每项包含卷名及沙箱内的绝对挂载路径。使用命名卷挂载时请配置 `client.WithAPIKey(...)`，以附带网关所需的 `X-API-KEY` 请求头。
 
@@ -237,7 +237,7 @@ cubepod mcp    # 通过 stdio 启动 MCP JSON-RPC 2.0 服务端
 
 | 命令 | 说明 |
 | :--- | :--- |
-| `cubepod sandbox create [--template <id>] [--volume-key <key>] [--volume-mount NAME:PATH ...]` | 创建新沙箱（默认模板：`cubeplex-ubuntu24-desktop`）。`--volume-mount` 可重复使用，用于挂载已有的命名卷（*v0.9.0 新增*）。 |
+| `cubepod sandbox create [--template <id>] [--volume-key <key>] [--volume-mount NAME:PATH ...]` | 创建新沙箱（默认模板：`cubeplex-ubuntu24-desktop`）。`--volume-mount` 可重复使用，用于挂载已有的命名卷（*vNEXT 新增*）。 |
 | `cubepod sandbox list [--template <id>]` | 列出活跃及暂停中的沙箱，支持按模板过滤。 |
 | `cubepod sandbox get <sandbox-id>` | 查看状态、`rootfsGeneration` 与 `volumeKey`。 |
 | `cubepod sandbox exec <sandbox-id> <cmd...>` | 在沙箱内运行前台命令，并沿用远程退出码退出。 |
@@ -252,7 +252,7 @@ cubepod mcp    # 通过 stdio 启动 MCP JSON-RPC 2.0 服务端
 | `cubepod sandbox fork <id>` | 对双卷执行约 1 秒的写时复制（CoW）克隆。 |
 | `cubepod sandbox delete <id>` | 终止并删除沙箱。 |
 
-命名卷挂载（*v0.9.0 新增*）需要 API key（写在子命令之前的全局参数 `--api-key`，或 `CUBEPOD_API_KEY`）；未配置时 CLI 会在调用网关前直接报错。每个 `--volume-mount` 的取值为 `NAME:PATH`，按第一个 `:` 拆分，首尾空白会被去除，`PATH` 必须为绝对路径。其余规则由网关校验：卷必须存在，挂载路径不能重复且不能位于系统保留路径下，块卷只能挂载到 `/workspace`，且 `/workspace` 块卷不能与 `--volume-key` 同时使用：
+命名卷挂载（*vNEXT 新增*）需要 API key（写在子命令之前的全局参数 `--api-key`，或 `CUBEPOD_API_KEY`）；未配置时 CLI 会在调用网关前直接报错。每个 `--volume-mount` 的取值为 `NAME:PATH`，按第一个 `:` 拆分，首尾空白会被去除，`PATH` 必须为绝对路径。其余规则由网关校验：卷必须存在，挂载路径不能重复且不能位于系统保留路径下，块卷只能挂载到 `/workspace`，且 `/workspace` 块卷不能与 `--volume-key` 同时使用：
 
 ```bash
 cubepod --api-key "$CUBEPOD_API_KEY" sandbox create --template base \
@@ -260,7 +260,7 @@ cubepod --api-key "$CUBEPOD_API_KEY" sandbox create --template base \
   --volume-mount assets:/mnt/assets
 ```
 
-> 由于配置 API key 后 CLI 会发送 `X-API-KEY`（*v0.9.0 变更*），在开启 `BlockWorkspaceVolumes` 与旧卷懒接管的网关上，`--volume-key` 对应的工作区可能被接管为归属该 API key 的 `/workspace` 块卷；若该卷属于其他租户，网关返回 `403`。
+> 由于配置 API key 后 CLI 会发送 `X-API-KEY`（*vNEXT 变更*），在开启 `BlockWorkspaceVolumes` 与旧卷懒接管的网关上，`--volume-key` 对应的工作区可能被接管为归属该 API key 的 `/workspace` 块卷；若该卷属于其他租户，网关返回 `403`。
 
 #### 模板管理命令
 

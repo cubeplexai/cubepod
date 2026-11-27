@@ -79,8 +79,15 @@ for name in $(printf '%s\n' "${!versions[@]}" | sort); do
   fi
 done
 
+# Unreleased docs markers (`Added in vNEXT`) must be resolved in the version-bump PR.
+if ! python3 scripts/resolve-vnext.py --check >/dev/null; then
+  python3 scripts/resolve-vnext.py --check || true
+  echo "unresolved vNEXT markers: run python3 scripts/resolve-vnext.py $tag" >&2
+  failed=1
+fi
+
 if [[ $failed -ne 0 ]]; then
   exit 1
 fi
 
-echo "all CubePod package, binary, Helm, and SDK versions match $expected"
+echo "all CubePod package, binary, Helm, and SDK versions match $expected and no vNEXT markers remain"

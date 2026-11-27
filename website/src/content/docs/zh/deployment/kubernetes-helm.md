@@ -125,7 +125,7 @@ helm upgrade --install cubepod ./deploy/helm/cubepod \
 
 ### 关键运行时与存储默认配置
 
-- **运行时注入（`runtime.poddInjectorImage`、`runtime.poddInjectionMode`、`runtime.poddHostPath`）**：默认为 `ghcr.io/cubeplexai/cubepod-podd:v0.8.0` 与 `runtime.poddInjectionMode: initContainer`，每个沙箱 Pod 通过 `initContainer` 将 `podd-init` 与 `podd` 拷贝至共享 `emptyDir`（`/opt/cubepod/bin`），保持基础业务镜像纯净。*Added in v0.9.0*：设置 `runtime.poddInjectionMode: hostPath` 可部署 `cubepod-podd-agent` DaemonSet，并将宿主机 `runtime.poddHostPath`（默认 `/var/lib/cubepod/bin/active`）以只读方式挂载到 `/opt/cubepod/bin`，彻底消除每个 Pod 的 `initContainer` 启动开销（当 `PodTemplate` 显式覆盖自定义 `poddImage` 时自动回退为 `initContainer` 模式）。
+- **运行时注入（`runtime.poddInjectorImage`、`runtime.poddInjectionMode`、`runtime.poddHostPath`）**：默认为 `ghcr.io/cubeplexai/cubepod-podd:v0.8.0` 与 `runtime.poddInjectionMode: initContainer`，每个沙箱 Pod 通过 `initContainer` 将 `podd-init` 与 `podd` 拷贝至共享 `emptyDir`（`/opt/cubepod/bin`），保持基础业务镜像纯净。*vNEXT 新增*：设置 `runtime.poddInjectionMode: hostPath` 可部署 `cubepod-podd-agent` DaemonSet，并将宿主机 `runtime.poddHostPath`（默认 `/var/lib/cubepod/bin/active`）以只读方式挂载到 `/opt/cubepod/bin`，彻底消除每个 Pod 的 `initContainer` 启动开销（当 `PodTemplate` 显式覆盖自定义 `poddImage` 时自动回退为 `initContainer` 模式）。
 - **私有仓库凭证（`global.imagePullSecrets`、`runtime.templatePullSecret`）**：自 `v0.5.2` 起支持，统一为控制面 Pod（`controller`、`gateway`、`buildkit`）与工作负载沙箱 Pod 注入镜像拉取凭证（即使关闭 `templateBuild.enabled` 也生效）。
 - **Egress CA 与状态持久化（`egress.caSecretName`、`gateway.persistence`）**：自 `v0.5.2` 起支持，可挂载持久化根 CA Secret 至控制面，并为 Gateway 持久化 `stateDir`（`CUBEPOD_STATE`）以保存模板目录、E2B Secrets 与生命周期事件/Webhook 状态。
 - **双裸块 PVC（`storage.*`）**：默认 `storageClassName: longhorn-v2-block-thin`、`volumeMode: Block`、`rootfsSize: "10Gi"`、`workspaceSize: "20Gi"`。
