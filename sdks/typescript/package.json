@@ -1,6 +1,6 @@
 {
   "name": "cubepod",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Official TypeScript/JavaScript SDK for CubePod (E2B-compatible persistent MicroVM sandboxes)",
   "license": "Apache-2.0",
   "type": "module",
