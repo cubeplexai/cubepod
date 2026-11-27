@@ -60,11 +60,11 @@ func main() {
 ```
 
 Available constructor options:
-- `client.WithAPIKey(apiKey string)`: Attaches `Authorization: Bearer <apiKey>` and `X-API-KEY: <apiKey>` (*Changed in vNEXT* to also send `X-API-KEY`).
+- `client.WithAPIKey(apiKey string)`: Attaches `Authorization: Bearer <apiKey>` and `X-API-KEY: <apiKey>` (*Changed in v0.8.1* to also send `X-API-KEY`).
 - `client.WithTimeout(timeout time.Duration)`: Overrides the default `60s` `http.Client.Timeout`.
 - `client.WithHTTPClient(httpClient *http.Client)`: Supplies a custom `*http.Client`.
 
-### Named Volume Mounts *(Added in vNEXT)*
+### Named Volume Mounts *(Added in v0.8.1)*
 
 Set `CreateSandboxRequest.VolumeMounts` to mount an existing named volume. Each entry contains the volume name and the absolute path inside the sandbox. Configure `client.WithAPIKey(...)` so requests include the `X-API-KEY` header required by the gateway for named mounts.
 
@@ -237,7 +237,7 @@ cubepod mcp    # Starts MCP JSON-RPC 2.0 server over stdio
 
 | Command | Description |
 | :--- | :--- |
-| `cubepod sandbox create [--template <id>] [--volume-key <key>] [--volume-mount NAME:PATH ...]` | Provision a new sandbox (default template: `cubeplex-ubuntu24-desktop`). `--volume-mount` is repeatable and mounts an existing named volume (*Added in vNEXT*). |
+| `cubepod sandbox create [--template <id>] [--volume-key <key>] [--volume-mount NAME:PATH ...]` | Provision a new sandbox (default template: `cubeplex-ubuntu24-desktop`). `--volume-mount` is repeatable and mounts an existing named volume (*Added in v0.8.1*). |
 | `cubepod sandbox list [--template <id>]` | List active and paused sandboxes, optionally filtered by template. |
 | `cubepod sandbox get <sandbox-id>` | Inspect state, `rootfsGeneration`, and `volumeKey`. |
 | `cubepod sandbox exec <sandbox-id> <cmd...>` | Run a foreground command and exit with the remote exit code. |
@@ -252,7 +252,7 @@ cubepod mcp    # Starts MCP JSON-RPC 2.0 server over stdio
 | `cubepod sandbox fork <id>` | Create a ~1s CoW clone of both volumes. |
 | `cubepod sandbox delete <id>` | Terminate and delete a sandbox. |
 
-Named volume mounts (*Added in vNEXT*) require an API key (the global `--api-key` flag, placed before the subcommand, or `CUBEPOD_API_KEY`); the CLI exits with an error before calling the gateway when none is configured. Each `--volume-mount` value is `NAME:PATH`, split on the first `:`; surrounding whitespace is trimmed and `PATH` must be absolute. Other rules are enforced by the gateway: the volume must exist, mount paths must be unique and outside reserved system paths, block volumes may only be mounted at `/workspace`, and a block `/workspace` mount cannot be combined with `--volume-key`:
+Named volume mounts (*Added in v0.8.1*) require an API key (the global `--api-key` flag, placed before the subcommand, or `CUBEPOD_API_KEY`); the CLI exits with an error before calling the gateway when none is configured. Each `--volume-mount` value is `NAME:PATH`, split on the first `:`; surrounding whitespace is trimmed and `PATH` must be absolute. Other rules are enforced by the gateway: the volume must exist, mount paths must be unique and outside reserved system paths, block volumes may only be mounted at `/workspace`, and a block `/workspace` mount cannot be combined with `--volume-key`:
 
 ```bash
 cubepod --api-key "$CUBEPOD_API_KEY" sandbox create --template base \
@@ -260,7 +260,7 @@ cubepod --api-key "$CUBEPOD_API_KEY" sandbox create --template base \
   --volume-mount assets:/mnt/assets
 ```
 
-> Because the CLI sends `X-API-KEY` whenever an API key is configured (*Changed in vNEXT*), a gateway with `BlockWorkspaceVolumes` and lazy legacy volume claims enabled may adopt a `--volume-key` workspace as a block `/workspace` volume owned by that API key, and rejects keys whose volume belongs to another tenant with `403`.
+> Because the CLI sends `X-API-KEY` whenever an API key is configured (*Changed in v0.8.1*), a gateway with `BlockWorkspaceVolumes` and lazy legacy volume claims enabled may adopt a `--volume-key` workspace as a block `/workspace` volume owned by that API key, and rejects keys whose volume belongs to another tenant with `403`.
 
 #### Template Commands
 

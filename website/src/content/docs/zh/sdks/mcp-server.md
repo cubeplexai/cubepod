@@ -31,8 +31,8 @@ flowchart LR
 | :--- | :--- | :--- | :--- |
 | `templateID` | `string` | 否 | 沙箱基础镜像模板 ID（默认：`cubeplex-ubuntu24-desktop`）。 |
 | `timeout` | `integer` | 否 | 可选空闲超时秒数，超时后自动暂停。 |
-| `volumeKey` | `string` | 否 | 可选的确定性旧版工作区卷键（*vNEXT 新增*）。 |
-| `volumeMounts` | `{ "name": string, "path": string }` 数组 | 否 | 要挂载的已有命名卷及其绝对路径（*vNEXT 新增*）。需使用 API key 启动 `cubepod mcp`（`cubepod --api-key <key> mcp` 或 `CUBEPOD_API_KEY`）。首尾空白会被去除；块卷只能挂载到 `/workspace`，且不能与 `volumeKey` 同时使用。 |
+| `volumeKey` | `string` | 否 | 可选的确定性旧版工作区卷键（*v0.8.1 新增*）。 |
+| `volumeMounts` | `{ "name": string, "path": string }` 数组 | 否 | 要挂载的已有命名卷及其绝对路径（*v0.8.1 新增*）。需使用 API key 启动 `cubepod mcp`（`cubepod --api-key <key> mcp` 或 `CUBEPOD_API_KEY`）。首尾空白会被去除；块卷只能挂载到 `/workspace`，且不能与 `volumeKey` 同时使用。 |
 
 ### 2. `cubepod_list_sandboxes`
 列举当前处于运行中或已暂停状态的 CubePod 沙箱，支持按模板过滤。

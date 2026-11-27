@@ -73,7 +73,7 @@ func defaultEgressImage() string {
 	if env := strings.TrimSpace(os.Getenv("CUBEPOD_EGRESS_IMAGE")); env != "" {
 		return env
 	}
-	return "ghcr.io/cubeplexai/cubepod-egress:v0.8.0"
+	return "ghcr.io/cubeplexai/cubepod-egress:v0.8.1"
 }
 
 func main() {
@@ -86,7 +86,7 @@ func main() {
 		storageClass         = flag.String("storage-class", "nfs-storage", "Default StorageClass name")
 		volumeMode           = flag.String("volume-mode", "Filesystem", "Storage volume mode (Block or Filesystem)")
 		runtimeClass         = flag.String("runtime-class", "", "Container runtime class name (empty for standard runc/containerd)")
-		poddImage            = flag.String("podd-image", "ghcr.io/cubeplexai/cubepod-podd:v0.8.0", "Image for podd-installer initContainer")
+		poddImage            = flag.String("podd-image", "ghcr.io/cubeplexai/cubepod-podd:v0.8.1", "Image for podd-installer initContainer")
 		poddInjectionMode    = flag.String("podd-injection-mode", envOrDefault("CUBEPOD_PODD_INJECTION_MODE", controller.PoddInjectionModeInitContainer), "How podd binaries are injected into sandboxes (initContainer or hostPath)")
 		poddHostPath         = flag.String("podd-host-path", envOrDefault("CUBEPOD_PODD_HOST_PATH", controller.DefaultPoddHostPath), "Host directory mounted read-only at /opt/cubepod/bin when --podd-injection-mode=hostPath")
 		sandboxImage         = flag.String("sandbox-image", "ubuntu:24.04", "Default sandbox image")

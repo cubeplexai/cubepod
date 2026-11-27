@@ -61,6 +61,12 @@ One CubePod semver (example: `0.4.2`) across these committed fields.
 | `website/src/content/docs/sdks/typescript.md` & `zh/sdks/typescript.md` | Package version |
 | `website/src/content/docs/reference/api-overview.md` & `zh/reference/api-overview.md` | OpenAPI spec version |
 
+**Other committed references (not checked by the script):**
+
+- `deploy/helm/cubepod/templates/_helpers.tpl` → default egress image tag
+- `deploy/k8s/local.example/values.yaml` → `poddInjectorImage` and image `tag`s
+- `website/src/components/LandingPage.astro` and `website/src/components/ScalarApiPage.astro` → version badges and the latest changelog link
+
 ### Do not bump
 
 - `deploy/helm/cubepod/values.yaml` `runtime.defaultSandboxImage` (`ghcr.io/cubeplexai/cubeplex-sandbox:v0.4.0`) and its mention in `kubernetes-helm.md` unless the external `cubeplex-sandbox` image itself released a matching tag.
