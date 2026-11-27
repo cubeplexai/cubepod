@@ -477,3 +477,46 @@ func TestStore_PromoteOwnerTenant_NameCollisionAndRotateKey(t *testing.T) {
 		t.Fatalf("expected disambiguated name for colliding adopted volume, still got %q", gotAdopted.Name)
 	}
 }
+
+func TestStore_LookupMounts_TrimsPathWhitespace(t *testing.T) {
+	st := openTestStore(t, Config{})
+	if _, err := st.CreateWithOptions("k", "ws", CreateOpts{Type: "block"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Create("k", "data"); err != nil {
+		t.Fatal(err)
+	}
+
+	planned, err := st.LookupMounts("k", []MountRequest{
+		{Name: "ws", Path: " /workspace\t"},
+		{Name: "data", Path: "  /mnt/datasets \n"},
+	})
+	if err != nil {
+		t.Fatalf("LookupMounts with padded paths: %v", err)
+	}
+	if planned[0].Path != "/workspace" || planned[1].Path != "/mnt/datasets" {
+		t.Fatalf("planned paths = %q, %q; want /workspace, /mnt/datasets", planned[0].Path, planned[1].Path)
+	}
+
+	// Paths that differ only by surrounding whitespace are duplicates.
+	if _, err := st.LookupMounts("k", []MountRequest{
+		{Name: "data", Path: "/mnt/datasets"},
+		{Name: "data", Path: "/mnt/datasets "},
+	}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("padded duplicate err = %v; want ErrConflict", err)
+	}
+
+	// Whitespace-only and padded relative paths stay invalid.
+	for _, p := range []string{"   ", " mnt/datasets "} {
+		if _, err := st.LookupMounts("k", []MountRequest{{Name: "data", Path: p}}); !errors.Is(err, ErrInvalidPath) {
+			t.Fatalf("path %q err = %v; want ErrInvalidPath", p, err)
+		}
+	}
+	// Missing volumes still report ErrInvalidPath for bad paths after trimming.
+	if _, err := st.LookupMounts("k", []MountRequest{{Name: "missing", Path: " relative "}}); !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("missing volume with bad path err = %v; want ErrInvalidPath", err)
+	}
+	if _, err := st.LookupMounts("k", []MountRequest{{Name: "missing", Path: " /mnt/x "}}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing volume err = %v; want ErrNotFound", err)
+	}
+}
