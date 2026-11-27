@@ -39,7 +39,7 @@ Commands:
   template delete <id> [--force]              Delete a template
   sandbox create [flags]                      Provision a new sandbox
                                               [--template <id>] [--volume-key <key>]
-                                              [--volume-mount NAME:PATH ...] (requires --api-key)
+                                              [--volume-mount NAME:PATH ...] (requires global --api-key)
   sandbox list [--template <id>]              List managed sandboxes
   sandbox get <sandbox-id>                    Get status for a sandbox
   sandbox exec <sandbox-id> <cmd...>          Execute a command inside a sandbox
@@ -118,7 +118,7 @@ func main() {
 		})
 
 	case "mcp":
-		if err := ServeMCP(ctx, c, os.Stdin, os.Stdout); err != nil {
+		if err := ServeMCP(ctx, c, os.Stdin, os.Stdout, MCPOptions{HasAPIKey: hasAPIKey(apiKey)}); err != nil {
 			fatal(err)
 		}
 
@@ -134,7 +134,7 @@ func main() {
 			printUsage()
 			os.Exit(1)
 		}
-		handleSandbox(ctx, c, subArgs, jsonOutput)
+		handleSandbox(ctx, c, subArgs, jsonOutput, hasAPIKey(apiKey))
 
 	case "warmpool":
 		if len(subArgs) == 0 {
@@ -153,7 +153,7 @@ func main() {
 	}
 }
 
-func handleSandbox(ctx context.Context, c *client.Client, args []string, jsonOutput bool) {
+func handleSandbox(ctx context.Context, c *client.Client, args []string, jsonOutput, hasAPIKey bool) {
 	sub := args[0]
 	rest := args[1:]
 
@@ -167,8 +167,8 @@ func handleSandbox(ctx context.Context, c *client.Client, args []string, jsonOut
 			// The FlagSet has already printed the error and usage.
 			os.Exit(2)
 		}
-		if len(createReq.VolumeMounts) > 0 && !c.HasAPIKey() {
-			fatal(errVolumeMountsRequireAPIKey)
+		if err := checkVolumeMountAuth(createReq.VolumeMounts, hasAPIKey); err != nil {
+			fatal(err)
 		}
 
 		sb, err := c.CreateSandbox(ctx, createReq)

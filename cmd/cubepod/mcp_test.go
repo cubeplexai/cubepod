@@ -19,6 +19,11 @@ import (
 
 func runMCPExchange(t *testing.T, c *client.Client, requests ...string) []jsonRPCResponse {
 	t.Helper()
+	return runMCPExchangeWithOptions(t, c, MCPOptions{}, requests...)
+}
+
+func runMCPExchangeWithOptions(t *testing.T, c *client.Client, opts MCPOptions, requests ...string) []jsonRPCResponse {
+	t.Helper()
 	in := &bytes.Buffer{}
 	for _, req := range requests {
 		var buf bytes.Buffer
@@ -33,7 +38,7 @@ func runMCPExchange(t *testing.T, c *client.Client, requests ...string) []jsonRP
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := ServeMCP(ctx, c, in, out); err != nil {
+	if err := ServeMCP(ctx, c, in, out, opts); err != nil {
 		t.Fatalf("ServeMCP returned error: %v", err)
 	}
 
@@ -588,7 +593,7 @@ func TestMCP_ErrorCases(t *testing.T) {
 		cancel() // immediately cancel
 		in := &bytes.Buffer{}
 		out := &bytes.Buffer{}
-		err := ServeMCP(ctx, c, in, out)
+		err := ServeMCP(ctx, c, in, out, MCPOptions{})
 		if err == nil || !strings.Contains(err.Error(), "context canceled") {
 			t.Fatalf("expected context canceled error, got %v", err)
 		}

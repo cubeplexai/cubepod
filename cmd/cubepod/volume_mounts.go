@@ -13,7 +13,7 @@ import (
 
 // errVolumeMountsRequireAPIKey is returned when named volume mounts are requested
 // without an API key; the gateway resolves volume names per API key.
-var errVolumeMountsRequireAPIKey = errors.New("named volume mounts require an API key; set --api-key or CUBEPOD_API_KEY")
+var errVolumeMountsRequireAPIKey = errors.New("named volume mounts require an API key; set the global --api-key flag (before the subcommand) or CUBEPOD_API_KEY")
 
 // volumeMountsFlag is a repeatable flag.Value collecting NAME:PATH volume mounts.
 type volumeMountsFlag []client.SandboxVolumeMount
@@ -76,6 +76,20 @@ func normalizeVolumeMounts(mounts []client.SandboxVolumeMount) {
 	}
 }
 
+// hasAPIKey mirrors the gateway, which treats a whitespace-only X-API-KEY as missing.
+func hasAPIKey(apiKey string) bool {
+	return strings.TrimSpace(apiKey) != ""
+}
+
+// checkVolumeMountAuth fails fast when named volume mounts are requested
+// without an API key, instead of surfacing a gateway 401.
+func checkVolumeMountAuth(mounts []client.SandboxVolumeMount, hasAPIKey bool) error {
+	if len(mounts) > 0 && !hasAPIKey {
+		return errVolumeMountsRequireAPIKey
+	}
+	return nil
+}
+
 func validateVolumeMounts(mounts []client.SandboxVolumeMount) error {
 	for i, m := range mounts {
 		if err := validateVolumeMount(m); err != nil {
@@ -92,7 +106,7 @@ func parseSandboxCreateArgs(args []string, stderr io.Writer) (client.CreateSandb
 	tpl := fs.String("template", "cubeplex-ubuntu24-desktop", "Template ID")
 	volKey := fs.String("volume-key", "", "Deterministic workspace volume key")
 	var mounts volumeMountsFlag
-	fs.Var(&mounts, "volume-mount", "Mount a named volume as NAME:PATH (repeatable; requires an API key)")
+	fs.Var(&mounts, "volume-mount", "Mount a named volume as NAME:PATH (repeatable; requires the global --api-key flag or CUBEPOD_API_KEY)")
 	if err := fs.Parse(args); err != nil {
 		return client.CreateSandboxRequest{}, err
 	}

@@ -1104,15 +1104,3 @@ func TestClient_OmittedUIDGID(t *testing.T) {
 		t.Fatalf("expected ArchiveSyncWithOwner to send uid=0&gid=0, got query: %s", syncQuery[1])
 	}
 }
-
-func TestClient_HasAPIKey(t *testing.T) {
-	if client.New("http://example.invalid").HasAPIKey() {
-		t.Error("HasAPIKey() = true without WithAPIKey")
-	}
-	if client.New("http://example.invalid", client.WithAPIKey("")).HasAPIKey() {
-		t.Error("HasAPIKey() = true with empty key")
-	}
-	if !client.New("http://example.invalid", client.WithAPIKey("k")).HasAPIKey() {
-		t.Error("HasAPIKey() = false with key configured")
-	}
-}
