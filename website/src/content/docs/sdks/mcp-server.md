@@ -31,6 +31,8 @@ Provision a new persistent MicroVM execution sandbox.
 | :--- | :--- | :--- | :--- |
 | `templateID` | `string` | No | Template ID for the sandbox base image (default: `cubeplex-ubuntu24-desktop`). |
 | `timeout` | `integer` | No | Optional idle timeout in seconds before auto-pause. |
+| `volumeKey` | `string` | No | Optional deterministic legacy workspace volume key (*Added in v0.9.0*). |
+| `volumeMounts` | `array` of `{ "name": string, "path": string }` | No | Existing named volumes to mount at absolute paths (*Added in v0.9.0*). Requires starting `cubepod mcp` with an API key (`--api-key` or `CUBEPOD_API_KEY`). |
 
 ### 2. `cubepod_list_sandboxes`
 List active and paused CubePod sandboxes, optionally filtered by template ID.

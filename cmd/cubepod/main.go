@@ -38,6 +38,8 @@ Commands:
   template update <id> --public=true|false    Update template public visibility
   template delete <id> [--force]              Delete a template
   sandbox create [flags]                      Provision a new sandbox
+                                              [--template <id>] [--volume-key <key>]
+                                              [--volume-mount NAME:PATH ...] (requires --api-key)
   sandbox list [--template <id>]              List managed sandboxes
   sandbox get <sandbox-id>                    Get status for a sandbox
   sandbox exec <sandbox-id> <cmd...>          Execute a command inside a sandbox
@@ -157,15 +159,19 @@ func handleSandbox(ctx context.Context, c *client.Client, args []string, jsonOut
 
 	switch sub {
 	case "create":
-		fs := flag.NewFlagSet("sandbox create", flag.ExitOnError)
-		tpl := fs.String("template", "cubeplex-ubuntu24-desktop", "Template ID")
-		volKey := fs.String("volume-key", "", "Deterministic workspace volume key")
-		_ = fs.Parse(rest)
+		createReq, err := parseSandboxCreateArgs(rest, os.Stderr)
+		if err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				os.Exit(0)
+			}
+			// The FlagSet has already printed the error and usage.
+			os.Exit(2)
+		}
+		if len(createReq.VolumeMounts) > 0 && !c.HasAPIKey() {
+			fatal(errVolumeMountsRequireAPIKey)
+		}
 
-		sb, err := c.CreateSandbox(ctx, client.CreateSandboxRequest{
-			TemplateID: *tpl,
-			VolumeKey:  *volKey,
-		})
+		sb, err := c.CreateSandbox(ctx, createReq)
 		if err != nil {
 			fatal(err)
 		}
